@@ -135,7 +135,10 @@ impl SystemTargets for WindowsSystemTargets {
 
     fn wipe_free_space(&mut self, drive: &str) -> Result<(), String> {
         let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let mut command: Vec<u16> = format!("{system}\\System32\\cipher.exe /w:{drive}\0")
+        let app: Vec<u16> = format!("{system}\\System32\\cipher.exe\0")
+            .encode_utf16()
+            .collect();
+        let mut command: Vec<u16> = format!("\"{system}\\System32\\cipher.exe\" /w:{drive}\0")
             .encode_utf16()
             .collect();
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
@@ -143,7 +146,7 @@ impl SystemTargets for WindowsSystemTargets {
         let mut child: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
         let ok = unsafe {
             CreateProcessW(
-                ptr::null(),
+                app.as_ptr(),
                 command.as_mut_ptr(),
                 ptr::null(),
                 ptr::null(),
@@ -165,5 +168,23 @@ impl SystemTargets for WindowsSystemTargets {
             CloseHandle(child.hThread);
         }
         Ok(())
+    }
+}
+
+/// Live Windows tests. Read-only drive queries; nothing is cleaned.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_drives_look_sane() {
+        let targets = WindowsSystemTargets;
+        let drives = targets.fixed_drives();
+        assert!(!drives.is_empty());
+        for drive in &drives {
+            assert_eq!(drive.len(), 3, "unexpected drive root: {drive}");
+            assert!(drive.ends_with(":\\"), "unexpected drive root: {drive}");
+        }
+        assert!(targets.free_bytes(&drives[0]) > 0);
     }
 }

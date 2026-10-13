@@ -16,12 +16,12 @@ pub struct Engine {
 }
 
 impl Engine {
-    pub fn builtin() -> Self {
-        Self {
-            rules: RuleSet::builtin(),
+    pub fn try_builtin() -> Result<Self, Error> {
+        Ok(Self {
+            rules: RuleSet::try_builtin()?,
             ignore: IgnoreDb::default(),
             deep_roots: builtin_deep_roots(),
-        }
+        })
     }
 
     /// `data_dir` is an extracted legacy cleaner `app` folder, or its `Data` folder.
@@ -29,7 +29,7 @@ impl Engine {
     pub fn load(rules_path: Option<&Path>, data_dir: Option<&Path>) -> Result<Self, Error> {
         let mut rules = match rules_path {
             Some(path) => load_rules_file(path)?,
-            None => RuleSet::builtin(),
+            None => RuleSet::try_builtin()?,
         };
         let mut ignore = IgnoreDb::default();
         let mut deep_roots = builtin_deep_roots();
@@ -321,6 +321,10 @@ pub fn repair(
 
 /// Writes the backup, then removes each finding the backup covers.
 /// `progress(done, total)` runs after each finding.
+///
+/// A value added between the backup read and its deletion would be removed
+/// without being in the backup; the window is milliseconds, and anything
+/// the backup could not read is skipped rather than deleted.
 pub fn repair_with_progress(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,

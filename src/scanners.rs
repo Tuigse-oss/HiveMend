@@ -2118,7 +2118,12 @@ mod tests {
             r"C:\Missing\button.exe",
         );
 
-        let report = scan(&Engine::builtin(), &reg, &fs, &ScanOptions::default());
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
         let text = report
             .findings
             .iter()
@@ -2292,7 +2297,12 @@ mod tests {
             r"C:\Missing\settings.exe",
         );
 
-        let report = scan(&Engine::builtin(), &reg, &fs, &ScanOptions::default());
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
         let text = report
             .findings
             .iter()
@@ -2445,7 +2455,12 @@ mod tests {
             r"C:\Missing\theme.theme",
         );
 
-        let report = scan(&Engine::builtin(), &reg, &fs, &ScanOptions::default());
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
         let text = report
             .findings
             .iter()

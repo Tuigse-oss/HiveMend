@@ -78,8 +78,34 @@ pub fn volume_ssd(drive: &str) -> Option<bool> {
         )
     };
     unsafe { CloseHandle(handle) };
-    if ok == 0 || returned as usize != out.len() {
+    // The flag lives at byte 8; accept any descriptor long enough to hold
+    // it rather than demanding the padded 12.
+    if ok == 0 || returned < 9 {
         return None;
     }
     crate::shredder::seek_penalty_false(&out)
+}
+
+/// Live Windows tests. Read-only drive and volume queries.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_fixed_drives_shaped() {
+        let drives = fixed_drives();
+        assert!(!drives.is_empty());
+        for drive in &drives {
+            assert_eq!(drive.len(), 3, "unexpected drive root: {drive}");
+            assert!(drive.ends_with(":\\"), "unexpected drive root: {drive}");
+        }
+    }
+
+    #[test]
+    fn live_volume_ssd_handles_bad_input() {
+        // Must not panic; the C: value itself depends on the machine.
+        let _ = volume_ssd("C:");
+        assert_eq!(volume_ssd(""), None);
+        assert_eq!(volume_ssd("9:"), None);
+    }
 }

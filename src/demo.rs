@@ -171,7 +171,7 @@ mod tests {
     fn sample_scan_matches_the_ported_jobs() {
         let sample = sample_world();
         let report = scan(
-            &Engine::builtin(),
+            &Engine::try_builtin().unwrap(),
             &sample.reg,
             &sample.fs,
             &ScanOptions::default(),
@@ -222,7 +222,7 @@ mod tests {
     fn repair_removes_a_startup_value_and_refuses_winlogon() {
         let mut sample = sample_world();
         let report = scan(
-            &Engine::builtin(),
+            &Engine::try_builtin().unwrap(),
             &sample.reg,
             &sample.fs,
             &ScanOptions::default(),

@@ -13,7 +13,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::{
@@ -24,14 +24,14 @@ use hive_mend::{
     ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
     WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
     custom_privacy_file, decode_text_owned, exclusions_file, expand_target, fixed_drives,
-    format_bytes, format_uptime, gather_hives, gather_snapshot, import_reg_file, list_backups,
-    list_recycle_bin, parse_custom, plan_profile, preview, random_seed, read_backup,
-    repair_with_progress, restore_files, scan_with_progress, settings_file, shred_allowed,
-    shred_paths, shred_recycle_items, sort_services, start_services, still_reported, stop_services,
-    volume_ssd,
+    format_bytes, format_uptime, gather_hives, gather_snapshot, import_reg_file,
+    is_hive_mend_backup, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
+    random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
+    settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services,
+    still_reported, stop_services, volume_ssd,
 };
 use windows_sys::Win32::Foundation::{
-    FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
+    FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
@@ -321,6 +321,17 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
+// Reentrancy guard for the window procedure. Modal pumps (MessageBoxW,
+// TrackPopupMenu) and synchronous dispatches (SetWindowPos, control
+// notifications) re-enter wnd_proc while the outer handler still holds its
+// &mut App. A second &mut to the same App would be undefined behavior, so
+// nested entries never touch App: job and close messages are parked for
+// redelivery, everything else falls through to DefWindowProcW. drain_nested
+// runs after every pump to redeliver and repaint.
+static IN_HANDLER: AtomicBool = AtomicBool::new(false);
+static PENDING_MSG: AtomicU32 = AtomicU32::new(0);
+static PENDING_CLOSE: AtomicBool = AtomicBool::new(false);
+
 struct Fonts {
     title: HFONT,
     heading: HFONT,
@@ -469,6 +480,10 @@ unsafe extern "system" fn wnd_proc(
         DragAcceptFiles(hwnd, 1);
         let app = Box::new(App::new(hwnd));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
+        let _guard = HandlerGuard::enter();
+        if _guard.is_none() {
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
         let app = &mut *window_app(hwnd);
         app.sync_controls();
         return 0;
@@ -486,6 +501,22 @@ unsafe extern "system" fn wnd_proc(
     if app.is_null() {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
+    // Nested dispatch while a handler runs: park what must not be lost,
+    // default the rest, and never form a second &mut App. WM_CLOSE must
+    // not reach DefWindowProcW here — its default action destroys the
+    // window without running our WM_DESTROY cleanup.
+    let _guard = match HandlerGuard::enter() {
+        Some(guard) => guard,
+        None => {
+            if msg == WM_JOB_PROGRESS || msg == WM_JOB_DONE {
+                PENDING_MSG.store(msg, Ordering::SeqCst);
+            } else if msg == WM_CLOSE {
+                PENDING_CLOSE.store(true, Ordering::SeqCst);
+                return 0;
+            }
+            return DefWindowProcW(hwnd, msg, wparam, lparam);
+        }
+    };
     let app = &mut *app;
     match msg {
         WM_ERASEBKGND => 1,
@@ -510,6 +541,10 @@ unsafe extern "system" fn wnd_proc(
                 rect.bottom - rect.top,
                 SWP_NOZORDER | SWP_NOACTIVATE,
             );
+            // The nested WM_SIZE is deferred by the guard, so lay out and
+            // repaint directly instead of relying on it.
+            app.sync_controls();
+            app.invalidate();
             0
         }
         WM_MOUSEMOVE => {
@@ -597,6 +632,10 @@ unsafe extern "system" fn wnd_proc(
                 );
                 return 0;
             }
+            // app is dead after this point: DestroyWindow dispatches
+            // WM_DESTROY synchronously, which must run as a normal guarded
+            // entry instead of being deferred.
+            drop(_guard);
             DestroyWindow(hwnd);
             0
         }
@@ -613,6 +652,38 @@ unsafe extern "system" fn wnd_proc(
 
 fn window_app(hwnd: HWND) -> *mut App {
     unsafe { GetWindowLongPtrW(hwnd, GWLP_USERDATA) as *mut App }
+}
+
+struct HandlerGuard;
+
+impl HandlerGuard {
+    fn enter() -> Option<Self> {
+        if IN_HANDLER.swap(true, Ordering::SeqCst) {
+            None
+        } else {
+            Some(Self)
+        }
+    }
+}
+
+impl Drop for HandlerGuard {
+    fn drop(&mut self) {
+        IN_HANDLER.store(false, Ordering::SeqCst);
+    }
+}
+
+/// Redeliver messages parked during a modal pump and force the repaint
+/// that nested WM_PAINTs skipped. Runs after every MessageBoxW and
+/// TrackPopupMenu, while still inside the outer handler.
+fn drain_nested(hwnd: HWND) {
+    let pending = PENDING_MSG.swap(0, Ordering::SeqCst);
+    if pending != 0 {
+        unsafe { PostMessageW(hwnd, pending, 0, 0) };
+    }
+    if PENDING_CLOSE.swap(false, Ordering::SeqCst) {
+        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+    }
+    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
 impl App {
@@ -1221,6 +1292,16 @@ impl App {
             self.go(Page::Settings);
             return;
         }
+        let engine = match Engine::try_builtin() {
+            Ok(engine) => engine,
+            Err(err) => {
+                self.message(
+                    &format!("Could not load the scanner rules: {err}"),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        };
         self.job = Job::Scanning;
         self.page = Page::Scan;
         CANCEL.store(false, Ordering::SeqCst);
@@ -1237,7 +1318,7 @@ impl App {
                 wow64: true,
             };
             let report = scan_with_progress(
-                &Engine::builtin(),
+                &engine,
                 &WindowsRegistry,
                 &HostFs,
                 &opts,
@@ -1540,6 +1621,7 @@ impl App {
             DestroyMenu(menu);
             choice as usize
         };
+        drain_nested(self.hwnd);
         match choice {
             MENU_DETAILS => self.show_details(rows[0]),
             MENU_COPY => {
@@ -1769,14 +1851,18 @@ impl App {
         }
         let verb = if start { "Start" } else { "Stop" };
         let mut question = if names.len() == 1 {
-            let info = self
+            // names[0] was just cloned from this list, so the lookup only
+            // misses if the impossible happens; fall back to the bare name
+            // rather than panic across the window procedure.
+            let display = self
                 .services
                 .iter()
                 .find(|info| info.name == names[0])
-                .unwrap();
+                .map(|info| info.display_name.clone())
+                .unwrap_or_else(|| names[0].clone());
             format!(
                 "{verb} {}?\n\nIt {} now and keeps its startup type{}.",
-                info.display_name,
+                display,
                 if start { "starts" } else { "stops" },
                 if start {
                     "."
@@ -3012,6 +3098,7 @@ impl App {
             DestroyMenu(menu);
             choice as usize
         };
+        drain_nested(self.hwnd);
         match choice {
             MENU_SVC_START => self.power_rows(&rows, true),
             MENU_SVC_STOP => self.power_rows(&rows, false),
@@ -3072,6 +3159,19 @@ impl App {
         self.invalidate();
         let hwnd = self.hwnd as isize;
         std::thread::spawn(move || {
+            let engine = match Engine::try_builtin() {
+                Ok(engine) => engine,
+                Err(err) => {
+                    finish_job(
+                        hwnd,
+                        JobResult::Repair {
+                            result: Err(format!("Could not load the scanner rules: {err}")),
+                            fixed_meanwhile: Vec::new(),
+                        },
+                    );
+                    return;
+                }
+            };
             let mut scope: Vec<ScannerId> = Vec::new();
             for finding in &selected {
                 if !scope.contains(&finding.scanner) {
@@ -3085,7 +3185,7 @@ impl App {
             };
             // The re-check is the first third of the bar, the repair the rest.
             let fresh = scan_with_progress(
-                &Engine::builtin(),
+                &engine,
                 &WindowsRegistry,
                 &HostFs,
                 &opts,
@@ -3126,7 +3226,7 @@ impl App {
                         post(hwnd, WM_JOB_PROGRESS);
                     },
                 )
-                .map_err(|err| err.to_string())
+                .map_err(|err| format!("The backup could not be written: {err}"))
             };
             finish_job(
                 hwnd,
@@ -3147,10 +3247,7 @@ impl App {
             Ok(outcome) => outcome,
             Err(err) => {
                 self.scan_note = "Repair stopped before changing anything.".into();
-                self.message(
-                    &format!("Nothing was changed. The backup could not be written:\n\n{err}"),
-                    MB_ICONWARNING,
-                );
+                self.message(&format!("Nothing was changed:\n\n{err}"), MB_ICONWARNING);
                 return;
             }
         };
@@ -3281,6 +3378,12 @@ impl App {
             let result = read_backup(&file)
                 .map_err(|err| err.to_string())
                 .and_then(|text| {
+                    if !is_hive_mend_backup(&text) {
+                        return Err(format!(
+                            "{} is not a Hive Mend backup; refusing to restore it",
+                            file.display()
+                        ));
+                    }
                     let summary = BackupSummary::parse(&text);
                     import_reg_file(&file)?;
                     let (files, errors) = restore_files(&summary);
@@ -3387,7 +3490,9 @@ impl App {
         };
         // Above 32 means the elevated copy started. Otherwise the prompt was declined.
         if result as isize > 32 {
-            unsafe { DestroyWindow(self.hwnd) };
+            // Ask for the close instead of destroying synchronously: a
+            // nested WM_DESTROY would run while this handler is live.
+            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
         }
     }
 
@@ -3455,20 +3560,23 @@ impl App {
     fn confirm(&self, text: &str) -> bool {
         let text = wide(text);
         let title = wide("Hive Mend");
-        unsafe {
+        let yes = unsafe {
             MessageBoxW(
                 self.hwnd,
                 text.as_ptr(),
                 title.as_ptr(),
                 MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
             ) == IDYES
-        }
+        };
+        drain_nested(self.hwnd);
+        yes
     }
 
     fn message(&self, text: &str, icon: u32) {
         let text = wide(text);
         let title = wide("Hive Mend");
         unsafe { MessageBoxW(self.hwnd, text.as_ptr(), title.as_ptr(), MB_OK | icon) };
+        drain_nested(self.hwnd);
     }
 
     // ---- layout --------------------------------------------------------
@@ -5952,15 +6060,21 @@ fn copy_text(hwnd: HWND, value: &str) {
         }
         let target = GlobalLock(memory) as *mut u16;
         if target.is_null() {
+            GlobalFree(memory);
             return;
         }
         std::ptr::copy_nonoverlapping(data.as_ptr(), target, data.len());
         GlobalUnlock(memory);
-        if OpenClipboard(hwnd) != 0 {
-            EmptyClipboard();
-            SetClipboardData(CF_UNICODETEXT, memory as HANDLE);
-            CloseClipboard();
+        // The block belongs to the caller until SetClipboardData succeeds.
+        if OpenClipboard(hwnd) == 0 {
+            GlobalFree(memory);
+            return;
         }
+        EmptyClipboard();
+        if SetClipboardData(CF_UNICODETEXT, memory as HANDLE).is_null() {
+            GlobalFree(memory);
+        }
+        CloseClipboard();
     }
 }
 
@@ -6009,7 +6123,7 @@ fn exe_path() -> PathBuf {
 }
 
 fn image_root() -> PathBuf {
-    let shared = PathBuf::from(r"C:\registrymasterimages");
+    let shared = PathBuf::from(r"C:\hivemendimages");
     if shared.is_dir() {
         return shared;
     }

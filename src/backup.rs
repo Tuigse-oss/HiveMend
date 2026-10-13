@@ -10,6 +10,10 @@ use crate::registry::{RegError, Registry};
 const MAX_EXPORT_DEPTH: usize = 512;
 const FILE_LINE: &str = "; file ";
 const FILE_ARROW: &str = " => ";
+/// Marker line every backup written here carries. Restore refuses files
+/// without it, so a stray Regedit export or downloaded tweak can never be
+/// merged by mistake. It is a mistake-guard, not a signature.
+const BACKUP_MARKER: &str = "; Hive Mend backup.";
 
 pub fn backup_name(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
@@ -106,7 +110,8 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     values.sort_by_key(|(key, _)| key.to_ascii_lowercase());
 
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-    body.push_str("; Hive Mend backup.\r\n");
+    body.push_str(BACKUP_MARKER);
+    body.push_str("\r\n");
     body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
     let mut unreadable = Vec::new();
 
@@ -442,9 +447,23 @@ pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
     (restored, errors)
 }
 
+/// True when the text carries the backup marker line.
+pub fn is_hive_mend_backup(text: &str) -> bool {
+    text.lines().any(|line| line.trim() == BACKUP_MARKER)
+}
+
 /// Merge a `.reg` file with the 64-bit `reg.exe`, the same as Regedit's Merge.
+/// Refuses files this program did not write.
 #[cfg(windows)]
 pub fn import_reg_file(path: &Path) -> Result<(), String> {
+    let text =
+        read_backup(path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
+    if !is_hive_mend_backup(&text) {
+        return Err(format!(
+            "{} is not a Hive Mend backup; refusing to merge it",
+            path.display()
+        ));
+    }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
     let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
@@ -489,6 +508,45 @@ mod tests {
     fn unix_epoch_is_1970() {
         assert_eq!(ymd_hms(0), "19700101-000000");
         assert!(ymd_hms(1_276_180_432).starts_with("20100610-"));
+    }
+
+    #[test]
+    fn marker_distinguishes_own_backups_from_stray_reg_files() {
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(r"HKCU\Software\X", "Old", r"C:\Missing\old.exe");
+        let plan = export_backup(
+            &reg,
+            &[finding(
+                r"HKCU\Software\X",
+                Repair::DeleteValue {
+                    key: r"HKCU\Software\X".into(),
+                    name: "Old".into(),
+                },
+            )],
+            Path::new("test.reg"),
+        );
+        assert!(is_hive_mend_backup(&plan.body));
+        assert!(!is_hive_mend_backup(
+            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\X]\r\n"
+        ));
+        assert!(!is_hive_mend_backup(""));
+    }
+
+    #[test]
+    #[cfg(windows)]
+    fn import_rejects_foreign_reg_file_before_shelling_out() {
+        let dir = std::env::temp_dir().join(format!("hivemend-refuse-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("crafted.reg");
+        std::fs::write(
+            &path,
+            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Evil]\r\n",
+        )
+        .unwrap();
+        let err = import_reg_file(&path).unwrap_err();
+        assert!(err.contains("not a Hive Mend backup"), "unexpected: {err}");
+        // Must fail before reg.exe is ever invoked: safe on any platform.
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]

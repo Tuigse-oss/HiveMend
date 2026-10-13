@@ -268,3 +268,23 @@ mod tests {
         assert_eq!(HiveInventory::default().total_bytes(), 0);
     }
 }
+
+/// Live Windows test. Read-only hive enumeration.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_gather_finds_system_hive() {
+        let inventory = gather_hives();
+        assert!(inventory.entries.len() >= 5, "too few hives");
+        let system = inventory
+            .entries
+            .iter()
+            .find(|entry| entry.key == r"HKEY_LOCAL_MACHINE\SYSTEM")
+            .expect("SYSTEM hive");
+        assert!(!system.file.is_empty());
+        assert!(system.bytes.unwrap_or(0) > 0);
+        assert!(inventory.total_bytes() > 0);
+    }
+}

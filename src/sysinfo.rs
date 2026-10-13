@@ -216,3 +216,18 @@ mod tests {
         assert_eq!(snapshot.disk_used_percent(), 75);
     }
 }
+
+/// Live Windows test. Read-only snapshot; asserts shape, not values.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_gather_snapshot_sane() {
+        let snapshot = gather();
+        assert!(!snapshot.os.is_empty());
+        assert!(!snapshot.system_drive.is_empty());
+        assert!(snapshot.memory_total > 0);
+        assert!(snapshot.disk_total > 0);
+    }
+}

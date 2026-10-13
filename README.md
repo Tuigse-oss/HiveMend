@@ -13,7 +13,7 @@ Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove the
 | ARP | Uninstall entries, installer sources, ARP cache orphans, mail and media clients, and firewall rules whose program is gone |
 | VD | Leftover virtual-device entries |
 | FX | Broken Open With lists and progids, open commands, association toasts, and per-user URL protocols |
-| PS | Broken shortcuts in the Start Menu and on the Desktop, and temp files older than an hour |
+| PS | Broken shortcuts in the Start Menu and on the Desktop, and temp files older than a day |
 | CC | COM controls, type libraries, default icons, shell hooks, preview handlers, autoplay handlers, codecs, context menus, and legacy browser extensions whose file is gone |
 | DEEP | Optional wider pass over path-shaped values |
 
@@ -98,7 +98,7 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
-Card and tile icons load from `C:\registrymasterimages` when that folder
+Card and tile icons load from `C:\hivemendimages` when that folder
 exists, next to a copy of the exe otherwise. The artwork is not part of
 this repository.
 

@@ -41,6 +41,13 @@ fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
 
+/// Scratch space for variable-length SCM out-params. The structs read back
+/// out of it contain pointers (8-byte alignment on x64), so a plain Vec<u8>
+/// (guaranteed alignment 1) cannot back them. A Vec<u64> can.
+fn aligned_buffer(bytes: usize) -> Vec<u64> {
+    vec![0u64; bytes.div_ceil(8)]
+}
+
 /// Common service error codes in plain words. Only access-denied counts as
 /// a rights problem; the rest are state the caller reports.
 fn scm_error(code: u32, what: &str) -> StoreError {
@@ -118,15 +125,16 @@ fn enumerate(manager: &ScHandle) -> Result<Vec<ServiceInfo>, StoreError> {
         if code != ERROR_MORE_DATA || needed == 0 {
             return Err(scm_error(code, "listing services"));
         }
-        let mut buffer = vec![0u8; needed as usize];
+        let mut buffer = aligned_buffer(needed as usize);
+        let bytes = (buffer.len() * 8) as u32;
         let ok = unsafe {
             EnumServicesStatusExW(
                 manager.handle,
                 SC_ENUM_PROCESS_INFO,
                 SERVICE_WIN32,
                 SERVICE_STATE_ALL,
-                buffer.as_mut_ptr(),
-                needed,
+                buffer.as_mut_ptr() as *mut u8,
+                bytes,
                 &mut needed,
                 &mut returned,
                 &mut resume,
@@ -181,12 +189,13 @@ fn query_start(manager: &ScHandle, name: &str) -> Option<StartType> {
     if last_error() != ERROR_INSUFFICIENT_BUFFER || needed == 0 {
         return None;
     }
-    let mut buffer = vec![0u8; needed as usize];
+    let mut buffer = aligned_buffer(needed as usize);
+    let bytes = (buffer.len() * 8) as u32;
     let ok = unsafe {
         QueryServiceConfigW(
             service.handle,
             buffer.as_mut_ptr() as *mut QUERY_SERVICE_CONFIGW,
-            needed,
+            bytes,
             &mut needed,
         )
     };
@@ -210,14 +219,14 @@ fn query_start(manager: &ScHandle, name: &str) -> Option<StartType> {
 }
 
 fn query_state(service: &ScHandle) -> Option<u32> {
-    let mut buffer = vec![0u8; std::mem::size_of::<SERVICE_STATUS_PROCESS>()];
+    let mut buffer = aligned_buffer(std::mem::size_of::<SERVICE_STATUS_PROCESS>());
     let mut needed = 0u32;
     let ok = unsafe {
         QueryServiceStatusEx(
             service.handle,
             SC_STATUS_PROCESS_INFO,
-            buffer.as_mut_ptr(),
-            buffer.len() as u32,
+            buffer.as_mut_ptr() as *mut u8,
+            (buffer.len() * 8) as u32,
             &mut needed,
         )
     };
@@ -331,5 +340,32 @@ impl ServiceStore for ScmServiceStore {
         }
         wait_for_state(&manager, name, false);
         Ok(true)
+    }
+}
+
+/// Live Windows tests. Read-only, plus one write call against a service
+/// name that cannot exist (it must fail before touching anything).
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_list_finds_core_services() {
+        let store = ScmServiceStore;
+        let services = store.list().expect("list services");
+        assert!(!services.is_empty());
+        assert!(services.iter().any(|service| service.name == "RpcSs"));
+    }
+
+    #[test]
+    fn live_set_start_on_missing_service_errors() {
+        let mut store = ScmServiceStore;
+        let err = store
+            .set_start("HiveMendNoSuchService", StartType::Manual)
+            .unwrap_err();
+        assert!(
+            err.message.contains("no such service"),
+            "unexpected: {err:?}"
+        );
     }
 }

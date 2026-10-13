@@ -1027,12 +1027,16 @@ mod tests {
 
     #[test]
     fn seek_penalty_descriptor_parses() {
-        assert_eq!(seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 0]), Some(true));
+        // Full 12-byte descriptors, as the Windows caller hands over.
         assert_eq!(
-            seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some(true)
+        );
+        assert_eq!(
+            seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0]),
             Some(false)
         );
-        assert_eq!(seek_penalty_false(&[0; 4]), None);
+        assert_eq!(seek_penalty_false(&[0; 8]), None);
     }
 
     #[test]

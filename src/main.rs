@@ -152,12 +152,8 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
         }
         Command::Demo => {
             let sample = hive_mend::sample_world();
-            let report = scan(
-                &Engine::builtin(),
-                &sample.reg,
-                &sample.fs,
-                &ScanOptions::default(),
-            );
+            let engine = Engine::try_builtin()?;
+            let report = scan(&engine, &sample.reg, &sample.fs, &ScanOptions::default());
             print_text(&report);
             Ok(if report.findings.is_empty() {
                 ExitCode::SUCCESS
@@ -320,6 +316,12 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
     #[cfg(windows)]
     {
         let text = hive_mend::read_backup(file)?;
+        if !hive_mend::is_hive_mend_backup(&text) {
+            return Err(hive_mend::Error(format!(
+                "{} is not a Hive Mend backup; refusing to restore it",
+                file.display()
+            )));
+        }
         let summary = hive_mend::BackupSummary::parse(&text);
         hive_mend::import_reg_file(file).map_err(hive_mend::Error)?;
         let (files, errors) = hive_mend::restore_files(&summary);

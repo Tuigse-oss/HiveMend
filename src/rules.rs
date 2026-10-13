@@ -12,8 +12,8 @@ pub struct RuleSet {
 }
 
 impl RuleSet {
-    pub fn builtin() -> Self {
-        parse_rules_xml(BUILTIN_XML).expect("built-in scanner rules")
+    pub fn try_builtin() -> Result<Self, Error> {
+        parse_rules_xml(BUILTIN_XML).map_err(|err| Error(format!("built-in scanner rules: {err}")))
     }
 
     pub fn get(&self, id: ScannerId) -> Option<&ScannerDef> {
@@ -337,7 +337,7 @@ mod tests {
 
     #[test]
     fn builtin_rules_cover_the_classic_scanners() {
-        let rules = RuleSet::builtin();
+        let rules = RuleSet::try_builtin().unwrap();
         assert_eq!(rules.scanners.len(), 12);
         let startup = rules.get(ScannerId::StartupPrograms).unwrap();
         assert!(startup.enabled);

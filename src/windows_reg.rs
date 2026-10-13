@@ -313,3 +313,116 @@ fn split_parent(path: &str) -> Result<(String, String), RegError> {
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
+
+/// Live Windows tests. They touch one throwaway key under the current
+/// user's hive (never HKLM, never anything real) and remove it on Drop,
+/// so a failing assert cannot leave residue behind.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+    use windows_sys::Win32::System::Registry::{
+        KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_SZ, RegCreateKeyExW, RegDeleteKeyExW,
+        RegSetValueExW,
+    };
+
+    struct TestKey {
+        root: String,
+    }
+
+    impl TestKey {
+        fn create() -> Self {
+            let root = format!(r"HKCU\Software\HiveMendTest{}", std::process::id());
+            let subkey = root.strip_prefix("HKCU\\").unwrap().to_string();
+            unsafe {
+                let mut key: HKEY = ptr::null_mut();
+                let mut disposition = 0u32;
+                let child = wide(&format!("{subkey}\\Child"));
+                let rc = RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    child.as_ptr(),
+                    0,
+                    ptr::null(),
+                    0,
+                    KEY_WRITE | KEY_WOW64_64KEY,
+                    ptr::null(),
+                    &mut key,
+                    &mut disposition,
+                );
+                assert_eq!(rc, ERROR_SUCCESS, "test key setup failed");
+                let text: Vec<u16> = "hello".encode_utf16().chain(std::iter::once(0)).collect();
+                let name = wide("Text");
+                let rc = RegSetValueExW(
+                    key,
+                    name.as_ptr(),
+                    0,
+                    REG_SZ,
+                    text.as_ptr() as *const u8,
+                    (text.len() * 2) as u32,
+                );
+                assert_eq!(rc, ERROR_SUCCESS, "test value setup failed");
+                let name = wide("Num");
+                let rc = RegSetValueExW(
+                    key,
+                    name.as_ptr(),
+                    0,
+                    REG_DWORD,
+                    42u32.to_le_bytes().as_ptr(),
+                    4,
+                );
+                assert_eq!(rc, ERROR_SUCCESS, "test value setup failed");
+                RegCloseKey(key);
+            }
+            Self { root }
+        }
+    }
+
+    impl Drop for TestKey {
+        fn drop(&mut self) {
+            let mut reg = WindowsRegistry;
+            let _ = reg.delete_tree(&self.root);
+            let subkey = match self.root.strip_prefix("HKCU\\") {
+                Some(rest) => rest,
+                None => return,
+            };
+            let wide = wide(subkey);
+            unsafe {
+                RegDeleteKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), KEY_WOW64_64KEY, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn live_registry_round_trip() {
+        let key = TestKey::create();
+        let reg = WindowsRegistry;
+        let kids = reg.subkeys(&key.root).expect("list test key");
+        assert!(kids.iter().any(|name| name == "Child"));
+        let child = format!(r"{}\Child", key.root);
+        let values = reg.values(&child).expect("read test values");
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Text"
+                    && value.data == ValueKind::Sz("hello".to_string()))
+        );
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Num" && value.data == ValueKind::Dword(42))
+        );
+        let mut reg = reg;
+        reg.delete_value(&child, "Text").expect("delete test value");
+        let values = reg.values(&child).expect("re-read test values");
+        assert!(!values.iter().any(|value| value.name == "Text"));
+        reg.delete_tree(&key.root).expect("delete test tree");
+        let kids = reg.subkeys(&key.root).expect("list emptied key");
+        assert!(kids.is_empty());
+    }
+
+    #[test]
+    fn live_missing_key_reads_fail_cleanly() {
+        let reg = WindowsRegistry;
+        assert!(reg.subkeys(r"HKCU\Software\HiveMendNoSuchKey").is_err());
+        assert!(reg.values(r"HKCU\Software\HiveMendNoSuchKey").is_err());
+    }
+}

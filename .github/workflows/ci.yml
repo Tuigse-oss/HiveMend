@@ -1,0 +1,23 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - run: cargo +1.99.0 test --locked --all-targets
+
+  windows:
+    # The #[cfg(windows)] FFI and its live tests only compile and run here;
+    # a Linux-only run would ship them unexercised while going green.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - run: cargo +1.99.0 test --locked --all-targets
