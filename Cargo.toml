@@ -6,7 +6,7 @@ description = "Scan and repair stale Windows registry entries on Windows 10 and 
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 authors = ["Brad Williamson"]
-repository = "https://github.com/bradwilliamson/Hive-Mend"
+repository = "https://github.com/bradwilliamson/HiveMend"
 
 [dependencies]
 clap = { version = "4.6.7", features = ["derive"] }
