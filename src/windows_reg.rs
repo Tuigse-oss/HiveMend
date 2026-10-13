@@ -176,18 +176,69 @@ fn read_value(opened: &Opened, name: &str, kind: u32, size: u32) -> Result<Value
 
 fn decode_value(kind: u32, bytes: &[u8]) -> ValueKind {
     match kind {
-        REG_SZ => ValueKind::Sz(decode_sz(bytes)),
-        REG_EXPAND_SZ => ValueKind::ExpandSz(decode_sz(bytes)),
-        REG_DWORD if bytes.len() >= 4 => {
+        // Keep decoded text only when it re-encodes to the exact original
+        // bytes. A non-canonical string (odd length, a missing or extra NUL,
+        // bytes after the terminator, or unpaired UTF-16) is preserved raw, so
+        // a backup round-trips the value rather than silently rewriting it.
+        REG_SZ => round_trip_sz(bytes)
+            .map(ValueKind::Sz)
+            .unwrap_or_else(|| other(kind, bytes)),
+        REG_EXPAND_SZ => round_trip_sz(bytes)
+            .map(ValueKind::ExpandSz)
+            .unwrap_or_else(|| other(kind, bytes)),
+        // A DWORD is exactly four bytes. Any other length keeps its raw bytes.
+        REG_DWORD if bytes.len() == 4 => {
             ValueKind::Dword(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         }
-        REG_MULTI_SZ => ValueKind::MultiSz(decode_multi(bytes)),
+        REG_MULTI_SZ => {
+            let parts = decode_multi(bytes);
+            if multi_sz_bytes(&parts) == bytes {
+                ValueKind::MultiSz(parts)
+            } else {
+                other(kind, bytes)
+            }
+        }
         REG_BINARY => ValueKind::Binary(bytes.to_vec()),
-        _ => ValueKind::Other {
-            kind,
-            bytes: bytes.to_vec(),
-        },
+        _ => other(kind, bytes),
     }
+}
+
+fn other(kind: u32, bytes: &[u8]) -> ValueKind {
+    ValueKind::Other {
+        kind,
+        bytes: bytes.to_vec(),
+    }
+}
+
+/// Re-encode a UTF-16 string the way a canonical REG_SZ is stored.
+fn sz_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2 + 2);
+    for unit in text.encode_utf16() {
+        out.extend(unit.to_le_bytes());
+    }
+    out.extend([0, 0]);
+    out
+}
+
+/// Decode a REG_SZ/REG_EXPAND_SZ buffer only when the decode is reversible:
+/// the decoded text must re-encode to the exact original bytes.
+fn round_trip_sz(bytes: &[u8]) -> Option<String> {
+    let text = decode_sz(bytes);
+    (sz_bytes(&text) == bytes).then_some(text)
+}
+
+/// Re-encode a MULTI_SZ the way a canonical value is stored: each element
+/// NUL-terminated, then a final NUL.
+fn multi_sz_bytes(parts: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        for unit in part.encode_utf16() {
+            out.extend(unit.to_le_bytes());
+        }
+        out.extend([0, 0]);
+    }
+    out.extend([0, 0]);
+    out
 }
 
 fn decode_sz(bytes: &[u8]) -> String {
@@ -320,10 +371,50 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(all(test, windows))]
 mod live_tests {
     use super::*;
+    use crate::model::ValueKind;
     use windows_sys::Win32::System::Registry::{
         KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_SZ, RegCreateKeyExW, RegDeleteKeyExW,
         RegSetValueExW,
     };
+
+    #[test]
+    fn canonical_sz_round_trips_but_noncanonical_is_preserved_raw() {
+        // Canonical `AB\0`.
+        assert_eq!(
+            decode_value(REG_SZ, &sz_bytes("AB")),
+            ValueKind::Sz("AB".into())
+        );
+        // No trailing NUL: preserved raw so the backup keeps the exact bytes.
+        assert!(matches!(
+            decode_value(REG_SZ, &[0x41, 0, 0x42, 0]),
+            ValueKind::Other { .. }
+        ));
+        // Bytes after the terminator: preserved raw.
+        let mut trailing = sz_bytes("AB");
+        trailing.extend([0x43, 0]);
+        assert!(matches!(
+            decode_value(REG_SZ, &trailing),
+            ValueKind::Other { .. }
+        ));
+        // Odd length: preserved raw.
+        assert!(matches!(
+            decode_value(REG_SZ, &[0x41, 0, 0x42]),
+            ValueKind::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn dword_must_be_exactly_four_bytes() {
+        assert_eq!(decode_value(REG_DWORD, &[1, 0, 0, 0]), ValueKind::Dword(1));
+        assert!(matches!(
+            decode_value(REG_DWORD, &[1, 0, 0, 0, 0]),
+            ValueKind::Other { .. }
+        ));
+        assert!(matches!(
+            decode_value(REG_DWORD, &[1, 0]),
+            ValueKind::Other { .. }
+        ));
+    }
 
     struct TestKey {
         root: String,

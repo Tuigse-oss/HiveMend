@@ -12,9 +12,13 @@ pub fn canonical_hive(name: &str) -> Option<&'static str> {
 }
 
 pub fn canonical_path(path: &str) -> String {
-    let trimmed = path.trim().trim_matches(['\\', '/']);
+    // Split on backslash only. A forward slash is a legal character inside a
+    // registry key name (for example a `text/html` content-type key), so
+    // treating it as a separator would rename the key and make a backup miss
+    // the real child that repair then deletes with its parent.
+    let trimmed = path.trim().trim_matches('\\');
     let mut parts: Vec<String> = trimmed
-        .split(['\\', '/'])
+        .split('\\')
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect();
@@ -111,6 +115,22 @@ pub fn normalize_fs(path: &str) -> String {
         out = out.replace("\\\\", "\\");
     }
     out
+}
+
+/// True when a path component would make the resolved target differ from its
+/// spelling, so a textual refusal check cannot be trusted. Win32 strips a
+/// trailing dot or space from each component, and `.`/`..` walk the tree, so
+/// `C:\.` and `C:\.\Windows` name the drive root and the Windows folder while
+/// reading as something the protected-root prefixes do not match. This is a
+/// fail-closed interim guard, not a full reparse/alias resolver.
+pub fn has_unsafe_fs_component(path: &str) -> bool {
+    let norm = normalize_fs(path);
+    let rest = match norm.split_once(":\\") {
+        Some((_, rest)) => rest,
+        None => norm.strip_prefix("\\\\").unwrap_or(norm.as_str()),
+    };
+    rest.split('\\')
+        .any(|part| part == "." || part == ".." || part.ends_with('.') || part.ends_with(' '))
 }
 
 pub fn under_windows_dir(fs: &dyn FileView, path: &str) -> bool {
@@ -308,8 +328,12 @@ fn find_later_path(text: &str) -> Option<usize> {
 
 fn push_path(found: &mut Vec<String>, raw: &str) {
     let mut path = raw.trim().trim_matches('"').to_string();
-    if let Some((left, _)) = path.rsplit_once(',')
+    // A trailing `,<index>` is an icon or resource index (`shell32.dll,-57`).
+    // Strip only a numeric suffix: a comma can also sit inside a real file
+    // name (`Tool,Pro.exe`), and truncating there invents a missing path.
+    if let Some((left, index)) = path.rsplit_once(',')
         && (left.contains('\\') || left.contains(':'))
+        && is_resource_index(index)
     {
         path = left.to_string();
     }
@@ -332,6 +356,14 @@ fn push_path(found: &mut Vec<String>, raw: &str) {
     if looks_like_path {
         found.push(normalize_fs(&path));
     }
+}
+
+/// A `,<index>` suffix on a command is a resource or icon index, always a
+/// (possibly negative) integer. A comma followed by anything else belongs to
+/// the file name.
+fn is_resource_index(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn has_extension(path: &str) -> bool {
@@ -395,14 +427,28 @@ pub fn bare_name_present(fs: &dyn FileView, name: &str) -> bool {
         .any(|dir| file_present(fs, &format!("{dir}\\{name}")))
 }
 
+/// `SYSTEM\<control set>\Services\...` under any control set the service
+/// control manager keeps: `CurrentControlSet` and the numbered `ControlSet001`,
+/// `ControlSet002`, ... clones. A rules file that names a numbered set would
+/// otherwise reach a service the `CurrentControlSet` spelling protects.
+fn under_any_services(lower: &str) -> bool {
+    lower.contains("\\currentcontrolset\\services\\")
+        || lower.split("\\controlset").skip(1).any(|segment| {
+            let digits = segment.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && segment[digits..].starts_with("\\services\\")
+        })
+}
+
 pub fn is_protected_key(path: &str) -> bool {
     let lower = canonical_path(path).to_ascii_lowercase();
     if lower.contains("\\services\\vxd\\") || lower.contains("\\firewallpolicy\\firewallrules") {
         return false;
     }
+    if under_any_services(&lower) {
+        return true;
+    }
     const BLOCKS: &[&str] = &[
         "\\winlogon",
-        "\\currentcontrolset\\services\\",
         "\\control\\session manager",
         "\\component based servicing",
         "\\windows\\currentversion\\sidebyside",
@@ -464,7 +510,7 @@ pub fn needs_admin(target: &str) -> bool {
 
 pub fn file_delete_allowed(path: &str) -> bool {
     let lower = normalize_fs(path).to_ascii_lowercase();
-    if lower.ends_with("\\desktop.ini") {
+    if lower.ends_with("\\desktop.ini") || has_unsafe_fs_component(path) {
         return false;
     }
     lower.contains("\\temp\\")
@@ -485,6 +531,11 @@ pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), Str
     }
     if clean.len() == 3 {
         return Err("a drive root cannot be shredded".to_string());
+    }
+    // `C:\.`, trailing dots or spaces, and the like resolve to a different
+    // object than they spell, so no textual root check below can be trusted.
+    if has_unsafe_fs_component(&clean) {
+        return Err(format!("{path} has an ambiguous path component"));
     }
     match fs.kind_of(&clean) {
         ItemKind::File | ItemKind::Dir => {}
@@ -626,5 +677,56 @@ mod tests {
         assert!(!key_delete_allowed(
             r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
         ));
+    }
+
+    #[test]
+    fn canonical_path_keeps_forward_slashes_in_key_names() {
+        assert_eq!(
+            canonical_path(r"HKCR\MIME\Database\Content Type\text/html"),
+            r"HKEY_CLASSES_ROOT\MIME\Database\Content Type\text/html"
+        );
+    }
+
+    #[test]
+    fn keeps_a_comma_inside_a_file_name_but_strips_an_icon_index() {
+        assert_eq!(
+            paths_in_command(r"C:\Apps\Tool,Pro.exe"),
+            vec![r"C:\Apps\Tool,Pro.exe"]
+        );
+        assert_eq!(
+            paths_in_command(r"C:\Windows\System32\shell32.dll,-57"),
+            vec![r"C:\Windows\System32\shell32.dll"]
+        );
+    }
+
+    #[test]
+    fn protects_services_under_a_numbered_control_set() {
+        assert!(is_protected_key(
+            r"HKLM\SYSTEM\ControlSet001\Services\Dnscache"
+        ));
+        assert!(is_protected_key(
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Dnscache"
+        ));
+        // VxD cleanup stays allowed under any control set.
+        assert!(!is_protected_key(
+            r"HKLM\SYSTEM\ControlSet002\Services\VxD\Old"
+        ));
+    }
+
+    #[test]
+    fn flags_dot_and_trailing_dot_components() {
+        assert!(has_unsafe_fs_component(r"C:\."));
+        assert!(has_unsafe_fs_component(r"C:\.\Windows\System32\x.dll"));
+        assert!(has_unsafe_fs_component(r"C:\Apps\bad. \child.txt"));
+        assert!(!has_unsafe_fs_component(
+            r"C:\Users\Me\AppData\Local\Temp\a.tmp"
+        ));
+    }
+
+    #[test]
+    fn shred_refuses_dot_root_and_dot_traversal() {
+        let fs = MemoryFs::new();
+        assert!(shred_allowed(&fs, r"C:\.").is_err());
+        assert!(shred_allowed(&fs, r"C:\.\Windows\System32\drivers\etc\hosts").is_err());
     }
 }

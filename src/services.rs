@@ -381,6 +381,8 @@ pub fn service_key(name: &str) -> String {
 /// reported in `unreadable` and must be left alone.
 pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    // The unified marker Restore validates, plus a line naming the kind.
+    body.push_str("; Hive Mend backup.\r\n");
     body.push_str("; Hive Mend services backup.\r\n");
     body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
     let mut unreadable = Vec::new();
@@ -771,6 +773,8 @@ mod tests {
         );
         assert!(plan.body.contains("\"Start\"=dword:00000002"));
         assert!(plan.body.contains("\"DelayedAutostart\"=dword:00000001"));
+        // The exported services backup must be one Restore will accept.
+        assert!(crate::backup::is_hive_mend_backup(&plan.body));
         assert_eq!(plan.unreadable.len(), 1);
         assert!(!plan.covers(&service_key("Missing")));
         assert!(plan.covers(&service_key("DiagTrack")));

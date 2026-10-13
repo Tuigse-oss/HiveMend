@@ -15,7 +15,10 @@ use std::time::Duration;
 use crate::backup::{export_repairs, write_backup};
 use crate::fs::{FileView, ItemKind};
 use crate::model::{Error, Repair};
-use crate::pathutil::{canonical_path, expand_env, is_protected_key, normalize_fs, system_root};
+use crate::pathutil::{
+    canonical_path, expand_env, has_unsafe_fs_component, is_protected_key, normalize_fs,
+    system_root,
+};
 use crate::registry::{RegError, Registry};
 
 /// Processes that veto a category while they run, lowercase exe names.
@@ -71,9 +74,14 @@ impl ValueMatch {
     fn matches(&self, name: &str) -> bool {
         match self {
             Self::PrefixDigits(prefix) => {
+                // Compare as bytes: a `name[..prefix.len()]` slice would panic
+                // when that offset falls inside a multi-byte character (an
+                // ordinary Unicode registry value name such as `éé`).
+                let name = name.as_bytes();
+                let prefix = prefix.as_bytes();
                 name.len() > prefix.len()
                     && name[..prefix.len()].eq_ignore_ascii_case(prefix)
-                    && name[prefix.len()..].chars().all(|ch| ch.is_ascii_digit())
+                    && name[prefix.len()..].iter().all(u8::is_ascii_digit)
             }
             Self::Exact(names) => names.iter().any(|want| want.eq_ignore_ascii_case(name)),
         }
@@ -642,7 +650,7 @@ pub fn privacy_reg_allowed(key: &str) -> bool {
 /// program folders and the app's own data dir, and inside the resolved root.
 fn privacy_file_allowed(fs: &dyn FileView, root: &str, path: &str) -> bool {
     let path = normalize_fs(path);
-    if !looks_absolute(&path) || path.contains("..") {
+    if !looks_absolute(&path) || path.contains("..") || has_unsafe_fs_component(&path) {
         return false;
     }
     let lower = path.to_ascii_lowercase();
@@ -1542,6 +1550,18 @@ mod tests {
     use crate::fs::MemoryFs;
     use crate::model::ValueKind;
     use crate::registry::MemoryRegistry;
+
+    #[test]
+    fn prefix_digits_handles_unicode_names_without_panicking() {
+        let spec = ValueMatch::PrefixDigits("url".into());
+        // A multi-byte name whose byte length exceeds the prefix must not
+        // panic on a non-boundary slice, and must not match.
+        assert!(!spec.matches("éé"));
+        assert!(!spec.matches("url"));
+        assert!(!spec.matches("urlx"));
+        assert!(spec.matches("url1"));
+        assert!(spec.matches("URL42"));
+    }
 
     struct FakeProcs {
         running: Vec<String>,

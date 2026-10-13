@@ -14,10 +14,46 @@ const FILE_ARROW: &str = " => ";
 /// without it, so a stray Regedit export or downloaded tweak can never be
 /// merged by mistake. It is a mistake-guard, not a signature.
 const BACKUP_MARKER: &str = "; Hive Mend backup.";
+/// Service start-type backups carried their own marker before the markers were
+/// unified. Restore still accepts it so a services backup written by an older
+/// build can be undone.
+const SERVICES_BACKUP_MARKER: &str = "; Hive Mend services backup.";
 
 pub fn backup_name(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("hive-mend-{}.reg", ymd_hms(secs))
+}
+
+/// Reserve a unique backup path by creating the file now. Two repairs within
+/// the same second would otherwise derive the same second-resolution name and
+/// the second would truncate the first, destroying its recovery record. The
+/// returned file exists (empty); the caller fills it with [`write_backup`],
+/// and its sidecar directory is derived from this unique name.
+pub fn reserve_backup_path(dir: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let base = backup_name(now);
+    let stem = base.strip_suffix(".reg").unwrap_or(&base);
+    for attempt in 0..10_000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{stem}-{attempt}.reg")
+        };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique backup name",
+    ))
 }
 
 /// What a repair is about to remove, in `.reg` form.
@@ -208,6 +244,21 @@ fn export_tree(
         return Err(RegError::Message(format!("{path} is nested too deeply")));
     }
     let values = reg.values(path)?;
+    // A key or value name with a control character (CR, LF, NUL, ...) cannot
+    // be written as an exact quoted `.reg` name, so the backup would not round
+    // trip. Refuse the whole key rather than let repair delete something the
+    // backup cannot put back.
+    if has_control_char(path) {
+        return Err(RegError::Message(format!(
+            "{path}: key name cannot be represented in a .reg backup"
+        )));
+    }
+    if let Some(value) = values.iter().find(|value| has_control_char(&value.name)) {
+        return Err(RegError::Message(format!(
+            "{path}: value name {:?} cannot be represented in a .reg backup",
+            value.name
+        )));
+    }
     body.push_str(&format!("[{}]\r\n", canonical_path(path)));
     for value in values {
         body.push_str(&format_value(&value));
@@ -258,6 +309,12 @@ fn format_value(value: &RegValue) -> String {
 
 fn escape_reg(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A control character (below U+0020) in a key or value name cannot survive a
+/// quoted `.reg` round trip: CR/LF break the line, NUL truncates on import.
+fn has_control_char(text: &str) -> bool {
+    text.chars().any(|ch| (ch as u32) < 0x20)
 }
 
 fn utf16_bytes(text: &str) -> Vec<u8> {
@@ -447,9 +504,13 @@ pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
     (restored, errors)
 }
 
-/// True when the text carries the backup marker line.
+/// True when the text carries a Hive Mend marker line: the unified marker, or
+/// the older services-only marker so a services backup can still be restored.
 pub fn is_hive_mend_backup(text: &str) -> bool {
-    text.lines().any(|line| line.trim() == BACKUP_MARKER)
+    text.lines().any(|line| {
+        let line = line.trim();
+        line == BACKUP_MARKER || line == SERVICES_BACKUP_MARKER
+    })
 }
 
 /// Merge a `.reg` file with the 64-bit `reg.exe`, the same as Regedit's Merge.
@@ -530,6 +591,52 @@ mod tests {
             "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\X]\r\n"
         ));
         assert!(!is_hive_mend_backup(""));
+    }
+
+    #[test]
+    fn restore_accepts_the_services_backup_marker() {
+        // New services backups carry the unified marker.
+        assert!(is_hive_mend_backup(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n"
+        ));
+        // Older services backups carried only their own marker; still accepted.
+        assert!(is_hive_mend_backup(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend services backup.\r\n"
+        ));
+    }
+
+    #[test]
+    fn reserve_backup_path_never_reuses_a_name() {
+        let dir = std::env::temp_dir().join(format!("hivemend-reserve-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let first = reserve_backup_path(&dir, now).unwrap();
+        let second = reserve_backup_path(&dir, now).unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+        // The matching sidecar directories differ too.
+        assert_ne!(files_dir(&first), files_dir(&second));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_control_char_value_name_leaves_the_key_uncovered() {
+        let mut reg = MemoryRegistry::new();
+        let key = r"HKCU\Software\Weird";
+        reg.set_sz(key, "ok", "fine");
+        reg.set_sz(key, "bad\nname", "x");
+        let plan = export_repairs(
+            &reg,
+            &[Repair::DeleteKey { key: key.into() }],
+            Path::new("t.reg"),
+        );
+        // The key cannot round-trip, so repair must leave it alone.
+        assert!(!plan.covers(key));
+        assert!(
+            plan.unreadable
+                .iter()
+                .any(|bad| bad.eq_ignore_ascii_case(&canonical_path(key)))
+        );
     }
 
     #[test]

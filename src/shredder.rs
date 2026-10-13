@@ -273,7 +273,14 @@ fn shred_file(
     let name = file_name(path).to_string();
     let passes = opts.method.passes();
     for pass in 0..passes {
-        if !progress(*done, total, &name) {
+        // Honor cancellation only before a file's first overwrite. Once the
+        // first pass has begun, finish the whole method — overwrite, verify,
+        // truncate, rename, delete — because stopping mid-file would leave it
+        // with destroyed contents yet still reported as untouched. The UI
+        // promises to stop only "after this file"; a cancel during a later
+        // pass takes effect at the next file's first pass.
+        let stop = !progress(*done, total, &name);
+        if stop && pass == 0 {
             return FileDone::Canceled;
         }
         if len > 0
@@ -705,6 +712,37 @@ mod tests {
             assert!(!name.is_empty());
         }
         assert_eq!(calls[6], (6, 6, String::new()));
+    }
+
+    #[test]
+    fn cancel_finishes_the_current_file_then_stops() {
+        let mut fs = MemoryFs::new();
+        fs.add_file_bytes(r"C:\Docs\a.txt", vec![0x41; 32], None);
+        fs.add_file_bytes(r"C:\Docs\b.txt", vec![0x42; 32], None);
+        // Allow only the first file's first pass, then ask to stop.
+        let mut seen = 0usize;
+        let mut progress = |_done: usize, _total: usize, _name: &str| {
+            seen += 1;
+            seen <= 1
+        };
+        let outcome = shred_paths(
+            &mut fs,
+            &[
+                target(r"C:\Docs\a.txt", false),
+                target(r"C:\Docs\b.txt", false),
+            ],
+            &ShredOptions::default(), // three passes
+            SEED,
+            &mut progress,
+        );
+        assert!(outcome.canceled);
+        // The first file is carried through all passes, not left destroyed
+        // yet reported as untouched.
+        assert_eq!(outcome.shredded, 1);
+        assert_eq!(outcome.shredded_paths, vec![r"C:\Docs\a.txt".to_string()]);
+        assert!(!fs.exists(r"C:\Docs\a.txt"));
+        // The next file was never started.
+        assert!(fs.exists(r"C:\Docs\b.txt"));
     }
 
     #[test]

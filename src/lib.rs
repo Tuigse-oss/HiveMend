@@ -31,7 +31,7 @@ mod windows_shredder;
 pub use backup::import_reg_file;
 pub use backup::{
     BackupInfo, BackupSummary, backup_name, is_hive_mend_backup, list_backups, read_backup,
-    restore_files,
+    reserve_backup_path, restore_files,
 };
 pub use demo::sample_world;
 pub use engine::{

@@ -490,14 +490,16 @@ fn temp_and_shortcuts(ctx: &mut ScanCtx<'_>, scanner: &ScannerDef, findings: &mu
             if item.name.eq_ignore_ascii_case("desktop.ini") {
                 continue;
             }
-            if item
+            // Delete only files proven to be at least a day old. An unreadable
+            // or future last-write time yields no age, and must not pass as old.
+            if !item
                 .age
-                .is_some_and(|age| age.as_secs() < TEMP_MIN_AGE_SECS)
+                .is_some_and(|age| age.as_secs() >= TEMP_MIN_AGE_SECS)
             {
                 continue;
             }
             let path = format!("{dir}\\{}", item.name);
-            if !file_delete_allowed(&path) {
+            if !file_delete_allowed(&path) || under_windows_dir(ctx.fs, &path) {
                 continue;
             }
             push_file(findings, scanner, &path, "temporary file".into(), false);
@@ -2504,5 +2506,39 @@ mod tests {
                 .iter()
                 .all(|finding| !finding.key.to_ascii_lowercase().ends_with("\\live"))
         );
+    }
+
+    #[test]
+    fn temp_sweep_needs_a_known_old_age() {
+        use std::time::Duration;
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.set_var("TEMP", r"C:\Users\Ada\AppData\Local\Temp");
+        // Two days old: eligible.
+        fs.add_file_bytes(
+            r"C:\Users\Ada\AppData\Local\Temp\old.tmp",
+            Vec::new(),
+            Some(Duration::from_secs(2 * 86_400)),
+        );
+        // No readable/positive age (a future or unreadable stamp): kept.
+        fs.add_file_bytes(
+            r"C:\Users\Ada\AppData\Local\Temp\mystery.tmp",
+            Vec::new(),
+            None,
+        );
+
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &MemoryRegistry::new(),
+            &fs,
+            &ScanOptions::default(),
+        );
+        let keys: Vec<String> = report
+            .findings
+            .iter()
+            .map(|finding| finding.key.to_ascii_lowercase())
+            .collect();
+        assert!(keys.iter().any(|key| key.ends_with("\\old.tmp")));
+        assert!(!keys.iter().any(|key| key.ends_with("\\mystery.tmp")));
     }
 }

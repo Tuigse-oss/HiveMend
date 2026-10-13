@@ -1785,6 +1785,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 8));
         }
         if !self.confirm(&question) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Services;
@@ -1978,6 +1979,7 @@ impl App {
             question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
         }
         if !self.confirm(&question) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Services;
@@ -2301,6 +2303,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 10));
         }
         if !self.confirm(&question) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Cleaning;
@@ -3149,6 +3152,7 @@ impl App {
             ));
         }
         if !self.confirm(&question) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Repairing;
@@ -5375,8 +5379,8 @@ impl App {
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
-            "Before repairing, the ticked entries are checked again, and everything about to be removed is saved to a backup first.",
-            "It never touches Winlogon, default-app choices, Windows Installer data, files inside the Windows folder, or built-in protocols such as http.",
+            "Before repairing, the ticked entries are checked again. Registry entries and shortcuts are saved to a backup first; old temporary files are deleted for good and are not backed up.",
+            "It never touches Winlogon, default-app choices, the services Windows needs to boot or stay secure, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",
         ] {
@@ -5648,6 +5652,7 @@ fn count(n: usize, one: &str, many: &str) -> String {
 
 fn next_backup_file_with(prefix: &str) -> PathBuf {
     let dir = backups_dir();
+    let _ = std::fs::create_dir_all(&dir);
     let stamp = unsafe {
         let mut t: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut t);
@@ -5656,13 +5661,41 @@ fn next_backup_file_with(prefix: &str) -> PathBuf {
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
         )
     };
-    let mut path = dir.join(format!("{prefix}-{stamp}.reg"));
-    let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{prefix}-{stamp}-{n}.reg"));
-        n += 1;
+    // Reserve the name by creating the (empty) file now, so a second window
+    // choosing a name in the same second cannot land on this one and later
+    // overwrite its backup. A cancelled job removes the placeholder with
+    // `discard_reserved_backup`.
+    for attempt in 0..10_000u32 {
+        let name = if attempt == 0 {
+            format!("{prefix}-{stamp}.reg")
+        } else {
+            format!("{prefix}-{stamp}-{}.reg", attempt + 1)
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return path,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            // A different error (for example the folder is not writable): hand
+            // the path back and let the later write surface the real error.
+            Err(_) => return path,
+        }
     }
-    path
+    dir.join(format!("{prefix}-{stamp}.reg"))
+}
+
+/// Remove a just-reserved backup placeholder after the user cancels. Only an
+/// empty file is removed, so a real backup is never deleted.
+fn discard_reserved_backup(path: &std::path::Path) {
+    if std::fs::metadata(path)
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // ---- Win32 helpers -----------------------------------------------------
