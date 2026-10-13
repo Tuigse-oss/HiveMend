@@ -24,7 +24,20 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPO: ${{ github.repository }}
-        run: echo "public=$(gh api "repos/$REPO" --jq '.private == false')" >> "$GITHUB_OUTPUT"
+        # Read visibility in its own command so a failed API call fails the
+        # step instead of writing an empty value that reads as "private" and
+        # silently skips the analysis.
+        run: |
+          set -euo pipefail
+          private=$(gh api "repos/$REPO" --jq '.private')
+          case "$private" in
+          true) echo "public=false" >> "$GITHUB_OUTPUT" ;;
+          false) echo "public=true" >> "$GITHUB_OUTPUT" ;;
+          *)
+            echo "::error::could not read repository visibility (got '$private')"
+            exit 1
+            ;;
+          esac
 
   analyze:
     name: analyze (${{ matrix.language }})
