@@ -170,7 +170,9 @@ pub fn gather_hives() -> HiveInventory {
 /// Reinterpret the first `units` UTF-16 units of a byte buffer.
 #[cfg(windows)]
 fn name_units(data: &[u8], units: usize) -> Vec<u16> {
-    data.chunks_exact(2)
+    data.as_chunks::<2>()
+        .0
+        .iter()
         .take(units)
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect()

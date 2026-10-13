@@ -43,10 +43,8 @@ pub fn wow_mirror(path: &str) -> Option<String> {
 pub fn hive_views(path: &str, wow64: bool) -> Vec<String> {
     let canonical = canonical_path(path);
     let mut views = vec![canonical.clone()];
-    if wow64 {
-        if let Some(mirror) = wow_mirror(&canonical) {
-            views.push(mirror);
-        }
+    if wow64 && let Some(mirror) = wow_mirror(&canonical) {
+        views.push(mirror);
     }
     views
 }
@@ -56,16 +54,16 @@ pub fn expand_env(fs: &dyn FileView, input: &str) -> String {
     let mut out = String::new();
     let mut index = 0;
     while index < chars.len() {
-        if chars[index] == '%' {
-            if let Some(end) = chars[index + 1..].iter().position(|ch| *ch == '%') {
-                let name: String = chars[index + 1..index + 1 + end].iter().collect();
-                if !name.is_empty() {
-                    if let Some(value) = lookup_var(fs, &name) {
-                        out.push_str(&value);
-                        index += end + 2;
-                        continue;
-                    }
-                }
+        if chars[index] == '%'
+            && let Some(end) = chars[index + 1..].iter().position(|ch| *ch == '%')
+        {
+            let name: String = chars[index + 1..index + 1 + end].iter().collect();
+            if !name.is_empty()
+                && let Some(value) = lookup_var(fs, &name)
+            {
+                out.push_str(&value);
+                index += end + 2;
+                continue;
             }
         }
         out.push(chars[index]);
@@ -131,10 +129,10 @@ pub fn file_present(fs: &dyn FileView, path: &str) -> bool {
     if fs.exists(&path) {
         return true;
     }
-    if let Some(alt) = swap_system32(&path) {
-        if fs.exists(&alt) {
-            return true;
-        }
+    if let Some(alt) = swap_system32(&path)
+        && fs.exists(&alt)
+    {
+        return true;
     }
     swap_program_files(fs, &path).is_some_and(|alt| fs.exists(&alt))
 }
@@ -228,12 +226,12 @@ fn collect_paths(text: &str, found: &mut Vec<String>) {
     if trimmed.is_empty() {
         return;
     }
-    if let Some(rest) = trimmed.strip_prefix('"') {
-        if let Some(end) = rest.find('"') {
-            push_path(found, &rest[..end]);
-            collect_paths(rest[end + 1..].trim(), found);
-            return;
-        }
+    if let Some(rest) = trimmed.strip_prefix('"')
+        && let Some(end) = rest.find('"')
+    {
+        push_path(found, &rest[..end]);
+        collect_paths(rest[end + 1..].trim(), found);
+        return;
     }
     if starts_like_path(trimmed) {
         if let Some(end) = extension_end(trimmed) {
@@ -251,10 +249,10 @@ fn collect_paths(text: &str, found: &mut Vec<String>) {
         push_path(found, trimmed[..end].trim());
         return;
     }
-    if let Some(index) = find_later_path(trimmed) {
-        if index > 0 {
-            collect_paths(&trimmed[index..], found);
-        }
+    if let Some(index) = find_later_path(trimmed)
+        && index > 0
+    {
+        collect_paths(&trimmed[index..], found);
     }
 }
 
@@ -310,17 +308,19 @@ fn find_later_path(text: &str) -> Option<usize> {
 
 fn push_path(found: &mut Vec<String>, raw: &str) {
     let mut path = raw.trim().trim_matches('"').to_string();
-    if let Some((left, _)) = path.rsplit_once(',') {
-        if left.contains('\\') || left.contains(':') {
-            path = left.to_string();
-        }
+    if let Some((left, _)) = path.rsplit_once(',')
+        && (left.contains('\\') || left.contains(':'))
+    {
+        path = left.to_string();
     }
     path = path.trim().trim_end_matches('\\').to_string();
     // Type libraries are stored as `file.dll\2`: a resource index, not a folder.
-    if let Some((left, index)) = path.rsplit_once('\\') {
-        if !index.is_empty() && index.chars().all(|ch| ch.is_ascii_digit()) && has_extension(left) {
-            path = left.to_string();
-        }
+    if let Some((left, index)) = path.rsplit_once('\\')
+        && !index.is_empty()
+        && index.chars().all(|ch| ch.is_ascii_digit())
+        && has_extension(left)
+    {
+        path = left.to_string();
     }
     if path.len() < 3 {
         return;

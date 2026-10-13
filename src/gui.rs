@@ -568,23 +568,23 @@ unsafe extern "system" fn wnd_proc(
             0
         }
         WM_SETCURSOR => {
-            if (lparam & 0xffff) as u32 == HTCLIENT && wparam as HWND == hwnd {
-                if let Some(index) = app.hover {
-                    if app.spot_enabled(index) {
-                        SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
-                        return 1;
-                    }
-                }
+            if (lparam & 0xffff) as u32 == HTCLIENT
+                && wparam as HWND == hwnd
+                && let Some(index) = app.hover
+                && app.spot_enabled(index)
+            {
+                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                return 1;
             }
             DefWindowProcW(hwnd, msg, wparam, lparam)
         }
         WM_LBUTTONUP => {
             let (x, y) = point(lparam);
-            if let Some(index) = app.spot_at(x, y) {
-                if app.spot_enabled(index) {
-                    let action = app.hotspots[index].action;
-                    app.perform(action);
-                }
+            if let Some(index) = app.spot_at(x, y)
+                && app.spot_enabled(index)
+            {
+                let action = app.hotspots[index].action;
+                app.perform(action);
             }
             0
         }
@@ -3504,11 +3504,9 @@ impl App {
             .lock()
             .map(|p| (p.done, p.total))
             .unwrap_or_default();
-        let pos = if total == 0 {
-            0
-        } else {
-            (done * 1000 / total).min(1000)
-        };
+        let pos = (done * 1000)
+            .checked_div(total)
+            .map_or(0, |pos| pos.min(1000));
         unsafe { SendMessageW(self.progress, PBM_SETPOS, pos, 0) };
         let mut rect = self.client();
         rect.top = self.s(HEADER_H);
@@ -5084,7 +5082,7 @@ impl App {
                     DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
             }
-            y += ((shown.len() + 1) / 2) as i32 * self.s(18);
+            y += shown.len().div_ceil(2) as i32 * self.s(18);
             text(
                 hdc,
                 self.fonts.body_bold,
@@ -5167,6 +5165,7 @@ impl App {
     }
 
     /// Label, value line, and usage bar. Returns the y below the meter.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn meter(
         &mut self,
         hdc: HDC,
@@ -5260,7 +5259,7 @@ impl App {
         let right = rect.right - self.s(28);
         let gap = self.s(12);
         let col_w = (right - left - gap) / 2;
-        let rows = (WINDOWS_TOOLS.len() + 1) / 2;
+        let rows = WINDOWS_TOOLS.len().div_ceil(2);
         let row_h = self.s(52);
         let step = row_h + self.s(6);
         for (index, tool) in WINDOWS_TOOLS.iter().enumerate() {

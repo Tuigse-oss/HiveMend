@@ -514,10 +514,10 @@ impl FileView for HostFs {
     }
 
     fn var(&self, name: &str) -> Option<String> {
-        if let Ok(value) = std::env::var(name) {
-            if !value.is_empty() {
-                return Some(value);
-            }
+        if let Ok(value) = std::env::var(name)
+            && !value.is_empty()
+        {
+            return Some(value);
         }
         std::env::vars().find_map(|(key, value)| {
             if key.eq_ignore_ascii_case(name) && !value.is_empty() {

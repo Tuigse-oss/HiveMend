@@ -24,12 +24,12 @@ pub fn lnk_target(bytes: &[u8]) -> Option<String> {
     }
     if header_size >= 0x24 && header_size + 4 <= info.len() {
         let unicode_off = u32::from_le_bytes(info[28..32].try_into().ok()?) as usize;
-        if unicode_off > 0 && unicode_off < info_size {
-            if let Some(text) = read_utf16(&info[unicode_off..info_size]) {
-                if !text.is_empty() {
-                    return Some(text);
-                }
-            }
+        if unicode_off > 0
+            && unicode_off < info_size
+            && let Some(text) = read_utf16(&info[unicode_off..info_size])
+            && !text.is_empty()
+        {
+            return Some(text);
         }
     }
     let local_off = u32::from_le_bytes(info[16..20].try_into().ok()?) as usize;

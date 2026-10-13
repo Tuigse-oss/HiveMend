@@ -367,12 +367,12 @@ impl BackupSummary {
                 }
             } else if line.starts_with('"') || line.starts_with('@') {
                 summary.values += 1;
-            } else if let Some(rest) = line.strip_prefix(FILE_LINE) {
-                if let Some((original, copy)) = rest.split_once(FILE_ARROW) {
-                    summary
-                        .files
-                        .push((original.trim().to_string(), PathBuf::from(copy.trim())));
-                }
+            } else if let Some(rest) = line.strip_prefix(FILE_LINE)
+                && let Some((original, copy)) = rest.split_once(FILE_ARROW)
+            {
+                summary
+                    .files
+                    .push((original.trim().to_string(), PathBuf::from(copy.trim())));
             }
         }
         summary
@@ -413,7 +413,7 @@ pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
             summary,
         });
     }
-    found.sort_by(|left, right| right.modified.cmp(&left.modified));
+    found.sort_by_key(|info| std::cmp::Reverse(info.modified));
     found
 }
 
@@ -433,11 +433,11 @@ pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
             ));
             continue;
         }
-        if let Some(parent) = target.parent() {
-            if let Err(err) = std::fs::create_dir_all(parent) {
-                errors.push(format!("{original}: {err}"));
-                continue;
-            }
+        if let Some(parent) = target.parent()
+            && let Err(err) = std::fs::create_dir_all(parent)
+        {
+            errors.push(format!("{original}: {err}"));
+            continue;
         }
         match std::fs::copy(copy, target) {
             Ok(_) => restored += 1,

@@ -252,6 +252,7 @@ fn file_name(path: &str) -> &str {
     path.rsplit(['\\', '/']).next().unwrap_or(path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn shred_file(
     fs: &mut dyn FileView,
     path: &str,
@@ -464,7 +465,9 @@ pub fn recycle_display_name(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let wide: Vec<u16> = bytes[28..end]
-        .chunks_exact(2)
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let path = String::from_utf16_lossy(&wide);

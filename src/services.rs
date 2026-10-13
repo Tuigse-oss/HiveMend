@@ -794,10 +794,10 @@ mod tests {
             "names match case-insensitively"
         );
         assert!(store.set_start("Missing", StartType::Manual).is_err());
-        assert_eq!(store.start("Fax").unwrap(), true);
-        assert_eq!(store.start("Fax").unwrap(), false);
-        assert_eq!(store.stop("Fax").unwrap(), true);
-        assert_eq!(store.stop("Fax").unwrap(), false);
+        assert!(store.start("Fax").unwrap());
+        assert!(!store.start("Fax").unwrap());
+        assert!(store.stop("Fax").unwrap());
+        assert!(!store.stop("Fax").unwrap());
         assert!(store.start("Old").unwrap_err().message.contains("disabled"));
     }
 
