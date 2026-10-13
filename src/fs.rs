@@ -29,8 +29,36 @@ pub trait FileView {
     }
     fn read(&self, path: &str) -> Option<Vec<u8>>;
     fn list(&self, dir: &str) -> Vec<DirItem>;
+    /// Precise kind for a staged path. Unknown paths report `Other`, which
+    /// the shredder refuses, so an answer that cannot be known is safe.
+    fn kind_of(&self, path: &str) -> ItemKind {
+        if self.is_dir(path) {
+            ItemKind::Dir
+        } else if self.exists(path) {
+            ItemKind::File
+        } else {
+            ItemKind::Other
+        }
+    }
+    /// True when the file carries both hidden and system attributes.
+    fn is_hidden_system(&self, path: &str) -> bool {
+        let _ = path;
+        false
+    }
     fn remove_file(&mut self, path: &str) -> Result<(), String>;
     fn copy_file(&mut self, from: &str, to: &str) -> Result<(), String>;
+    /// Overwrite `bytes.len()` bytes at `offset`. May extend a short file.
+    fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String>;
+    /// Flush buffers and metadata for a shredded file.
+    fn sync_file(&mut self, path: &str) -> Result<(), String>;
+    /// Truncate (or zero-extend) a file.
+    fn set_len(&mut self, path: &str, len: u64) -> Result<(), String>;
+    /// Rename a file. Refuses directories and existing targets.
+    fn rename_file(&mut self, from: &str, to: &str) -> Result<(), String>;
+    /// Remove an empty directory.
+    fn remove_dir(&mut self, path: &str) -> Result<(), String>;
+    /// Read up to `len` bytes at `offset` for the verify pass.
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>>;
     fn var(&self, name: &str) -> Option<String>;
 }
 
@@ -41,6 +69,8 @@ enum FsNode {
         age: Option<Duration>,
     },
     Dir,
+    /// Stands in for symlinks and reparse points.
+    Other,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -72,6 +102,12 @@ impl MemoryFs {
         let path = norm(path);
         self.ensure_parents(&path);
         self.nodes.insert(path, FsNode::Dir);
+    }
+
+    pub fn add_other(&mut self, path: &str) {
+        let path = norm(path);
+        self.ensure_parents(&path);
+        self.nodes.insert(path, FsNode::Other);
     }
 
     fn ensure_parents(&mut self, path: &str) {
@@ -134,6 +170,7 @@ impl FileView for MemoryFs {
             let (kind, age) = match node {
                 FsNode::Dir => (ItemKind::Dir, None),
                 FsNode::File { age, .. } => (ItemKind::File, *age),
+                FsNode::Other => (ItemKind::Other, None),
             };
             items.push(DirItem {
                 name: name.to_string(),
@@ -163,6 +200,94 @@ impl FileView for MemoryFs {
         };
         self.add_file_bytes(to, bytes, None);
         Ok(())
+    }
+
+    fn kind_of(&self, path: &str) -> ItemKind {
+        match self.nodes.get(&norm(path)) {
+            Some(FsNode::Dir) => ItemKind::Dir,
+            Some(FsNode::File { .. }) => ItemKind::File,
+            _ => ItemKind::Other,
+        }
+    }
+
+    fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        let offset = offset as usize;
+        match self.nodes.get_mut(&norm(path)) {
+            Some(FsNode::File { bytes: body, .. }) => {
+                if body.len() < offset {
+                    body.resize(offset, 0);
+                }
+                let end = offset + bytes.len();
+                if body.len() < end {
+                    body.resize(end, 0);
+                }
+                body[offset..end].copy_from_slice(bytes);
+                Ok(())
+            }
+            _ => Err("file not found".into()),
+        }
+    }
+
+    fn sync_file(&mut self, path: &str) -> Result<(), String> {
+        match self.nodes.get(&norm(path)) {
+            Some(FsNode::File { .. }) => Ok(()),
+            _ => Err("file not found".into()),
+        }
+    }
+
+    fn set_len(&mut self, path: &str, len: u64) -> Result<(), String> {
+        match self.nodes.get_mut(&norm(path)) {
+            Some(FsNode::File { bytes, .. }) => {
+                bytes.resize(len as usize, 0);
+                Ok(())
+            }
+            _ => Err("file not found".into()),
+        }
+    }
+
+    fn rename_file(&mut self, from: &str, to: &str) -> Result<(), String> {
+        let from = norm(from);
+        let to = norm(to);
+        if self.nodes.contains_key(&to) {
+            return Err("target already exists".into());
+        }
+        match self.nodes.remove(&from) {
+            Some(node @ FsNode::File { .. }) => {
+                self.ensure_parents(&to);
+                self.nodes.insert(to, node);
+                Ok(())
+            }
+            Some(other) => {
+                self.nodes.insert(from, other);
+                Err("not a file".into())
+            }
+            None => Err("file not found".into()),
+        }
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), String> {
+        let path = norm(path);
+        match self.nodes.get(&path) {
+            Some(FsNode::Dir) => {}
+            _ => return Err("directory not found".into()),
+        }
+        let prefix = format!("{path}\\");
+        if self.nodes.keys().any(|key| key.starts_with(&prefix)) {
+            return Err("directory not empty".into());
+        }
+        self.nodes.remove(&path);
+        Ok(())
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        match self.nodes.get(&norm(path)) {
+            Some(FsNode::File { bytes, .. }) => {
+                let offset = (offset as usize).min(bytes.len());
+                let end = offset.saturating_add(len).min(bytes.len());
+                Some(bytes[offset..end].to_vec())
+            }
+            _ => None,
+        }
     }
 
     fn var(&self, name: &str) -> Option<String> {
@@ -277,6 +402,83 @@ impl FileView for HostFs {
         std::fs::copy(from, to)
             .map(|_| ())
             .map_err(|err| err.to_string())
+    }
+
+    fn kind_of(&self, path: &str) -> ItemKind {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return ItemKind::Other;
+        };
+        let kind = meta.file_type();
+        if kind.is_symlink() {
+            ItemKind::Other
+        } else if kind.is_dir() {
+            ItemKind::Dir
+        } else if kind.is_file() {
+            ItemKind::File
+        } else {
+            ItemKind::Other
+        }
+    }
+
+    fn is_hidden_system(&self, path: &str) -> bool {
+        #[cfg(windows)]
+        {
+            use windows_sys::Win32::Storage::FileSystem::GetFileAttributesW;
+            const INVALID: u32 = 0xffff_ffff;
+            const HIDDEN: u32 = 0x2;
+            const SYSTEM: u32 = 0x4;
+            let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+            let attrs = unsafe { GetFileAttributesW(wide.as_ptr()) };
+            attrs != INVALID && attrs & (HIDDEN | SYSTEM) == (HIDDEN | SYSTEM)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            false
+        }
+    }
+
+    fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
+        use std::io::{Seek, SeekFrom, Write};
+        let mut file =
+            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
+        file.seek(SeekFrom::Start(offset)).map_err(|err| err.to_string())?;
+        file.write_all(bytes).map_err(|err| err.to_string())
+    }
+
+    fn sync_file(&mut self, path: &str) -> Result<(), String> {
+        let file =
+            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
+        file.sync_all().map_err(|err| err.to_string())
+    }
+
+    fn set_len(&mut self, path: &str, len: u64) -> Result<(), String> {
+        let file =
+            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
+        file.set_len(len).map_err(|err| err.to_string())
+    }
+
+    fn rename_file(&mut self, from: &str, to: &str) -> Result<(), String> {
+        if self.kind_of(from) != ItemKind::File {
+            return Err("not a file".into());
+        }
+        if self.exists(to) {
+            return Err("target already exists".into());
+        }
+        std::fs::rename(from, to).map_err(|err| err.to_string())
+    }
+
+    fn remove_dir(&mut self, path: &str) -> Result<(), String> {
+        std::fs::remove_dir(path).map_err(|err| err.to_string())
+    }
+
+    fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
+        use std::io::{Read, Seek, SeekFrom};
+        let mut file = std::fs::File::open(path).ok()?;
+        file.seek(SeekFrom::Start(offset)).ok()?;
+        let mut buf = Vec::new();
+        file.take(len as u64).read_to_end(&mut buf).ok()?;
+        Some(buf)
     }
 
     fn var(&self, name: &str) -> Option<String> {

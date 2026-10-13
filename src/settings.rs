@@ -13,6 +13,8 @@ pub struct Settings {
     pub last_repair: String,
     /// Privacy category ids left ticked. Empty means nothing ticked.
     pub privacy_ticked: Vec<String>,
+    /// Shredder overwrite passes. Only 1, 3, or 7 stick; default 3.
+    pub shred_passes: u8,
 }
 
 impl Default for Settings {
@@ -23,6 +25,7 @@ impl Default for Settings {
             last_problems: None,
             last_repair: String::new(),
             privacy_ticked: Vec::new(),
+            shred_passes: 3,
         }
     }
 }
@@ -51,6 +54,13 @@ impl Settings {
                         .map(|id| id.trim().to_string())
                         .filter(|id| !id.is_empty())
                         .collect();
+                }
+                "shred_passes" => {
+                    if let Ok(passes) = value.parse::<u8>()
+                        && matches!(passes, 1 | 3 | 7)
+                    {
+                        settings.shred_passes = passes;
+                    }
                 }
                 _ => {}
             }
@@ -81,6 +91,9 @@ impl Settings {
         text.push_str(&format!("last_repair={}\r\n", one_line(&self.last_repair)));
         if !self.privacy_ticked.is_empty() {
             text.push_str(&format!("privacy_ticked={}\r\n", self.privacy_ticked.join(",")));
+        }
+        if self.shred_passes != 3 {
+            text.push_str(&format!("shred_passes={}\r\n", self.shred_passes));
         }
         text
     }

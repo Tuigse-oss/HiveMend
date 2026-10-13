@@ -40,9 +40,11 @@ registry-master scan
 registry-master scan --only SL,SUP,ARP
 registry-master repair --backup-dir C:\RegistryMaster\backups
 registry-master repair --backup-dir C:\RegistryMaster\backups --yes
+registry-master shred --passes 3 C:\Users\Me\old-letters
+registry-master shred --passes 3 --yes C:\Users\Me\old-letters
 ```
 
-`scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes.
+`scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
 
 If you still have an extracted legacy cleaner `app` folder, its original rules and ignore lists can be merged in:
 
@@ -57,7 +59,7 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window: Status, Start Scan, Restore,
-Settings, Services, Privacy, Monitor, Tools, and About.
+Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
 
 - Status shows Scan Your Registry, Optimize Your System (a quick
   startup, uninstall, shared-DLL, and COM pass), and Monitor Your System
@@ -77,6 +79,14 @@ Settings, Services, Privacy, Monitor, Tools, and About.
   for good. History and cookie cleaning waits for a closed browser and
   never touches saved logins, autofill, or bookmarks. Everything here is
   user-scope, so no administrator rights are needed.
+- Shredder overwrites files so they cannot be recovered, then deletes
+  them. Drop files onto the page, type a path and Add, or stage the
+  Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The
+  confirmation names every path and cannot be undone. The Windows
+  folder, program folders, drive roots, links, and hidden system files
+  are always refused. Shredding on a solid-state drive warns that
+  traces may survive in spare blocks the overwrite cannot reach. No
+  administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Registry Master health summary. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,

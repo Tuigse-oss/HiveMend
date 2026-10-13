@@ -17,15 +17,18 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use registry_master::{
-    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, Finding, HostFs, ItemOutcome,
-    Preview, PrivacyItem, Repair, RepairOutcome, SUGGESTED, ScanOptions, ScanReport,
-    ScannerId, ScmServiceStore, ServiceChange, ServiceInfo, ServiceOutcome, ServiceState,
-    ServiceStore, Settings, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
-    WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
-    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
-    format_uptime, gather_snapshot, import_reg_file, list_backups, parse_custom, plan_profile,
-    preview, read_backup, repair_with_progress, restore_files, scan_with_progress,
-    settings_file, sort_services, start_services, still_reported, stop_services,
+    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HostFs,
+    ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
+    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod,
+    ShredOptions, ShredOutcome, ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList,
+    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backups_dir, build_items,
+    clean_with_progress, custom_privacy_file, decode_text_owned, exclusions_file,
+    expand_target, fixed_drives, format_bytes, format_uptime, gather_snapshot,
+    import_reg_file, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
+    random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
+    settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services,
+    start_services, still_reported, stop_services, volume_ssd,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -62,12 +65,14 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
-use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
+use windows_sys::Win32::UI::Shell::{
+    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, IsUserAnAdmin, ShellExecuteW,
+};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
-    GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP,
+    DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos,
+    GetMessageW, GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP,
     IsDialogMessageW, LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
     MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
@@ -75,10 +80,10 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY,
-    WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD,
-    WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE,
-    WS_VSCROLL,
+    WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH,
+    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW,
+    WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
@@ -106,6 +111,13 @@ const ID_PRIV_PREVIEW: u16 = 1400;
 const ID_PRIV_ALL: u16 = 1401;
 const ID_PRIV_NONE: u16 = 1402;
 const ID_PRIV_CLEAN: u16 = 1403;
+const ID_SHRED_ADD: u16 = 1500;
+const ID_SHRED_BIN: u16 = 1501;
+const ID_SHRED_ALL: u16 = 1502;
+const ID_SHRED_NONE: u16 = 1503;
+const ID_SHRED_REMOVE: u16 = 1504;
+const ID_SHRED_PASSES: u16 = 1505;
+const ID_SHRED: u16 = 1506;
 const ID_FINDINGS: u16 = 2000;
 const ID_PROGRESS: u16 = 2001;
 const ID_BACKUPS: u16 = 2002;
@@ -113,6 +125,8 @@ const ID_IGNORED: u16 = 2003;
 const ID_SVC_LIST: u16 = 2004;
 const ID_SVC_TUNE: u16 = 2005;
 const ID_PRIV_LIST: u16 = 2006;
+const ID_SHRED_LIST: u16 = 2007;
+const ID_SHRED_PATH: u16 = 2008;
 const IDCANCEL: u16 = 2;
 
 const MENU_DETAILS: usize = 1;
@@ -154,6 +168,7 @@ enum Page {
     Settings,
     Services,
     Privacy,
+    Shredder,
     Monitor,
     Tools,
     About,
@@ -166,6 +181,7 @@ const NAV: &[(&str, Page)] = &[
     ("Settings", Page::Settings),
     ("Services", Page::Services),
     ("Privacy", Page::Privacy),
+    ("Shredder", Page::Shredder),
     ("Monitor", Page::Monitor),
     ("Tools", Page::Tools),
     ("About", Page::About),
@@ -202,6 +218,7 @@ enum Job {
     Restoring,
     Services,
     Cleaning,
+    Shredding,
 }
 
 /// Services page views: suggested Manual starts, or every service.
@@ -264,6 +281,16 @@ enum JobResult {
     Privacy {
         result: Result<CleanOutcome, String>,
     },
+    Shred {
+        outcome: ShredOutcome,
+    },
+}
+
+/// One staged row: a file or folder target, optionally a Recycle Bin item
+/// whose metadata is deleted after its data shreds.
+struct ShredRow {
+    target: ShredTarget,
+    bin: Option<RecycleItem>,
 }
 
 struct Progress {
@@ -354,6 +381,20 @@ struct App {
     btn_priv_all: HWND,
     btn_priv_none: HWND,
     btn_priv_clean: HWND,
+    shred_rows: Vec<ShredRow>,
+    shred_checked: Vec<bool>,
+    shred_note: String,
+    shred_warn: Vec<String>,
+    shred_filling: bool,
+    shred_list: HWND,
+    shred_path: HWND,
+    btn_shred_add: HWND,
+    btn_shred_bin: HWND,
+    btn_shred_all: HWND,
+    btn_shred_none: HWND,
+    btn_shred_remove: HWND,
+    btn_shred_passes: HWND,
+    btn_shred: HWND,
 }
 
 pub fn run() -> std::process::ExitCode {
@@ -406,6 +447,7 @@ pub fn run() -> std::process::ExitCode {
 
 unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
     if msg == WM_CREATE {
+        DragAcceptFiles(hwnd, 1);
         let app = Box::new(App::new(hwnd));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         let app = &mut *window_app(hwnd);
@@ -509,6 +551,12 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             SetBkColor(wparam as HDC, BG);
             app.bg_brush as LRESULT
         }
+        WM_DROPFILES => {
+            let drop = wparam as HDROP;
+            app.drop_files(drop);
+            DragFinish(drop);
+            0
+        }
         WM_JOB_PROGRESS => {
             app.show_progress();
             0
@@ -520,7 +568,10 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_CLOSE => {
-            if matches!(app.job, Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning) {
+            if matches!(
+                app.job,
+                Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning | Job::Shredding
+            ) {
                 app.message(
                     "Registry Master is still working. Please wait for it to finish before closing.",
                     MB_ICONWARNING,
@@ -619,6 +670,20 @@ impl App {
             btn_priv_all: std::ptr::null_mut(),
             btn_priv_none: std::ptr::null_mut(),
             btn_priv_clean: std::ptr::null_mut(),
+            shred_rows: Vec::new(),
+            shred_checked: Vec::new(),
+            shred_note: String::new(),
+            shred_warn: Vec::new(),
+            shred_filling: false,
+            shred_list: std::ptr::null_mut(),
+            shred_path: std::ptr::null_mut(),
+            btn_shred_add: std::ptr::null_mut(),
+            btn_shred_bin: std::ptr::null_mut(),
+            btn_shred_all: std::ptr::null_mut(),
+            btn_shred_none: std::ptr::null_mut(),
+            btn_shred_remove: std::ptr::null_mut(),
+            btn_shred_passes: std::ptr::null_mut(),
+            btn_shred: std::ptr::null_mut(),
         };
         app.create_controls();
         app
@@ -707,6 +772,21 @@ impl App {
         self.btn_priv_all = button(hwnd, ID_PRIV_ALL, "Tick All", BS_PUSHBUTTON);
         self.btn_priv_none = button(hwnd, ID_PRIV_NONE, "Untick All", BS_PUSHBUTTON);
         self.btn_priv_clean = button(hwnd, ID_PRIV_CLEAN, "Clean Ticked", BS_PUSHBUTTON);
+        self.shred_list = list_view(
+            hwnd,
+            ID_SHRED_LIST,
+            0,
+            LVS_EX_CHECKBOXES,
+            &[("Name", 240), ("Size", 110), ("Location", 470)],
+        );
+        self.shred_path = edit(hwnd, ID_SHRED_PATH);
+        self.btn_shred_add = button(hwnd, ID_SHRED_ADD, "Add", BS_PUSHBUTTON);
+        self.btn_shred_bin = button(hwnd, ID_SHRED_BIN, "Add Recycle Bin", BS_PUSHBUTTON);
+        self.btn_shred_all = button(hwnd, ID_SHRED_ALL, "Tick All", BS_PUSHBUTTON);
+        self.btn_shred_none = button(hwnd, ID_SHRED_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_shred_remove = button(hwnd, ID_SHRED_REMOVE, "Remove", BS_PUSHBUTTON);
+        self.btn_shred_passes = button(hwnd, ID_SHRED_PASSES, "Passes: 3", BS_PUSHBUTTON);
+        self.btn_shred = button(hwnd, ID_SHRED, "Shred Ticked", BS_PUSHBUTTON);
         self.apply_fonts();
         self.fill_backups();
         self.fill_ignored();
@@ -740,6 +820,15 @@ impl App {
             self.btn_priv_all,
             self.btn_priv_none,
             self.btn_priv_clean,
+            self.shred_list,
+            self.shred_path,
+            self.btn_shred_add,
+            self.btn_shred_bin,
+            self.btn_shred_all,
+            self.btn_shred_none,
+            self.btn_shred_remove,
+            self.btn_shred_passes,
+            self.btn_shred,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
         all
@@ -887,6 +976,10 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping after this category...");
                     self.show_progress();
+                } else if self.job == Job::Shredding {
+                    CANCEL.store(true, Ordering::SeqCst);
+                    progress_text("Stopping after this file...");
+                    self.show_progress();
                 }
             }
             ID_RESTORE => {
@@ -912,6 +1005,13 @@ impl App {
             ID_PRIV_ALL => self.priv_tick_all(true),
             ID_PRIV_NONE => self.priv_tick_all(false),
             ID_PRIV_CLEAN => self.start_privacy_clean(),
+            ID_SHRED_ADD => self.shred_add_typed(),
+            ID_SHRED_BIN => self.shred_add_bin(),
+            ID_SHRED_ALL => self.shred_tick_all(true),
+            ID_SHRED_NONE => self.shred_tick_all(false),
+            ID_SHRED_REMOVE => self.shred_remove_highlighted(),
+            ID_SHRED_PASSES => self.shred_cycle_passes(),
+            ID_SHRED => self.start_shred(),
             _ => {}
         }
     }
@@ -1025,6 +1125,38 @@ impl App {
                 NM_DBLCLK => {
                     if let Some(row) = selected_rows(self.priv_list).first() {
                         self.show_priv_details(*row);
+                    }
+                }
+                _ => {}
+            }
+        } else if id == ID_SHRED_LIST {
+            match header.code {
+                LVN_ITEMCHANGING => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.shred_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old && self.busy() {
+                            return 1;
+                        }
+                    }
+                }
+                LVN_ITEMCHANGED => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.shred_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old {
+                            if let Some(slot) = self.shred_checked.get_mut(change.iItem as usize) {
+                                *slot = new == 2;
+                            }
+                            self.update_shred_label();
+                        }
+                    }
+                }
+                NM_DBLCLK => {
+                    if let Some(row) = selected_rows(self.shred_list).first() {
+                        self.show_shred_details(*row);
                     }
                 }
                 _ => {}
@@ -2148,6 +2280,411 @@ impl App {
         }
     }
 
+    // ---- shredder ------------------------------------------------------
+
+    fn shred_add_typed(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let text = edit_text(self.shred_path);
+        if text.trim().is_empty() {
+            self.message(
+                "Type a file or folder path first, or drop files onto this window.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        if self.stage_path(&text) {
+            set_text(self.shred_path, "");
+        }
+    }
+
+    /// Stage one path after the shred gate passes. True when staged.
+    fn stage_path(&mut self, text: &str) -> bool {
+        let path = text.trim().trim_matches('"').to_string();
+        if path.is_empty() {
+            return false;
+        }
+        if self.shred_rows.iter().any(|row| row.target.path.eq_ignore_ascii_case(&path)) {
+            self.message("That path is already staged.", MB_ICONINFORMATION);
+            return false;
+        }
+        if let Err(reason) = shred_allowed(&HostFs, &path) {
+            self.message(&format!("Not staged.\n\n{reason}"), MB_ICONWARNING);
+            return false;
+        }
+        let is_dir = HostFs.kind_of(&path) == ItemKind::Dir;
+        self.shred_rows.push(ShredRow {
+            target: ShredTarget { path, is_dir },
+            bin: None,
+        });
+        self.shred_checked.push(true);
+        self.after_stage();
+        true
+    }
+
+    fn shred_add_bin(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let (items, notes) = list_recycle_bin(&HostFs, &fixed_drives());
+        if items.is_empty() {
+            let mut text = "The Recycle Bin is empty.".to_string();
+            if !notes.is_empty() {
+                text.push_str(&format!("\n\n{}", notes.join("\n")));
+            }
+            self.message(&text, MB_ICONINFORMATION);
+            return;
+        }
+        let mut added = 0;
+        let mut refused = Vec::new();
+        for item in items {
+            if self.shred_rows.iter().any(|row| row.target.path.eq_ignore_ascii_case(&item.data)) {
+                continue;
+            }
+            // The gate runs again at shred time; refusing early explains why.
+            if let Err(reason) = shred_allowed(&HostFs, &item.data) {
+                refused.push(reason);
+                continue;
+            }
+            self.shred_rows.push(ShredRow {
+                target: ShredTarget { path: item.data.clone(), is_dir: false },
+                bin: Some(item),
+            });
+            self.shred_checked.push(true);
+            added += 1;
+        }
+        self.after_stage();
+        self.shred_note = format!("Staged {added} Recycle Bin files.");
+        let mut extra = Vec::new();
+        extra.extend(notes.iter().take(5).cloned());
+        extra.extend(refused.iter().take(5).cloned());
+        if !extra.is_empty() {
+            self.message(&extra.join("\n"), MB_ICONINFORMATION);
+        }
+        self.invalidate();
+    }
+
+    fn shred_remove_highlighted(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let mut rows = selected_rows(self.shred_list);
+        if rows.is_empty() {
+            self.message("Highlight the staged rows to remove first.", MB_ICONINFORMATION);
+            return;
+        }
+        rows.sort_unstable_by(|left, right| right.cmp(left));
+        for row in rows {
+            if row < self.shred_rows.len() {
+                self.shred_rows.remove(row);
+                self.shred_checked.remove(row);
+            }
+        }
+        self.after_stage();
+    }
+
+    fn shred_tick_all(&mut self, on: bool) {
+        if self.busy() {
+            return;
+        }
+        for slot in self.shred_checked.iter_mut() {
+            *slot = on;
+        }
+        self.fill_shredder();
+        self.update_shred_label();
+    }
+
+    fn shred_cycle_passes(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.settings.shred_passes = match self.settings.shred_passes {
+            1 => 3,
+            3 => 7,
+            _ => 1,
+        };
+        self.save_settings();
+        self.update_shred_label();
+    }
+
+    fn shred_method(&self) -> ShredMethod {
+        ShredMethod::from_passes(self.settings.shred_passes).unwrap_or(ShredMethod::ThreePass)
+    }
+
+    fn shred_ticked_rows(&self) -> Vec<usize> {
+        self.shred_checked
+            .iter()
+            .enumerate()
+            .filter(|(_, on)| **on)
+            .map(|(row, _)| row)
+            .collect()
+    }
+
+    fn after_stage(&mut self) {
+        self.refresh_shred_warn();
+        self.fill_shredder();
+        self.update_shred_label();
+        self.invalidate();
+    }
+
+    fn refresh_shred_warn(&mut self) {
+        let mut drives = Vec::new();
+        for row in &self.shred_rows {
+            let bytes = row.target.path.trim().as_bytes();
+            if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+                let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
+                if !drives.contains(&drive) {
+                    drives.push(drive);
+                }
+            }
+        }
+        let mut warn = Vec::new();
+        for drive in drives {
+            match volume_ssd(&drive) {
+                Some(true) => warn.push(format!(
+                    "{drive} is a solid-state drive: shredding cannot reach its spare blocks, so traces may survive."
+                )),
+                None => warn.push(format!(
+                    "Could not tell whether {drive} is solid-state; shredded data may survive."
+                )),
+                Some(false) => {}
+            }
+        }
+        self.shred_warn = warn;
+    }
+
+    fn update_shred_label(&self) {
+        let count = self.shred_checked.iter().filter(|on| **on).count();
+        set_text(self.btn_shred_passes, &format!("Passes: {}", self.settings.shred_passes));
+        let text = if count == 0 {
+            "Shred Ticked".to_string()
+        } else {
+            format!("Shred Ticked ({count})")
+        };
+        set_text(self.btn_shred, &text);
+        unsafe { EnableWindow(self.btn_shred, (count > 0 && !self.busy()) as i32) };
+    }
+
+    fn shred_row_cells(&self, index: usize) -> (String, String, String) {
+        let row = &self.shred_rows[index];
+        if let Some(item) = &row.bin {
+            (
+                format!("{} (Recycle Bin)", item.display),
+                format_bytes(item.bytes),
+                row.target.path.clone(),
+            )
+        } else if row.target.is_dir {
+            (file_name(&row.target.path), "Folder".to_string(), row.target.path.clone())
+        } else {
+            let size = HostFs.len(&row.target.path).map(format_bytes).unwrap_or_default();
+            (file_name(&row.target.path), size, row.target.path.clone())
+        }
+    }
+
+    fn fill_shredder(&mut self) {
+        self.shred_filling = true;
+        unsafe {
+            SendMessageW(self.shred_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.shred_list, LVM_DELETEALLITEMS, 0, 0);
+            for row in 0..self.shred_rows.len() {
+                let (name, size, location) = self.shred_row_cells(row);
+                insert_row(self.shred_list, row, &[&name, &size, &location]);
+                set_state_image(
+                    self.shred_list,
+                    row,
+                    if self.shred_checked.get(row).copied().unwrap_or(false) { 2 } else { 1 },
+                );
+            }
+            SendMessageW(self.shred_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.shred_list, std::ptr::null(), 1);
+        }
+        self.shred_filling = false;
+        self.update_shred_label();
+    }
+
+    fn size_shred_columns(&self, width: i32) {
+        let name = self.s(240);
+        let size = self.s(110);
+        let location = (width - name - size - self.s(26)).max(self.s(120));
+        unsafe {
+            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 0, name as isize);
+            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 1, size as isize);
+            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 2, location as isize);
+        }
+    }
+
+    fn start_shred(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let ticked = self.shred_ticked_rows();
+        if ticked.is_empty() {
+            self.message("Tick the staged rows you want to shred first.", MB_ICONINFORMATION);
+            return;
+        }
+        let method = self.shred_method();
+        let mut files = Vec::new();
+        let mut bin = Vec::new();
+        for row in &ticked {
+            let staged = &self.shred_rows[*row];
+            match &staged.bin {
+                Some(item) => bin.push(item.clone()),
+                None => files.push(staged.target.clone()),
+            }
+        }
+        let mut question = format!(
+            "Shred {} {} with {}?\n\nThis cannot be undone. No backup is possible.",
+            ticked.len(),
+            if ticked.len() == 1 { "item" } else { "items" },
+            method.label()
+        );
+        for warn in &self.shred_warn {
+            question.push_str(&format!("\n\n{warn}"));
+        }
+        for row in ticked.iter().take(10) {
+            question.push_str(&format!("\n{}", self.shred_rows[*row].target.path));
+        }
+        if ticked.len() > 10 {
+            question.push_str(&format!("\n...and {} more", ticked.len() - 10));
+        }
+        if !self.confirm(&question) {
+            return;
+        }
+        self.job = Job::Shredding;
+        self.page = Page::Shredder;
+        CANCEL.store(false, Ordering::SeqCst);
+        set_progress(
+            0,
+            (files.len() + bin.len()).max(1) * method.passes(),
+            "Starting the shred...",
+        );
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let seed = random_seed();
+            let opts = ShredOptions { method, rename: true };
+            let file_total = files.len() * method.passes();
+            let grand = (file_total + bin.len() * method.passes()).max(1);
+            let mut outcome = shred_paths(&mut HostFs, &files, &opts, seed, &mut |done, _, name| {
+                set_progress(done, grand, &format!("Shredding {name} ({done} of {grand})..."));
+                post(hwnd, WM_JOB_PROGRESS);
+                !CANCEL.load(Ordering::SeqCst)
+            });
+            if !outcome.canceled && !bin.is_empty() {
+                let second =
+                    shred_recycle_items(&mut HostFs, &bin, &opts, seed, &mut |done, _, name| {
+                        let at = file_total + done;
+                        set_progress(at, grand, &format!("Shredding {name} ({at} of {grand})..."));
+                        post(hwnd, WM_JOB_PROGRESS);
+                        !CANCEL.load(Ordering::SeqCst)
+                    });
+                outcome.shredded += second.shredded;
+                outcome.bytes += second.bytes;
+                outcome.shredded_paths.extend(second.shredded_paths);
+                outcome.refused.extend(second.refused);
+                outcome.errors.extend(second.errors);
+                outcome.canceled = second.canceled;
+            }
+            finish_job(hwnd, JobResult::Shred { outcome });
+        });
+    }
+
+    fn finish_shred(&mut self, outcome: ShredOutcome) {
+        let mut lines =
+            vec![format!("Shredded {} files ({}).", outcome.shredded, format_bytes(outcome.bytes))];
+        if outcome.canceled {
+            lines.push(
+                "Canceled: rows after the stop were left alone. Shredded files cannot be recovered."
+                    .to_string(),
+            );
+        }
+        for refused in outcome.refused.iter().take(8) {
+            lines.push(format!("Refused: {refused}"));
+        }
+        if outcome.refused.len() > 8 {
+            lines.push(format!("...and {} more refused", outcome.refused.len() - 8));
+        }
+        for error in outcome.errors.iter().take(5) {
+            lines.push(format!("Failed: {error}"));
+        }
+        // Shredded rows leave the stage; refused and failed rows stay. A
+        // folder row is done when the folder itself is gone: the core only
+        // lists the files it shredded, and a failed folder still exists.
+        let rows = std::mem::take(&mut self.shred_rows);
+        let checks = std::mem::take(&mut self.shred_checked);
+        for (row, on) in rows.into_iter().zip(checks) {
+            let done = if row.bin.is_some() || !row.target.is_dir {
+                outcome.shredded_paths.iter().any(|path| path == &row.target.path)
+            } else {
+                !HostFs.exists(&row.target.path)
+            };
+            if done {
+                continue;
+            }
+            self.shred_rows.push(row);
+            self.shred_checked.push(on);
+        }
+        self.shred_note = if outcome.canceled {
+            format!(
+                "Canceled: shredded {} files ({}) so far.",
+                outcome.shredded,
+                format_bytes(outcome.bytes)
+            )
+        } else {
+            format!("Shredded {} files ({}).", outcome.shredded, format_bytes(outcome.bytes))
+        };
+        let icon =
+            if outcome.errors.is_empty() { MB_ICONINFORMATION } else { MB_ICONWARNING };
+        self.refresh_shred_warn();
+        self.fill_shredder();
+        self.message(&lines.join("\n"), icon);
+    }
+
+    fn show_shred_details(&mut self, row: usize) {
+        let Some(staged) = self.shred_rows.get(row) else {
+            return;
+        };
+        let mut lines = vec![staged.target.path.clone()];
+        if let Some(item) = &staged.bin {
+            lines.push(format!("Original name: {}", item.display));
+            lines.push(format!("Bin metadata: {}", item.meta));
+            lines.push(format!("Size: {}", format_bytes(item.bytes)));
+        } else if staged.target.is_dir {
+            lines.push("A folder: every file inside is shredded.".to_string());
+        } else if let Some(len) = HostFs.len(&staged.target.path) {
+            lines.push(format!("Size: {}", format_bytes(len)));
+        }
+        let bytes = staged.target.path.trim().as_bytes();
+        if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
+            let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
+            match volume_ssd(&drive) {
+                Some(true) => lines
+                    .push(format!("{drive} is a solid-state drive: traces may survive in spare blocks.")),
+                None => lines.push(format!("Could not tell whether {drive} is solid-state.")),
+                Some(false) => {}
+            }
+        }
+        self.message(&lines.join("\n"), MB_ICONINFORMATION);
+    }
+
+    fn drop_files(&mut self, drop: HDROP) {
+        if self.page != Page::Shredder || self.busy() {
+            return;
+        }
+        let count = unsafe { DragQueryFileW(drop, 0xffff_ffff, std::ptr::null_mut(), 0) };
+        for index in 0..count {
+            let len = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) } as usize;
+            let mut buf = vec![0u16; len + 1];
+            unsafe { DragQueryFileW(drop, index, buf.as_mut_ptr(), buf.len() as u32) };
+            let path = String::from_utf16_lossy(&buf[..len]);
+            self.stage_path(&path);
+        }
+        self.invalidate();
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -2681,6 +3218,10 @@ impl App {
                 self.sync_controls();
                 self.finish_privacy(result);
             }
+            JobResult::Shred { outcome } => {
+                self.sync_controls();
+                self.finish_shred(outcome);
+            }
         }
         self.sync_controls();
         self.invalidate();
@@ -2886,6 +3427,52 @@ impl App {
                     self.size_priv_columns(width);
                 }
             }
+            Page::Shredder => {
+                if matches!(self.job, Job::Shredding) {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
+                    visible.push(self.btn_cancel);
+                    place(self.btn_cancel, left, self.s(BODY_Y + 88), self.s(110), button_h);
+                } else {
+                    visible.extend([
+                        self.shred_path,
+                        self.btn_shred_add,
+                        self.shred_list,
+                        self.btn_shred_bin,
+                        self.btn_shred_all,
+                        self.btn_shred_none,
+                        self.btn_shred_remove,
+                        self.btn_shred_passes,
+                        self.btn_shred,
+                    ]);
+                    let edit_y = self.s(BODY_Y + 26);
+                    let add_w = self.s(90);
+                    place(self.btn_shred_add, right - add_w, edit_y, add_w, self.s(28));
+                    place(self.shred_path, left, edit_y, width - add_w - self.s(8), self.s(28));
+                    let top = self.s(BODY_Y + 62);
+                    place(
+                        self.shred_list,
+                        left,
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
+                    );
+                    let mut x = left;
+                    for (control, w) in [
+                        (self.btn_shred_bin, 150),
+                        (self.btn_shred_all, 96),
+                        (self.btn_shred_none, 104),
+                        (self.btn_shred_remove, 110),
+                        (self.btn_shred_passes, 110),
+                    ] {
+                        place(control, x, button_y, self.s(w), button_h);
+                        x += self.s(w + 8);
+                    }
+                    let shred_w = self.s(200);
+                    place(self.btn_shred, right - shred_w, button_y, shred_w, button_h);
+                    self.size_shred_columns(width);
+                }
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -2906,6 +3493,12 @@ impl App {
             self.btn_priv_preview,
             self.btn_priv_all,
             self.btn_priv_none,
+            self.btn_shred_add,
+            self.btn_shred_bin,
+            self.btn_shred_all,
+            self.btn_shred_none,
+            self.btn_shred_remove,
+            self.btn_shred_passes,
         ] {
             unsafe { EnableWindow(control, idle as i32) };
         }
@@ -2917,9 +3510,12 @@ impl App {
         unsafe { EnableWindow(self.svc_list, idle as i32) };
         unsafe { EnableWindow(self.svc_tune_list, idle as i32) };
         unsafe { EnableWindow(self.priv_list, idle as i32) };
+        unsafe { EnableWindow(self.shred_list, idle as i32) };
+        unsafe { EnableWindow(self.shred_path, idle as i32) };
         self.update_repair_label();
         self.update_svc_apply_label();
         self.update_priv_clean_label();
+        self.update_shred_label();
     }
 
     fn size_svc_columns(&self, width: i32) {
@@ -2996,6 +3592,7 @@ impl App {
                 Page::Settings => self.draw_settings(mem, rect),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Privacy => self.draw_privacy(mem, rect),
+                Page::Shredder => self.draw_shredder(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
                 Page::About => self.draw_about(mem, rect),
@@ -3120,6 +3717,7 @@ impl App {
                 Job::Restoring => "Restoring...",
                 Job::Services => "Working...",
                 Job::Cleaning => "Cleaning...",
+                Job::Shredding => "Shredding...",
                 Job::Idle => "",
             };
             text(
@@ -3289,6 +3887,45 @@ impl App {
             MUTED,
             RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 22) },
             "Double-click a row for details. Registry entries are backed up first; files are not.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_shredder(&mut self, hdc: HDC, rect: RECT) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        if self.job == Job::Shredding {
+            self.heading(hdc, rect, "Shredder", None);
+            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            return;
+        }
+        self.heading(hdc, rect, "Shredder", None);
+        let line = if !self.shred_note.is_empty() {
+            self.shred_note.clone()
+        } else {
+            "Stage files, pick passes, then Shred. Shredding cannot be undone.".to_string()
+        };
+        self.subtitle(hdc, rect, &line);
+        let hint = if self.shred_warn.is_empty() {
+            "Drop files here, type a path and Add, or stage the Recycle Bin. Refused paths are never touched.".to_string()
+        } else {
+            self.shred_warn.join(" ")
+        };
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 22) },
+            &hint,
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }
@@ -3629,7 +4266,7 @@ impl App {
             y = paragraph(hdc, self.fonts.body, INK, left + self.s(190), right, y, &value) + gap / 2;
         }
         y += gap * 2;
-        paragraph(hdc, self.fonts.body, MUTED, left, right, y, "From a terminal, run registry-master --help for the scan, repair, and restore commands.");
+        paragraph(hdc, self.fonts.body, MUTED, left, right, y, "From a terminal, run registry-master --help for the scan, repair, restore, and shred commands.");
     }
 }
 
@@ -3926,6 +4563,38 @@ fn button(parent: HWND, id: u16, label: &str, style: i32) -> HWND {
             std::ptr::null(),
         )
     }
+}
+
+fn edit(parent: HWND, id: u16) -> HWND {
+    unsafe {
+        CreateWindowExW(
+            0,
+            wide("EDIT").as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
+            0,
+            0,
+            10,
+            10,
+            parent,
+            id as usize as HMENU,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        )
+    }
+}
+
+fn edit_text(control: HWND) -> String {
+    unsafe {
+        let len = SendMessageW(control, WM_GETTEXTLENGTH, 0, 0) as usize;
+        let mut buf = vec![0u16; len + 1];
+        SendMessageW(control, WM_GETTEXT, buf.len(), buf.as_mut_ptr() as isize);
+        String::from_utf16_lossy(&buf[..len])
+    }
+}
+
+fn file_name(path: &str) -> String {
+    path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
 }
 
 fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str, i32)]) -> HWND {

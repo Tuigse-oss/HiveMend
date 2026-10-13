@@ -466,6 +466,54 @@ pub fn file_delete_allowed(path: &str) -> bool {
         || lower.contains("\\desktop\\")
 }
 
+/// Shredder staging gate. Only absolute local files and folders outside
+/// the Windows, program, and app-data folders may shred. Errors name the
+/// rule that fired and are absolute: no caller may override a refusal.
+pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), String> {
+    use crate::fs::ItemKind;
+    let clean = normalize_fs(path);
+    let bytes = clean.as_bytes();
+    let absolute = bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\';
+    if !absolute || clean.contains("..") {
+        return Err(format!("{path} is not an absolute local path"));
+    }
+    if clean.len() == 3 {
+        return Err("a drive root cannot be shredded".to_string());
+    }
+    match fs.kind_of(&clean) {
+        ItemKind::File | ItemKind::Dir => {}
+        ItemKind::Other => {
+            if !fs.exists(&clean) {
+                return Err(format!("{path} does not exist"));
+            }
+            return Err(format!("{path} is a link; links are never followed"));
+        }
+    }
+    if fs.is_hidden_system(&clean) {
+        return Err(format!("{path} is a hidden system file"));
+    }
+    let lower = clean.to_ascii_lowercase();
+    let under = |root: &str| {
+        let root = normalize_fs(root).to_ascii_lowercase();
+        lower == root || lower.starts_with(&(root + "\\"))
+    };
+    if under(&system_root(fs)) {
+        return Err(format!("{path} is inside the Windows folder"));
+    }
+    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
+        if let Some(dir) = fs.var(var)
+            && !dir.is_empty()
+            && under(&dir)
+        {
+            return Err(format!("{path} is inside a program folder"));
+        }
+    }
+    if under(crate::DATA_DIR) {
+        return Err(format!("{path} is inside the app data folder"));
+    }
+    Ok(())
+}
+
 pub fn looks_like_stored_path(text: &str) -> bool {
     let text = text.trim().trim_matches('"');
     let text = text.strip_prefix('@').unwrap_or(text);
