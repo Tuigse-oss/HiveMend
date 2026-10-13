@@ -476,10 +476,10 @@ fn temp_and_shortcuts(ctx: &mut ScanCtx<'_>, scanner: &ScannerDef, findings: &mu
     if let Some(temp) = ctx.fs.var("TEMP") {
         temp_dirs.push(temp);
     }
-    if let Some(tmp) = ctx.fs.var("TMP") {
-        if !temp_dirs.iter().any(|have| have.eq_ignore_ascii_case(&tmp)) {
-            temp_dirs.push(tmp);
-        }
+    if let Some(tmp) = ctx.fs.var("TMP")
+        && !temp_dirs.iter().any(|have| have.eq_ignore_ascii_case(&tmp))
+    {
+        temp_dirs.push(tmp);
     }
     let mut temp_findings = 0usize;
     for dir in temp_dirs {

@@ -907,6 +907,7 @@ struct FileHit {
     bytes: u64,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn walk_files(
     fs: &dyn FileView,
     dir: &str,
@@ -1158,6 +1159,7 @@ fn collect_repairs(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn execute_item(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,

@@ -143,6 +143,7 @@ pub fn gather() -> SystemSnapshot {
 /// Build the OS line from the registry values. Windows 11 still reports
 /// `ProductName` as "Windows 10", so promote the name when the build number
 /// is 22000 or higher; the build itself is the authoritative signal.
+#[cfg(any(windows, test))]
 fn os_label(product: Option<String>, display: Option<String>, build: Option<String>) -> String {
     let build_num = build
         .as_deref()

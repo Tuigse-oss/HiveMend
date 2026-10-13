@@ -1,0 +1,45 @@
+name: security
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    # New RustSec advisories are published without any change to this repo,
+    # so the lockfile is re-audited every week as well as on every change.
+    - cron: "17 6 * * 1"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: rustsec audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - run: cargo +1.99.0 install cargo-audit --version 0.22.2 --locked
+      # Checks Cargo.lock against the RustSec advisory database. Fails on any
+      # vulnerability, and on unmaintained, unsound, or yanked crates.
+      - run: cargo +1.99.0 audit --deny warnings
+
+  dependency-review:
+    name: dependency review
+    # Needs the dependency graph, which is free once the repository is public.
+    # Until then this job is skipped rather than failed.
+    if: github.event_name == 'pull_request' && github.event.repository.visibility == 'public'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/dependency-review-action@a1d282b36b6f3519aa1f3fc636f609c47dddb294 # v5.0.0
+        with:
+          fail-on-severity: low
+          # Every current dependency is MIT or Apache-2.0, plus Unicode-3.0
+          # for unicode-ident. Anything else needs a deliberate decision.
+          allow-licenses: MIT, Apache-2.0, Unicode-3.0
