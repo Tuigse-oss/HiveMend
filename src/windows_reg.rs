@@ -414,9 +414,14 @@ mod live_tests {
         reg.delete_value(&child, "Text").expect("delete test value");
         let values = reg.values(&child).expect("re-read test values");
         assert!(!values.iter().any(|value| value.name == "Text"));
-        reg.delete_tree(&key.root).expect("delete test tree");
+        // delete_tree removes the whole subtree. Delete the child first,
+        // which empties the root's listing, then the root itself, which is
+        // then gone rather than present-but-empty.
+        reg.delete_tree(&child).expect("delete child subtree");
         let kids = reg.subkeys(&key.root).expect("list emptied key");
         assert!(kids.is_empty());
+        reg.delete_tree(&key.root).expect("delete test tree");
+        assert!(matches!(reg.subkeys(&key.root), Err(RegError::NotFound)));
     }
 
     #[test]
