@@ -11,6 +11,8 @@ pub struct Settings {
     pub last_scan: String,
     pub last_problems: Option<usize>,
     pub last_repair: String,
+    /// Privacy category ids left ticked. Empty means nothing ticked.
+    pub privacy_ticked: Vec<String>,
 }
 
 impl Default for Settings {
@@ -20,6 +22,7 @@ impl Default for Settings {
             last_scan: String::new(),
             last_problems: None,
             last_repair: String::new(),
+            privacy_ticked: Vec::new(),
         }
     }
 }
@@ -42,6 +45,13 @@ impl Settings {
                 "last_scan" => settings.last_scan = value.to_string(),
                 "last_problems" => settings.last_problems = value.parse().ok(),
                 "last_repair" => settings.last_repair = value.to_string(),
+                "privacy_ticked" => {
+                    settings.privacy_ticked = value
+                        .split(',')
+                        .map(|id| id.trim().to_string())
+                        .filter(|id| !id.is_empty())
+                        .collect();
+                }
                 _ => {}
             }
         }
@@ -69,6 +79,9 @@ impl Settings {
             text.push_str(&format!("last_problems={count}\r\n"));
         }
         text.push_str(&format!("last_repair={}\r\n", one_line(&self.last_repair)));
+        if !self.privacy_ticked.is_empty() {
+            text.push_str(&format!("privacy_ticked={}\r\n", self.privacy_ticked.join(",")));
+        }
         text
     }
 
@@ -111,10 +124,13 @@ mod tests {
         settings.last_scan = "10/12/2026 15:30".into();
         settings.last_problems = Some(12);
         settings.last_repair = "Removed 3\nBackup x".into();
+        settings.privacy_ticked = ["user-temp".to_string(), "clipboard".to_string()].to_vec();
         let again = Settings::parse(&settings.to_text());
         assert!(again.full_scan().contains(&ScannerId::DeepScan));
         assert!(!again.full_scan().contains(&ScannerId::TempShortcuts));
         assert_eq!(again.last_problems, Some(12));
         assert_eq!(again.last_repair, "Removed 3 Backup x");
+        assert_eq!(again.privacy_ticked, ["user-temp", "clipboard"]);
+        assert!(Settings::default().privacy_ticked.is_empty());
     }
 }

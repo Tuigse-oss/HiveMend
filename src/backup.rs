@@ -53,11 +53,18 @@ pub fn files_dir(backup_file: &Path) -> PathBuf {
 }
 
 pub fn export_backup(reg: &dyn Registry, findings: &[Finding], backup_file: &Path) -> BackupPlan {
+    let repairs: Vec<Repair> = findings.iter().map(|finding| finding.repair.clone()).collect();
+    export_repairs(reg, &repairs, backup_file)
+}
+
+/// Same `.reg` backup as [`export_backup`], for callers whose removals are
+/// not scan findings (privacy categories build `Repair` values directly).
+pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path) -> BackupPlan {
     let mut trees: Vec<String> = Vec::new();
     let mut values: Vec<(String, Vec<String>)> = Vec::new();
     let mut files: Vec<(String, bool)> = Vec::new();
-    for finding in findings {
-        match &finding.repair {
+    for repair in repairs {
+        match repair {
             Repair::DeleteKey { key } => {
                 let key = canonical_path(key);
                 if !trees.iter().any(|have| have.eq_ignore_ascii_case(&key)) {

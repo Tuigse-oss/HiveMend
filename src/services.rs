@@ -138,7 +138,7 @@ pub trait ServiceStore {
     fn stop(&mut self, name: &str) -> Result<bool, StoreError>;
 }
 
-/// In-memory store for tests. Pure mechanics; the refusal rules live in
+/// In-memory store for tests. Pure plumbing; the refusal rules live in
 /// the apply layer so every backend inherits them.
 #[derive(Clone, Debug, Default)]
 pub struct MemoryServiceStore {

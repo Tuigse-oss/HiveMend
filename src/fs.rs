@@ -22,6 +22,11 @@ pub trait FileView {
     fn exists(&self, path: &str) -> bool;
     /// Same rule as `exists`: true when the answer cannot be known.
     fn is_dir(&self, path: &str) -> bool;
+    /// File size in bytes, for preview totals. `None` when unknown.
+    fn len(&self, path: &str) -> Option<u64> {
+        let _ = path;
+        None
+    }
     fn read(&self, path: &str) -> Option<Vec<u8>>;
     fn list(&self, dir: &str) -> Vec<DirItem>;
     fn remove_file(&mut self, path: &str) -> Result<(), String>;
@@ -99,6 +104,13 @@ impl FileView for MemoryFs {
 
     fn is_dir(&self, path: &str) -> bool {
         matches!(self.nodes.get(&norm(path)), Some(FsNode::Dir))
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        match self.nodes.get(&norm(path)) {
+            Some(FsNode::File { bytes, .. }) => Some(bytes.len() as u64),
+            _ => None,
+        }
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -209,6 +221,13 @@ impl FileView for HostFs {
             Ok(meta) => meta.is_dir(),
             Err(err) => err.kind() != std::io::ErrorKind::NotFound,
         }
+    }
+
+    fn len(&self, path: &str) -> Option<u64> {
+        if !on_local_fixed_drive(path) {
+            return None;
+        }
+        std::fs::metadata(path).ok().filter(|meta| meta.is_file()).map(|meta| meta.len())
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {

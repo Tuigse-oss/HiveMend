@@ -57,7 +57,7 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window: Status, Start Scan, Restore,
-Settings, Services, Monitor, Tools, and About.
+Settings, Services, Privacy, Monitor, Tools, and About.
 
 - Status shows Scan Your Registry, Optimize Your System (a quick
   startup, uninstall, shared-DLL, and COM pass), and Monitor Your System
@@ -69,6 +69,14 @@ Settings, Services, Monitor, Tools, and About.
   Boot drivers and the services Windows needs to boot, update, or stay
   secure are always refused. Listing is read-only; changing anything
   needs administrator rights.
+- Privacy lists cleanable categories (history lists, temp files,
+  clipboard, Recycle Bin, browser caches, application histories, custom
+  items, free-space wipe). Preview counts what each holds, tick what to
+  clean, then Clean. Registry entries are saved to a `privacy-*.reg`
+  backup first and can be undone on the Restore page; files are deleted
+  for good. History and cookie cleaning waits for a closed browser and
+  never touches saved logins, autofill, or bookmarks. Everything here is
+  user-scope, so no administrator rights are needed.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Registry Master health summary. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,
@@ -79,3 +87,15 @@ Settings, Services, Monitor, Tools, and About.
 Card and tile icons load from `C:\registrymasterimages` when that folder
 exists, next to a copy of the exe otherwise. The artwork is not part of
 this repository.
+
+Custom privacy items live in `C:\RegistryMaster\privacy-custom.ini`, one
+per line (`#` starts a comment). Only Temp folders, browser profiles,
+and your own history keys are allowed; anything else is refused with a
+reason shown on the Custom row.
+
+```ini
+file=%TEMP%\myapp\session.log
+files=%TEMP%\myapp|*.log
+files-rec=%TMP%\myapp|*.tmp
+value=HKCU\Software\MyApp\Settings|RecentFile1
+```

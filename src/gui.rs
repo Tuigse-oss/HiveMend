@@ -17,12 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use registry_master::{
-    BackupInfo, BackupSummary, Engine, Exclusions, Finding, HostFs, Repair, RepairOutcome,
-    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
-    ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, WINDOWS_TOOLS,
-    WindowsRegistry, apply_start_changes, backups_dir, exclusions_file, expand_target,
-    format_bytes, format_uptime, gather_snapshot, import_reg_file, list_backups,
-    plan_profile, read_backup, repair_with_progress, restore_files, scan_with_progress,
+    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, Finding, HostFs, ItemOutcome,
+    Preview, PrivacyItem, Repair, RepairOutcome, SUGGESTED, ScanOptions, ScanReport,
+    ScannerId, ScmServiceStore, ServiceChange, ServiceInfo, ServiceOutcome, ServiceState,
+    ServiceStore, Settings, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
+    WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
+    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
+    format_uptime, gather_snapshot, import_reg_file, list_backups, parse_custom, plan_profile,
+    preview, read_backup, repair_with_progress, restore_files, scan_with_progress,
     settings_file, sort_services, start_services, still_reported, stop_services,
 };
 use windows_sys::Win32::Foundation::{
@@ -100,12 +102,17 @@ const ID_SVC_NONE: u16 = 1302;
 const ID_SVC_APPLY: u16 = 1303;
 const ID_SVC_START: u16 = 1304;
 const ID_SVC_STOP: u16 = 1305;
+const ID_PRIV_PREVIEW: u16 = 1400;
+const ID_PRIV_ALL: u16 = 1401;
+const ID_PRIV_NONE: u16 = 1402;
+const ID_PRIV_CLEAN: u16 = 1403;
 const ID_FINDINGS: u16 = 2000;
 const ID_PROGRESS: u16 = 2001;
 const ID_BACKUPS: u16 = 2002;
 const ID_IGNORED: u16 = 2003;
 const ID_SVC_LIST: u16 = 2004;
 const ID_SVC_TUNE: u16 = 2005;
+const ID_PRIV_LIST: u16 = 2006;
 const IDCANCEL: u16 = 2;
 
 const MENU_DETAILS: usize = 1;
@@ -146,6 +153,7 @@ enum Page {
     Restore,
     Settings,
     Services,
+    Privacy,
     Monitor,
     Tools,
     About,
@@ -157,6 +165,7 @@ const NAV: &[(&str, Page)] = &[
     ("Restore", Page::Restore),
     ("Settings", Page::Settings),
     ("Services", Page::Services),
+    ("Privacy", Page::Privacy),
     ("Monitor", Page::Monitor),
     ("Tools", Page::Tools),
     ("About", Page::About),
@@ -192,6 +201,7 @@ enum Job {
     Repairing,
     Restoring,
     Services,
+    Cleaning,
 }
 
 /// Services page views: suggested Manual starts, or every service.
@@ -250,6 +260,9 @@ enum JobResult {
         op: SvcOp,
         result: Result<ServiceOutcome, String>,
         services: Vec<ServiceInfo>,
+    },
+    Privacy {
+        result: Result<CleanOutcome, String>,
     },
 }
 
@@ -330,6 +343,17 @@ struct App {
     btn_svc_apply: HWND,
     btn_svc_start: HWND,
     btn_svc_stop: HWND,
+    priv_items: Vec<PrivacyItem>,
+    priv_checked: Vec<bool>,
+    priv_preview: Option<Preview>,
+    priv_outcome: Option<CleanOutcome>,
+    priv_note: String,
+    priv_filling: bool,
+    priv_list: HWND,
+    btn_priv_preview: HWND,
+    btn_priv_all: HWND,
+    btn_priv_none: HWND,
+    btn_priv_clean: HWND,
 }
 
 pub fn run() -> std::process::ExitCode {
@@ -496,7 +520,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_CLOSE => {
-            if matches!(app.job, Job::Repairing | Job::Restoring | Job::Services) {
+            if matches!(app.job, Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning) {
                 app.message(
                     "Registry Master is still working. Please wait for it to finish before closing.",
                     MB_ICONWARNING,
@@ -584,6 +608,17 @@ impl App {
             btn_svc_apply: std::ptr::null_mut(),
             btn_svc_start: std::ptr::null_mut(),
             btn_svc_stop: std::ptr::null_mut(),
+            priv_items: Vec::new(),
+            priv_checked: Vec::new(),
+            priv_preview: None,
+            priv_outcome: None,
+            priv_note: String::new(),
+            priv_filling: false,
+            priv_list: std::ptr::null_mut(),
+            btn_priv_preview: std::ptr::null_mut(),
+            btn_priv_all: std::ptr::null_mut(),
+            btn_priv_none: std::ptr::null_mut(),
+            btn_priv_clean: std::ptr::null_mut(),
         };
         app.create_controls();
         app
@@ -661,6 +696,17 @@ impl App {
         self.btn_svc_apply = button(hwnd, ID_SVC_APPLY, "Apply Ticked", BS_PUSHBUTTON);
         self.btn_svc_start = button(hwnd, ID_SVC_START, "Start", BS_PUSHBUTTON);
         self.btn_svc_stop = button(hwnd, ID_SVC_STOP, "Stop", BS_PUSHBUTTON);
+        self.priv_list = list_view(
+            hwnd,
+            ID_PRIV_LIST,
+            0,
+            LVS_EX_CHECKBOXES,
+            &[("Category", 250), ("Holds", 210), ("Detail", 360)],
+        );
+        self.btn_priv_preview = button(hwnd, ID_PRIV_PREVIEW, "Preview", BS_PUSHBUTTON);
+        self.btn_priv_all = button(hwnd, ID_PRIV_ALL, "Tick All", BS_PUSHBUTTON);
+        self.btn_priv_none = button(hwnd, ID_PRIV_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_priv_clean = button(hwnd, ID_PRIV_CLEAN, "Clean Ticked", BS_PUSHBUTTON);
         self.apply_fonts();
         self.fill_backups();
         self.fill_ignored();
@@ -689,6 +735,11 @@ impl App {
             self.btn_svc_apply,
             self.btn_svc_start,
             self.btn_svc_stop,
+            self.priv_list,
+            self.btn_priv_preview,
+            self.btn_priv_all,
+            self.btn_priv_none,
+            self.btn_priv_clean,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
         all
@@ -792,6 +843,9 @@ impl App {
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
+        if page == Page::Privacy && self.priv_items.is_empty() && !self.busy() {
+            self.rebuild_privacy();
+        }
         self.sync_controls();
         self.invalidate();
     }
@@ -829,6 +883,10 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping the scan...");
                     self.show_progress();
+                } else if self.job == Job::Cleaning {
+                    CANCEL.store(true, Ordering::SeqCst);
+                    progress_text("Stopping after this category...");
+                    self.show_progress();
                 }
             }
             ID_RESTORE => {
@@ -850,6 +908,10 @@ impl App {
             ID_SVC_APPLY => self.start_services_apply(),
             ID_SVC_START => self.power_highlighted(true),
             ID_SVC_STOP => self.power_highlighted(false),
+            ID_PRIV_PREVIEW => self.run_priv_preview(),
+            ID_PRIV_ALL => self.priv_tick_all(true),
+            ID_PRIV_NONE => self.priv_tick_all(false),
+            ID_PRIV_CLEAN => self.start_privacy_clean(),
             _ => {}
         }
     }
@@ -933,6 +995,39 @@ impl App {
         } else if id == ID_SVC_LIST && header.code == NM_DBLCLK {
             if let Some(row) = selected_rows(self.svc_list).first() {
                 self.show_svc_details(*row);
+            }
+        } else if id == ID_PRIV_LIST {
+            match header.code {
+                LVN_ITEMCHANGING => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.priv_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old && self.busy() {
+                            return 1;
+                        }
+                    }
+                }
+                LVN_ITEMCHANGED => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.priv_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old {
+                            if let Some(slot) = self.priv_checked.get_mut(change.iItem as usize) {
+                                *slot = new == 2;
+                            }
+                            self.save_priv_ticks();
+                            self.update_priv_clean_label();
+                        }
+                    }
+                }
+                NM_DBLCLK => {
+                    if let Some(row) = selected_rows(self.priv_list).first() {
+                        self.show_priv_details(*row);
+                    }
+                }
+                _ => {}
             }
         }
         0
@@ -1699,6 +1794,360 @@ impl App {
         }
     }
 
+    // ---- privacy ----
+
+    fn rebuild_privacy(&mut self) {
+        let mut items = build_items(&WindowsSystemTargets);
+        if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
+            let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
+            if !custom.targets.is_empty() || !custom.warnings.is_empty() {
+                items.push(custom);
+            }
+        }
+        let ticked: Vec<String> = self.settings.privacy_ticked.clone();
+        self.priv_checked =
+            items.iter().map(|item| ticked.iter().any(|id| id == &item.id)).collect();
+        self.priv_items = items;
+        self.priv_preview = None;
+        self.priv_outcome = None;
+        self.fill_privacy();
+    }
+
+    fn save_priv_ticks(&mut self) {
+        self.settings.privacy_ticked = self
+            .priv_items
+            .iter()
+            .zip(&self.priv_checked)
+            .filter(|(_, on)| **on)
+            .map(|(item, _)| item.id.clone())
+            .collect();
+        self.save_settings();
+    }
+
+    fn run_priv_preview(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if self.priv_items.is_empty() {
+            self.rebuild_privacy();
+        }
+        let report = preview(
+            &WindowsRegistry,
+            &HostFs,
+            &WindowsSystemTargets,
+            &WindowsProcessList,
+            &self.priv_items,
+        );
+        self.priv_note = format!(
+            "Preview: {} files, {} registry values, {} in scope.",
+            report.files(),
+            report.values(),
+            format_bytes(report.bytes())
+        );
+        self.priv_preview = Some(report);
+        self.fill_privacy();
+        self.invalidate();
+    }
+
+    fn priv_preview_row(&self, id: &str) -> Option<(String, String)> {
+        let row = self.priv_preview.as_ref()?.items.iter().find(|row| row.id == id)?;
+        if row.skipped_running {
+            let why = row.restricted.first().cloned().unwrap_or_default();
+            return Some(("Waiting".to_string(), why));
+        }
+        if row.gated_out {
+            return Some(("Not installed".to_string(), String::new()));
+        }
+        let mut parts = Vec::new();
+        if row.files > 0 {
+            parts.push(count(row.files, "file", "files"));
+        }
+        if row.values > 0 {
+            parts.push(count(row.values, "value", "values"));
+        }
+        if row.other > 0 {
+            parts.push(count(row.other, "item", "items"));
+        }
+        if row.bytes > 0 {
+            parts.push(format_bytes(row.bytes));
+        }
+        if parts.is_empty() {
+            parts.push("Empty".to_string());
+        }
+        let mut holds = parts.join(" · ");
+        if !row.restricted.is_empty() {
+            let more = row.restricted.len() + row.restricted_extra;
+            holds.push_str(&format!(" (+{more} skipped)"));
+        }
+        Some((holds, String::new()))
+    }
+
+    fn fill_privacy(&mut self) {
+        self.priv_filling = true;
+        unsafe {
+            SendMessageW(self.priv_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.priv_list, LVM_DELETEALLITEMS, 0, 0);
+            for (row, item) in self.priv_items.iter().enumerate() {
+                let (holds, extra) = self.priv_preview_row(&item.id).unwrap_or_default();
+                let detail =
+                    if extra.is_empty() { item.detail.clone() } else { extra };
+                insert_row(
+                    self.priv_list,
+                    row,
+                    &[&item.name, &holds, &detail],
+                );
+                set_state_image(
+                    self.priv_list,
+                    row,
+                    if self.priv_checked.get(row).copied().unwrap_or(false) { 2 } else { 1 },
+                );
+            }
+            SendMessageW(self.priv_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.priv_list, std::ptr::null(), 1);
+        }
+        self.priv_filling = false;
+        self.update_priv_clean_label();
+    }
+
+    fn priv_tick_all(&mut self, on: bool) {
+        if self.busy() {
+            return;
+        }
+        for slot in self.priv_checked.iter_mut() {
+            *slot = on;
+        }
+        self.fill_privacy();
+        self.save_priv_ticks();
+    }
+
+    fn priv_ticked(&self) -> Vec<PrivacyItem> {
+        self.priv_items
+            .iter()
+            .zip(&self.priv_checked)
+            .filter(|(_, on)| **on)
+            .map(|(item, _)| item.clone())
+            .collect()
+    }
+
+    fn update_priv_clean_label(&self) {
+        let count = self.priv_checked.iter().filter(|on| **on).count();
+        let ready = self.priv_preview.is_some();
+        let text = if count == 0 {
+            "Clean Ticked".to_string()
+        } else {
+            format!("Clean Ticked ({count})")
+        };
+        set_text(self.btn_priv_clean, &text);
+        unsafe { EnableWindow(self.btn_priv_clean, (count > 0 && ready && !self.busy()) as i32) };
+    }
+
+    fn start_privacy_clean(&mut self) {
+        if self.busy() {
+            return;
+        }
+        let selected = self.priv_ticked();
+        if selected.is_empty() {
+            self.message("Tick the categories you want to clean first.", MB_ICONINFORMATION);
+            return;
+        }
+        if self.priv_preview.is_none() {
+            self.message(
+                "Preview first, so you can see what each category holds.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let backup_file = next_privacy_backup_file();
+        let mut question = format!(
+            "Clean {} {}?\n\nRegistry Master saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            selected.len(),
+            if selected.len() == 1 { "category" } else { "categories" },
+            backup_file.display()
+        );
+        let shown = selected.iter().take(10);
+        for item in shown {
+            let holds = self
+                .priv_preview_row(&item.id)
+                .map(|(holds, _)| holds)
+                .unwrap_or_default();
+            question.push_str(&format!("\n{}: {holds}", item.name));
+            if let Some(note) = &item.confirm_note {
+                question.push_str(&format!("\n  {note}"));
+            }
+        }
+        if selected.len() > 10 {
+            question.push_str(&format!("\n...and {} more", selected.len() - 10));
+        }
+        if !self.confirm(&question) {
+            return;
+        }
+        self.job = Job::Cleaning;
+        self.page = Page::Privacy;
+        CANCEL.store(false, Ordering::SeqCst);
+        set_progress(0, selected.len().max(1), "Starting the clean...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let result = clean_with_progress(
+                &mut WindowsRegistry,
+                &mut HostFs,
+                &mut WindowsSystemTargets,
+                &WindowsProcessList,
+                &selected,
+                &backup_file,
+                &mut |done, total, name| {
+                    set_progress(
+                        done,
+                        total.max(1),
+                        &format!("Cleaning {name} ({done} of {total})..."),
+                    );
+                    post(hwnd, WM_JOB_PROGRESS);
+                    !CANCEL.load(Ordering::SeqCst)
+                },
+            )
+            .map_err(|err| err.to_string());
+            finish_job(hwnd, JobResult::Privacy { result });
+        });
+    }
+
+    fn finish_privacy(&mut self, result: Result<CleanOutcome, String>) {
+        match result {
+            Err(err) => {
+                self.priv_note = "The clean could not finish.".to_string();
+                self.message(&format!("Nothing was changed.\n\n{err}"), MB_ICONWARNING);
+            }
+            Ok(outcome) => {
+                self.refresh_backups();
+                let mut lines = vec![format!(
+                    "Removed {} files ({}) and {} registry values.",
+                    outcome.files(),
+                    format_bytes(outcome.bytes()),
+                    outcome.values()
+                )];
+                if outcome.canceled {
+                    lines.push("Canceled: categories after the stop were left alone.".to_string());
+                }
+                for item in outcome.items.iter().take(8) {
+                    lines.push(self.priv_outcome_line(item));
+                }
+                if outcome.items.len() > 8 {
+                    lines.push(format!("...and {} more", outcome.items.len() - 8));
+                }
+                for error in outcome.errors.iter().take(5) {
+                    lines.push(format!("Failed: {error}"));
+                }
+                if !outcome.backup_file.as_os_str().is_empty() {
+                    lines.push(format!("Backup: {}", outcome.backup_file.display()));
+                }
+                self.priv_note = if outcome.canceled {
+                    format!(
+                        "Canceled: removed {} files ({}) and {} values so far.",
+                        outcome.files(),
+                        format_bytes(outcome.bytes()),
+                        outcome.values()
+                    )
+                } else {
+                    format!(
+                        "Removed {} files ({}) and {} registry values.",
+                        outcome.files(),
+                        format_bytes(outcome.bytes()),
+                        outcome.values()
+                    )
+                };
+                let icon =
+                    if outcome.errors.is_empty() { MB_ICONINFORMATION } else { MB_ICONWARNING };
+                self.priv_outcome = Some(outcome);
+                self.message(&lines.join("\n"), icon);
+                let report = preview(
+                    &WindowsRegistry,
+                    &HostFs,
+                    &WindowsSystemTargets,
+                    &WindowsProcessList,
+                    &self.priv_items,
+                );
+                self.priv_preview = Some(report);
+                self.fill_privacy();
+            }
+        }
+    }
+
+    fn priv_outcome_line(&self, item: &ItemOutcome) -> String {
+        let name = self
+            .priv_items
+            .iter()
+            .find(|have| have.id == item.id)
+            .map(|have| have.name.clone())
+            .unwrap_or_else(|| item.id.clone());
+        if item.skipped_running {
+            return format!("{name}: waiting, close the program first.");
+        }
+        if item.gated_out {
+            return format!("{name}: not installed.");
+        }
+        if !item.note.is_empty() {
+            return format!("{name}: {}", item.note);
+        }
+        let mut parts = Vec::new();
+        if item.files > 0 {
+            parts.push(format!("{} files ({})", item.files, format_bytes(item.bytes)));
+        }
+        if item.values > 0 {
+            parts.push(count(item.values, "value", "values"));
+        }
+        if item.other > 0 {
+            parts.push(count(item.other, "item", "items"));
+        }
+        if parts.is_empty() {
+            parts.push("already empty".to_string());
+        }
+        let mut line = format!("{name}: {}", parts.join(", "));
+        let skipped = item.restricted.len() + item.restricted_extra;
+        if skipped > 0 {
+            line.push_str(&format!(" ({skipped} skipped)"));
+        }
+        line
+    }
+
+    fn show_priv_details(&mut self, row: usize) {
+        let Some(item) = self.priv_items.get(row) else { return };
+        let mut lines = vec![item.detail.clone()];
+        if let Some((holds, _)) = self.priv_preview_row(&item.id) {
+            lines.push(format!("Holds: {holds}"));
+        }
+        if let Some(report) = &self.priv_preview
+            && let Some(preview) = report.items.iter().find(|preview| preview.id == item.id)
+        {
+            for note in preview.restricted.iter().take(20) {
+                lines.push(note.clone());
+            }
+            if preview.restricted.len() + preview.restricted_extra > 20 {
+                lines.push(format!(
+                    "...and {} more",
+                    preview.restricted.len() + preview.restricted_extra - 20
+                ));
+            }
+        }
+        if let Some(outcome) = &self.priv_outcome
+            && let Some(done) = outcome.items.iter().find(|done| done.id == item.id)
+        {
+            lines.push(self.priv_outcome_line(done));
+        }
+        self.message(&lines.join("\n"), MB_ICONINFORMATION);
+    }
+
+    fn size_priv_columns(&self, width: i32) {
+        let category = self.s(250);
+        let holds = self.s(210);
+        let detail = (width - category - holds - self.s(26)).max(self.s(120));
+        unsafe {
+            SendMessageW(self.priv_list, LVM_SETCOLUMNWIDTH, 0, category as isize);
+            SendMessageW(self.priv_list, LVM_SETCOLUMNWIDTH, 1, holds as isize);
+            SendMessageW(self.priv_list, LVM_SETCOLUMNWIDTH, 2, detail as isize);
+        }
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -2228,6 +2677,10 @@ impl App {
                 self.sync_controls();
                 self.finish_services(op, result, services);
             }
+            JobResult::Privacy { result } => {
+                self.sync_controls();
+                self.finish_privacy(result);
+            }
         }
         self.sync_controls();
         self.invalidate();
@@ -2404,6 +2857,35 @@ impl App {
                     self.size_svc_columns(width);
                 }
             }
+            Page::Privacy => {
+                if matches!(self.job, Job::Cleaning) {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
+                    visible.push(self.btn_cancel);
+                    place(self.btn_cancel, left, self.s(BODY_Y + 88), self.s(110), button_h);
+                } else {
+                    visible.extend([
+                        self.priv_list,
+                        self.btn_priv_preview,
+                        self.btn_priv_all,
+                        self.btn_priv_none,
+                        self.btn_priv_clean,
+                    ]);
+                    place(self.priv_list, left, list_top, width, list_h);
+                    let mut x = left;
+                    for (control, w) in [
+                        (self.btn_priv_preview, 110),
+                        (self.btn_priv_all, 96),
+                        (self.btn_priv_none, 104),
+                    ] {
+                        place(control, x, button_y, self.s(w), button_h);
+                        x += self.s(w + 8);
+                    }
+                    let clean_w = self.s(220);
+                    place(self.btn_priv_clean, right - clean_w, button_y, clean_w, button_h);
+                    self.size_priv_columns(width);
+                }
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -2421,6 +2903,9 @@ impl App {
             self.btn_svc_refresh,
             self.btn_svc_all,
             self.btn_svc_none,
+            self.btn_priv_preview,
+            self.btn_priv_all,
+            self.btn_priv_none,
         ] {
             unsafe { EnableWindow(control, idle as i32) };
         }
@@ -2431,8 +2916,10 @@ impl App {
         unsafe { EnableWindow(self.list, idle as i32) };
         unsafe { EnableWindow(self.svc_list, idle as i32) };
         unsafe { EnableWindow(self.svc_tune_list, idle as i32) };
+        unsafe { EnableWindow(self.priv_list, idle as i32) };
         self.update_repair_label();
         self.update_svc_apply_label();
+        self.update_priv_clean_label();
     }
 
     fn size_svc_columns(&self, width: i32) {
@@ -2508,6 +2995,7 @@ impl App {
                 Page::Restore => self.draw_restore(mem, rect),
                 Page::Settings => self.draw_settings(mem, rect),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
+                Page::Privacy => self.draw_privacy(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
                 Page::About => self.draw_about(mem, rect),
@@ -2631,6 +3119,7 @@ impl App {
                 Job::Repairing => "Repairing...",
                 Job::Restoring => "Restoring...",
                 Job::Services => "Working...",
+                Job::Cleaning => "Cleaning...",
                 Job::Idle => "",
             };
             text(
@@ -2768,6 +3257,40 @@ impl App {
             fill(hdc, RECT { left: link.left, top: link.bottom - 1, right: link.right, bottom: link.bottom }, LINK);
         }
         self.spot(link, Action::ResetStats);
+    }
+
+    unsafe fn draw_privacy(&mut self, hdc: HDC, rect: RECT) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        if self.job == Job::Cleaning {
+            self.heading(hdc, rect, "Privacy", None);
+            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            return;
+        }
+        self.heading(hdc, rect, "Privacy", None);
+        let line = if !self.priv_note.is_empty() {
+            self.priv_note.clone()
+        } else {
+            "Tick what to clean, then Preview. Cleaning never touches Windows itself.".to_string()
+        };
+        self.subtitle(hdc, rect, &line);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 22) },
+            "Double-click a row for details. Registry entries are backed up first; files are not.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
     }
 
     unsafe fn draw_services(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
@@ -3090,6 +3613,7 @@ impl App {
             "Before repairing, the ticked entries are checked again, and everything about to be removed is saved to a backup first.",
             "It never touches Winlogon, default-app choices, Windows Installer data, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
+            "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",
         ] {
             paragraph(hdc, self.fonts.body, BLUE_INK, left, left + self.s(16), y, "\u{2022}");
             y = paragraph(hdc, self.fonts.body, INK, left + self.s(16), right, y, line) + gap / 2;
@@ -3303,6 +3827,14 @@ fn next_backup_file() -> PathBuf {
 /// `services-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
 fn next_services_backup_file() -> PathBuf {
     next_backup_file_with("services")
+}
+
+fn next_privacy_backup_file() -> PathBuf {
+    next_backup_file_with("privacy")
+}
+
+fn count(n: usize, one: &str, many: &str) -> String {
+    format!("{n} {}", if n == 1 { one } else { many })
 }
 
 fn next_backup_file_with(prefix: &str) -> PathBuf {
