@@ -73,8 +73,9 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   cards, plus the last scan result and a statistics reset link.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
-  startup type of a highlighted row). Every change writes a
-  `services-*.reg` backup first and can be undone on the Restore page.
+  startup type of a highlighted row). Changing a startup type writes a
+  `services-*.reg` backup first and can be undone on the Restore page;
+  starting or stopping a service is transient and is not backed up.
   Boot drivers and the services Windows needs to boot, update, or stay
   secure are always refused. Listing is read-only; changing anything
   needs administrator rights.
@@ -83,13 +84,17 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   items, free-space wipe). Preview counts what each holds, tick what to
   clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
-  for good. History and cookie cleaning waits for a closed browser and
-  never touches saved logins, autofill, or bookmarks. Everything here is
-  user-scope, so no administrator rights are needed.
+  for good. The built-in history and cookie cleaning waits for a closed
+  browser and never touches saved logins, autofill, or bookmarks. Custom
+  items you add can name any allowed Temp or browser-profile file, so add
+  only paths you understand. The built-in categories are user-scope; the
+  optional free-space wipe runs across a whole drive. No administrator
+  rights are needed.
 - Shredder overwrites files so they cannot be recovered, then deletes
   them. Drop files onto the page, type a path and Add, or stage the
   Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The
-  confirmation names every path and cannot be undone. The Windows
+  confirmation lists the paths (the first ten, then a count of any rest)
+  and cannot be undone. The Windows
   folder, program folders, drive roots, links, and hidden system files
   are always refused. Shredding on a solid-state drive warns that
   traces may survive in spare blocks the overwrite cannot reach. No
@@ -120,7 +125,7 @@ value=HKCU\Software\MyApp\Settings|RecentFile1
 
 ## Releases
 
-Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt` and a GitHub build provenance attestation, and the exe embeds its dependency list so it can be audited after download:
+Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt`, the exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
 
 ```bash
 gh attestation verify hive-mend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend
