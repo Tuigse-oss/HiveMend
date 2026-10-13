@@ -156,7 +156,11 @@ fn swap_program_files(fs: &dyn FileView, path: &str) -> Option<String> {
         let from_dir = normalize_fs(&from_dir).trim_end_matches('\\').to_string();
         let prefix = format!("{}\\", from_dir.to_ascii_lowercase());
         if lower.starts_with(&prefix) {
-            return Some(format!("{}\\{}", normalize_fs(&to_dir).trim_end_matches('\\'), &path[prefix.len()..]));
+            return Some(format!(
+                "{}\\{}",
+                normalize_fs(&to_dir).trim_end_matches('\\'),
+                &path[prefix.len()..]
+            ));
         }
     }
     None
@@ -333,7 +337,9 @@ fn push_path(found: &mut Vec<String>, raw: &str) {
 fn has_extension(path: &str) -> bool {
     let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
     name.rsplit_once('.').is_some_and(|(stem, ext)| {
-        !stem.is_empty() && (1..=4).contains(&ext.len()) && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
+        !stem.is_empty()
+            && (1..=4).contains(&ext.len())
+            && ext.chars().all(|ch| ch.is_ascii_alphanumeric())
     })
 }
 
@@ -567,11 +573,10 @@ mod tests {
             paths_in_command(r"@C:\WINDOWS\System32\msrating.dll,3"),
             vec![r"C:\WINDOWS\System32\msrating.dll"]
         );
-        assert!(looks_like_stored_path(r"@C:\WINDOWS\System32\msrating.dll,3"));
-        assert_eq!(
-            paths_in_command(r"C:\Data\2024\5"),
-            vec![r"C:\Data\2024\5"]
-        );
+        assert!(looks_like_stored_path(
+            r"@C:\WINDOWS\System32\msrating.dll,3"
+        ));
+        assert_eq!(paths_in_command(r"C:\Data\2024\5"), vec![r"C:\Data\2024\5"]);
     }
 
     #[test]
@@ -580,11 +585,20 @@ mod tests {
         fs.set_var("ProgramFiles", r"C:\Program Files");
         fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
         fs.set_var("CommonProgramFiles", r"C:\Program Files\Common Files");
-        fs.set_var("CommonProgramFiles(x86)", r"C:\Program Files (x86)\Common Files");
+        fs.set_var(
+            "CommonProgramFiles(x86)",
+            r"C:\Program Files (x86)\Common Files",
+        );
         fs.add_file(r"C:\Program Files (x86)\Common Files\Microsoft Shared\DAO\dao360.dll");
-        assert!(file_present(&fs, r"%CommonProgramFiles%\Microsoft Shared\DAO\dao360.dll"));
+        assert!(file_present(
+            &fs,
+            r"%CommonProgramFiles%\Microsoft Shared\DAO\dao360.dll"
+        ));
         assert!(file_present(&fs, r"%NoSuchVariable%\tool.exe"));
-        assert!(!file_present(&fs, r"%CommonProgramFiles%\Microsoft Shared\DAO\gone.dll"));
+        assert!(!file_present(
+            &fs,
+            r"%CommonProgramFiles%\Microsoft Shared\DAO\gone.dll"
+        ));
     }
 
     #[test]

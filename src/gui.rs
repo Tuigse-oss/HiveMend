@@ -19,28 +19,27 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use hive_mend::{
     BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
     HostFs, ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
-    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
-    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod,
-    ShredOptions, ShredOutcome, ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList,
-    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backups_dir, build_items,
-    clean_with_progress, custom_privacy_file, decode_text_owned, exclusions_file,
-    expand_target, fixed_drives, format_bytes, format_uptime, gather_hives, gather_snapshot,
-    import_reg_file, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
-    random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
-    settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services,
-    start_services, still_reported, stop_services, volume_ssd,
+    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
+    ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions, ShredOutcome,
+    ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
+    WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
+    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, fixed_drives,
+    format_bytes, format_uptime, gather_hives, gather_snapshot, import_reg_file, list_backups,
+    list_recycle_bin, parse_custom, plan_profile, preview, random_seed, read_backup,
+    repair_with_progress, restore_files, scan_with_progress, settings_file, shred_allowed,
+    shred_paths, shred_recycle_items, sort_services, start_services, still_reported, stop_services,
+    volume_ssd,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
-    BeginPaint, ClientToScreen, BitBlt, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW, CreatePen,
-    CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
-    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint,
-    FillRect, GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HALFTONE, HBITMAP,
-    HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject,
-    SetBkColor, SetBkMode, SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt,
-    TRANSPARENT, TRIVERTEX,
+    BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
+    CreatePen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
+    DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
+    GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HALFTONE, HBITMAP, HBRUSH, HDC,
+    HFONT, InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
+    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, TRIVERTEX,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -50,40 +49,40 @@ use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock,
 use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
+use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Controls::{
     ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
     InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT,
-    LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW,
-    LVM_SETCOLUMNWIDTH, LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW,
-    LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_DBLCLK, NMHDR, NMLISTVIEW, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW,
-    SetWindowTheme, WC_LISTVIEWW,
+    LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT,
+    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
+    LVN_ITEMCHANGING, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
+    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK,
+    NMHDR, NMLISTVIEW, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
     EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
-use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Shell::{
     DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, IsUserAnAdmin, ShellExecuteW,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
-    DispatchMessageW, ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos,
-    GetMessageW, GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP,
-    IsDialogMessageW, LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
+    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW,
+    LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
+    MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
     RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
     SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH,
-    WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW,
-    WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
-    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONUP,
+    WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW,
+    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
@@ -189,18 +188,33 @@ const NAV: &[(&str, Page)] = &[
 
 /// Friendly names and what each scanner looks at, for Settings.
 const SCANNERS: &[(ScannerId, &str)] = &[
-    (ScannerId::SoftwareLocations, "Software locations and run history"),
+    (
+        ScannerId::SoftwareLocations,
+        "Software locations and run history",
+    ),
     (ScannerId::StartupPrograms, "Startup programs"),
-    (ScannerId::AddRemovePrograms, "Uninstall entries and firewall rules"),
-    (ScannerId::CustomControls, "COM controls and shell extensions"),
+    (
+        ScannerId::AddRemovePrograms,
+        "Uninstall entries and firewall rules",
+    ),
+    (
+        ScannerId::CustomControls,
+        "COM controls and shell extensions",
+    ),
     (ScannerId::FileExtensions, "File associations and Open With"),
     (ScannerId::SharedDlls, "Shared DLLs"),
     (ScannerId::WindowsFonts, "Fonts"),
     (ScannerId::HelpResources, "Help files and sounds"),
     (ScannerId::VirtualDevices, "Virtual devices"),
-    (ScannerId::TempShortcuts, "Broken shortcuts and old temp files"),
+    (
+        ScannerId::TempShortcuts,
+        "Broken shortcuts and old temp files",
+    ),
     (ScannerId::RegistryIntegrity, "Shell folders (report only)"),
-    (ScannerId::DeepScan, "Deep Scan (slower; review results closely)"),
+    (
+        ScannerId::DeepScan,
+        "Deep Scan (slower; review results closely)",
+    ),
 ];
 
 const OPTIMIZE: [ScannerId; 4] = [
@@ -445,7 +459,12 @@ pub fn run() -> std::process::ExitCode {
     }
 }
 
-unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam: LPARAM) -> LRESULT {
+unsafe extern "system" fn wnd_proc(
+    hwnd: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
     if msg == WM_CREATE {
         DragAcceptFiles(hwnd, 1);
         let app = Box::new(App::new(hwnd));
@@ -615,7 +634,10 @@ impl App {
             .into_iter()
             .map(load_bitmap)
             .collect(),
-            tool_icons: WINDOWS_TOOLS.iter().map(|tool| load_bitmap(tool.icon)).collect(),
+            tool_icons: WINDOWS_TOOLS
+                .iter()
+                .map(|tool| load_bitmap(tool.icon))
+                .collect(),
             hotspots: Vec::new(),
             hover: None,
             tracking: false,
@@ -696,7 +718,12 @@ impl App {
             ID_FINDINGS,
             0,
             LVS_EX_CHECKBOXES,
-            &[("Category", 124), ("Problem", 320), ("Location", 360), ("Fix", 160)],
+            &[
+                ("Category", 124),
+                ("Problem", 320),
+                ("Location", 360),
+                ("Fix", 160),
+            ],
         );
         self.progress = unsafe {
             CreateWindowExW(
@@ -739,21 +766,36 @@ impl App {
             self.scanner_boxes.push((*id, check));
         }
         self.ignored_list = list_view(hwnd, ID_IGNORED, 0, 0, &[("Ignored entry", 700)]);
-        self.btn_unignore = button(hwnd, ID_UNIGNORE, "Stop Ignoring Highlighted", BS_PUSHBUTTON);
+        self.btn_unignore = button(
+            hwnd,
+            ID_UNIGNORE,
+            "Stop Ignoring Highlighted",
+            BS_PUSHBUTTON,
+        );
 
         self.svc_list = list_view(
             hwnd,
             ID_SVC_LIST,
             0,
             0,
-            &[("Service", 300), ("Status", 110), ("Startup", 150), ("Name", 220)],
+            &[
+                ("Service", 300),
+                ("Status", 110),
+                ("Startup", 150),
+                ("Name", 220),
+            ],
         );
         self.svc_tune_list = list_view(
             hwnd,
             ID_SVC_TUNE,
             0,
             LVS_EX_CHECKBOXES,
-            &[("Service", 240), ("Now", 150), ("Change to", 130), ("Why", 300)],
+            &[
+                ("Service", 240),
+                ("Now", 150),
+                ("Change to", 130),
+                ("Why", 300),
+            ],
         );
         self.btn_svc_refresh = button(hwnd, ID_SVC_REFRESH, "Refresh", BS_PUSHBUTTON);
         self.btn_svc_all = button(hwnd, ID_SVC_ALL, "Tick All", BS_PUSHBUTTON);
@@ -1201,7 +1243,11 @@ impl App {
                 &opts,
                 &mut |step, total, name| {
                     if !name.is_empty() {
-                        set_progress(step, total, &format!("Checking {name}  ({} of {total})", step + 1));
+                        set_progress(
+                            step,
+                            total,
+                            &format!("Checking {name}  ({} of {total})", step + 1),
+                        );
                         post(hwnd, WM_JOB_PROGRESS);
                     }
                     !CANCEL.load(Ordering::SeqCst)
@@ -1256,7 +1302,10 @@ impl App {
             note.push_str(&format!(" {ignored} ignored entries hidden."));
         }
         if !report.warnings.is_empty() {
-            note.push_str(&format!(" {} keys could not be read.", report.warnings.len()));
+            note.push_str(&format!(
+                " {} keys could not be read.",
+                report.warnings.len()
+            ));
         }
         self.scan_note = note;
     }
@@ -1296,9 +1345,7 @@ impl App {
 
     /// Ticked unless it cannot be undone, or cannot succeed without rights.
     fn default_tick(&self, finding: &Finding) -> bool {
-        finding.repairable()
-            && !finding.permanent()
-            && (self.elevated || !finding.needs_admin())
+        finding.repairable() && !finding.permanent() && (self.elevated || !finding.needs_admin())
     }
 
     fn fix_label(&self, finding: &Finding) -> String {
@@ -1306,8 +1353,12 @@ impl App {
             Repair::None => return "Report only".into(),
             Repair::DeleteValue { .. } => "Delete value".to_string(),
             Repair::DeleteKey { .. } => "Delete key".to_string(),
-            Repair::DeleteFile { keep_copy: true, .. } => "Delete shortcut (copy kept)".to_string(),
-            Repair::DeleteFile { keep_copy: false, .. } => "Delete file (no undo)".to_string(),
+            Repair::DeleteFile {
+                keep_copy: true, ..
+            } => "Delete shortcut (copy kept)".to_string(),
+            Repair::DeleteFile {
+                keep_copy: false, ..
+            } => "Delete file (no undo)".to_string(),
         };
         if !self.elevated && finding.needs_admin() {
             label.push_str(", needs admin");
@@ -1370,7 +1421,10 @@ impl App {
             }
         }
         if let Err(err) = self.exclusions.save(&exclusions_file()) {
-            self.message(&format!("Could not save the ignore list: {err}"), MB_ICONWARNING);
+            self.message(
+                &format!("Could not save the ignore list: {err}"),
+                MB_ICONWARNING,
+            );
         }
         self.drop_rows(rows);
         self.fill_ignored();
@@ -1380,7 +1434,12 @@ impl App {
     fn drop_rows(&mut self, rows: &[usize]) {
         let mut keep_findings = Vec::new();
         let mut keep_ticks = Vec::new();
-        for (row, (finding, tick)) in self.findings.drain(..).zip(self.checked.drain(..)).enumerate() {
+        for (row, (finding, tick)) in self
+            .findings
+            .drain(..)
+            .zip(self.checked.drain(..))
+            .enumerate()
+        {
             if !rows.contains(&row) {
                 keep_findings.push(finding);
                 keep_ticks.push(tick);
@@ -1434,7 +1493,12 @@ impl App {
         if lparam == -1 {
             let mut rect = RECT::default();
             unsafe {
-                SendMessageW(self.list, LVM_GETITEMRECT, rows[0], &mut rect as *mut _ as isize);
+                SendMessageW(
+                    self.list,
+                    LVM_GETITEMRECT,
+                    rows[0],
+                    &mut rect as *mut _ as isize,
+                );
                 at = POINT {
                     x: rect.left + self.s(24),
                     y: rect.bottom,
@@ -1453,7 +1517,11 @@ impl App {
             let menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, MENU_DETAILS, wide("Details...").as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_COPY, wide("Copy location").as_ptr());
-            let show = if is_file { "Show in File Explorer" } else { "Show in Registry Editor" };
+            let show = if is_file {
+                "Show in File Explorer"
+            } else {
+                "Show in Registry Editor"
+            };
             AppendMenuW(menu, MF_STRING, MENU_SHOW, wide(show).as_ptr());
             AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
             AppendMenuW(menu, MF_STRING, MENU_IGNORE, wide(&ignore_label).as_ptr());
@@ -1614,7 +1682,11 @@ impl App {
         let mut question = format!(
             "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
-                format!("{} ({})", selected[0].display_name, selected[0].from.label())
+                format!(
+                    "{} ({})",
+                    selected[0].display_name,
+                    selected[0].from.label()
+                )
             } else {
                 format!("these {} services", selected.len())
             },
@@ -1634,7 +1706,11 @@ impl App {
             return;
         }
         self.job = Job::Services;
-        set_progress(0, selected.len().max(1), "Saving the current start types...");
+        set_progress(
+            0,
+            selected.len().max(1),
+            "Saving the current start types...",
+        );
         self.sync_controls();
         self.show_progress();
         self.invalidate();
@@ -1702,7 +1778,11 @@ impl App {
                 "{verb} {}?\n\nIt {} now and keeps its startup type{}.",
                 info.display_name,
                 if start { "starts" } else { "stops" },
-                if start { "." } else { ". You can start it again here." }
+                if start {
+                    "."
+                } else {
+                    ". You can start it again here."
+                }
             )
         } else {
             format!(
@@ -1728,12 +1808,20 @@ impl App {
         std::thread::spawn(move || {
             let outcome = if start {
                 start_services(&mut ScmServiceStore, &names, &mut |done, total| {
-                    set_progress(done, total, &format!("Starting services ({done} of {total})..."));
+                    set_progress(
+                        done,
+                        total,
+                        &format!("Starting services ({done} of {total})..."),
+                    );
                     post(hwnd, WM_JOB_PROGRESS);
                 })
             } else {
                 stop_services(&mut ScmServiceStore, &names, &mut |done, total| {
-                    set_progress(done, total, &format!("Stopping services ({done} of {total})..."));
+                    set_progress(
+                        done,
+                        total,
+                        &format!("Stopping services ({done} of {total})..."),
+                    );
                     post(hwnd, WM_JOB_PROGRESS);
                 })
             };
@@ -1849,10 +1937,7 @@ impl App {
         match result {
             Err(err) => {
                 self.svc_note = "Could not read or change services.".to_string();
-                self.message(
-                    &format!("Nothing was changed.\n\n{err}"),
-                    MB_ICONWARNING,
-                );
+                self.message(&format!("Nothing was changed.\n\n{err}"), MB_ICONWARNING);
             }
             Ok(outcome) => {
                 if !services.is_empty() || matches!(op, SvcOp::Refresh) {
@@ -1897,10 +1982,7 @@ impl App {
                             );
                         }
                         if !outcome.backup_file.as_os_str().is_empty() {
-                            lines.push(format!(
-                                "Backup: {}",
-                                outcome.backup_file.display()
-                            ));
+                            lines.push(format!("Backup: {}", outcome.backup_file.display()));
                         }
                         self.svc_note = if outcome.applied.is_empty() && outcome.errors.is_empty() {
                             "Nothing needed changing.".to_string()
@@ -1937,8 +2019,10 @@ impl App {
             }
         }
         let ticked: Vec<String> = self.settings.privacy_ticked.clone();
-        self.priv_checked =
-            items.iter().map(|item| ticked.iter().any(|id| id == &item.id)).collect();
+        self.priv_checked = items
+            .iter()
+            .map(|item| ticked.iter().any(|id| id == &item.id))
+            .collect();
         self.priv_items = items;
         self.priv_preview = None;
         self.priv_outcome = None;
@@ -1982,7 +2066,12 @@ impl App {
     }
 
     fn priv_preview_row(&self, id: &str) -> Option<(String, String)> {
-        let row = self.priv_preview.as_ref()?.items.iter().find(|row| row.id == id)?;
+        let row = self
+            .priv_preview
+            .as_ref()?
+            .items
+            .iter()
+            .find(|row| row.id == id)?;
         if row.skipped_running {
             let why = row.restricted.first().cloned().unwrap_or_default();
             return Some(("Waiting".to_string(), why));
@@ -2021,17 +2110,20 @@ impl App {
             SendMessageW(self.priv_list, LVM_DELETEALLITEMS, 0, 0);
             for (row, item) in self.priv_items.iter().enumerate() {
                 let (holds, extra) = self.priv_preview_row(&item.id).unwrap_or_default();
-                let detail =
-                    if extra.is_empty() { item.detail.clone() } else { extra };
-                insert_row(
-                    self.priv_list,
-                    row,
-                    &[&item.name, &holds, &detail],
-                );
+                let detail = if extra.is_empty() {
+                    item.detail.clone()
+                } else {
+                    extra
+                };
+                insert_row(self.priv_list, row, &[&item.name, &holds, &detail]);
                 set_state_image(
                     self.priv_list,
                     row,
-                    if self.priv_checked.get(row).copied().unwrap_or(false) { 2 } else { 1 },
+                    if self.priv_checked.get(row).copied().unwrap_or(false) {
+                        2
+                    } else {
+                        1
+                    },
                 );
             }
             SendMessageW(self.priv_list, WM_SETREDRAW, 1, 0);
@@ -2070,7 +2162,12 @@ impl App {
             format!("Clean Ticked ({count})")
         };
         set_text(self.btn_priv_clean, &text);
-        unsafe { EnableWindow(self.btn_priv_clean, (count > 0 && ready && !self.busy()) as i32) };
+        unsafe {
+            EnableWindow(
+                self.btn_priv_clean,
+                (count > 0 && ready && !self.busy()) as i32,
+            )
+        };
     }
 
     fn start_privacy_clean(&mut self) {
@@ -2079,7 +2176,10 @@ impl App {
         }
         let selected = self.priv_ticked();
         if selected.is_empty() {
-            self.message("Tick the categories you want to clean first.", MB_ICONINFORMATION);
+            self.message(
+                "Tick the categories you want to clean first.",
+                MB_ICONINFORMATION,
+            );
             return;
         }
         if self.priv_preview.is_none() {
@@ -2093,7 +2193,11 @@ impl App {
         let mut question = format!(
             "Clean {} {}?\n\nHive Mend saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
-            if selected.len() == 1 { "category" } else { "categories" },
+            if selected.len() == 1 {
+                "category"
+            } else {
+                "categories"
+            },
             backup_file.display()
         );
         let shown = selected.iter().take(10);
@@ -2188,8 +2292,11 @@ impl App {
                         outcome.values()
                     )
                 };
-                let icon =
-                    if outcome.errors.is_empty() { MB_ICONINFORMATION } else { MB_ICONWARNING };
+                let icon = if outcome.errors.is_empty() {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
                 self.priv_outcome = Some(outcome);
                 self.message(&lines.join("\n"), icon);
                 let report = preview(
@@ -2223,7 +2330,11 @@ impl App {
         }
         let mut parts = Vec::new();
         if item.files > 0 {
-            parts.push(format!("{} files ({})", item.files, format_bytes(item.bytes)));
+            parts.push(format!(
+                "{} files ({})",
+                item.files,
+                format_bytes(item.bytes)
+            ));
         }
         if item.values > 0 {
             parts.push(count(item.values, "value", "values"));
@@ -2243,7 +2354,9 @@ impl App {
     }
 
     fn show_priv_details(&mut self, row: usize) {
-        let Some(item) = self.priv_items.get(row) else { return };
+        let Some(item) = self.priv_items.get(row) else {
+            return;
+        };
         let mut lines = vec![item.detail.clone()];
         if let Some((holds, _)) = self.priv_preview_row(&item.id) {
             lines.push(format!("Holds: {holds}"));
@@ -2305,7 +2418,11 @@ impl App {
         if path.is_empty() {
             return false;
         }
-        if self.shred_rows.iter().any(|row| row.target.path.eq_ignore_ascii_case(&path)) {
+        if self
+            .shred_rows
+            .iter()
+            .any(|row| row.target.path.eq_ignore_ascii_case(&path))
+        {
             self.message("That path is already staged.", MB_ICONINFORMATION);
             return false;
         }
@@ -2339,7 +2456,11 @@ impl App {
         let mut added = 0;
         let mut refused = Vec::new();
         for item in items {
-            if self.shred_rows.iter().any(|row| row.target.path.eq_ignore_ascii_case(&item.data)) {
+            if self
+                .shred_rows
+                .iter()
+                .any(|row| row.target.path.eq_ignore_ascii_case(&item.data))
+            {
                 continue;
             }
             // The gate runs again at shred time; refusing early explains why.
@@ -2348,7 +2469,10 @@ impl App {
                 continue;
             }
             self.shred_rows.push(ShredRow {
-                target: ShredTarget { path: item.data.clone(), is_dir: false },
+                target: ShredTarget {
+                    path: item.data.clone(),
+                    is_dir: false,
+                },
                 bin: Some(item),
             });
             self.shred_checked.push(true);
@@ -2371,7 +2495,10 @@ impl App {
         }
         let mut rows = selected_rows(self.shred_list);
         if rows.is_empty() {
-            self.message("Highlight the staged rows to remove first.", MB_ICONINFORMATION);
+            self.message(
+                "Highlight the staged rows to remove first.",
+                MB_ICONINFORMATION,
+            );
             return;
         }
         rows.sort_unstable_by(|left, right| right.cmp(left));
@@ -2456,7 +2583,10 @@ impl App {
 
     fn update_shred_label(&self) {
         let count = self.shred_checked.iter().filter(|on| **on).count();
-        set_text(self.btn_shred_passes, &format!("Passes: {}", self.settings.shred_passes));
+        set_text(
+            self.btn_shred_passes,
+            &format!("Passes: {}", self.settings.shred_passes),
+        );
         let text = if count == 0 {
             "Shred Ticked".to_string()
         } else {
@@ -2475,9 +2605,16 @@ impl App {
                 row.target.path.clone(),
             )
         } else if row.target.is_dir {
-            (file_name(&row.target.path), "Folder".to_string(), row.target.path.clone())
+            (
+                file_name(&row.target.path),
+                "Folder".to_string(),
+                row.target.path.clone(),
+            )
         } else {
-            let size = HostFs.len(&row.target.path).map(format_bytes).unwrap_or_default();
+            let size = HostFs
+                .len(&row.target.path)
+                .map(format_bytes)
+                .unwrap_or_default();
             (file_name(&row.target.path), size, row.target.path.clone())
         }
     }
@@ -2493,7 +2630,11 @@ impl App {
                 set_state_image(
                     self.shred_list,
                     row,
-                    if self.shred_checked.get(row).copied().unwrap_or(false) { 2 } else { 1 },
+                    if self.shred_checked.get(row).copied().unwrap_or(false) {
+                        2
+                    } else {
+                        1
+                    },
                 );
             }
             SendMessageW(self.shred_list, WM_SETREDRAW, 1, 0);
@@ -2520,7 +2661,10 @@ impl App {
         }
         let ticked = self.shred_ticked_rows();
         if ticked.is_empty() {
-            self.message("Tick the staged rows you want to shred first.", MB_ICONINFORMATION);
+            self.message(
+                "Tick the staged rows you want to shred first.",
+                MB_ICONINFORMATION,
+            );
             return;
         }
         let method = self.shred_method();
@@ -2565,14 +2709,22 @@ impl App {
         let hwnd = self.hwnd as isize;
         std::thread::spawn(move || {
             let seed = random_seed();
-            let opts = ShredOptions { method, rename: true };
+            let opts = ShredOptions {
+                method,
+                rename: true,
+            };
             let file_total = files.len() * method.passes();
             let grand = (file_total + bin.len() * method.passes()).max(1);
-            let mut outcome = shred_paths(&mut HostFs, &files, &opts, seed, &mut |done, _, name| {
-                set_progress(done, grand, &format!("Shredding {name} ({done} of {grand})..."));
-                post(hwnd, WM_JOB_PROGRESS);
-                !CANCEL.load(Ordering::SeqCst)
-            });
+            let mut outcome =
+                shred_paths(&mut HostFs, &files, &opts, seed, &mut |done, _, name| {
+                    set_progress(
+                        done,
+                        grand,
+                        &format!("Shredding {name} ({done} of {grand})..."),
+                    );
+                    post(hwnd, WM_JOB_PROGRESS);
+                    !CANCEL.load(Ordering::SeqCst)
+                });
             if !outcome.canceled && !bin.is_empty() {
                 let second =
                     shred_recycle_items(&mut HostFs, &bin, &opts, seed, &mut |done, _, name| {
@@ -2593,8 +2745,11 @@ impl App {
     }
 
     fn finish_shred(&mut self, outcome: ShredOutcome) {
-        let mut lines =
-            vec![format!("Shredded {} files ({}).", outcome.shredded, format_bytes(outcome.bytes))];
+        let mut lines = vec![format!(
+            "Shredded {} files ({}).",
+            outcome.shredded,
+            format_bytes(outcome.bytes)
+        )];
         if outcome.canceled {
             lines.push(
                 "Canceled: rows after the stop were left alone. Shredded files cannot be recovered."
@@ -2617,7 +2772,10 @@ impl App {
         let checks = std::mem::take(&mut self.shred_checked);
         for (row, on) in rows.into_iter().zip(checks) {
             let done = if row.bin.is_some() || !row.target.is_dir {
-                outcome.shredded_paths.iter().any(|path| path == &row.target.path)
+                outcome
+                    .shredded_paths
+                    .iter()
+                    .any(|path| path == &row.target.path)
             } else {
                 !HostFs.exists(&row.target.path)
             };
@@ -2634,10 +2792,17 @@ impl App {
                 format_bytes(outcome.bytes)
             )
         } else {
-            format!("Shredded {} files ({}).", outcome.shredded, format_bytes(outcome.bytes))
+            format!(
+                "Shredded {} files ({}).",
+                outcome.shredded,
+                format_bytes(outcome.bytes)
+            )
         };
-        let icon =
-            if outcome.errors.is_empty() { MB_ICONINFORMATION } else { MB_ICONWARNING };
+        let icon = if outcome.errors.is_empty() {
+            MB_ICONINFORMATION
+        } else {
+            MB_ICONWARNING
+        };
         self.refresh_shred_warn();
         self.fill_shredder();
         self.message(&lines.join("\n"), icon);
@@ -2661,8 +2826,9 @@ impl App {
         if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
             let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
             match volume_ssd(&drive) {
-                Some(true) => lines
-                    .push(format!("{drive} is a solid-state drive: traces may survive in spare blocks.")),
+                Some(true) => lines.push(format!(
+                    "{drive} is a solid-state drive: traces may survive in spare blocks."
+                )),
                 None => lines.push(format!("Could not tell whether {drive} is solid-state.")),
                 Some(false) => {}
             }
@@ -2774,7 +2940,12 @@ impl App {
         if lparam == -1 {
             let mut rect = RECT::default();
             unsafe {
-                SendMessageW(self.svc_list, LVM_GETITEMRECT, rows[0], &mut rect as *mut _ as isize);
+                SendMessageW(
+                    self.svc_list,
+                    LVM_GETITEMRECT,
+                    rows[0],
+                    &mut rect as *mut _ as isize,
+                );
                 at = POINT {
                     x: rect.left + self.s(24),
                     y: rect.bottom,
@@ -2860,14 +3031,21 @@ impl App {
         }
         let selected = self.ticked();
         if selected.is_empty() {
-            self.message("Tick the entries you want to repair first.", MB_ICONINFORMATION);
+            self.message(
+                "Tick the entries you want to repair first.",
+                MB_ICONINFORMATION,
+            );
             return;
         }
         let backup_file = next_backup_file();
         let mut question = format!(
             "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
-            if selected.len() == 1 { "entry" } else { "entries" },
+            if selected.len() == 1 {
+                "entry"
+            } else {
+                "entries"
+            },
             backup_file.display()
         );
         let permanent = selected.iter().filter(|f| f.permanent()).count();
@@ -2940,7 +3118,11 @@ impl App {
                     &confirmed,
                     &backup_file,
                     &mut |done, _| {
-                        set_progress(total + done * 2, total * 3, &format!("Removing {done} of {total}..."));
+                        set_progress(
+                            total + done * 2,
+                            total * 3,
+                            &format!("Removing {done} of {total}..."),
+                        );
                         post(hwnd, WM_JOB_PROGRESS);
                     },
                 )
@@ -2956,7 +3138,11 @@ impl App {
         });
     }
 
-    fn finish_repair(&mut self, result: Result<RepairOutcome, String>, fixed_meanwhile: Vec<Finding>) {
+    fn finish_repair(
+        &mut self,
+        result: Result<RepairOutcome, String>,
+        fixed_meanwhile: Vec<Finding>,
+    ) {
         let outcome = match result {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -2980,7 +3166,9 @@ impl App {
         let already = outcome.already_gone + fixed_meanwhile.len();
         let mut lines = vec![format!("Removed: {}", outcome.applied)];
         if already > 0 {
-            lines.push(format!("Already fixed before repair reached them: {already}"));
+            lines.push(format!(
+                "Already fixed before repair reached them: {already}"
+            ));
         }
         let left = outcome.refused + outcome.not_backed_up;
         if left > 0 {
@@ -2991,10 +3179,7 @@ impl App {
         if !outcome.errors.is_empty() {
             let mut line = format!("Could not remove: {}", outcome.errors.len());
             if outcome.denied > 0 && !self.elevated {
-                line.push_str(&format!(
-                    " ({} need Run as administrator)",
-                    outcome.denied
-                ));
+                line.push_str(&format!(" ({} need Run as administrator)", outcome.denied));
             }
             lines.push(line);
         }
@@ -3056,7 +3241,11 @@ impl App {
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
-            insert_row(self.backup_list, row, &[&saved, &contents(&backup.summary), &name]);
+            insert_row(
+                self.backup_list,
+                row,
+                &[&saved, &contents(&backup.summary), &name],
+            );
         }
     }
 
@@ -3101,28 +3290,44 @@ impl App {
         });
     }
 
-    fn finish_restore(&mut self, file: PathBuf, result: Result<(BackupSummary, usize, Vec<String>), String>) {
+    fn finish_restore(
+        &mut self,
+        file: PathBuf,
+        result: Result<(BackupSummary, usize, Vec<String>), String>,
+    ) {
         match result {
             Ok((summary, files, errors)) => {
-                let mut text = format!(
-                    "Restored {} from\n{}",
-                    contents(&summary),
-                    file.display()
-                );
+                let mut text = format!("Restored {} from\n{}", contents(&summary), file.display());
                 if files > 0 {
                     text.push_str(&format!("\n\n{files} shortcuts were put back."));
                 }
                 if !errors.is_empty() {
                     text.push_str("\n\nSome files could not be put back:\n");
-                    text.push_str(&errors.iter().take(5).cloned().collect::<Vec<_>>().join("\n"));
+                    text.push_str(
+                        &errors
+                            .iter()
+                            .take(5)
+                            .cloned()
+                            .collect::<Vec<_>>()
+                            .join("\n"),
+                    );
                 }
                 if self.scanned {
-                    self.scan_note = "A backup was restored since this scan. Scan again to refresh the results.".into();
+                    self.scan_note =
+                        "A backup was restored since this scan. Scan again to refresh the results."
+                            .into();
                 }
-                let icon = if errors.is_empty() { MB_ICONINFORMATION } else { MB_ICONWARNING };
+                let icon = if errors.is_empty() {
+                    MB_ICONINFORMATION
+                } else {
+                    MB_ICONWARNING
+                };
                 self.message(&text, icon);
             }
-            Err(err) => self.message(&format!("The backup could not be restored:\n\n{err}"), MB_ICONWARNING),
+            Err(err) => self.message(
+                &format!("The backup could not be restored:\n\n{err}"),
+                MB_ICONWARNING,
+            ),
         }
     }
 
@@ -3142,14 +3347,20 @@ impl App {
     fn unignore(&mut self) {
         let rows = selected_rows(self.ignored_list);
         if rows.is_empty() {
-            self.message("Click an ignored entry to highlight it first.", MB_ICONINFORMATION);
+            self.message(
+                "Click an ignored entry to highlight it first.",
+                MB_ICONINFORMATION,
+            );
             return;
         }
         for row in rows.iter().rev() {
             self.exclusions.remove(*row);
         }
         if let Err(err) = self.exclusions.save(&exclusions_file()) {
-            self.message(&format!("Could not save the ignore list: {err}"), MB_ICONWARNING);
+            self.message(
+                &format!("Could not save the ignore list: {err}"),
+                MB_ICONWARNING,
+            );
         }
         self.fill_ignored();
         self.invalidate();
@@ -3184,8 +3395,15 @@ impl App {
 
     fn show_progress(&self) {
         // The text line is painted by draw_scan.
-        let (done, total) = PROGRESS.lock().map(|p| (p.done, p.total)).unwrap_or_default();
-        let pos = if total == 0 { 0 } else { (done * 1000 / total).min(1000) };
+        let (done, total) = PROGRESS
+            .lock()
+            .map(|p| (p.done, p.total))
+            .unwrap_or_default();
+        let pos = if total == 0 {
+            0
+        } else {
+            (done * 1000 / total).min(1000)
+        };
         unsafe { SendMessageW(self.progress, PBM_SETPOS, pos, 0) };
         let mut rect = self.client();
         rect.top = self.s(HEADER_H);
@@ -3196,8 +3414,15 @@ impl App {
     fn finish(&mut self, result: JobResult) {
         self.job = Job::Idle;
         match result {
-            JobResult::Scan { report, scope, seconds } => self.finish_scan(report, scope, seconds),
-            JobResult::Repair { result, fixed_meanwhile } => {
+            JobResult::Scan {
+                report,
+                scope,
+                seconds,
+            } => self.finish_scan(report, scope, seconds),
+            JobResult::Repair {
+                result,
+                fixed_meanwhile,
+            } => {
                 self.sync_controls();
                 self.finish_repair(result, fixed_meanwhile);
             }
@@ -3267,12 +3492,24 @@ impl App {
                     place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
                     if self.job == Job::Scanning {
                         visible.push(self.btn_cancel);
-                        place(self.btn_cancel, left, self.s(BODY_Y + 88), self.s(110), button_h);
+                        place(
+                            self.btn_cancel,
+                            left,
+                            self.s(BODY_Y + 88),
+                            self.s(110),
+                            button_h,
+                        );
                     }
                 } else if !self.scanned {
                     visible.push(self.btn_scan);
                     set_text(self.btn_scan, "Start Scan");
-                    place(self.btn_scan, left, self.s(BODY_Y + 128), self.s(150), self.s(38));
+                    place(
+                        self.btn_scan,
+                        left,
+                        self.s(BODY_Y + 128),
+                        self.s(150),
+                        self.s(38),
+                    );
                 } else {
                     visible.extend([
                         self.list,
@@ -3295,20 +3532,53 @@ impl App {
                         x += self.s(w + 8);
                     }
                     let repair_w = self.s(200);
-                    place(self.btn_repair, right - repair_w, button_y, repair_w, button_h);
+                    place(
+                        self.btn_repair,
+                        right - repair_w,
+                        button_y,
+                        repair_w,
+                        button_h,
+                    );
                     self.size_finding_columns(width);
                 }
             }
             Page::Restore => {
                 visible.extend([self.backup_list, self.btn_restore, self.btn_open_backups]);
-                place(self.backup_list, left, self.s(BODY_Y), width, list_h + list_top - self.s(BODY_Y));
+                place(
+                    self.backup_list,
+                    left,
+                    self.s(BODY_Y),
+                    width,
+                    list_h + list_top - self.s(BODY_Y),
+                );
                 place(self.btn_restore, left, button_y, self.s(200), button_h);
-                place(self.btn_open_backups, left + self.s(208), button_y, self.s(170), button_h);
+                place(
+                    self.btn_open_backups,
+                    left + self.s(208),
+                    button_y,
+                    self.s(170),
+                    button_h,
+                );
                 let file_w = width - self.s(170 + 300) - self.s(24);
                 unsafe {
-                    SendMessageW(self.backup_list, LVM_SETCOLUMNWIDTH, 0, self.s(170) as isize);
-                    SendMessageW(self.backup_list, LVM_SETCOLUMNWIDTH, 1, self.s(300) as isize);
-                    SendMessageW(self.backup_list, LVM_SETCOLUMNWIDTH, 2, file_w.max(self.s(120)) as isize);
+                    SendMessageW(
+                        self.backup_list,
+                        LVM_SETCOLUMNWIDTH,
+                        0,
+                        self.s(170) as isize,
+                    );
+                    SendMessageW(
+                        self.backup_list,
+                        LVM_SETCOLUMNWIDTH,
+                        1,
+                        self.s(300) as isize,
+                    );
+                    SendMessageW(
+                        self.backup_list,
+                        LVM_SETCOLUMNWIDTH,
+                        2,
+                        file_w.max(self.s(120)) as isize,
+                    );
                 }
             }
             Page::Settings => {
@@ -3336,7 +3606,12 @@ impl App {
                 );
                 place(self.btn_unignore, left, button_y, self.s(220), button_h);
                 unsafe {
-                    SendMessageW(self.ignored_list, LVM_SETCOLUMNWIDTH, 0, (width - self.s(24)) as isize);
+                    SendMessageW(
+                        self.ignored_list,
+                        LVM_SETCOLUMNWIDTH,
+                        0,
+                        (width - self.s(24)) as isize,
+                    );
                 }
             }
             Page::Services => {
@@ -3369,7 +3644,13 @@ impl App {
                         x += self.s(w + 8);
                     }
                     let apply_w = self.s(220);
-                    place(self.btn_svc_apply, right - apply_w, button_y, apply_w, button_h);
+                    place(
+                        self.btn_svc_apply,
+                        right - apply_w,
+                        button_y,
+                        apply_w,
+                        button_h,
+                    );
                     self.size_svc_columns(width);
                 } else {
                     visible.extend([
@@ -3403,7 +3684,13 @@ impl App {
                     visible.push(self.progress);
                     place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
                     visible.push(self.btn_cancel);
-                    place(self.btn_cancel, left, self.s(BODY_Y + 88), self.s(110), button_h);
+                    place(
+                        self.btn_cancel,
+                        left,
+                        self.s(BODY_Y + 88),
+                        self.s(110),
+                        button_h,
+                    );
                 } else {
                     visible.extend([
                         self.priv_list,
@@ -3423,7 +3710,13 @@ impl App {
                         x += self.s(w + 8);
                     }
                     let clean_w = self.s(220);
-                    place(self.btn_priv_clean, right - clean_w, button_y, clean_w, button_h);
+                    place(
+                        self.btn_priv_clean,
+                        right - clean_w,
+                        button_y,
+                        clean_w,
+                        button_h,
+                    );
                     self.size_priv_columns(width);
                 }
             }
@@ -3432,7 +3725,13 @@ impl App {
                     visible.push(self.progress);
                     place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
                     visible.push(self.btn_cancel);
-                    place(self.btn_cancel, left, self.s(BODY_Y + 88), self.s(110), button_h);
+                    place(
+                        self.btn_cancel,
+                        left,
+                        self.s(BODY_Y + 88),
+                        self.s(110),
+                        button_h,
+                    );
                 } else {
                     visible.extend([
                         self.shred_path,
@@ -3448,7 +3747,13 @@ impl App {
                     let edit_y = self.s(BODY_Y + 26);
                     let add_w = self.s(90);
                     place(self.btn_shred_add, right - add_w, edit_y, add_w, self.s(28));
-                    place(self.shred_path, left, edit_y, width - add_w - self.s(8), self.s(28));
+                    place(
+                        self.shred_path,
+                        left,
+                        edit_y,
+                        width - add_w - self.s(8),
+                        self.s(28),
+                    );
                     let top = self.s(BODY_Y + 62);
                     place(
                         self.shred_list,
@@ -3523,7 +3828,12 @@ impl App {
         let change = self.s(130);
         let why = (width - self.s(240) - now - change - self.s(26)).max(self.s(120));
         unsafe {
-            SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 0, self.s(240) as isize);
+            SendMessageW(
+                self.svc_tune_list,
+                LVM_SETCOLUMNWIDTH,
+                0,
+                self.s(240) as isize,
+            );
             SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 1, now as isize);
             SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 2, change as isize);
             SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 3, why as isize);
@@ -3581,7 +3891,10 @@ impl App {
             let old = SelectObject(mem, bitmap);
             SetBkMode(mem, TRANSPARENT as i32);
             // Hover tests during this paint use the previous frame's spots.
-            let previous_hover = self.hover.and_then(|i| self.hotspots.get(i)).map(|s| s.rect);
+            let previous_hover = self
+                .hover
+                .and_then(|i| self.hotspots.get(i))
+                .map(|s| s.rect);
             self.hotspots.clear();
             fill(mem, rect, BG);
             self.draw_chrome(mem, rect, previous_hover);
@@ -3615,14 +3928,50 @@ impl App {
     unsafe fn draw_chrome(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         let header = self.s(HEADER_H);
         // A lighter top half over a deeper bottom half gives the header its gloss.
-        gradient(hdc, RECT { left: 0, top: 0, right: rect.right, bottom: header / 2 }, (44, 110, 196), (96, 166, 230), false);
-        gradient(hdc, RECT { left: 0, top: header / 2, right: rect.right, bottom: header }, (16, 72, 160), (52, 128, 206), false);
-        fill(hdc, RECT { left: 0, top: header - 1, right: rect.right, bottom: header }, rgb(12, 52, 120));
+        gradient(
+            hdc,
+            RECT {
+                left: 0,
+                top: 0,
+                right: rect.right,
+                bottom: header / 2,
+            },
+            (44, 110, 196),
+            (96, 166, 230),
+            false,
+        );
+        gradient(
+            hdc,
+            RECT {
+                left: 0,
+                top: header / 2,
+                right: rect.right,
+                bottom: header,
+            },
+            (16, 72, 160),
+            (52, 128, 206),
+            false,
+        );
+        fill(
+            hdc,
+            RECT {
+                left: 0,
+                top: header - 1,
+                right: rect.right,
+                bottom: header,
+            },
+            rgb(12, 52, 120),
+        );
         text(
             hdc,
             self.fonts.title,
             rgb(255, 255, 255),
-            RECT { left: self.s(24), top: 0, right: rect.right / 2, bottom: header },
+            RECT {
+                left: self.s(24),
+                top: 0,
+                right: rect.right / 2,
+                bottom: header,
+            },
             "Hive Mend",
             DT_SINGLELINE | DT_VCENTER,
         );
@@ -3637,13 +3986,26 @@ impl App {
         text(
             hdc,
             self.fonts.body_bold,
-            if help_lit { rgb(255, 255, 255) } else { rgb(214, 232, 250) },
+            if help_lit {
+                rgb(255, 255, 255)
+            } else {
+                rgb(214, 232, 250)
+            },
             help,
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
         );
         if help_lit {
-            fill(hdc, RECT { left: help.left, top: help.bottom - 1, right: help.right, bottom: help.bottom }, rgb(255, 255, 255));
+            fill(
+                hdc,
+                RECT {
+                    left: help.left,
+                    top: help.bottom - 1,
+                    right: help.right,
+                    bottom: help.bottom,
+                },
+                rgb(255, 255, 255),
+            );
         }
         self.spot(help, Action::Page(Page::About));
         let badge = RECT {
@@ -3653,7 +4015,14 @@ impl App {
             bottom: header,
         };
         if self.elevated {
-            text(hdc, self.fonts.small, rgb(220, 236, 255), badge, "Running as administrator", DT_SINGLELINE | DT_VCENTER | DT_RIGHT);
+            text(
+                hdc,
+                self.fonts.small,
+                rgb(220, 236, 255),
+                badge,
+                "Running as administrator",
+                DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
+            );
         } else {
             let label = "Run as administrator";
             let size = measure(hdc, self.fonts.body_bold, label);
@@ -3668,20 +4037,50 @@ impl App {
                 hdc,
                 link,
                 self.s(16),
-                if lit { rgb(255, 255, 255) } else { rgb(232, 242, 255) },
+                if lit {
+                    rgb(255, 255, 255)
+                } else {
+                    rgb(232, 242, 255)
+                },
                 rgb(160, 196, 236),
                 1,
             );
-            text(hdc, self.fonts.body_bold, BLUE_INK, link, label, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            text(
+                hdc,
+                self.fonts.body_bold,
+                BLUE_INK,
+                link,
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+            );
             self.spot(link, Action::Elevate);
         }
 
-        let side = RECT { left: 0, top: header, right: self.s(SIDEBAR_W), bottom: rect.bottom - self.s(FOOTER_H) };
+        let side = RECT {
+            left: 0,
+            top: header,
+            right: self.s(SIDEBAR_W),
+            bottom: rect.bottom - self.s(FOOTER_H),
+        };
         fill(hdc, side, SIDEBAR_BG);
-        fill(hdc, RECT { left: side.right, top: header, right: side.right + 1, bottom: side.bottom }, rgb(206, 212, 222));
+        fill(
+            hdc,
+            RECT {
+                left: side.right,
+                top: header,
+                right: side.right + 1,
+                bottom: side.bottom,
+            },
+            rgb(206, 212, 222),
+        );
         gradient(
             hdc,
-            RECT { left: 0, top: rect.bottom - self.s(FOOTER_H), right: rect.right, bottom: rect.bottom },
+            RECT {
+                left: 0,
+                top: rect.bottom - self.s(FOOTER_H),
+                right: rect.right,
+                bottom: rect.bottom,
+            },
             (236, 214, 70),
             (90, 176, 72),
             false,
@@ -3704,9 +4103,20 @@ impl App {
                 (rgb(255, 255, 255), rgb(184, 190, 200), 1)
             };
             round_box(hdc, pill, self.s(18), fill_color, border, width);
-            let font = if selected { self.fonts.body_bold } else { self.fonts.body };
+            let font = if selected {
+                self.fonts.body_bold
+            } else {
+                self.fonts.body
+            };
             let label = label.replace("&&", "&");
-            text(hdc, font, if selected { BLUE_INK } else { INK }, pill, &label, DT_SINGLELINE | DT_VCENTER | DT_CENTER);
+            text(
+                hdc,
+                font,
+                if selected { BLUE_INK } else { INK },
+                pill,
+                &label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+            );
             self.spot(pill, Action::Page(*page));
             y += self.s(46);
         }
@@ -3724,7 +4134,12 @@ impl App {
                 hdc,
                 self.fonts.small,
                 MUTED,
-                RECT { left: self.s(16), top: y + self.s(8), right: self.s(SIDEBAR_W - 16), bottom: y + self.s(30) },
+                RECT {
+                    left: self.s(16),
+                    top: y + self.s(8),
+                    right: self.s(SIDEBAR_W - 16),
+                    bottom: y + self.s(30),
+                },
                 note,
                 DT_SINGLELINE | DT_CENTER,
             );
@@ -3735,10 +4150,34 @@ impl App {
         let left = self.s(CONTENT_X);
         let top = self.s(TITLE_Y);
         let size = measure(hdc, self.fonts.title, title);
-        text(hdc, self.fonts.title, INK, RECT { left, top, right: rect.right, bottom: top + self.s(40) }, title, DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.title,
+            INK,
+            RECT {
+                left,
+                top,
+                right: rect.right,
+                bottom: top + self.s(40),
+            },
+            title,
+            DT_SINGLELINE,
+        );
         if let Some(accent) = accent {
             let x = left + size.0 + self.s(8);
-            text(hdc, self.fonts.title, ACCENT, RECT { left: x, top, right: rect.right, bottom: top + self.s(40) }, accent, DT_SINGLELINE);
+            text(
+                hdc,
+                self.fonts.title,
+                ACCENT,
+                RECT {
+                    left: x,
+                    top,
+                    right: rect.right,
+                    bottom: top + self.s(40),
+                },
+                accent,
+                DT_SINGLELINE,
+            );
         }
     }
 
@@ -3749,7 +4188,12 @@ impl App {
             hdc,
             self.fonts.body,
             MUTED,
-            RECT { left, top, right: rect.right - self.s(24), bottom: top + self.s(26) },
+            RECT {
+                left,
+                top,
+                right: rect.right - self.s(24),
+                bottom: top + self.s(26),
+            },
             line,
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -3795,43 +4239,138 @@ impl App {
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
         let cards = [
-            (0, "Scan Your Registry", "Find entries left behind by programs that are no longer installed", Action::ScanAll),
-            (1, "Optimize Your System", "Quick check of startup programs, uninstall entries, shared DLLs, and COM controls", Action::Optimize),
-            (2, "Monitor Your System", "Memory, disk space, and uptime at a glance", Action::Page(Page::Monitor)),
+            (
+                0,
+                "Scan Your Registry",
+                "Find entries left behind by programs that are no longer installed",
+                Action::ScanAll,
+            ),
+            (
+                1,
+                "Optimize Your System",
+                "Quick check of startup programs, uninstall entries, shared DLLs, and COM controls",
+                Action::Optimize,
+            ),
+            (
+                2,
+                "Monitor Your System",
+                "Memory, disk space, and uptime at a glance",
+                Action::Page(Page::Monitor),
+            ),
         ];
         let mut y = self.s(HEADER_H + 64);
         let card_h = self.s(84);
         for (icon, title, subtitle, action) in cards {
-            let card = RECT { left, top: y, right, bottom: y + card_h };
+            let card = RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + card_h,
+            };
             let disabled = action.starts_job() && self.busy();
             let lit = !disabled && lit(hover, card);
             round_box(
                 hdc,
                 card,
                 self.s(18),
-                if lit { rgb(236, 244, 253) } else { rgb(248, 250, 252) },
-                if lit { rgb(60, 130, 210) } else { rgb(186, 196, 210) },
+                if lit {
+                    rgb(236, 244, 253)
+                } else {
+                    rgb(248, 250, 252)
+                },
+                if lit {
+                    rgb(60, 130, 210)
+                } else {
+                    rgb(186, 196, 210)
+                },
                 if lit { 2 } else { 1 },
             );
             let icon_w = self.s(70);
             if let Some(bitmap) = self.icons.get(icon).copied().filter(|b| !b.is_null()) {
-                blit(hdc, bitmap, card.left + self.s(14), card.top + (card_h - self.s(64)) / 2, icon_w, self.s(64));
+                blit(
+                    hdc,
+                    bitmap,
+                    card.left + self.s(14),
+                    card.top + (card_h - self.s(64)) / 2,
+                    icon_w,
+                    self.s(64),
+                );
             }
             let text_left = card.left + self.s(104);
             let color = if disabled { MUTED } else { BLUE_INK };
-            text(hdc, self.fonts.heading, color, RECT { left: text_left, top: card.top + self.s(14), right: card.right - self.s(16), bottom: card.top + self.s(44) }, title, DT_SINGLELINE);
-            text(hdc, self.fonts.body, MUTED, RECT { left: text_left, top: card.top + self.s(46), right: card.right - self.s(16), bottom: card.bottom - self.s(8) }, subtitle, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(
+                hdc,
+                self.fonts.heading,
+                color,
+                RECT {
+                    left: text_left,
+                    top: card.top + self.s(14),
+                    right: card.right - self.s(16),
+                    bottom: card.top + self.s(44),
+                },
+                title,
+                DT_SINGLELINE,
+            );
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left: text_left,
+                    top: card.top + self.s(46),
+                    right: card.right - self.s(16),
+                    bottom: card.bottom - self.s(8),
+                },
+                subtitle,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
             self.spot(card, action);
             y += card_h + self.s(12);
         }
 
         y += self.s(10);
-        text(hdc, self.fonts.title, INK, RECT { left, top: y, right, bottom: y + self.s(40) }, "Status & Summary", DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.title,
+            INK,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(40),
+            },
+            "Status & Summary",
+            DT_SINGLELINE,
+        );
         y += self.s(46);
         let label_w = self.s(150);
         for (label, value) in self.summary_rows() {
-            text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(24) }, label, DT_SINGLELINE);
-            text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(24) }, &value, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(
+                hdc,
+                self.fonts.body_bold,
+                INK,
+                RECT {
+                    left,
+                    top: y,
+                    right: left + label_w,
+                    bottom: y + self.s(24),
+                },
+                label,
+                DT_SINGLELINE,
+            );
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left: left + label_w,
+                    top: y,
+                    right,
+                    bottom: y + self.s(24),
+                },
+                &value,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
             y += self.s(26);
         }
         y += self.s(6);
@@ -3839,20 +4378,48 @@ impl App {
         if self.scanned && self.page == Page::Status {
             let label = "View scan results";
             let size = measure(hdc, self.fonts.body, label);
-            let link = RECT { left: x, top: y, right: x + size.0, bottom: y + size.1 };
+            let link = RECT {
+                left: x,
+                top: y,
+                right: x + size.0,
+                bottom: y + size.1,
+            };
             text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
             if lit(hover, link) {
-                fill(hdc, RECT { left: link.left, top: link.bottom - 1, right: link.right, bottom: link.bottom }, LINK);
+                fill(
+                    hdc,
+                    RECT {
+                        left: link.left,
+                        top: link.bottom - 1,
+                        right: link.right,
+                        bottom: link.bottom,
+                    },
+                    LINK,
+                );
             }
             self.spot(link, Action::Page(Page::Scan));
             x = link.right + self.s(24);
         }
         let label = "Click to reset statistics";
         let size = measure(hdc, self.fonts.body, label);
-        let link = RECT { left: x, top: y, right: x + size.0, bottom: y + size.1 };
+        let link = RECT {
+            left: x,
+            top: y,
+            right: x + size.0,
+            bottom: y + size.1,
+        };
         text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
         if lit(hover, link) {
-            fill(hdc, RECT { left: link.left, top: link.bottom - 1, right: link.right, bottom: link.bottom }, LINK);
+            fill(
+                hdc,
+                RECT {
+                    left: link.left,
+                    top: link.bottom - 1,
+                    right: link.right,
+                    bottom: link.bottom,
+                },
+                LINK,
+            );
         }
         self.spot(link, Action::ResetStats);
     }
@@ -3868,7 +4435,12 @@ impl App {
                 hdc,
                 self.fonts.body,
                 INK,
-                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 74),
+                },
                 &text_line,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -3885,7 +4457,12 @@ impl App {
             hdc,
             self.fonts.small,
             MUTED,
-            RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 22) },
+            RECT {
+                left,
+                top: self.s(BODY_Y),
+                right,
+                bottom: self.s(BODY_Y + 22),
+            },
             "Double-click a row for details. Registry entries are backed up first; files are not.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -3902,7 +4479,12 @@ impl App {
                 hdc,
                 self.fonts.body,
                 INK,
-                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 74),
+                },
                 &text_line,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -3924,7 +4506,12 @@ impl App {
             hdc,
             self.fonts.small,
             MUTED,
-            RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 22) },
+            RECT {
+                left,
+                top: self.s(BODY_Y),
+                right,
+                bottom: self.s(BODY_Y + 22),
+            },
             &hint,
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -3941,7 +4528,12 @@ impl App {
                 hdc,
                 self.fonts.body,
                 INK,
-                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 74),
+                },
                 &text_line,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -3956,7 +4548,10 @@ impl App {
             "Suggested Manual starts, or every service. Listing never changes anything.".to_string()
         };
         self.subtitle(hdc, rect, &line);
-        let tabs = [("Suggested", SvcView::Tuneup), ("All services", SvcView::Manage)];
+        let tabs = [
+            ("Suggested", SvcView::Tuneup),
+            ("All services", SvcView::Manage),
+        ];
         let mut x = left;
         for (label, view) in tabs {
             let size = measure(hdc, self.fonts.body_bold, label);
@@ -3979,7 +4574,11 @@ impl App {
                 } else {
                     rgb(248, 250, 252)
                 },
-                if selected { rgb(60, 130, 210) } else { rgb(186, 196, 210) },
+                if selected {
+                    rgb(60, 130, 210)
+                } else {
+                    rgb(186, 196, 210)
+                },
                 if selected { 2 } else { 1 },
             );
             text(
@@ -4005,7 +4604,12 @@ impl App {
             hdc,
             self.fonts.small,
             MUTED,
-            RECT { left: x + self.s(8), top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 30) },
+            RECT {
+                left: x + self.s(8),
+                top: self.s(BODY_Y),
+                right,
+                bottom: self.s(BODY_Y + 30),
+            },
             hint,
             DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
         );
@@ -4016,7 +4620,11 @@ impl App {
         let right = rect.right - self.s(24);
         match self.job {
             Job::Scanning | Job::Repairing => {
-                let title = if self.job == Job::Scanning { "Scanning" } else { "Repairing" };
+                let title = if self.job == Job::Scanning {
+                    "Scanning"
+                } else {
+                    "Repairing"
+                };
                 self.heading(hdc, rect, title, None);
                 let line = if self.job == Job::Scanning {
                     "Scanning only reads the registry. Nothing is changed."
@@ -4029,7 +4637,12 @@ impl App {
                     hdc,
                     self.fonts.body,
                     INK,
-                    RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                    RECT {
+                        left,
+                        top: self.s(BODY_Y + 48),
+                        right,
+                        bottom: self.s(BODY_Y + 74),
+                    },
                     &text_line,
                     DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
@@ -4038,10 +4651,38 @@ impl App {
                 self.heading(hdc, rect, "Scan & Repair", None);
                 self.subtitle(hdc, rect, "No scan has been run in this session.");
                 let width = right.min(left + self.s(720));
-                let y = paragraph(hdc, self.fonts.body, INK, left, width, self.s(BODY_Y), "A scan looks for registry entries and shortcuts that point at programs and files that are no longer on this PC. Scanning never changes anything.");
-                paragraph(hdc, self.fonts.body, INK, left, width, y + self.s(12), "After the scan you choose what to repair. Every repair saves a backup first, so it can be undone on the Restore page.");
+                let y = paragraph(
+                    hdc,
+                    self.fonts.body,
+                    INK,
+                    left,
+                    width,
+                    self.s(BODY_Y),
+                    "A scan looks for registry entries and shortcuts that point at programs and files that are no longer on this PC. Scanning never changes anything.",
+                );
+                paragraph(
+                    hdc,
+                    self.fonts.body,
+                    INK,
+                    left,
+                    width,
+                    y + self.s(12),
+                    "After the scan you choose what to repair. Every repair saves a backup first, so it can be undone on the Restore page.",
+                );
                 if !self.scan_note.is_empty() {
-                    text(hdc, self.fonts.body, MUTED, RECT { left, top: self.s(BODY_Y + 180), right, bottom: self.s(BODY_Y + 206) }, &self.scan_note, DT_SINGLELINE);
+                    text(
+                        hdc,
+                        self.fonts.body,
+                        MUTED,
+                        RECT {
+                            left,
+                            top: self.s(BODY_Y + 180),
+                            right,
+                            bottom: self.s(BODY_Y + 206),
+                        },
+                        &self.scan_note,
+                        DT_SINGLELINE,
+                    );
                 }
             }
             _ => {
@@ -4059,7 +4700,12 @@ impl App {
                     hdc,
                     self.fonts.small,
                     MUTED,
-                    RECT { left, top: self.s(BODY_Y - 6), right, bottom: self.s(LIST_Y - 2) },
+                    RECT {
+                        left,
+                        top: self.s(BODY_Y - 6),
+                        right,
+                        bottom: self.s(LIST_Y - 2),
+                    },
                     hint,
                     DT_SINGLELINE | DT_END_ELLIPSIS,
                 );
@@ -4072,7 +4718,8 @@ impl App {
         let line = if self.backups.is_empty() {
             "No backups yet. Each repair saves one here before it changes anything.".to_string()
         } else {
-            "Each repair saved what it removed. Pick a backup to put those entries back.".to_string()
+            "Each repair saved what it removed. Pick a backup to put those entries back."
+                .to_string()
         };
         self.subtitle(hdc, rect, &line);
         if self.job == Job::Restoring {
@@ -4080,7 +4727,12 @@ impl App {
                 hdc,
                 self.fonts.body_bold,
                 BLUE_INK,
-                RECT { left: rect.right - self.s(160), top: self.s(SUBTITLE_Y), right: rect.right - self.s(24), bottom: self.s(SUBTITLE_Y + 24) },
+                RECT {
+                    left: rect.right - self.s(160),
+                    top: self.s(SUBTITLE_Y),
+                    right: rect.right - self.s(24),
+                    bottom: self.s(SUBTITLE_Y + 24),
+                },
                 "Restoring...",
                 DT_SINGLELINE | DT_RIGHT,
             );
@@ -4092,14 +4744,43 @@ impl App {
         self.subtitle(hdc, rect, "Changes are saved as you make them.");
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
-        text(hdc, self.fonts.heading, INK, RECT { left, top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 28) }, "What Scan Your Registry checks", DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.heading,
+            INK,
+            RECT {
+                left,
+                top: self.s(BODY_Y),
+                right,
+                bottom: self.s(BODY_Y + 28),
+            },
+            "What Scan Your Registry checks",
+            DT_SINGLELINE,
+        );
         let top = self.s(SETTINGS_IGNORED_Y);
-        text(hdc, self.fonts.heading, INK, RECT { left, top, right, bottom: top + self.s(28) }, "Ignored entries", DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.heading,
+            INK,
+            RECT {
+                left,
+                top,
+                right,
+                bottom: top + self.s(28),
+            },
+            "Ignored entries",
+            DT_SINGLELINE,
+        );
         text(
             hdc,
             self.fonts.body,
             MUTED,
-            RECT { left, top: top + self.s(30), right, bottom: top + self.s(56) },
+            RECT {
+                left,
+                top: top + self.s(30),
+                right,
+                bottom: top + self.s(56),
+            },
             "These never appear in scans, so they are never repaired. To add one, right-click it in the scan results.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -4107,7 +4788,11 @@ impl App {
 
     unsafe fn draw_monitor(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Monitor Your System", None);
-        self.subtitle(hdc, rect, "Read when this page paints. Nothing here changes your PC.");
+        self.subtitle(
+            hdc,
+            rect,
+            "Read when this page paints. Nothing here changes your PC.",
+        );
         let snapshot = gather_snapshot();
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
@@ -4117,8 +4802,32 @@ impl App {
             ("Windows", snapshot.os.clone()),
             ("Up time", format_uptime(snapshot.uptime_secs)),
         ] {
-            text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(24) }, label, DT_SINGLELINE);
-            text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(24) }, &value, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(
+                hdc,
+                self.fonts.body_bold,
+                INK,
+                RECT {
+                    left,
+                    top: y,
+                    right: left + label_w,
+                    bottom: y + self.s(24),
+                },
+                label,
+                DT_SINGLELINE,
+            );
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left: left + label_w,
+                    top: y,
+                    right,
+                    bottom: y + self.s(24),
+                },
+                &value,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
             y += self.s(26);
         }
         y += self.s(4);
@@ -4128,7 +4837,16 @@ impl App {
             format_bytes(snapshot.memory_total),
             snapshot.memory_used_percent()
         );
-        y = self.meter(hdc, left, right, label_w, y, "Memory", &memory_line, snapshot.memory_used_percent());
+        y = self.meter(
+            hdc,
+            left,
+            right,
+            label_w,
+            y,
+            "Memory",
+            &memory_line,
+            snapshot.memory_used_percent(),
+        );
         let disk_line = format!(
             "{} {} free of {} ({}% used)",
             snapshot.system_drive,
@@ -4136,21 +4854,90 @@ impl App {
             format_bytes(snapshot.disk_total),
             snapshot.disk_used_percent()
         );
-        y = self.meter(hdc, left, right, label_w, y, "System drive", &disk_line, snapshot.disk_used_percent());
+        y = self.meter(
+            hdc,
+            left,
+            right,
+            label_w,
+            y,
+            "System drive",
+            &disk_line,
+            snapshot.disk_used_percent(),
+        );
         y += self.s(14);
-        text(hdc, self.fonts.title, INK, RECT { left, top: y, right, bottom: y + self.s(40) }, "Hive Mend Health", DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.title,
+            INK,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(40),
+            },
+            "Hive Mend Health",
+            DT_SINGLELINE,
+        );
         y += self.s(46);
         for (label, value) in self.summary_rows() {
-            text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(24) }, label, DT_SINGLELINE);
-            text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(24) }, &value, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(
+                hdc,
+                self.fonts.body_bold,
+                INK,
+                RECT {
+                    left,
+                    top: y,
+                    right: left + label_w,
+                    bottom: y + self.s(24),
+                },
+                label,
+                DT_SINGLELINE,
+            );
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left: left + label_w,
+                    top: y,
+                    right,
+                    bottom: y + self.s(24),
+                },
+                &value,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
             y += self.s(26);
         }
         y += self.s(10);
-        text(hdc, self.fonts.heading, INK, RECT { left, top: y, right, bottom: y + self.s(26) }, "Registry hives", DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.heading,
+            INK,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(26),
+            },
+            "Registry hives",
+            DT_SINGLELINE,
+        );
         y += self.s(28);
         let hives = gather_hives();
         if hives.entries.is_empty() {
-            text(hdc, self.fonts.body, MUTED, RECT { left, top: y, right, bottom: y + self.s(24) }, "The hive list could not be read.", DT_SINGLELINE);
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left,
+                    top: y,
+                    right,
+                    bottom: y + self.s(24),
+                },
+                "The hive list could not be read.",
+                DT_SINGLELINE,
+            );
             y += self.s(26);
         } else {
             let shown: Vec<&HiveEntry> = hives.entries.iter().take(8).collect();
@@ -4158,12 +4945,51 @@ impl App {
             for (index, entry) in shown.iter().enumerate() {
                 let x = left + (index % 2) as i32 * col_w;
                 let row = y + (index / 2) as i32 * self.s(18);
-                let size = entry.bytes.map(format_bytes).unwrap_or_else(|| "unknown".to_string());
-                text(hdc, self.fonts.body_bold, INK, RECT { left: x, top: row, right: x + self.s(150), bottom: row + self.s(18) }, &hive_label(entry), DT_SINGLELINE | DT_END_ELLIPSIS);
-                text(hdc, self.fonts.body, INK, RECT { left: x + self.s(150), top: row, right: x + col_w - self.s(8), bottom: row + self.s(18) }, &size, DT_SINGLELINE | DT_END_ELLIPSIS);
+                let size = entry
+                    .bytes
+                    .map(format_bytes)
+                    .unwrap_or_else(|| "unknown".to_string());
+                text(
+                    hdc,
+                    self.fonts.body_bold,
+                    INK,
+                    RECT {
+                        left: x,
+                        top: row,
+                        right: x + self.s(150),
+                        bottom: row + self.s(18),
+                    },
+                    &hive_label(entry),
+                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
+                text(
+                    hdc,
+                    self.fonts.body,
+                    INK,
+                    RECT {
+                        left: x + self.s(150),
+                        top: row,
+                        right: x + col_w - self.s(8),
+                        bottom: row + self.s(18),
+                    },
+                    &size,
+                    DT_SINGLELINE | DT_END_ELLIPSIS,
+                );
             }
             y += ((shown.len() + 1) / 2) as i32 * self.s(18);
-            text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(22) }, "Total", DT_SINGLELINE);
+            text(
+                hdc,
+                self.fonts.body_bold,
+                INK,
+                RECT {
+                    left,
+                    top: y,
+                    right: left + label_w,
+                    bottom: y + self.s(22),
+                },
+                "Total",
+                DT_SINGLELINE,
+            );
             let total = if hives.entries.len() > shown.len() {
                 format!(
                     "{} in {} hives ({} shown; see hive-mend hives)",
@@ -4172,16 +4998,37 @@ impl App {
                     shown.len()
                 )
             } else {
-                format!("{} in {} hives", format_bytes(hives.total_bytes()), hives.entries.len())
+                format!(
+                    "{} in {} hives",
+                    format_bytes(hives.total_bytes()),
+                    hives.entries.len()
+                )
             };
-            text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(22) }, &total, DT_SINGLELINE | DT_END_ELLIPSIS);
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left: left + label_w,
+                    top: y,
+                    right,
+                    bottom: y + self.s(22),
+                },
+                &total,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
             y += self.s(22);
         }
         text(
             hdc,
             self.fonts.small,
             MUTED,
-            RECT { left, top: y, right, bottom: y + self.s(18) },
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(18),
+            },
             "Sizes only. Windows manages hive space itself; compacting needs a reboot and is not offered.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
@@ -4189,21 +5036,88 @@ impl App {
         y += self.s(6);
         let label = "Refresh readings";
         let size = measure(hdc, self.fonts.body, label);
-        let link = RECT { left, top: y, right: left + size.0, bottom: y + size.1 };
+        let link = RECT {
+            left,
+            top: y,
+            right: left + size.0,
+            bottom: y + size.1,
+        };
         text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
         if lit(hover, link) {
-            fill(hdc, RECT { left: link.left, top: link.bottom - 1, right: link.right, bottom: link.bottom }, LINK);
+            fill(
+                hdc,
+                RECT {
+                    left: link.left,
+                    top: link.bottom - 1,
+                    right: link.right,
+                    bottom: link.bottom,
+                },
+                LINK,
+            );
         }
         self.spot(link, Action::Refresh);
     }
 
     /// Label, value line, and usage bar. Returns the y below the meter.
-    unsafe fn meter(&mut self, hdc: HDC, left: i32, right: i32, label_w: i32, y: i32, label: &str, value: &str, used: u64) -> i32 {
-        text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(24) }, label, DT_SINGLELINE);
-        text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(24) }, value, DT_SINGLELINE | DT_END_ELLIPSIS);
-        let bar = RECT { left: left + label_w, top: y + self.s(28), right: (left + label_w + self.s(260)).min(right), bottom: y + self.s(40) };
-        let track = if bar.right - bar.left >= self.s(60) { bar } else { RECT { right: bar.left + self.s(60), ..bar } };
-        round_box(hdc, track, self.s(6), rgb(238, 242, 247), rgb(186, 196, 210), 1);
+    unsafe fn meter(
+        &mut self,
+        hdc: HDC,
+        left: i32,
+        right: i32,
+        label_w: i32,
+        y: i32,
+        label: &str,
+        value: &str,
+        used: u64,
+    ) -> i32 {
+        text(
+            hdc,
+            self.fonts.body_bold,
+            INK,
+            RECT {
+                left,
+                top: y,
+                right: left + label_w,
+                bottom: y + self.s(24),
+            },
+            label,
+            DT_SINGLELINE,
+        );
+        text(
+            hdc,
+            self.fonts.body,
+            INK,
+            RECT {
+                left: left + label_w,
+                top: y,
+                right,
+                bottom: y + self.s(24),
+            },
+            value,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        let bar = RECT {
+            left: left + label_w,
+            top: y + self.s(28),
+            right: (left + label_w + self.s(260)).min(right),
+            bottom: y + self.s(40),
+        };
+        let track = if bar.right - bar.left >= self.s(60) {
+            bar
+        } else {
+            RECT {
+                right: bar.left + self.s(60),
+                ..bar
+            }
+        };
+        round_box(
+            hdc,
+            track,
+            self.s(6),
+            rgb(238, 242, 247),
+            rgb(186, 196, 210),
+            1,
+        );
         let color = if used >= 90 {
             rgb(200, 60, 60)
         } else if used >= 70 {
@@ -4215,7 +5129,12 @@ impl App {
         if inner > 0 {
             fill(
                 hdc,
-                RECT { left: track.left + self.s(2), top: track.top + self.s(2), right: track.left + self.s(2) + inner, bottom: track.bottom - self.s(2) },
+                RECT {
+                    left: track.left + self.s(2),
+                    top: track.top + self.s(2),
+                    right: track.left + self.s(2) + inner,
+                    bottom: track.bottom - self.s(2),
+                },
                 color,
             );
         }
@@ -4224,7 +5143,11 @@ impl App {
 
     unsafe fn draw_tools(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Windows Tools", None);
-        self.subtitle(hdc, rect, "Screens that ship with Windows. Hive Mend only opens them.");
+        self.subtitle(
+            hdc,
+            rect,
+            "Screens that ship with Windows. Hive Mend only opens them.",
+        );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
         let gap = self.s(12);
@@ -4237,26 +5160,51 @@ impl App {
             let row = (index % rows) as i32;
             let x = left + col * (col_w + gap);
             let y = self.s(BODY_Y) + row * step;
-            let tile = RECT { left: x, top: y, right: x + col_w, bottom: y + row_h };
+            let tile = RECT {
+                left: x,
+                top: y,
+                right: x + col_w,
+                bottom: y + row_h,
+            };
             let lit = lit(hover, tile);
             round_box(
                 hdc,
                 tile,
                 self.s(12),
-                if lit { rgb(236, 244, 253) } else { rgb(248, 250, 252) },
-                if lit { rgb(60, 130, 210) } else { rgb(186, 196, 210) },
+                if lit {
+                    rgb(236, 244, 253)
+                } else {
+                    rgb(248, 250, 252)
+                },
+                if lit {
+                    rgb(60, 130, 210)
+                } else {
+                    rgb(186, 196, 210)
+                },
                 if lit { 2 } else { 1 },
             );
             let icon_size = self.s(40);
             if let Some(bitmap) = self.tool_icons.get(index).copied().filter(|b| !b.is_null()) {
-                blit(hdc, bitmap, tile.left + self.s(8), tile.top + (row_h - icon_size) / 2, icon_size, icon_size);
+                blit(
+                    hdc,
+                    bitmap,
+                    tile.left + self.s(8),
+                    tile.top + (row_h - icon_size) / 2,
+                    icon_size,
+                    icon_size,
+                );
             }
             let text_left = tile.left + self.s(8) + icon_size + self.s(8);
             text(
                 hdc,
                 self.fonts.body_bold,
                 BLUE_INK,
-                RECT { left: text_left, top: tile.top + self.s(4), right: tile.right - self.s(8), bottom: tile.top + self.s(26) },
+                RECT {
+                    left: text_left,
+                    top: tile.top + self.s(4),
+                    right: tile.right - self.s(8),
+                    bottom: tile.top + self.s(26),
+                },
                 tool.name,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -4264,7 +5212,12 @@ impl App {
                 hdc,
                 self.fonts.small,
                 MUTED,
-                RECT { left: text_left, top: tile.top + self.s(26), right: tile.right - self.s(8), bottom: tile.bottom - self.s(2) },
+                RECT {
+                    left: text_left,
+                    top: tile.top + self.s(26),
+                    right: tile.right - self.s(8),
+                    bottom: tile.bottom - self.s(2),
+                },
                 tool.description,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
@@ -4274,17 +5227,44 @@ impl App {
 
     unsafe fn draw_about(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "About", None);
-        self.subtitle(hdc, rect, &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")));
+        self.subtitle(
+            hdc,
+            rect,
+            &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")),
+        );
         let left = self.s(CONTENT_X);
         let icon_w = self.s(70);
         let right = (rect.right - self.s(24) - icon_w - self.s(24)).max(left + self.s(200));
         if let Some(bitmap) = self.icons.get(4).copied().filter(|b| !b.is_null()) {
-            blit(hdc, bitmap, rect.right - self.s(24) - icon_w, self.s(TITLE_Y), icon_w, self.s(64));
+            blit(
+                hdc,
+                bitmap,
+                rect.right - self.s(24) - icon_w,
+                self.s(TITLE_Y),
+                icon_w,
+                self.s(64),
+            );
         }
         let gap = self.s(10);
         let mut y = self.s(BODY_Y);
-        y = paragraph(hdc, self.fonts.body, INK, left, right, y, "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.") + gap * 2;
-        y = paragraph(hdc, self.fonts.heading, INK, left, right, y, "How it keeps your PC safe") + gap / 2;
+        y = paragraph(
+            hdc,
+            self.fonts.body,
+            INK,
+            left,
+            right,
+            y,
+            "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
+        ) + gap * 2;
+        y = paragraph(
+            hdc,
+            self.fonts.heading,
+            INK,
+            left,
+            right,
+            y,
+            "How it keeps your PC safe",
+        ) + gap / 2;
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
@@ -4293,21 +5273,61 @@ impl App {
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",
         ] {
-            paragraph(hdc, self.fonts.body, BLUE_INK, left, left + self.s(16), y, "\u{2022}");
+            paragraph(
+                hdc,
+                self.fonts.body,
+                BLUE_INK,
+                left,
+                left + self.s(16),
+                y,
+                "\u{2022}",
+            );
             y = paragraph(hdc, self.fonts.body, INK, left + self.s(16), right, y, line) + gap / 2;
         }
         y += gap * 2;
-        y = paragraph(hdc, self.fonts.heading, INK, left, right, y, "Where things are kept") + gap / 2;
+        y = paragraph(
+            hdc,
+            self.fonts.heading,
+            INK,
+            left,
+            right,
+            y,
+            "Where things are kept",
+        ) + gap / 2;
         for (label, value) in [
             ("Backups", backups_dir().display().to_string()),
             ("Settings and ignore list", hive_mend::DATA_DIR.to_string()),
             ("Images", image_root().display().to_string()),
         ] {
-            paragraph(hdc, self.fonts.body_bold, INK, left, left + self.s(190), y, label);
-            y = paragraph(hdc, self.fonts.body, INK, left + self.s(190), right, y, &value) + gap / 2;
+            paragraph(
+                hdc,
+                self.fonts.body_bold,
+                INK,
+                left,
+                left + self.s(190),
+                y,
+                label,
+            );
+            y = paragraph(
+                hdc,
+                self.fonts.body,
+                INK,
+                left + self.s(190),
+                right,
+                y,
+                &value,
+            ) + gap / 2;
         }
         y += gap * 2;
-        paragraph(hdc, self.fonts.body, MUTED, left, right, y, "From a terminal, run hive-mend --help for the scan, repair, restore, and shred commands.");
+        paragraph(
+            hdc,
+            self.fonts.body,
+            MUTED,
+            left,
+            right,
+            y,
+            "From a terminal, run hive-mend --help for the scan, repair, restore, and shred commands.",
+        );
     }
 }
 
@@ -4409,7 +5429,11 @@ fn compact_path(path: &str, tail: usize) -> String {
     if parts.len() <= tail + 2 {
         return path.to_string();
     }
-    format!("{}\\\u{2026}\\{}", parts[0], parts[parts.len() - tail..].join("\\"))
+    format!(
+        "{}\\\u{2026}\\{}",
+        parts[0],
+        parts[parts.len() - tail..].join("\\")
+    )
 }
 
 /// Shorten every path inside a problem description.
@@ -4569,7 +5593,22 @@ fn wide(text: &str) -> Vec<u16> {
 
 fn make_fonts(dpi: u32) -> Fonts {
     let font = |size: i32, weight: i32| unsafe {
-        CreateFontW(-scale(size, dpi), 0, 0, 0, weight, 0, 0, 0, 1, 0, 0, 5, 0, wide("Segoe UI").as_ptr())
+        CreateFontW(
+            -scale(size, dpi),
+            0,
+            0,
+            0,
+            weight,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+            5,
+            0,
+            wide("Segoe UI").as_ptr(),
+        )
     };
     Fonts {
         title: font(26, 600),
@@ -4581,7 +5620,13 @@ fn make_fonts(dpi: u32) -> Fonts {
 }
 
 fn delete_fonts(fonts: &Fonts) {
-    for font in [fonts.title, fonts.heading, fonts.body, fonts.body_bold, fonts.small] {
+    for font in [
+        fonts.title,
+        fonts.heading,
+        fonts.body,
+        fonts.body_bold,
+        fonts.small,
+    ] {
         unsafe { DeleteObject(font) };
     }
 }
@@ -4642,7 +5687,12 @@ fn hive_label(entry: &HiveEntry) -> String {
     if !entry.file.is_empty() {
         return file_name(&entry.file);
     }
-    entry.key.rsplit('\\').next().unwrap_or(&entry.key).to_string()
+    entry
+        .key
+        .rsplit('\\')
+        .next()
+        .unwrap_or(&entry.key)
+        .to_string()
 }
 
 fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str, i32)]) -> HWND {
@@ -4651,7 +5701,14 @@ fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str,
             0,
             WC_LISTVIEWW,
             std::ptr::null(),
-            WS_CHILD | WS_BORDER | WS_VSCROLL | WS_TABSTOP | LVS_REPORT | LVS_SHOWSELALWAYS | LVS_NOSORTHEADER | style,
+            WS_CHILD
+                | WS_BORDER
+                | WS_VSCROLL
+                | WS_TABSTOP
+                | LVS_REPORT
+                | LVS_SHOWSELALWAYS
+                | LVS_NOSORTHEADER
+                | style,
             0,
             0,
             10,
@@ -4662,7 +5719,12 @@ fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str,
             std::ptr::null(),
         );
         let extended = LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER | LVS_EX_LABELTIP | ex_style;
-        SendMessageW(list, LVM_SETEXTENDEDLISTVIEWSTYLE, extended as usize, extended as isize);
+        SendMessageW(
+            list,
+            LVM_SETEXTENDEDLISTVIEWSTYLE,
+            extended as usize,
+            extended as isize,
+        );
         SetWindowTheme(list, wide("Explorer").as_ptr(), std::ptr::null());
         for (index, (title, width)) in columns.iter().enumerate() {
             let mut text = wide(title);
@@ -4670,7 +5732,12 @@ fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str,
             column.mask = LVCF_TEXT | LVCF_WIDTH;
             column.cx = *width;
             column.pszText = text.as_mut_ptr();
-            SendMessageW(list, LVM_INSERTCOLUMNW, index, &mut column as *mut _ as isize);
+            SendMessageW(
+                list,
+                LVM_INSERTCOLUMNW,
+                index,
+                &mut column as *mut _ as isize,
+            );
         }
         list
     }
@@ -4743,7 +5810,15 @@ unsafe fn round_box(hdc: HDC, rect: RECT, radius: i32, fill_color: u32, border: 
     let brush = CreateSolidBrush(fill_color);
     let old_pen = SelectObject(hdc, pen);
     let old_brush = SelectObject(hdc, brush);
-    RoundRect(hdc, rect.left, rect.top, rect.right, rect.bottom, radius, radius);
+    RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
     SelectObject(hdc, old_pen);
     SelectObject(hdc, old_brush);
     DeleteObject(pen);
@@ -4752,12 +5827,40 @@ unsafe fn round_box(hdc: HDC, rect: RECT, radius: i32, fill_color: u32, border: 
 
 unsafe fn gradient(hdc: HDC, rect: RECT, start: (u8, u8, u8), end: (u8, u8, u8), vertical: bool) {
     let mut vert = [
-        TRIVERTEX { x: rect.left, y: rect.top, Red: (start.0 as u16) << 8, Green: (start.1 as u16) << 8, Blue: (start.2 as u16) << 8, Alpha: 0 },
-        TRIVERTEX { x: rect.right, y: rect.bottom, Red: (end.0 as u16) << 8, Green: (end.1 as u16) << 8, Blue: (end.2 as u16) << 8, Alpha: 0 },
+        TRIVERTEX {
+            x: rect.left,
+            y: rect.top,
+            Red: (start.0 as u16) << 8,
+            Green: (start.1 as u16) << 8,
+            Blue: (start.2 as u16) << 8,
+            Alpha: 0,
+        },
+        TRIVERTEX {
+            x: rect.right,
+            y: rect.bottom,
+            Red: (end.0 as u16) << 8,
+            Green: (end.1 as u16) << 8,
+            Blue: (end.2 as u16) << 8,
+            Alpha: 0,
+        },
     ];
-    let mut mesh = windows_sys::Win32::Graphics::Gdi::GRADIENT_RECT { UpperLeft: 0, LowerRight: 1 };
-    let mode = if vertical { GRADIENT_FILL_RECT_V } else { GRADIENT_FILL_RECT_H };
-    GradientFill(hdc, vert.as_mut_ptr(), 2, &mut mesh as *mut _ as *mut _, 1, mode);
+    let mut mesh = windows_sys::Win32::Graphics::Gdi::GRADIENT_RECT {
+        UpperLeft: 0,
+        LowerRight: 1,
+    };
+    let mode = if vertical {
+        GRADIENT_FILL_RECT_V
+    } else {
+        GRADIENT_FILL_RECT_H
+    };
+    GradientFill(
+        hdc,
+        vert.as_mut_ptr(),
+        2,
+        &mut mesh as *mut _ as *mut _,
+        1,
+        mode,
+    );
 }
 
 unsafe fn text(hdc: HDC, font: HFONT, color: u32, rect: RECT, value: &str, flags: u32) {
@@ -4771,14 +5874,45 @@ unsafe fn text(hdc: HDC, font: HFONT, color: u32, rect: RECT, value: &str, flags
 }
 
 /// Draw wrapped text at `y` and return the y just below it.
-unsafe fn paragraph(hdc: HDC, font: HFONT, color: u32, left: i32, right: i32, y: i32, value: &str) -> i32 {
+unsafe fn paragraph(
+    hdc: HDC,
+    font: HFONT,
+    color: u32,
+    left: i32,
+    right: i32,
+    y: i32,
+    value: &str,
+) -> i32 {
     let old = SelectObject(hdc, font);
     let wide_value = wide(value);
-    let mut rect = RECT { left, top: y, right, bottom: y };
-    DrawTextW(hdc, wide_value.as_ptr(), -1, &mut rect, DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX);
+    let mut rect = RECT {
+        left,
+        top: y,
+        right,
+        bottom: y,
+    };
+    DrawTextW(
+        hdc,
+        wide_value.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CALCRECT | DT_WORDBREAK | DT_NOPREFIX,
+    );
     SelectObject(hdc, old);
     let height = rect.bottom - rect.top;
-    text(hdc, font, color, RECT { left, top: y, right, bottom: y + height }, value, DT_WORDBREAK);
+    text(
+        hdc,
+        font,
+        color,
+        RECT {
+            left,
+            top: y,
+            right,
+            bottom: y + height,
+        },
+        value,
+        DT_WORDBREAK,
+    );
     y + height
 }
 
@@ -4786,7 +5920,13 @@ unsafe fn measure(hdc: HDC, font: HFONT, value: &str) -> (i32, i32) {
     let old = SelectObject(hdc, font);
     let mut rect = RECT::default();
     let value = wide(value);
-    DrawTextW(hdc, value.as_ptr(), -1, &mut rect, DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX);
+    DrawTextW(
+        hdc,
+        value.as_ptr(),
+        -1,
+        &mut rect,
+        DT_CALCRECT | DT_SINGLELINE | DT_NOPREFIX,
+    );
     SelectObject(hdc, old);
     (rect.right - rect.left, rect.bottom - rect.top)
 }
@@ -4857,7 +5997,13 @@ fn open_in_regedit(hwnd: HWND, key: &str) {
 
 fn exe_path() -> PathBuf {
     let mut buffer = vec![0u16; 32_768];
-    let len = unsafe { GetModuleFileNameW(std::ptr::null_mut(), buffer.as_mut_ptr(), buffer.len() as u32) };
+    let len = unsafe {
+        GetModuleFileNameW(
+            std::ptr::null_mut(),
+            buffer.as_mut_ptr(),
+            buffer.len() as u32,
+        )
+    };
     buffer.truncate(len as usize);
     PathBuf::from(String::from_utf16_lossy(&buffer))
 }

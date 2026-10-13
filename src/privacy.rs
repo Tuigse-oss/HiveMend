@@ -95,9 +95,14 @@ pub enum DirSpec {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PrivacyTarget {
     /// Delete a whole registry tree.
-    RegTree { key: String },
+    RegTree {
+        key: String,
+    },
     /// Delete matched values on one key. The key itself stays.
-    RegValues { key: String, values: ValueMatch },
+    RegValues {
+        key: String,
+        values: ValueMatch,
+    },
     /// Files under a directory. Only plain files go; symlinks never do.
     DirFiles {
         dir: DirSpec,
@@ -113,7 +118,9 @@ pub enum PrivacyTarget {
     },
     Clipboard,
     RecycleBin,
-    FreeSpace { drive: String },
+    FreeSpace {
+        drive: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -166,7 +173,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
             PrivacyGroup::Windows,
             "Run box entries and open/save dialog history.",
             vec![
-                PrivacyTarget::RegTree { key: format!(r"{explorer}\RunMRU") },
+                PrivacyTarget::RegTree {
+                    key: format!(r"{explorer}\RunMRU"),
+                },
                 PrivacyTarget::RegTree {
                     key: format!(r"{explorer}\ComDlg32\LastVisitedPidlMRU"),
                 },
@@ -199,7 +208,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
             "Recent documents",
             PrivacyGroup::Windows,
             "Recent documents history.",
-            vec![PrivacyTarget::RegTree { key: format!(r"{explorer}\RecentDocs") }],
+            vec![PrivacyTarget::RegTree {
+                key: format!(r"{explorer}\RecentDocs"),
+            }],
         ),
         item(
             "find-history",
@@ -207,8 +218,12 @@ fn builtin_items() -> Vec<PrivacyItem> {
             PrivacyGroup::Windows,
             "Legacy find-computer and search-assistant entries.",
             vec![
-                PrivacyTarget::RegTree { key: format!(r"{explorer}\Doc Find Spec MRU") },
-                PrivacyTarget::RegTree { key: format!(r"{explorer}\FindComputerMRU") },
+                PrivacyTarget::RegTree {
+                    key: format!(r"{explorer}\Doc Find Spec MRU"),
+                },
+                PrivacyTarget::RegTree {
+                    key: format!(r"{explorer}\FindComputerMRU"),
+                },
                 PrivacyTarget::RegTree {
                     key: r"HKEY_CURRENT_USER\Software\Microsoft\Search Assistant\ACMru".into(),
                 },
@@ -221,13 +236,19 @@ fn builtin_items() -> Vec<PrivacyItem> {
             "Files older than 48 hours in your Temp folders.",
             vec![
                 PrivacyTarget::DirFiles {
-                    dir: DirSpec::Env { var: "TEMP".into(), sub: String::new() },
+                    dir: DirSpec::Env {
+                        var: "TEMP".into(),
+                        sub: String::new(),
+                    },
                     mask: "*.*".into(),
                     recursive: true,
                     min_age: Some(Duration::from_secs(48 * 3600)),
                 },
                 PrivacyTarget::DirFiles {
-                    dir: DirSpec::Env { var: "TMP".into(), sub: String::new() },
+                    dir: DirSpec::Env {
+                        var: "TMP".into(),
+                        sub: String::new(),
+                    },
                     mask: "*.*".into(),
                     recursive: true,
                     min_age: Some(Duration::from_secs(48 * 3600)),
@@ -249,13 +270,17 @@ fn builtin_items() -> Vec<PrivacyItem> {
             vec![PrivacyTarget::RecycleBin],
         ),
     ];
-    for (vendor, id, name) in
-        [("Google\\Chrome", "chrome-cache", "Chrome cache"), ("Microsoft\\Edge", "edge-cache", "Edge cache")]
-    {
+    for (vendor, id, name) in [
+        ("Google\\Chrome", "chrome-cache", "Chrome cache"),
+        ("Microsoft\\Edge", "edge-cache", "Edge cache"),
+    ] {
         let mut targets = Vec::new();
         for sub in ["Cache", "Code Cache", "GPUCache", "Service Worker"] {
             targets.push(PrivacyTarget::DirFiles {
-                dir: DirSpec::Chromium { vendor: vendor.into(), sub: sub.into() },
+                dir: DirSpec::Chromium {
+                    vendor: vendor.into(),
+                    sub: sub.into(),
+                },
                 mask: "*.*".into(),
                 recursive: true,
                 min_age: None,
@@ -275,7 +300,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
         PrivacyGroup::Browsers,
         "Cached web files. Locked files are skipped.",
         vec![PrivacyTarget::DirFiles {
-            dir: DirSpec::Firefox { sub: "cache2".into() },
+            dir: DirSpec::Firefox {
+                sub: "cache2".into(),
+            },
             mask: "*.*".into(),
             recursive: true,
             min_age: None,
@@ -285,8 +312,18 @@ fn builtin_items() -> Vec<PrivacyItem> {
     // bookmarks: Login Data, Web Data, and places.sqlite hold passwords
     // and bookmarks, which no confirm can give back.
     for (vendor, id, name, exe) in [
-        ("Google\\Chrome", "chrome-data", "Chrome history + cookies (closed)", "chrome.exe"),
-        ("Microsoft\\Edge", "edge-data", "Edge history + cookies (closed)", "msedge.exe"),
+        (
+            "Google\\Chrome",
+            "chrome-data",
+            "Chrome history + cookies (closed)",
+            "chrome.exe",
+        ),
+        (
+            "Microsoft\\Edge",
+            "edge-data",
+            "Edge history + cookies (closed)",
+            "msedge.exe",
+        ),
     ] {
         let mut closed = item(
             id,
@@ -294,8 +331,14 @@ fn builtin_items() -> Vec<PrivacyItem> {
             PrivacyGroup::Browsers,
             "Browsing history and cookies, only while the browser is closed.",
             vec![PrivacyTarget::ExactFiles {
-                dir: DirSpec::Chromium { vendor: vendor.into(), sub: String::new() },
-                names: ["History", "Cookies"].into_iter().map(str::to_string).collect(),
+                dir: DirSpec::Chromium {
+                    vendor: vendor.into(),
+                    sub: String::new(),
+                },
+                names: ["History", "Cookies"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
                 sidecars: true,
             }],
         );
@@ -324,7 +367,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
         PrivacyGroup::Plugins,
         "Archive names and dialog history.",
         vec![
-            PrivacyTarget::RegTree { key: r"HKEY_CURRENT_USER\Software\WinRAR\ArcHistory".into() },
+            PrivacyTarget::RegTree {
+                key: r"HKEY_CURRENT_USER\Software\WinRAR\ArcHistory".into(),
+            },
             PrivacyTarget::RegTree {
                 key: r"HKEY_CURRENT_USER\Software\WinRAR\DialogEditHistory\ArcName".into(),
             },
@@ -341,7 +386,10 @@ fn builtin_items() -> Vec<PrivacyItem> {
         vec![PrivacyTarget::RegValues {
             key: r"HKEY_CURRENT_USER\Software\7-ZIP\FM".into(),
             values: ValueMatch::Exact(
-                ["CopyHistory", "FolderHistory", "PanelPath"].into_iter().map(str::to_string).collect(),
+                ["CopyHistory", "FolderHistory", "PanelPath"]
+                    .into_iter()
+                    .map(str::to_string)
+                    .collect(),
             ),
         }],
     );
@@ -361,7 +409,9 @@ pub fn build_items(sys: &dyn SystemTargets) -> Vec<PrivacyItem> {
             &format!("Free-space wipe ({short})"),
             PrivacyGroup::Maintenance,
             "Overwrites empty space with cipher. Very slow.",
-            vec![PrivacyTarget::FreeSpace { drive: drive.clone() }],
+            vec![PrivacyTarget::FreeSpace {
+                drive: drive.clone(),
+            }],
         );
         wipe.confirm_note = Some(
             "This takes tens of minutes and runs on its own after it starts. On SSDs the benefit is partial."
@@ -415,14 +465,20 @@ pub fn uninstall_present(reg: &dyn Registry, needle: &str) -> bool {
         r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
     ] {
-        let Ok(entries) = reg.subkeys(root) else { continue };
+        let Ok(entries) = reg.subkeys(root) else {
+            continue;
+        };
         for entry in entries {
             let key = format!(r"{root}\{entry}");
-            let Ok(values) = reg.values(&key) else { continue };
+            let Ok(values) = reg.values(&key) else {
+                continue;
+            };
             for value in values {
                 if value.name.eq_ignore_ascii_case("DisplayName")
                     && let Some(text) = value.data.as_text()
-                    && text.to_ascii_lowercase().contains(&needle.to_ascii_lowercase())
+                    && text
+                        .to_ascii_lowercase()
+                        .contains(&needle.to_ascii_lowercase())
                 {
                     return true;
                 }
@@ -439,7 +495,10 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
     let mut notes = Vec::new();
     let mut push = |dir: String| {
         let dir = normalize_fs(&dir);
-        if !dirs.iter().any(|have: &String| have.eq_ignore_ascii_case(&dir)) {
+        if !dirs
+            .iter()
+            .any(|have: &String| have.eq_ignore_ascii_case(&dir))
+        {
             dirs.push(dir);
         }
     };
@@ -449,7 +508,11 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             if root.contains('%') {
                 notes.push(format!("%{var}% is not set"));
             } else {
-                let dir = if sub.is_empty() { root } else { format!("{root}\\{sub}") };
+                let dir = if sub.is_empty() {
+                    root
+                } else {
+                    format!("{root}\\{sub}")
+                };
                 if fs.is_dir(&dir) {
                     push(dir);
                 }
@@ -468,7 +531,11 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             }
             let users = format!("{base}\\{vendor}\\User Data");
             for profile in child_dirs(fs, &users) {
-                let dir = if sub.is_empty() { profile } else { format!("{profile}\\{sub}") };
+                let dir = if sub.is_empty() {
+                    profile
+                } else {
+                    format!("{profile}\\{sub}")
+                };
                 if fs.is_dir(&dir) {
                     push(dir);
                 }
@@ -482,7 +549,11 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             }
             let home = format!("{base}\\Mozilla\\Firefox");
             for profile in firefox_profiles(fs, &home) {
-                let dir = if sub.is_empty() { profile } else { format!("{profile}\\{sub}") };
+                let dir = if sub.is_empty() {
+                    profile
+                } else {
+                    format!("{profile}\\{sub}")
+                };
                 if fs.is_dir(&dir) {
                     push(dir);
                 }
@@ -505,7 +576,10 @@ fn child_dirs(fs: &dyn FileView, dir: &str) -> Vec<String> {
 fn firefox_profiles(fs: &dyn FileView, home: &str) -> Vec<String> {
     let mut profiles = Vec::new();
     let mut push = |dir: String| {
-        if !profiles.iter().any(|have: &String| have.eq_ignore_ascii_case(&dir)) {
+        if !profiles
+            .iter()
+            .any(|have: &String| have.eq_ignore_ascii_case(&dir))
+        {
             profiles.push(dir);
         }
     };
@@ -552,7 +626,10 @@ fn looks_absolute(path: &str) -> bool {
 /// a privacy target, no matter who asked).
 pub fn privacy_reg_allowed(key: &str) -> bool {
     let canonical = canonical_path(key);
-    if !canonical.to_ascii_lowercase().starts_with("hkey_current_user\\") {
+    if !canonical
+        .to_ascii_lowercase()
+        .starts_with("hkey_current_user\\")
+    {
         return false;
     }
     if is_protected_key(&canonical) {
@@ -621,7 +698,10 @@ pub struct PreviewItem {
 
 impl PreviewItem {
     fn blank(id: &str) -> Self {
-        Self { id: id.to_string(), ..Self::default() }
+        Self {
+            id: id.to_string(),
+            ..Self::default()
+        }
     }
 
     fn note(&mut self, note: String) {
@@ -710,20 +790,33 @@ fn preview_target(
             }
             match reg.values(key) {
                 Ok(present) => {
-                    row.values += present.iter().filter(|value| values.matches(&value.name)).count();
+                    row.values += present
+                        .iter()
+                        .filter(|value| values.matches(&value.name))
+                        .count();
                 }
                 Err(RegError::NotFound) => {}
                 Err(err) => row.note(format!("cannot read {key}: {err}")),
             }
         }
-        PrivacyTarget::DirFiles { dir, mask, recursive, min_age } => {
+        PrivacyTarget::DirFiles {
+            dir,
+            mask,
+            recursive,
+            min_age,
+        } => {
             let (dirs, notes) = resolve_dirs(fs, dir);
             for note in notes {
                 row.note(note);
             }
             for dir in dirs {
-                let gate =
-                    format!("{}\0{}\0{}\0{:?}", dir.to_ascii_lowercase(), mask.to_ascii_lowercase(), recursive, min_age);
+                let gate = format!(
+                    "{}\0{}\0{}\0{:?}",
+                    dir.to_ascii_lowercase(),
+                    mask.to_ascii_lowercase(),
+                    recursive,
+                    min_age
+                );
                 if !walked.insert(gate) {
                     continue;
                 }
@@ -735,7 +828,11 @@ fn preview_target(
                 }
             }
         }
-        PrivacyTarget::ExactFiles { dir, names, sidecars } => {
+        PrivacyTarget::ExactFiles {
+            dir,
+            names,
+            sidecars,
+        } => {
             let (dirs, notes) = resolve_dirs(fs, dir);
             for note in notes {
                 row.note(note);
@@ -882,7 +979,10 @@ pub struct ItemOutcome {
 
 impl ItemOutcome {
     fn blank(id: &str) -> Self {
-        Self { id: id.to_string(), ..Self::default() }
+        Self {
+            id: id.to_string(),
+            ..Self::default()
+        }
     }
 
     fn note(&mut self, note: String) {
@@ -928,7 +1028,10 @@ pub fn clean_with_progress(
 ) -> Result<CleanOutcome, Error> {
     enum Planned {
         Skip(ItemOutcome),
-        Run { repairs: Vec<PlannedRepair>, pre: Vec<String> },
+        Run {
+            repairs: Vec<PlannedRepair>,
+            pre: Vec<String>,
+        },
     }
     let mut planned = Vec::with_capacity(items.len());
     for item in items {
@@ -956,16 +1059,26 @@ pub fn clean_with_progress(
         planned.push(Planned::Run { repairs, pre });
     }
 
-    let all: Vec<Repair> =
-        planned.iter().flat_map(|step| match step {
-            Planned::Run { repairs, .. } => repairs.iter().map(|(repair, _)| repair.clone()).collect(),
+    let all: Vec<Repair> = planned
+        .iter()
+        .flat_map(|step| match step {
+            Planned::Run { repairs, .. } => {
+                repairs.iter().map(|(repair, _)| repair.clone()).collect()
+            }
             Planned::Skip(_) => Vec::new(),
-        }).collect();
+        })
+        .collect();
     let plan = export_repairs(reg, &all, backup_file);
     write_backup(backup_file, &plan.body)?;
 
-    let total = planned.iter().filter(|step| matches!(step, Planned::Run { .. })).count();
-    let mut outcome = CleanOutcome { backup_file: backup_file.to_path_buf(), ..CleanOutcome::default() };
+    let total = planned
+        .iter()
+        .filter(|step| matches!(step, Planned::Run { .. }))
+        .count();
+    let mut outcome = CleanOutcome {
+        backup_file: backup_file.to_path_buf(),
+        ..CleanOutcome::default()
+    };
     let mut done = 0usize;
     for (item, step) in items.iter().zip(planned) {
         match step {
@@ -975,7 +1088,16 @@ pub fn clean_with_progress(
                     outcome.canceled = true;
                     return Ok(outcome);
                 }
-                outcome.items.push(execute_item(reg, fs, sys, item, &repairs, pre, &plan, &mut outcome.errors));
+                outcome.items.push(execute_item(
+                    reg,
+                    fs,
+                    sys,
+                    item,
+                    &repairs,
+                    pre,
+                    &plan,
+                    &mut outcome.errors,
+                ));
                 done += 1;
             }
         }
@@ -1015,7 +1137,10 @@ fn collect_repairs(
                     Ok(present) => {
                         for value in present.iter().filter(|value| values.matches(&value.name)) {
                             repairs.push((
-                                Repair::DeleteValue { key: key.clone(), name: value.name.clone() },
+                                Repair::DeleteValue {
+                                    key: key.clone(),
+                                    name: value.name.clone(),
+                                },
                                 1,
                             ));
                         }
@@ -1057,7 +1182,12 @@ fn execute_item(
     for target in &item.targets {
         match target {
             PrivacyTarget::RegTree { .. } | PrivacyTarget::RegValues { .. } => {}
-            PrivacyTarget::DirFiles { dir, mask, recursive, min_age } => {
+            PrivacyTarget::DirFiles {
+                dir,
+                mask,
+                recursive,
+                min_age,
+            } => {
                 let (dirs, notes) = resolve_dirs(fs, dir);
                 for note in notes {
                     done.note(note);
@@ -1075,7 +1205,16 @@ fn execute_item(
                     }
                     let mut counter = PreviewItem::blank(&item.id);
                     let mut hits = Vec::new();
-                    walk_files(fs, &dir, mask, *recursive, *min_age, 0, &mut hits, &mut counter);
+                    walk_files(
+                        fs,
+                        &dir,
+                        mask,
+                        *recursive,
+                        *min_age,
+                        0,
+                        &mut hits,
+                        &mut counter,
+                    );
                     for note in counter.restricted {
                         done.note(note);
                     }
@@ -1085,7 +1224,11 @@ fn execute_item(
                     }
                 }
             }
-            PrivacyTarget::ExactFiles { dir, names, sidecars } => {
+            PrivacyTarget::ExactFiles {
+                dir,
+                names,
+                sidecars,
+            } => {
                 let (dirs, notes) = resolve_dirs(fs, dir);
                 for note in notes {
                     done.note(note);
@@ -1255,7 +1398,9 @@ pub fn parse_custom(text: &str, fs: &dyn FileView) -> PrivacyItem {
         }
         let lineno = index + 1;
         let Some((kind, rest)) = line.split_once('=') else {
-            custom.warnings.push(format!("line {lineno}: want file=, files=, files-rec=, or value="));
+            custom.warnings.push(format!(
+                "line {lineno}: want file=, files=, files-rec=, or value="
+            ));
             continue;
         };
         match kind.trim().to_ascii_lowercase().as_str() {
@@ -1274,7 +1419,9 @@ pub fn parse_custom(text: &str, fs: &dyn FileView) -> PrivacyItem {
                 Ok(target) => custom.targets.push(target),
                 Err(reason) => custom.warnings.push(format!("line {lineno}: {reason}")),
             },
-            _ => custom.warnings.push(format!("line {lineno}: want file=, files=, files-rec=, or value=")),
+            _ => custom.warnings.push(format!(
+                "line {lineno}: want file=, files=, files-rec=, or value="
+            )),
         }
     }
     custom
@@ -1357,7 +1504,9 @@ fn custom_dir(raw: &str, recursive: bool, fs: &dyn FileView) -> Result<PrivacyTa
         return Err(format!("{raw} is not an absolute path"));
     }
     if !under_custom_root(&dir, &custom_roots(fs)) {
-        return Err("custom folders must live under a Temp folder or a browser profile".to_string());
+        return Err(
+            "custom folders must live under a Temp folder or a browser profile".to_string(),
+        );
     }
     Ok(PrivacyTarget::DirFiles {
         dir: DirSpec::Fixed(dir),
@@ -1379,7 +1528,10 @@ fn custom_value(raw: &str) -> Result<PrivacyTarget, String> {
     if !privacy_reg_allowed(&key) {
         return Err(format!("{key} is outside the current user's history keys"));
     }
-    Ok(PrivacyTarget::RegValues { key, values: ValueMatch::Exact(vec![name.to_string()]) })
+    Ok(PrivacyTarget::RegValues {
+        key,
+        values: ValueMatch::Exact(vec![name.to_string()]),
+    })
 }
 
 #[cfg(test)]
@@ -1395,12 +1547,16 @@ mod tests {
 
     impl ProcessList for FakeProcs {
         fn running(&self, exe: &str) -> bool {
-            self.running.iter().any(|name| name.eq_ignore_ascii_case(exe))
+            self.running
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case(exe))
         }
     }
 
     fn quiet() -> FakeProcs {
-        FakeProcs { running: Vec::new() }
+        FakeProcs {
+            running: Vec::new(),
+        }
     }
 
     #[derive(Default)]
@@ -1467,7 +1623,11 @@ mod tests {
         );
         reg.set_sz(&format!(r"{EXPLORER}\RecentDocs\.txt"), "0", "note");
         // Decoys the cleaner must never touch.
-        reg.set_sz(r"HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon", "Shell", "explorer");
+        reg.set_sz(
+            r"HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Winlogon",
+            "Shell",
+            "explorer",
+        );
         reg
     }
 
@@ -1482,10 +1642,26 @@ mod tests {
         fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
         let old = Some(Duration::from_secs(49 * 3600));
         let fresh = Some(Duration::from_secs(3600));
-        fs.add_file_bytes(r"C:\Users\test\AppData\Local\Temp\old.tmp", vec![1; 10], old);
-        fs.add_file_bytes(r"C:\Users\test\AppData\Local\Temp\sub\older.tmp", vec![1; 20], old);
-        fs.add_file_bytes(r"C:\Users\test\AppData\Local\Temp\fresh.tmp", vec![1; 30], fresh);
-        fs.add_file_bytes(r"C:\Users\test\AppData\Local\Temp\mystery.tmp", vec![1; 5], None);
+        fs.add_file_bytes(
+            r"C:\Users\test\AppData\Local\Temp\old.tmp",
+            vec![1; 10],
+            old,
+        );
+        fs.add_file_bytes(
+            r"C:\Users\test\AppData\Local\Temp\sub\older.tmp",
+            vec![1; 20],
+            old,
+        );
+        fs.add_file_bytes(
+            r"C:\Users\test\AppData\Local\Temp\fresh.tmp",
+            vec![1; 30],
+            fresh,
+        );
+        fs.add_file_bytes(
+            r"C:\Users\test\AppData\Local\Temp\mystery.tmp",
+            vec![1; 5],
+            None,
+        );
         fs.add_file_bytes(
             r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001",
             vec![1; 100],
@@ -1517,21 +1693,34 @@ mod tests {
     }
 
     fn builtin(id: &str) -> PrivacyItem {
-        builtin_items().into_iter().find(|item| item.id == id).expect("built-in id")
+        builtin_items()
+            .into_iter()
+            .find(|item| item.id == id)
+            .expect("built-in id")
     }
 
     #[test]
     fn preview_counts_without_mutating() {
         let reg = seed_reg();
         let fs = seed_fs();
-        let sys = FakeSys { clipboard: 1, bin: (2, 70), ..FakeSys::default() };
+        let sys = FakeSys {
+            clipboard: 1,
+            bin: (2, 70),
+            ..FakeSys::default()
+        };
         let before_reg = format!("{:?}", reg);
         let before_fs = format!("{:?}", fs);
-        let items =
-            ["run-dialog", "typed-paths", "recent-docs", "user-temp", "clipboard", "recycle-bin"]
-                .into_iter()
-                .map(builtin)
-                .collect::<Vec<_>>();
+        let items = [
+            "run-dialog",
+            "typed-paths",
+            "recent-docs",
+            "user-temp",
+            "clipboard",
+            "recycle-bin",
+        ]
+        .into_iter()
+        .map(builtin)
+        .collect::<Vec<_>>();
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert_eq!(format!("{:?}", reg), before_reg);
         assert_eq!(format!("{:?}", fs), before_fs);
@@ -1544,7 +1733,12 @@ mod tests {
         // unknown-age files are skipped, the system temp file is out of scope.
         assert_eq!(row("user-temp").files, 2);
         assert_eq!(row("user-temp").bytes, 30);
-        assert!(row("user-temp").restricted.iter().any(|note| note.contains("age unknown")));
+        assert!(
+            row("user-temp")
+                .restricted
+                .iter()
+                .any(|note| note.contains("age unknown"))
+        );
         assert_eq!(row("clipboard").other, 1);
         assert_eq!(row("recycle-bin").files, 2);
         assert_eq!(row("recycle-bin").bytes, 70);
@@ -1557,9 +1751,15 @@ mod tests {
         let mut sys = FakeSys::default();
         let backup = std::env::temp_dir().join("hive-mend-privacy-test.reg");
         // chrome-data is vetoed by a running browser; user-temp is not ticked.
-        let procs = FakeProcs { running: vec!["chrome.exe".into()] };
-        let items =
-            [builtin("chrome-data"), builtin("chrome-cache"), builtin("run-dialog")].to_vec();
+        let procs = FakeProcs {
+            running: vec!["chrome.exe".into()],
+        };
+        let items = [
+            builtin("chrome-data"),
+            builtin("chrome-cache"),
+            builtin("run-dialog"),
+        ]
+        .to_vec();
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
@@ -1576,9 +1776,7 @@ mod tests {
         assert_eq!(row("chrome-cache").bytes, 100);
         assert_eq!(row("run-dialog").values, 2);
         // Vetoed and unticked tracks are untouched.
-        assert!(fs.exists(
-            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"
-        ));
+        assert!(fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"));
         assert!(fs.exists(r"C:\Users\test\AppData\Local\Temp\old.tmp"));
         assert!(reg.values(&format!(r"{EXPLORER}\RunMRU")).is_err());
         // The backup covers the removed values and restores through reg.exe.
@@ -1637,7 +1835,12 @@ mod tests {
         .unwrap();
         let row = |id: &str| outcome.items.iter().find(|row| row.id == id).unwrap();
         assert_eq!(row("run-dialog").values, 0);
-        assert!(row("run-dialog").restricted.iter().any(|note| note.contains("not backed up")));
+        assert!(
+            row("run-dialog")
+                .restricted
+                .iter()
+                .any(|note| note.contains("not backed up"))
+        );
         assert_eq!(row("typed-paths").values, 1);
         assert!(reg.inner.values(&format!(r"{EXPLORER}\RunMRU")).is_ok());
         let _ = std::fs::remove_file(&backup);
@@ -1661,10 +1864,25 @@ mod tests {
         );
         assert_eq!(custom.targets.len(), 4);
         assert_eq!(custom.warnings.len(), 6);
-        assert!(custom.warnings.iter().any(|note| note.contains("browser profile")));
-        assert!(custom.warnings.iter().any(|note| note.contains("no wildcards")));
+        assert!(
+            custom
+                .warnings
+                .iter()
+                .any(|note| note.contains("browser profile"))
+        );
+        assert!(
+            custom
+                .warnings
+                .iter()
+                .any(|note| note.contains("no wildcards"))
+        );
         assert!(custom.warnings.iter().any(|note| note.contains("Winlogon")));
-        assert!(custom.warnings.iter().any(|note| note.contains("HKEY_LOCAL_MACHINE")));
+        assert!(
+            custom
+                .warnings
+                .iter()
+                .any(|note| note.contains("HKEY_LOCAL_MACHINE"))
+        );
     }
 
     #[test]
@@ -1679,8 +1897,16 @@ mod tests {
         let temp = r"C:\Users\test\AppData\Local\Temp";
         assert!(privacy_file_allowed(&fs, temp, &format!(r"{temp}\a.tmp")));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Windows\Temp\a.tmp"));
-        assert!(!privacy_file_allowed(&fs, temp, r"C:\Program Files\App\a.tmp"));
-        assert!(!privacy_file_allowed(&fs, temp, r"C:\HiveMend\backups\a.reg"));
+        assert!(!privacy_file_allowed(
+            &fs,
+            temp,
+            r"C:\Program Files\App\a.tmp"
+        ));
+        assert!(!privacy_file_allowed(
+            &fs,
+            temp,
+            r"C:\HiveMend\backups\a.reg"
+        ));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Users\test\a.tmp"));
     }
 
@@ -1704,8 +1930,18 @@ mod tests {
         let sys = FakeSys::default();
         let report = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
         assert_eq!(report.items[0].files, 0);
-        assert!(report.items[0].restricted.iter().any(|note| note.contains("%TEMP%")));
-        assert!(report.items[0].restricted.iter().any(|note| note.contains("%TMP%")));
+        assert!(
+            report.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("%TEMP%"))
+        );
+        assert!(
+            report.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("%TMP%"))
+        );
     }
 
     #[test]
@@ -1726,8 +1962,10 @@ mod tests {
         assert_eq!(report.items[0].other, 1);
         assert_eq!(report.items[1].files, 2);
         let backup = std::env::temp_dir().join("hive-mend-privacy-special-test.reg");
-        let freespace =
-            built.into_iter().find(|item| item.id == r"freespace-C:").expect("wipe row");
+        let freespace = built
+            .into_iter()
+            .find(|item| item.id == r"freespace-C:")
+            .expect("wipe row");
         let report = preview(&reg, &fs, &sys, &quiet(), std::slice::from_ref(&freespace));
         assert_eq!(report.items[0].bytes, 1000);
         let outcome = clean_with_progress(
@@ -1786,7 +2024,11 @@ mod tests {
             "DisplayName",
             "WinRAR 7.20 (64-bit)",
         );
-        reg.set_sz(r"HKEY_CURRENT_USER\Software\WinRAR\ArcHistory", "0", "c.rar");
+        reg.set_sz(
+            r"HKEY_CURRENT_USER\Software\WinRAR\ArcHistory",
+            "0",
+            "c.rar",
+        );
         let items = [builtin("plugin-winrar"), builtin("plugin-7zip")].to_vec();
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert!(!report.items[0].gated_out);
@@ -1843,20 +2085,17 @@ mod tests {
         // History plus its -wal sidecar; -shm/-journal were absent.
         assert_eq!(outcome.items[0].files, 2);
         assert_eq!(outcome.items[0].bytes, 58);
-        assert!(!fs.exists(
-            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"
-        ));
+        assert!(!fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"));
         // Saved logins and autofill survive the clean.
-        assert!(fs.exists(
-            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Login Data"
-        ));
-        assert!(fs.exists(
-            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Web Data"
-        ));
-        assert!(fs.exists(
-            r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
-        ));
+        assert!(
+            fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Login Data")
+        );
+        assert!(fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Web Data"));
+        assert!(
+            fs.exists(
+                r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
+            )
+        );
         let _ = std::fs::remove_file(&backup);
     }
 }
-

@@ -9,15 +9,14 @@ use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, CountClipboardFormats, EmptyClipboard, OpenClipboard,
 };
 use windows_sys::Win32::System::Diagnostics::ToolHelp::{
-    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW,
-    TH32CS_SNAPPROCESS,
+    CreateToolhelp32Snapshot, PROCESSENTRY32W, Process32FirstW, Process32NextW, TH32CS_SNAPPROCESS,
 };
 use windows_sys::Win32::System::Threading::{
     CREATE_NO_WINDOW, CreateProcessW, DETACHED_PROCESS, PROCESS_INFORMATION, STARTUPINFOW,
 };
 use windows_sys::Win32::UI::Shell::{
-    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW,
-    SHQUERYRBINFO, SHQueryRecycleBinW,
+    SHERB_NOCONFIRMATION, SHERB_NOPROGRESSUI, SHERB_NOSOUND, SHEmptyRecycleBinW, SHQUERYRBINFO,
+    SHQueryRecycleBinW,
 };
 
 use crate::privacy::{ProcessList, SystemTargets};
@@ -129,14 +128,16 @@ impl SystemTargets for WindowsSystemTargets {
         let mut free = 0u64;
         let mut total = 0u64;
         let mut total_free = 0u64;
-        let ok = unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, &mut total, &mut total_free) };
+        let ok =
+            unsafe { GetDiskFreeSpaceExW(path.as_ptr(), &mut free, &mut total, &mut total_free) };
         if ok == 0 { 0 } else { free }
     }
 
     fn wipe_free_space(&mut self, drive: &str) -> Result<(), String> {
         let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let mut command: Vec<u16> =
-            format!("{system}\\System32\\cipher.exe /w:{drive}\0").encode_utf16().collect();
+        let mut command: Vec<u16> = format!("{system}\\System32\\cipher.exe /w:{drive}\0")
+            .encode_utf16()
+            .collect();
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
         let mut child: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -155,7 +156,9 @@ impl SystemTargets for WindowsSystemTargets {
             )
         };
         if ok == 0 {
-            return Err(format!("could not start cipher ({})", unsafe { GetLastError() }));
+            return Err(format!("could not start cipher ({})", unsafe {
+                GetLastError()
+            }));
         }
         unsafe {
             CloseHandle(child.hProcess);

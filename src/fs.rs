@@ -352,7 +352,10 @@ impl FileView for HostFs {
         if !on_local_fixed_drive(path) {
             return None;
         }
-        std::fs::metadata(path).ok().filter(|meta| meta.is_file()).map(|meta| meta.len())
+        std::fs::metadata(path)
+            .ok()
+            .filter(|meta| meta.is_file())
+            .map(|meta| meta.len())
     }
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
@@ -440,21 +443,28 @@ impl FileView for HostFs {
 
     fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file =
-            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
-        file.seek(SeekFrom::Start(offset)).map_err(|err| err.to_string())?;
+        let mut file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| err.to_string())?;
+        file.seek(SeekFrom::Start(offset))
+            .map_err(|err| err.to_string())?;
         file.write_all(bytes).map_err(|err| err.to_string())
     }
 
     fn sync_file(&mut self, path: &str) -> Result<(), String> {
-        let file =
-            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| err.to_string())?;
         file.sync_all().map_err(|err| err.to_string())
     }
 
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), String> {
-        let file =
-            std::fs::OpenOptions::new().write(true).open(path).map_err(|err| err.to_string())?;
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(path)
+            .map_err(|err| err.to_string())?;
         file.set_len(len).map_err(|err| err.to_string())
     }
 

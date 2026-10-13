@@ -435,7 +435,9 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
                 unreadable.push(key);
             }
             Err(err) => {
-                body.push_str(&format!("\r\n; not backed up, left alone: {key}: {err}\r\n"));
+                body.push_str(&format!(
+                    "\r\n; not backed up, left alone: {key}: {err}\r\n"
+                ));
                 unreadable.push(key);
             }
         }
@@ -524,7 +526,9 @@ pub fn apply_start_changes(
                 if err.denied {
                     outcome.denied += 1;
                 }
-                outcome.errors.push(format!("{}: {}", info.name, err.message));
+                outcome
+                    .errors
+                    .push(format!("{}: {}", info.name, err.message));
             }
         }
         progress(index + 1, changes.len());
@@ -566,13 +570,17 @@ pub fn start_services(
             continue;
         }
         match store.start(&info.name) {
-            Ok(true) => outcome.applied.push(format!("{}: started", info.display_name)),
+            Ok(true) => outcome
+                .applied
+                .push(format!("{}: started", info.display_name)),
             Ok(false) => outcome.already_correct += 1,
             Err(err) => {
                 if err.denied {
                     outcome.denied += 1;
                 }
-                outcome.errors.push(format!("{}: {}", info.name, err.message));
+                outcome
+                    .errors
+                    .push(format!("{}: {}", info.name, err.message));
             }
         }
         progress(index + 1, names.len());
@@ -614,13 +622,17 @@ pub fn stop_services(
             continue;
         }
         match store.stop(&info.name) {
-            Ok(true) => outcome.applied.push(format!("{}: stopped", info.display_name)),
+            Ok(true) => outcome
+                .applied
+                .push(format!("{}: stopped", info.display_name)),
             Ok(false) => outcome.already_correct += 1,
             Err(err) => {
                 if err.denied {
                     outcome.denied += 1;
                 }
-                outcome.errors.push(format!("{}: {}", info.name, err.message));
+                outcome
+                    .errors
+                    .push(format!("{}: {}", info.name, err.message));
             }
         }
         progress(index + 1, names.len());
@@ -678,7 +690,11 @@ mod tests {
             info("Fax", StartType::Automatic, ServiceState::Stopped),
             info("SysMain", StartType::Manual, ServiceState::Running),
             info("RemoteRegistry", StartType::Disabled, ServiceState::Stopped),
-            info("DelayedSvc", StartType::AutomaticDelayed, ServiceState::Running),
+            info(
+                "DelayedSvc",
+                StartType::AutomaticDelayed,
+                ServiceState::Running,
+            ),
             info("BootDrv", StartType::Boot, ServiceState::Running),
         ];
         let profile = TuneupProfile {
@@ -827,7 +843,10 @@ mod tests {
         assert_eq!(outcome.already_correct, 1);
         assert_eq!(outcome.refused.len(), 1);
         assert!(outcome.refused[0].starts_with("RpcSs:"));
-        assert_eq!(outcome.not_backed_up, vec!["Odd".to_string(), "Missing".to_string()]);
+        assert_eq!(
+            outcome.not_backed_up,
+            vec!["Odd".to_string(), "Missing".to_string()]
+        );
         assert!(outcome.errors.is_empty());
         assert_eq!(store.find("Good").unwrap().start, StartType::Manual);
         assert_eq!(store.find("RpcSs").unwrap().start, StartType::Automatic);
@@ -865,7 +884,12 @@ mod tests {
         store.insert(info("Spooler", StartType::Automatic, ServiceState::Stopped));
         let stopped = stop_services(
             &mut store,
-            &["RpcSs".into(), "BootDrv".into(), "Spooler".into(), "Missing".into()],
+            &[
+                "RpcSs".into(),
+                "BootDrv".into(),
+                "Spooler".into(),
+                "Missing".into(),
+            ],
             &mut |_, _| {},
         );
         assert_eq!(stopped.refused.len(), 2);

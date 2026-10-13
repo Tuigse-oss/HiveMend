@@ -195,7 +195,13 @@ impl Finding {
 
     /// Deleting this cannot be undone from a backup.
     pub fn permanent(&self) -> bool {
-        matches!(self.repair, Repair::DeleteFile { keep_copy: false, .. })
+        matches!(
+            self.repair,
+            Repair::DeleteFile {
+                keep_copy: false,
+                ..
+            }
+        )
     }
 
     /// The repair writes to a machine-wide key or shared folder.

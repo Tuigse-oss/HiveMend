@@ -33,7 +33,9 @@ impl HiveInventory {
 /// it backs (`HKEY_LOCAL_MACHINE\SOFTWARE`). Anything outside the machine
 /// and user hives is rejected.
 pub fn hivelist_key(name: &str) -> Option<String> {
-    let rest = name.strip_prefix("\\REGISTRY\\").or_else(|| name.strip_prefix("\\registry\\"))?;
+    let rest = name
+        .strip_prefix("\\REGISTRY\\")
+        .or_else(|| name.strip_prefix("\\registry\\"))?;
     if rest.is_empty() {
         return None;
     }
@@ -80,7 +82,8 @@ pub fn gather_hives() -> HiveInventory {
         let name: Vec<u16> = drive.encode_utf16().chain(std::iter::once(0)).collect();
         let mut target = vec![0u16; 256];
         // The target can be a multi-string; the first entry is the volume.
-        let chars = unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
+        let chars =
+            unsafe { QueryDosDeviceW(name.as_ptr(), target.as_mut_ptr(), target.len() as u32) };
         if chars > 1 {
             let volume = String::from_utf16_lossy(&target[..chars as usize - 1]);
             let volume = volume.split('\0').next().unwrap_or("").to_string();
@@ -91,10 +94,20 @@ pub fn gather_hives() -> HiveInventory {
     }
 
     let mut inventory = HiveInventory::default();
-    let subkey: Vec<u16> =
-        r"SYSTEM\CurrentControlSet\Control\hivelist".encode_utf16().chain(std::iter::once(0)).collect();
+    let subkey: Vec<u16> = r"SYSTEM\CurrentControlSet\Control\hivelist"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
     let mut key: HKEY = std::ptr::null_mut();
-    if unsafe { RegOpenKeyExW(HKEY_LOCAL_MACHINE, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) } != 0
+    if unsafe {
+        RegOpenKeyExW(
+            HKEY_LOCAL_MACHINE,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE,
+            &mut key,
+        )
+    } != 0
         || key.is_null()
     {
         return inventory;
@@ -129,24 +142,38 @@ pub fn gather_hives() -> HiveInventory {
             continue;
         };
         let units = data_len as usize / 2;
-        let device_path =
-            String::from_utf16_lossy(&name_units(&data, units)).trim_end_matches('\0').to_string();
+        let device_path = String::from_utf16_lossy(&name_units(&data, units))
+            .trim_end_matches('\0')
+            .to_string();
         let file = device_path_to_drive(&device_path, &drives).unwrap_or_default();
-        let bytes = if file.is_empty() { None } else { std::fs::metadata(&file).ok().map(|meta| meta.len()) };
-        inventory.entries.push(HiveEntry { key: hive_key, file, bytes });
+        let bytes = if file.is_empty() {
+            None
+        } else {
+            std::fs::metadata(&file).ok().map(|meta| meta.len())
+        };
+        inventory.entries.push(HiveEntry {
+            key: hive_key,
+            file,
+            bytes,
+        });
         if index > 512 {
             break;
         }
     }
     unsafe { RegCloseKey(key) };
-    inventory.entries.sort_by(|left, right| left.key.cmp(&right.key));
+    inventory
+        .entries
+        .sort_by(|left, right| left.key.cmp(&right.key));
     inventory
 }
 
 /// Reinterpret the first `units` UTF-16 units of a byte buffer.
 #[cfg(windows)]
 fn name_units(data: &[u8], units: usize) -> Vec<u16> {
-    data.chunks_exact(2).take(units).map(|pair| u16::from_le_bytes([pair[0], pair[1]])).collect()
+    data.chunks_exact(2)
+        .take(units)
+        .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
+        .collect()
 }
 
 #[cfg(test)]
@@ -181,21 +208,35 @@ mod tests {
 
     #[test]
     fn device_paths_translate_by_volume() {
-        let drives =
-            vec![("\\Device\\HarddiskVolume4".to_string(), "C:".to_string()), ("\\Device\\HarddiskVolume9".to_string(), "D:".to_string())];
+        let drives = vec![
+            ("\\Device\\HarddiskVolume4".to_string(), "C:".to_string()),
+            ("\\Device\\HarddiskVolume9".to_string(), "D:".to_string()),
+        ];
         assert_eq!(
-            device_path_to_drive("\\Device\\HarddiskVolume4\\Windows\\System32\\config\\SOFTWARE", &drives),
+            device_path_to_drive(
+                "\\Device\\HarddiskVolume4\\Windows\\System32\\config\\SOFTWARE",
+                &drives
+            ),
             Some("C:\\Windows\\System32\\config\\SOFTWARE".to_string())
         );
-        assert_eq!(device_path_to_drive("\\Device\\HarddiskVolume9\\pagefile.sys", &drives), Some("D:\\pagefile.sys".to_string()));
-        assert_eq!(device_path_to_drive("\\Device\\HarddiskVolume7\\x", &drives), None);
+        assert_eq!(
+            device_path_to_drive("\\Device\\HarddiskVolume9\\pagefile.sys", &drives),
+            Some("D:\\pagefile.sys".to_string())
+        );
+        assert_eq!(
+            device_path_to_drive("\\Device\\HarddiskVolume7\\x", &drives),
+            None
+        );
         assert_eq!(device_path_to_drive("C:\\Windows", &drives), None);
     }
 
     #[test]
     fn volume_prefixes_do_not_collide() {
         let drives = vec![("\\Device\\HarddiskVolume1".to_string(), "C:".to_string())];
-        assert_eq!(device_path_to_drive("\\Device\\HarddiskVolume10\\x", &drives), None);
+        assert_eq!(
+            device_path_to_drive("\\Device\\HarddiskVolume10\\x", &drives),
+            None
+        );
         assert_eq!(
             device_path_to_drive("\\Device\\HarddiskVolume1\\x", &drives),
             Some("C:\\x".to_string())
@@ -206,9 +247,21 @@ mod tests {
     fn totals_skip_unknown_sizes() {
         let inventory = HiveInventory {
             entries: vec![
-                HiveEntry { key: "a".into(), file: "a".into(), bytes: Some(100) },
-                HiveEntry { key: "b".into(), file: String::new(), bytes: None },
-                HiveEntry { key: "c".into(), file: "c".into(), bytes: Some(50) },
+                HiveEntry {
+                    key: "a".into(),
+                    file: "a".into(),
+                    bytes: Some(100),
+                },
+                HiveEntry {
+                    key: "b".into(),
+                    file: String::new(),
+                    bytes: None,
+                },
+                HiveEntry {
+                    key: "c".into(),
+                    file: "c".into(),
+                    bytes: Some(50),
+                },
             ],
         };
         assert_eq!(inventory.total_bytes(), 150);

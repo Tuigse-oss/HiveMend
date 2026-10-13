@@ -23,7 +23,10 @@ impl SystemSnapshot {
     }
 
     pub fn disk_used_percent(&self) -> u64 {
-        percent(self.disk_total.saturating_sub(self.disk_free), self.disk_total)
+        percent(
+            self.disk_total.saturating_sub(self.disk_free),
+            self.disk_total,
+        )
     }
 }
 
@@ -144,7 +147,11 @@ pub fn gather() -> SystemSnapshot {
 }
 
 #[cfg(windows)]
-fn reg_string(hive: windows_sys::Win32::System::Registry::HKEY, key: &str, value: &str) -> Option<String> {
+fn reg_string(
+    hive: windows_sys::Win32::System::Registry::HKEY,
+    key: &str,
+    value: &str,
+) -> Option<String> {
     use windows_sys::Win32::System::Registry::{RRF_RT_REG_SZ, RegGetValueW};
     let key: Vec<u16> = key.encode_utf16().chain(std::iter::once(0)).collect();
     let value: Vec<u16> = value.encode_utf16().chain(std::iter::once(0)).collect();

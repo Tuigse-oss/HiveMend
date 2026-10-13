@@ -27,44 +27,46 @@ mod windows_services;
 #[cfg(windows)]
 mod windows_shredder;
 
-pub use backup::{BackupInfo, BackupSummary, backup_name, list_backups, read_backup, restore_files};
 #[cfg(windows)]
 pub use backup::import_reg_file;
+pub use backup::{
+    BackupInfo, BackupSummary, backup_name, list_backups, read_backup, restore_files,
+};
 pub use demo::sample_world;
 pub use engine::{
     Engine, RepairOutcome, ScanReport, repair, repair_with_progress, scan, scan_with_progress,
     still_reported,
 };
 pub use exclude::{Exclusion, Exclusions};
-pub use settings::Settings;
 pub use fs::{FileView, HostFs, ItemKind, MemoryFs};
-pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
 #[cfg(windows)]
 pub use hiveinfo::gather_hives;
+pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
+pub use pathutil::shred_allowed;
 pub use privacy::{
     CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,
     PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,
     mask_matches, parse_custom, preview, privacy_reg_allowed, uninstall_present,
 };
-pub use pathutil::shred_allowed;
-pub use rules::decode_text_owned;
 pub use registry::MemoryRegistry;
+pub use rules::decode_text_owned;
 pub use services::{
-    NEVER_TOUCH, SUGGESTED, MemoryServiceStore, ServiceChange, ServiceInfo, ServiceOutcome,
+    MemoryServiceStore, NEVER_TOUCH, SUGGESTED, ServiceChange, ServiceInfo, ServiceOutcome,
     ServiceState, ServiceStore, StartType, StoreError, TuneupProfile, TuneupTarget,
     apply_start_changes, export_start_backup, is_never_touch, plan_profile, refuse_change,
     refuse_start, refuse_stop, service_key, sort_services, start_services, stop_services,
     tuneup_allowed,
 };
+pub use settings::Settings;
 pub use shredder::{
     RecycleItem, ShredMethod, ShredOptions, ShredOutcome, ShredTarget, list_recycle_bin,
     random_seed, recycle_display_name, recycle_pairs, seek_penalty_false, shred_paths,
     shred_recycle_items,
 };
-pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};
 #[cfg(windows)]
 pub use sysinfo::gather as gather_snapshot;
+pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};
 pub use tools::{WINDOWS_TOOLS, WindowsTool, expand_target, is_openable};
 
 #[cfg(windows)]

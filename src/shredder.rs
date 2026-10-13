@@ -49,7 +49,10 @@ pub struct ShredOptions {
 
 impl Default for ShredOptions {
     fn default() -> Self {
-        Self { method: ShredMethod::ThreePass, rename: true }
+        Self {
+            method: ShredMethod::ThreePass,
+            rename: true,
+        }
     }
 }
 
@@ -81,7 +84,11 @@ pub struct XorShift(u64);
 
 impl XorShift {
     pub fn new(seed: u64) -> Self {
-        Self(if seed == 0 { 0x9e37_79b9_7f4a_7c15 } else { seed })
+        Self(if seed == 0 {
+            0x9e37_79b9_7f4a_7c15
+        } else {
+            seed
+        })
     }
 
     pub fn next_u8(&mut self) -> u8 {
@@ -166,14 +173,25 @@ pub fn shred_paths(
             ItemKind::Dir if target.is_dir => {
                 collect_dir(fs, &target.path, 0, &mut files, &mut dirs, &mut outcome);
             }
-            _ => outcome.refused.push(format!("{} changed since staging", target.path)),
+            _ => outcome
+                .refused
+                .push(format!("{} changed since staging", target.path)),
         }
     }
     let passes = opts.method.passes();
     let total = files.len() * passes;
     let mut done = 0usize;
     for (file_no, path) in files.iter().enumerate() {
-        match shred_file(fs, path, file_no as u64, opts, seed, &mut done, total, progress) {
+        match shred_file(
+            fs,
+            path,
+            file_no as u64,
+            opts,
+            seed,
+            &mut done,
+            total,
+            progress,
+        ) {
             FileDone::Shredded(bytes) => {
                 outcome.shredded += 1;
                 outcome.bytes += bytes;
@@ -345,9 +363,7 @@ fn window_matches(
     len: usize,
 ) -> bool {
     match fs.read_at(path, offset, len) {
-        Some(got) => {
-            got.len() == len && got == expected_bytes(pass, seed, file_no, offset, len)
-        }
+        Some(got) => got.len() == len && got == expected_bytes(pass, seed, file_no, offset, len),
         None => false,
     }
 }
@@ -452,8 +468,17 @@ pub fn recycle_display_name(bytes: &[u8]) -> Option<String> {
         .map(|pair| u16::from_le_bytes([pair[0], pair[1]]))
         .collect();
     let path = String::from_utf16_lossy(&wide);
-    let base = path.rsplit(['\\', '/']).next().unwrap_or("").trim_matches('\0').trim();
-    if base.is_empty() { None } else { Some(base.to_string()) }
+    let base = path
+        .rsplit(['\\', '/'])
+        .next()
+        .unwrap_or("")
+        .trim_matches('\0')
+        .trim();
+    if base.is_empty() {
+        None
+    } else {
+        Some(base.to_string())
+    }
 }
 
 /// List shreddable Recycle Bin contents across fixed drives, plus notes for
@@ -509,7 +534,10 @@ pub fn shred_recycle_items(
 ) -> ShredOutcome {
     let targets: Vec<ShredTarget> = items
         .iter()
-        .map(|item| ShredTarget { path: item.data.clone(), is_dir: false })
+        .map(|item| ShredTarget {
+            path: item.data.clone(),
+            is_dir: false,
+        })
         .collect();
     let mut outcome = shred_paths(fs, &targets, opts, seed, progress);
     for item in items {
@@ -542,7 +570,10 @@ mod tests {
     }
 
     fn target(path: &str, is_dir: bool) -> ShredTarget {
-        ShredTarget { path: path.to_string(), is_dir }
+        ShredTarget {
+            path: path.to_string(),
+            is_dir,
+        }
     }
 
     /// A `$I` blob in the on-disk layout: version, size, time, UTF-16
@@ -620,11 +651,23 @@ mod tests {
     fn one_pass_shreds_file_and_counts_bytes() {
         let mut fs = MemoryFs::new();
         fs.add_file_bytes(r"C:\Docs\secret.txt", vec![0x41; 100], None);
-        let opts = ShredOptions { method: ShredMethod::OnePass, rename: true };
-        let outcome = shred_paths(&mut fs, &[target(r"C:\Docs\secret.txt", false)], &opts, SEED, &mut allow);
+        let opts = ShredOptions {
+            method: ShredMethod::OnePass,
+            rename: true,
+        };
+        let outcome = shred_paths(
+            &mut fs,
+            &[target(r"C:\Docs\secret.txt", false)],
+            &opts,
+            SEED,
+            &mut allow,
+        );
         assert_eq!(outcome.shredded, 1);
         assert_eq!(outcome.bytes, 100);
-        assert_eq!(outcome.shredded_paths, vec![r"C:\Docs\secret.txt".to_string()]);
+        assert_eq!(
+            outcome.shredded_paths,
+            vec![r"C:\Docs\secret.txt".to_string()]
+        );
         assert!(outcome.refused.is_empty());
         assert!(outcome.errors.is_empty());
         assert!(!outcome.canceled);
@@ -644,7 +687,10 @@ mod tests {
         };
         let outcome = shred_paths(
             &mut fs,
-            &[target(r"C:\Docs\a.txt", false), target(r"C:\Docs\b.txt", false)],
+            &[
+                target(r"C:\Docs\a.txt", false),
+                target(r"C:\Docs\b.txt", false),
+            ],
             &ShredOptions::default(),
             SEED,
             &mut progress,
@@ -734,7 +780,10 @@ mod tests {
     fn hidden_system_file_is_refused() {
         let mut inner = MemoryFs::new();
         inner.add_file_bytes(r"C:\Docs\page.dat", vec![1; 8], None);
-        let mut fs = HiddenFs { inner, flagged: r"C:\Docs\page.dat".to_string() };
+        let mut fs = HiddenFs {
+            inner,
+            flagged: r"C:\Docs\page.dat".to_string(),
+        };
         let outcome = shred_paths(
             &mut fs,
             &[target(r"C:\Docs\page.dat", false)],
@@ -799,9 +848,24 @@ mod tests {
         );
         assert_eq!(outcome.shredded, 0);
         assert_eq!(outcome.refused.len(), 3);
-        assert!(outcome.refused.iter().any(|note| note.contains("Windows folder")));
-        assert!(outcome.refused.iter().any(|note| note.contains("program folder")));
-        assert!(outcome.refused.iter().any(|note| note.contains("app data folder")));
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|note| note.contains("Windows folder"))
+        );
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|note| note.contains("program folder"))
+        );
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|note| note.contains("app data folder"))
+        );
     }
 
     #[test]
@@ -811,14 +875,22 @@ mod tests {
         fs.add_dir(r"C:\Docs\Sub");
         let outcome = shred_paths(
             &mut fs,
-            &[target(r"C:\Docs\a.txt", true), target(r"C:\Docs\Sub", false)],
+            &[
+                target(r"C:\Docs\a.txt", true),
+                target(r"C:\Docs\Sub", false),
+            ],
             &ShredOptions::default(),
             SEED,
             &mut allow,
         );
         assert_eq!(outcome.shredded, 0);
         assert_eq!(outcome.refused.len(), 2);
-        assert!(outcome.refused.iter().all(|note| note.contains("changed since staging")));
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .all(|note| note.contains("changed since staging"))
+        );
     }
 
     #[test]
@@ -827,10 +899,16 @@ mod tests {
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![1; 8], None);
         fs.add_file_bytes(r"C:\Docs\b.txt", vec![2; 8], None);
         let mut progress = |done: usize, _total: usize, _name: &str| done < 1;
-        let opts = ShredOptions { method: ShredMethod::OnePass, rename: true };
+        let opts = ShredOptions {
+            method: ShredMethod::OnePass,
+            rename: true,
+        };
         let outcome = shred_paths(
             &mut fs,
-            &[target(r"C:\Docs\a.txt", false), target(r"C:\Docs\b.txt", false)],
+            &[
+                target(r"C:\Docs\a.txt", false),
+                target(r"C:\Docs\b.txt", false),
+            ],
             &opts,
             SEED,
             &mut progress,
@@ -843,18 +921,30 @@ mod tests {
 
     #[test]
     fn recycle_pairs_match_and_report_strays() {
-        let names: Vec<String> =
-            ["$IABC", "$rabc", "$Ilone", "$Rlone2", "desktop.ini", "notes.txt", "$I", "$R"]
-                .iter()
-                .map(|name| name.to_string())
-                .collect();
+        let names: Vec<String> = [
+            "$IABC",
+            "$rabc",
+            "$Ilone",
+            "$Rlone2",
+            "desktop.ini",
+            "notes.txt",
+            "$I",
+            "$R",
+        ]
+        .iter()
+        .map(|name| name.to_string())
+        .collect();
         let (pairs, strays) = recycle_pairs(&names);
         assert_eq!(pairs, vec![("$IABC".to_string(), "$rabc".to_string())]);
         assert_eq!(strays.len(), 5);
         assert!(strays.iter().any(|name| name == "$Ilone"));
         assert!(strays.iter().any(|name| name == "$Rlone2"));
         assert!(strays.iter().any(|name| name == "notes.txt"));
-        assert!(!strays.iter().any(|name| name.eq_ignore_ascii_case("desktop.ini")));
+        assert!(
+            !strays
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("desktop.ini"))
+        );
     }
 
     #[test]
@@ -872,9 +962,8 @@ mod tests {
         // Bytes captured from a real Windows 11 bin: version 2, size
         // 0xac000, deletion time, 59 UTF-16 units, NUL-terminated path.
         let mut blob = vec![
-            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0a, 0x00, 0x00,
-            0x00, 0x00, 0x00, 0x40, 0xe7, 0x03, 0x9d, 0x0d, 0x97, 0xdc, 0x01, 0x3b, 0x00,
-            0x00, 0x00,
+            0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xc0, 0x0a, 0x00, 0x00, 0x00,
+            0x00, 0x00, 0x40, 0xe7, 0x03, 0x9d, 0x0d, 0x97, 0xdc, 0x01, 0x3b, 0x00, 0x00, 0x00,
         ];
         let path = r"C:\q2starter\q2advanceog_win11_modern_res_1080_1440_4k.exe";
         assert_eq!(path.encode_utf16().count() + 1, 0x3b);
@@ -917,7 +1006,8 @@ mod tests {
     fn shred_recycle_items_removes_meta_of_shredded() {
         let mut fs = recycle_fs();
         let (items, _) = list_recycle_bin(&fs, &["C:".to_string()]);
-        let outcome = shred_recycle_items(&mut fs, &items, &ShredOptions::default(), SEED, &mut allow);
+        let outcome =
+            shred_recycle_items(&mut fs, &items, &ShredOptions::default(), SEED, &mut allow);
         assert_eq!(outcome.shredded, 1);
         assert_eq!(outcome.bytes, 32);
         assert!(outcome.errors.is_empty());
@@ -938,7 +1028,10 @@ mod tests {
     #[test]
     fn seek_penalty_descriptor_parses() {
         assert_eq!(seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 0]), Some(true));
-        assert_eq!(seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 1]), Some(false));
+        assert_eq!(
+            seek_penalty_false(&[0, 0, 0, 0, 0, 0, 0, 0, 1]),
+            Some(false)
+        );
         assert_eq!(seek_penalty_false(&[0; 4]), None);
     }
 

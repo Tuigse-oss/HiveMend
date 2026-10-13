@@ -40,10 +40,7 @@ impl Settings {
             let value = value.trim();
             match name.trim() {
                 "disabled" => {
-                    settings.disabled = value
-                        .split(',')
-                        .filter_map(ScannerId::parse)
-                        .collect();
+                    settings.disabled = value.split(',').filter_map(ScannerId::parse).collect();
                 }
                 "last_scan" => settings.last_scan = value.to_string(),
                 "last_problems" => settings.last_problems = value.parse().ok(),
@@ -90,7 +87,10 @@ impl Settings {
         }
         text.push_str(&format!("last_repair={}\r\n", one_line(&self.last_repair)));
         if !self.privacy_ticked.is_empty() {
-            text.push_str(&format!("privacy_ticked={}\r\n", self.privacy_ticked.join(",")));
+            text.push_str(&format!(
+                "privacy_ticked={}\r\n",
+                self.privacy_ticked.join(",")
+            ));
         }
         if self.shred_passes != 3 {
             text.push_str(&format!("shred_passes={}\r\n", self.shred_passes));

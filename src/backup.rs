@@ -29,7 +29,10 @@ pub struct BackupPlan {
 impl BackupPlan {
     pub fn covers(&self, key: &str) -> bool {
         let key = canonical_path(key);
-        !self.unreadable.iter().any(|bad| bad.eq_ignore_ascii_case(&key))
+        !self
+            .unreadable
+            .iter()
+            .any(|bad| bad.eq_ignore_ascii_case(&key))
     }
 
     pub fn copy_for(&self, path: &str) -> Option<&Path> {
@@ -53,7 +56,10 @@ pub fn files_dir(backup_file: &Path) -> PathBuf {
 }
 
 pub fn export_backup(reg: &dyn Registry, findings: &[Finding], backup_file: &Path) -> BackupPlan {
-    let repairs: Vec<Repair> = findings.iter().map(|finding| finding.repair.clone()).collect();
+    let repairs: Vec<Repair> = findings
+        .iter()
+        .map(|finding| finding.repair.clone())
+        .collect();
     export_repairs(reg, &repairs, backup_file)
 }
 
@@ -86,7 +92,10 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                 }
             }
             Repair::DeleteFile { path, keep_copy } => {
-                if !files.iter().any(|(have, _)| have.eq_ignore_ascii_case(path)) {
+                if !files
+                    .iter()
+                    .any(|(have, _)| have.eq_ignore_ascii_case(path))
+                {
                     files.push((path.clone(), *keep_copy));
                 }
             }
@@ -110,7 +119,9 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
             }
             Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
             Err(err) => {
-                body.push_str(&format!("\r\n; not backed up, left alone: {key}: {err}\r\n"));
+                body.push_str(&format!(
+                    "\r\n; not backed up, left alone: {key}: {err}\r\n"
+                ));
                 unreadable.push(key);
             }
         }
@@ -121,18 +132,25 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
             Ok(present) => {
                 body.push_str(&format!("\r\n[{key}]\r\n"));
                 for name in names {
-                    match present.iter().find(|value| value.name.eq_ignore_ascii_case(&name)) {
+                    match present
+                        .iter()
+                        .find(|value| value.name.eq_ignore_ascii_case(&name))
+                    {
                         Some(value) => {
                             body.push_str(&format_value(value));
                             body.push_str("\r\n");
                         }
-                        None => body.push_str(&format!("; already gone {}\r\n", value_label(&name))),
+                        None => {
+                            body.push_str(&format!("; already gone {}\r\n", value_label(&name)))
+                        }
                     }
                 }
             }
             Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
             Err(err) => {
-                body.push_str(&format!("\r\n; not backed up, left alone: {key}: {err}\r\n"));
+                body.push_str(&format!(
+                    "\r\n; not backed up, left alone: {key}: {err}\r\n"
+                ));
                 unreadable.push(key);
             }
         }
@@ -149,7 +167,10 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                     .and_then(|name| name.to_str())
                     .unwrap_or("shortcut.lnk");
                 let copy = dir.join(format!("{:04}-{name}", index + 1));
-                body.push_str(&format!("{FILE_LINE}{path}{FILE_ARROW}{}\r\n", copy.display()));
+                body.push_str(&format!(
+                    "{FILE_LINE}{path}{FILE_ARROW}{}\r\n",
+                    copy.display()
+                ));
                 file_copies.push((path, copy));
             } else {
                 body.push_str(&format!("; removed without a copy {path}\r\n"));
@@ -334,7 +355,9 @@ impl BackupSummary {
             if let Some(key) = line.strip_prefix('[') {
                 summary.keys += 1;
                 let upper = key.to_ascii_uppercase();
-                if !upper.starts_with("HKEY_CURRENT_USER") && !upper.starts_with("-HKEY_CURRENT_USER") {
+                if !upper.starts_with("HKEY_CURRENT_USER")
+                    && !upper.starts_with("-HKEY_CURRENT_USER")
+                {
                     summary.machine_wide = true;
                 }
             } else if line.starts_with('"') || line.starts_with('@') {
@@ -399,7 +422,10 @@ pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
             continue;
         }
         if !copy.exists() {
-            errors.push(format!("{original}: the saved copy {} is gone", copy.display()));
+            errors.push(format!(
+                "{original}: the saved copy {} is gone",
+                copy.display()
+            ));
             continue;
         }
         if let Some(parent) = target.parent() {
@@ -482,7 +508,10 @@ mod tests {
             )],
             Path::new("/tmp/b.reg"),
         );
-        assert!(plan.body.starts_with("Windows Registry Editor Version 5.00"));
+        assert!(
+            plan.body
+                .starts_with("Windows Registry Editor Version 5.00")
+        );
         assert!(plan.body.contains(r#""Old"="C:\\Missing\\old.exe""#));
         assert!(!plan.body.contains("Keep"));
         assert!(plan.unreadable.is_empty());
@@ -494,7 +523,8 @@ mod tests {
     #[test]
     fn key_backup_includes_the_whole_tree_and_qword_types() {
         let mut reg = MemoryRegistry::new();
-        let mut deep = String::from(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Gone");
+        let mut deep =
+            String::from(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\Gone");
         for level in 0..10 {
             deep.push_str(&format!("\\L{level}"));
         }
@@ -514,7 +544,10 @@ mod tests {
             Path::new("/tmp/b.reg"),
         );
         assert!(plan.body.contains(r#""Leaf"="bottom""#), "{}", plan.body);
-        assert!(plan.body.contains(r#""Size"=hex(b):01,00,00,00,00,00,00,00"#));
+        assert!(
+            plan.body
+                .contains(r#""Size"=hex(b):01,00,00,00,00,00,00,00"#)
+        );
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 11);
         assert!(summary.machine_wide);
@@ -529,10 +562,7 @@ mod tests {
         let text = format_value(&value);
         assert!(text.starts_with(r#""Blob"=hex:ab,ab"#));
         assert!(text.contains("\\\r\n  ab"));
-        let joined: String = text
-            .split("\\\r\n  ")
-            .collect::<Vec<_>>()
-            .join("");
+        let joined: String = text.split("\\\r\n  ").collect::<Vec<_>>().join("");
         assert_eq!(joined.matches("ab").count(), 100);
     }
 
@@ -544,8 +574,20 @@ mod tests {
         let plan = export_backup(
             &reg,
             &[
-                finding(one, Repair::DeleteFile { path: one.into(), keep_copy: true }),
-                finding(two, Repair::DeleteFile { path: two.into(), keep_copy: true }),
+                finding(
+                    one,
+                    Repair::DeleteFile {
+                        path: one.into(),
+                        keep_copy: true,
+                    },
+                ),
+                finding(
+                    two,
+                    Repair::DeleteFile {
+                        path: two.into(),
+                        keep_copy: true,
+                    },
+                ),
             ],
             Path::new("/backups/hive-mend-1.reg"),
         );

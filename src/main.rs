@@ -230,9 +230,9 @@ fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) {
     if !args.no_ignore_list {
         let ignored = Exclusions::load(&hive_mend::exclusions_file()).filter(&mut report.findings);
         if ignored > 0 {
-            report
-                .warnings
-                .push(format!("{ignored} ignored entries hidden (see --no-ignore-list)"));
+            report.warnings.push(format!(
+                "{ignored} ignored entries hidden (see --no-ignore-list)"
+            ));
         }
     }
     if let Some(text) = &args.matching {
@@ -391,7 +391,11 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
     }
     if !args.yes {
         for target in &targets {
-            println!("{}  {}", if target.is_dir { "folder" } else { "file" }, target.path);
+            println!(
+                "{}  {}",
+                if target.is_dir { "folder" } else { "file" },
+                target.path
+            );
         }
         for reason in &refused {
             println!("refused  {reason}");
@@ -401,21 +405,39 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
             targets.len(),
             method.label()
         );
-        return Ok(if targets.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(2) });
-    }
-    let opts = ShredOptions { method, rename: true };
-    let outcome =
-        shred_paths(&mut HostFs, &targets, &opts, hive_mend::random_seed(), &mut |_, _, _| {
-            true
+        return Ok(if targets.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(2)
         });
-    println!("shredded {} files ({})", outcome.shredded, format_bytes(outcome.bytes));
+    }
+    let opts = ShredOptions {
+        method,
+        rename: true,
+    };
+    let outcome = shred_paths(
+        &mut HostFs,
+        &targets,
+        &opts,
+        hive_mend::random_seed(),
+        &mut |_, _, _| true,
+    );
+    println!(
+        "shredded {} files ({})",
+        outcome.shredded,
+        format_bytes(outcome.bytes)
+    );
     for reason in refused.iter().chain(outcome.refused.iter()) {
         eprintln!("hive-mend: refused: {reason}");
     }
     for err in &outcome.errors {
         eprintln!("hive-mend: {err}");
     }
-    Ok(if outcome.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+    Ok(if outcome.errors.is_empty() {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(1)
+    })
 }
 
 fn hives_live() -> Result<ExitCode, hive_mend::Error> {
@@ -423,8 +445,15 @@ fn hives_live() -> Result<ExitCode, hive_mend::Error> {
     {
         let inventory = hive_mend::gather_hives();
         for entry in &inventory.entries {
-            let size = entry.bytes.map(hive_mend::format_bytes).unwrap_or_else(|| "unknown".into());
-            let file = if entry.file.is_empty() { "(no file)" } else { &entry.file };
+            let size = entry
+                .bytes
+                .map(hive_mend::format_bytes)
+                .unwrap_or_else(|| "unknown".into());
+            let file = if entry.file.is_empty() {
+                "(no file)"
+            } else {
+                &entry.file
+            };
             println!("{}  {}  {}", entry.key, size, file);
         }
         println!(

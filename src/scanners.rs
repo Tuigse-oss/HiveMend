@@ -1049,7 +1049,9 @@ fn application_registered(ctx: &mut ScanCtx<'_>, exe: &str) -> bool {
     let app_paths = [
         format!(r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\App Paths\{file}"),
         format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{file}"),
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{file}"),
+        format!(
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{file}"
+        ),
     ];
     let applications = [
         format!(r"HKEY_CURRENT_USER\Software\Classes\Applications\{file}"),
@@ -1082,7 +1084,9 @@ fn application_known_missing(ctx: &mut ScanCtx<'_>, exe: &str) -> bool {
     let targets = [
         format!(r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
         format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{exe}"),
+        format!(
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths\{exe}"
+        ),
         format!(r"HKEY_CURRENT_USER\Software\Classes\Applications\{exe}\shell\open\command"),
         format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Applications\{exe}\shell\open\command"),
     ];
@@ -1240,9 +1244,15 @@ fn server_missing(ctx: &ScanCtx<'_>, text: &str) -> Option<String> {
     }
     let paths = paths_in_command(text);
     if let Some(first) = paths.first() {
-        return missing_outside(ctx, std::slice::from_ref(first)).into_iter().next();
+        return missing_outside(ctx, std::slice::from_ref(first))
+            .into_iter()
+            .next();
     }
-    let first = text.split_whitespace().next().unwrap_or(text).trim_matches('"');
+    let first = text
+        .split_whitespace()
+        .next()
+        .unwrap_or(text)
+        .trim_matches('"');
     if first.contains(['\\', '/', ':', '%']) || !first.contains('.') {
         return None;
     }

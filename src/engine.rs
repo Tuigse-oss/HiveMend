@@ -150,9 +150,9 @@ pub fn still_reported(selected: &[Finding], fresh: &[Finding]) -> Vec<Finding> {
     selected
         .iter()
         .filter(|finding| {
-            fresh
-                .iter()
-                .any(|now| now.scanner == finding.scanner && same_target(&now.repair, &finding.repair))
+            fresh.iter().any(|now| {
+                now.scanner == finding.scanner && same_target(&now.repair, &finding.repair)
+            })
         })
         .cloned()
         .collect()
@@ -163,10 +163,9 @@ fn same_target(left: &Repair, right: &Repair) -> bool {
         (Repair::DeleteKey { key: a }, Repair::DeleteKey { key: b }) => {
             canonical_path(a).eq_ignore_ascii_case(&canonical_path(b))
         }
-        (
-            Repair::DeleteValue { key: a, name: x },
-            Repair::DeleteValue { key: b, name: y },
-        ) => canonical_path(a).eq_ignore_ascii_case(&canonical_path(b)) && x.eq_ignore_ascii_case(y),
+        (Repair::DeleteValue { key: a, name: x }, Repair::DeleteValue { key: b, name: y }) => {
+            canonical_path(a).eq_ignore_ascii_case(&canonical_path(b)) && x.eq_ignore_ascii_case(y)
+        }
         (Repair::DeleteFile { path: a, .. }, Repair::DeleteFile { path: b, .. }) => {
             a.eq_ignore_ascii_case(b)
         }
@@ -206,7 +205,9 @@ mod tests {
     }
 
     fn uninstall_finding(name: &str) -> Finding {
-        let key = format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}");
+        let key = format!(
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
+        );
         Finding {
             scanner: ScannerId::AddRemovePrograms,
             scanner_name: "Add/Remove Programs".into(),
@@ -369,8 +370,14 @@ fn reg_result(result: Result<(), RegError>) -> Applied {
     match result {
         Ok(()) => Applied::Removed,
         Err(RegError::NotFound) => Applied::AlreadyGone,
-        Err(RegError::Denied(message)) => Applied::Failed { message, denied: true },
-        Err(RegError::Message(message)) => Applied::Failed { message, denied: false },
+        Err(RegError::Denied(message)) => Applied::Failed {
+            message,
+            denied: true,
+        },
+        Err(RegError::Message(message)) => Applied::Failed {
+            message,
+            denied: false,
+        },
     }
 }
 

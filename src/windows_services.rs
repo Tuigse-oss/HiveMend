@@ -13,9 +13,9 @@ use windows_sys::Win32::System::Services::{
     QUERY_SERVICE_CONFIGW, QueryServiceConfig2W, QueryServiceConfigW, QueryServiceStatusEx,
     SC_ENUM_PROCESS_INFO, SC_HANDLE, SC_MANAGER_CONNECT, SC_MANAGER_ENUMERATE_SERVICE,
     SC_STATUS_PROCESS_INFO, SERVICE_CHANGE_CONFIG, SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
-    SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO, SERVICE_NO_CHANGE,
-    SERVICE_QUERY_CONFIG, SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATE_ALL,
-    SERVICE_STATUS, SERVICE_STATUS_PROCESS, SERVICE_STOP, SERVICE_WIN32, StartServiceW,
+    SERVICE_CONTROL_STOP, SERVICE_DELAYED_AUTO_START_INFO, SERVICE_NO_CHANGE, SERVICE_QUERY_CONFIG,
+    SERVICE_QUERY_STATUS, SERVICE_START, SERVICE_STATE_ALL, SERVICE_STATUS, SERVICE_STATUS_PROCESS,
+    SERVICE_STOP, SERVICE_WIN32, StartServiceW,
 };
 
 use crate::services::{ServiceInfo, ServiceState, ServiceStore, StartType, StoreError};
@@ -50,9 +50,7 @@ fn scm_error(code: u32, what: &str) -> StoreError {
         )),
         1060 => StoreError::new(format!("{what}: no such service")),
         1058 => StoreError::new(format!("{what}: cannot start a disabled service")),
-        1051 => StoreError::new(format!(
-            "{what}: it has running services that depend on it"
-        )),
+        1051 => StoreError::new(format!("{what}: it has running services that depend on it")),
         1072 => StoreError::new(format!("{what}: it is marked for deletion")),
         _ => StoreError::new(format!("{what}: service call failed ({code})")),
     }
@@ -205,7 +203,8 @@ fn query_start(manager: &ScHandle, name: &str) -> Option<StartType> {
             &mut delayed_info as *mut _ as *mut u8,
             std::mem::size_of::<SERVICE_DELAYED_AUTO_START_INFO>() as u32,
             &mut delayed_needed,
-        ) != 0 && delayed_info.fDelayedAutostart != 0
+        ) != 0
+            && delayed_info.fDelayedAutostart != 0
     };
     StartType::from_dword(config.dwStartType, delayed)
 }
@@ -235,9 +234,7 @@ fn wait_for_state(manager: &ScHandle, name: &str, running: bool) {
         let reached = open_service(manager, name, SERVICE_QUERY_STATUS)
             .ok()
             .and_then(|service| query_state(&service))
-            .is_some_and(|state| {
-                (running && state == 4) || (!running && state == 1)
-            });
+            .is_some_and(|state| (running && state == 4) || (!running && state == 1));
         if reached {
             return;
         }
@@ -296,7 +293,7 @@ impl ServiceStore for ScmServiceStore {
                     service.handle,
                     SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
                     &info as *const _ as *const _,
-                    )
+                )
             };
             if ok == 0 {
                 return Err(scm_error(last_error(), name));

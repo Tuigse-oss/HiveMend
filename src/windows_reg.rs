@@ -117,7 +117,10 @@ impl Registry for WindowsRegistry {
             return Err(RegError::NotFound);
         }
         if rc != ERROR_SUCCESS {
-            return Err(failure(rc, format!("RegDeleteValueW {path}\\{name} failed ({rc})")));
+            return Err(failure(
+                rc,
+                format!("RegDeleteValueW {path}\\{name} failed ({rc})"),
+            ));
         }
         Ok(())
     }
@@ -252,14 +255,16 @@ fn open(path: &str, write: bool) -> Result<Opened, RegError> {
             match open_raw(hive, &subkey, access & !KEY_WOW64_64KEY) {
                 Ok(key) => Ok(Opened { key, close: true }),
                 Err(OpenFail::Missing) => Err(RegError::NotFound),
-                Err(OpenFail::Code(code)) => {
-                    Err(failure(code, format!("RegOpenKeyExW {path} failed ({code})")))
-                }
+                Err(OpenFail::Code(code)) => Err(failure(
+                    code,
+                    format!("RegOpenKeyExW {path} failed ({code})"),
+                )),
             }
         }
-        Err(OpenFail::Code(code)) => {
-            Err(failure(code, format!("RegOpenKeyExW {path} failed ({code})")))
-        }
+        Err(OpenFail::Code(code)) => Err(failure(
+            code,
+            format!("RegOpenKeyExW {path} failed ({code})"),
+        )),
     }
 }
 
