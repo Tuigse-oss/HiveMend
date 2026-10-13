@@ -5,9 +5,9 @@ use crate::model::{
     Finding, PathKind, RegValue, Repair, RulePath, ScannerDef, ScannerId, ValueKind,
 };
 use crate::pathutil::{
-    bare_name_present, canonical_path, expand_env, file_delete_allowed, file_present, hive_views,
-    is_protected_key, key_delete_allowed, looks_like_stored_path, paths_in_command, system_root,
-    under_windows_dir,
+    bare_name_present, canonical_path, command_dependencies, expand_env, file_delete_allowed,
+    file_present, hive_views, is_protected_key, key_delete_allowed, looks_like_stored_path,
+    paths_in_command, system_root, under_windows_dir,
 };
 use crate::registry::{RegError, Registry};
 
@@ -679,9 +679,11 @@ fn every_outside_path_missing(ctx: &ScanCtx<'_>, paths: &[String]) -> Option<Str
 }
 
 fn missing_outside(ctx: &ScanCtx<'_>, paths: &[String]) -> Vec<String> {
+    // Only the program and the code files a command loads count. A present
+    // program with a missing data or output argument is not a broken command.
     let mut missing = Vec::new();
-    for path in paths {
-        let expanded = expand_env(ctx.fs, path);
+    for path in command_dependencies(paths) {
+        let expanded = expand_env(ctx.fs, &path);
         if expanded.contains('%')
             || skip_text(ctx, &expanded)
             || under_windows_dir(ctx.fs, &expanded)
@@ -2505,6 +2507,32 @@ mod tests {
                 .findings
                 .iter()
                 .all(|finding| !finding.key.to_ascii_lowercase().ends_with("\\live"))
+        );
+    }
+
+    #[test]
+    fn a_present_program_with_a_missing_data_argument_is_not_stale() {
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.add_file(r"C:\Apps\runner.exe");
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "App",
+            r#""C:\Apps\runner.exe" --log "C:\Logs\gone.log""#,
+        );
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.value.as_deref() != Some("App")),
+            "a working Run entry was flagged over a missing data argument"
         );
     }
 

@@ -1760,7 +1760,13 @@ impl App {
             );
             return;
         }
-        let backup_file = next_services_backup_file();
+        let Some(backup_file) = next_services_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
             "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
@@ -1960,7 +1966,13 @@ impl App {
             );
             return;
         }
-        let backup_file = next_services_backup_file();
+        let Some(backup_file) = next_services_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
             "Set {} to {}?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
@@ -2277,7 +2289,13 @@ impl App {
             );
             return;
         }
-        let backup_file = next_privacy_backup_file();
+        let Some(backup_file) = next_privacy_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
             "Clean {} {}?\n\nHive Mend saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
@@ -3127,7 +3145,13 @@ impl App {
             );
             return;
         }
-        let backup_file = next_backup_file();
+        let Some(backup_file) = next_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
             "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
@@ -5632,17 +5656,18 @@ fn local_time_text(time: SystemTime) -> String {
     }
 }
 
-/// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
-fn next_backup_file() -> PathBuf {
+/// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, reserved so a name is never
+/// reused; `None` when no name could be reserved.
+fn next_backup_file() -> Option<PathBuf> {
     next_backup_file_with("hive-mend")
 }
 
-/// `services-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
-fn next_services_backup_file() -> PathBuf {
+/// `services-YYYYMMDD-HHMMSS.reg` in local time, reserved; `None` on failure.
+fn next_services_backup_file() -> Option<PathBuf> {
     next_backup_file_with("services")
 }
 
-fn next_privacy_backup_file() -> PathBuf {
+fn next_privacy_backup_file() -> Option<PathBuf> {
     next_backup_file_with("privacy")
 }
 
@@ -5650,9 +5675,11 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn next_backup_file_with(prefix: &str) -> PathBuf {
+fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
     let dir = backups_dir();
-    let _ = std::fs::create_dir_all(&dir);
+    if std::fs::create_dir_all(&dir).is_err() {
+        return None;
+    }
     let stamp = unsafe {
         let mut t: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut t);
@@ -5664,7 +5691,8 @@ fn next_backup_file_with(prefix: &str) -> PathBuf {
     // Reserve the name by creating the (empty) file now, so a second window
     // choosing a name in the same second cannot land on this one and later
     // overwrite its backup. A cancelled job removes the placeholder with
-    // `discard_reserved_backup`.
+    // `discard_reserved_backup`. Return None rather than an unreserved name:
+    // the caller aborts the job instead of writing a backup it never reserved.
     for attempt in 0..10_000u32 {
         let name = if attempt == 0 {
             format!("{prefix}-{stamp}.reg")
@@ -5677,14 +5705,12 @@ fn next_backup_file_with(prefix: &str) -> PathBuf {
             .create_new(true)
             .open(&path)
         {
-            Ok(_) => return path,
+            Ok(_) => return Some(path),
             Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            // A different error (for example the folder is not writable): hand
-            // the path back and let the later write surface the real error.
-            Err(_) => return path,
+            Err(_) => return None,
         }
     }
-    dir.join(format!("{prefix}-{stamp}.reg"))
+    None
 }
 
 /// Remove a just-reserved backup placeholder after the user cancels. Only an

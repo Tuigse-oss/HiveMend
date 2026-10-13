@@ -358,6 +358,32 @@ fn push_path(found: &mut Vec<String>, raw: &str) {
     }
 }
 
+/// From the paths pulled out of a single command, the ones whose absence means
+/// the command is broken: the program it launches (the first path) and any
+/// code file it loads. A data or output argument — a `--log out.txt` path — is
+/// not a dependency, so a present program with a missing data argument is not
+/// stale and must not be offered for deletion.
+pub fn command_dependencies(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|(index, path)| *index == 0 || is_code_file(path))
+        .map(|(_, path)| path.clone())
+        .collect()
+}
+
+/// A file a command executes or loads, by extension: programs, libraries,
+/// drivers, scripts. Data and document files are not code.
+fn is_code_file(path: &str) -> bool {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    const CODE: &[&str] = &[
+        ".exe", ".dll", ".ocx", ".sys", ".drv", ".vxd", ".scr", ".com", ".cpl", ".bat", ".cmd",
+        ".pif", ".msc",
+    ];
+    CODE.iter().any(|ext| lower.ends_with(ext))
+}
+
 /// A `,<index>` suffix on a command is a resource or icon index, always a
 /// (possibly negative) integer. A comma followed by anything else belongs to
 /// the file name.
@@ -685,6 +711,24 @@ mod tests {
             canonical_path(r"HKCR\MIME\Database\Content Type\text/html"),
             r"HKEY_CLASSES_ROOT\MIME\Database\Content Type\text/html"
         );
+    }
+
+    #[test]
+    fn command_dependencies_drop_data_arguments_but_keep_code() {
+        let with_log = vec![
+            r"C:\Apps\runner.exe".to_string(),
+            r"C:\Logs\next.log".to_string(),
+        ];
+        assert_eq!(
+            command_dependencies(&with_log),
+            vec![r"C:\Apps\runner.exe".to_string()]
+        );
+        // A loaded library is still a dependency.
+        let with_dll = vec![
+            r"C:\Apps\host.exe".to_string(),
+            r"C:\Apps\plugin.dll".to_string(),
+        ];
+        assert_eq!(command_dependencies(&with_dll), with_dll);
     }
 
     #[test]

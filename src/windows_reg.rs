@@ -110,6 +110,13 @@ impl Registry for WindowsRegistry {
     }
 
     fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        // An embedded NUL would truncate the name at the Win32 boundary and
+        // could address a different value, so refuse it before opening.
+        if name.contains('\0') {
+            return Err(RegError::Message(format!(
+                "{path}: value name contains a NUL and cannot be addressed safely"
+            )));
+        }
         let opened = open(path, true)?;
         let wide = wide(name);
         let rc = unsafe { RegDeleteValueW(opened.key, wide.as_ptr()) };
@@ -151,6 +158,14 @@ fn failure(rc: u32, message: String) -> RegError {
 /// Reads the whole value. A backup that dropped part of a value would put
 /// back something different from what repair removed.
 fn read_value(opened: &Opened, name: &str, kind: u32, size: u32) -> Result<ValueKind, RegError> {
+    // An embedded NUL truncates the name at the Win32 boundary, so re-querying
+    // by it could read a different value. Refuse rather than back up the wrong
+    // bytes; the key is then reported unreadable and left alone.
+    if name.contains('\0') {
+        return Err(RegError::Message(format!(
+            "value name {name:?} contains a NUL and cannot be read back safely"
+        )));
+    }
     let mut bytes = vec![0u8; size as usize];
     let mut got = size;
     let mut read_kind = kind;
@@ -414,6 +429,17 @@ mod live_tests {
             decode_value(REG_DWORD, &[1, 0]),
             ValueKind::Other { .. }
         ));
+    }
+
+    #[test]
+    fn delete_value_refuses_a_name_with_an_embedded_nul() {
+        // The guard returns before the key is opened, so no registry access
+        // happens; a NUL must never reach the NUL-terminated Win32 call.
+        let mut reg = WindowsRegistry;
+        let err = reg
+            .delete_value(r"HKCU\Software\HiveMendTest\Nope", "abc\0tail")
+            .unwrap_err();
+        assert!(matches!(err, RegError::Message(msg) if msg.contains("NUL")));
     }
 
     struct TestKey {

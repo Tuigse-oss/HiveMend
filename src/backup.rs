@@ -169,6 +169,16 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     }
 
     for (key, names) in values {
+        // A single value backup must validate names too: a Run value whose
+        // name holds CR/LF or trailing whitespace cannot round-trip, so the
+        // whole key is marked uncovered and repair leaves every value under it.
+        if unrepresentable_name(&key) || names.iter().any(|name| unrepresentable_name(name)) {
+            body.push_str(&format!(
+                "\r\n; not backed up, left alone: {key}: a value name cannot be represented in a .reg backup\r\n"
+            ));
+            unreadable.push(key);
+            continue;
+        }
         match reg.values(&key) {
             Ok(present) => {
                 body.push_str(&format!("\r\n[{key}]\r\n"));
@@ -248,12 +258,15 @@ fn export_tree(
     // be written as an exact quoted `.reg` name, so the backup would not round
     // trip. Refuse the whole key rather than let repair delete something the
     // backup cannot put back.
-    if has_control_char(path) {
+    if unrepresentable_name(path) {
         return Err(RegError::Message(format!(
             "{path}: key name cannot be represented in a .reg backup"
         )));
     }
-    if let Some(value) = values.iter().find(|value| has_control_char(&value.name)) {
+    if let Some(value) = values
+        .iter()
+        .find(|value| unrepresentable_name(&value.name))
+    {
         return Err(RegError::Message(format!(
             "{path}: value name {:?} cannot be represented in a .reg backup",
             value.name
@@ -273,9 +286,17 @@ fn export_tree(
     for child in children {
         let child_path = format!("{}\\{child}", canonical_path(path));
         match export_tree(reg, &child_path, depth + 1, body) {
-            // Removed by someone else while we read it. Nothing to save.
-            Err(RegError::NotFound) => {}
-            other => other?,
+            Ok(()) => {}
+            // A child that was just listed but cannot be read back (a name
+            // canonicalization would alter, such as trailing whitespace, or a
+            // child removed mid-read) must not be silently dropped: delete_tree
+            // would still remove it with no backup. Fail the key's coverage.
+            Err(RegError::NotFound) => {
+                return Err(RegError::Message(format!(
+                    "{child_path}: a listed subkey could not be backed up"
+                )));
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -315,6 +336,14 @@ fn escape_reg(text: &str) -> String {
 /// quoted `.reg` round trip: CR/LF break the line, NUL truncates on import.
 fn has_control_char(text: &str) -> bool {
     text.chars().any(|ch| (ch as u32) < 0x20)
+}
+
+/// A key or value name this backup cannot reproduce byte-for-byte, so repair
+/// must leave it alone: a control character breaks or truncates the `.reg`
+/// line, and leading or trailing whitespace is dropped when the path is
+/// canonicalized, so the name written would not match the name removed.
+fn unrepresentable_name(name: &str) -> bool {
+    has_control_char(name) || name != name.trim()
 }
 
 fn utf16_bytes(text: &str) -> Vec<u8> {
@@ -637,6 +666,62 @@ mod tests {
                 .iter()
                 .any(|bad| bad.eq_ignore_ascii_case(&canonical_path(key)))
         );
+    }
+
+    #[test]
+    fn a_control_char_in_a_deletevalue_name_leaves_the_key_uncovered() {
+        // The single-value backup path must validate names too, not only the
+        // whole-key export.
+        let mut reg = MemoryRegistry::new();
+        let key = r"HKCU\Software\Run";
+        reg.set_sz(key, "Good", "x");
+        reg.set_sz(key, "Bad\r\nEntry", "y");
+        let plan = export_repairs(
+            &reg,
+            &[Repair::DeleteValue {
+                key: key.into(),
+                name: "Bad\r\nEntry".into(),
+            }],
+            Path::new("t.reg"),
+        );
+        assert!(!plan.covers(key));
+    }
+
+    #[test]
+    fn a_subkey_name_that_cannot_be_reproduced_leaves_the_parent_uncovered() {
+        use crate::model::RegValue;
+        use crate::registry::{RegError, Registry};
+
+        // A registry whose parent lists a child whose name ends in a space —
+        // a name canonicalization would alter, so it cannot be backed up.
+        struct TrailingSpace;
+        impl Registry for TrailingSpace {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                if canonical_path(path).eq_ignore_ascii_case(r"HKEY_CURRENT_USER\Software\App") {
+                    Ok(vec!["Saved ".to_string()])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn values(&self, _path: &str) -> Result<Vec<RegValue>, RegError> {
+                Ok(Vec::new())
+            }
+            fn delete_value(&mut self, _path: &str, _name: &str) -> Result<(), RegError> {
+                Ok(())
+            }
+            fn delete_tree(&mut self, _path: &str) -> Result<(), RegError> {
+                Ok(())
+            }
+        }
+
+        let parent = r"HKCU\Software\App";
+        let plan = export_repairs(
+            &TrailingSpace,
+            &[Repair::DeleteKey { key: parent.into() }],
+            Path::new("t.reg"),
+        );
+        // The listed child could not be exported, so the whole tree is left.
+        assert!(!plan.covers(parent));
     }
 
     #[test]
