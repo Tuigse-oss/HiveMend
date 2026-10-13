@@ -1,0 +1,61 @@
+name: codeql
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "41 7 * * 2"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Code scanning can only take uploads once the repository is public (or has
+  # GitHub Advanced Security). Until then the analysis is skipped, not failed,
+  # and it starts on its own with the first run after the repo goes public.
+  visibility:
+    runs-on: ubuntu-latest
+    outputs:
+      public: ${{ steps.check.outputs.public }}
+    steps:
+      - id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+        run: echo "public=$(gh api "repos/$REPO" --jq '.private == false')" >> "$GITHUB_OUTPUT"
+
+  analyze:
+    name: analyze (${{ matrix.language }})
+    needs: visibility
+    if: needs.visibility.outputs.public == 'true'
+    runs-on: ${{ matrix.os }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # The Win32 FFI and the GUI are cfg(windows); the extractor only sees
+          # them when it runs where they compile.
+          - language: rust
+            os: windows-latest
+          - language: actions
+            os: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      # The Rust extractor needs the pinned toolchain and the std sources.
+      - if: matrix.language == 'rust'
+        run: rustup toolchain install 1.99.0 --profile minimal --component rust-src
+      - uses: github/codeql-action/init@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          languages: ${{ matrix.language }}
+          build-mode: none
+          queries: security-extended
+      - uses: github/codeql-action/analyze@24c54180a607b1449ed407dd24f251e4e9147c8d # v4.38.3
+        with:
+          category: /language:${{ matrix.language }}
