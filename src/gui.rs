@@ -18,10 +18,12 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use registry_master::{
     BackupInfo, BackupSummary, Engine, Exclusions, Finding, HostFs, Repair, RepairOutcome,
-    ScanOptions, ScanReport, ScannerId, Settings, WINDOWS_TOOLS, WindowsRegistry, backups_dir,
-    exclusions_file, expand_target, format_bytes, format_uptime, gather_snapshot, import_reg_file,
-    list_backups, read_backup, repair_with_progress, restore_files, scan_with_progress,
-    settings_file, still_reported,
+    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
+    ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, WINDOWS_TOOLS,
+    WindowsRegistry, apply_start_changes, backups_dir, exclusions_file, expand_target,
+    format_bytes, format_uptime, gather_snapshot, import_reg_file, list_backups,
+    plan_profile, read_backup, repair_with_progress, restore_files, scan_with_progress,
+    settings_file, sort_services, start_services, still_reported, stop_services,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -65,8 +67,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     DispatchMessageW, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW,
     GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP,
     IsDialogMessageW, LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_SEPARATOR,
-    MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
+    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
     RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
     SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
@@ -92,16 +94,30 @@ const ID_RESTORE: u16 = 1101;
 const ID_OPEN_BACKUPS: u16 = 1102;
 const ID_UNIGNORE: u16 = 1103;
 const ID_SCANNER_BASE: u16 = 1200;
+const ID_SVC_REFRESH: u16 = 1300;
+const ID_SVC_ALL: u16 = 1301;
+const ID_SVC_NONE: u16 = 1302;
+const ID_SVC_APPLY: u16 = 1303;
+const ID_SVC_START: u16 = 1304;
+const ID_SVC_STOP: u16 = 1305;
 const ID_FINDINGS: u16 = 2000;
 const ID_PROGRESS: u16 = 2001;
 const ID_BACKUPS: u16 = 2002;
 const ID_IGNORED: u16 = 2003;
+const ID_SVC_LIST: u16 = 2004;
+const ID_SVC_TUNE: u16 = 2005;
 const IDCANCEL: u16 = 2;
 
 const MENU_DETAILS: usize = 1;
 const MENU_COPY: usize = 2;
 const MENU_SHOW: usize = 3;
 const MENU_IGNORE: usize = 4;
+const MENU_SVC_START: usize = 11;
+const MENU_SVC_STOP: usize = 12;
+const MENU_SVC_AUTO: usize = 13;
+const MENU_SVC_AUTO_DELAYED: usize = 14;
+const MENU_SVC_MANUAL: usize = 15;
+const MENU_SVC_DISABLED: usize = 16;
 
 /// Layout is designed at 96 DPI and scaled.
 const HEADER_H: i32 = 72;
@@ -129,6 +145,7 @@ enum Page {
     Scan,
     Restore,
     Settings,
+    Services,
     Monitor,
     Tools,
     About,
@@ -139,6 +156,7 @@ const NAV: &[(&str, Page)] = &[
     ("Start Scan", Page::Scan),
     ("Restore", Page::Restore),
     ("Settings", Page::Settings),
+    ("Services", Page::Services),
     ("Monitor", Page::Monitor),
     ("Tools", Page::Tools),
     ("About", Page::About),
@@ -173,6 +191,21 @@ enum Job {
     Scanning,
     Repairing,
     Restoring,
+    Services,
+}
+
+/// Services page views: suggested Manual starts, or every service.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SvcView {
+    Tuneup,
+    Manage,
+}
+
+/// What a services worker did: re-read the list, or applied a change.
+#[derive(Clone, Copy)]
+enum SvcOp {
+    Refresh,
+    Apply,
 }
 
 #[derive(Clone, Copy)]
@@ -184,6 +217,7 @@ enum Action {
     Elevate,
     OpenTool(usize),
     Refresh,
+    SvcView(SvcView),
 }
 
 impl Action {
@@ -211,6 +245,11 @@ enum JobResult {
     Restore {
         file: PathBuf,
         result: Result<(BackupSummary, usize, Vec<String>), String>,
+    },
+    Services {
+        op: SvcOp,
+        result: Result<ServiceOutcome, String>,
+        services: Vec<ServiceInfo>,
     },
 }
 
@@ -275,6 +314,22 @@ struct App {
     scanner_boxes: Vec<(ScannerId, HWND)>,
     ignored_list: HWND,
     btn_unignore: HWND,
+
+    svc_view: SvcView,
+    services: Vec<ServiceInfo>,
+    svc_loaded: bool,
+    svc_proposals: Vec<ServiceChange>,
+    svc_checked: Vec<bool>,
+    svc_note: String,
+    svc_filling: bool,
+    svc_list: HWND,
+    svc_tune_list: HWND,
+    btn_svc_refresh: HWND,
+    btn_svc_all: HWND,
+    btn_svc_none: HWND,
+    btn_svc_apply: HWND,
+    btn_svc_start: HWND,
+    btn_svc_stop: HWND,
 }
 
 pub fn run() -> std::process::ExitCode {
@@ -421,6 +476,8 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
         WM_CONTEXTMENU => {
             if wparam as HWND == app.list {
                 app.findings_menu(lparam);
+            } else if wparam as HWND == app.svc_list {
+                app.services_menu(lparam);
             }
             0
         }
@@ -439,9 +496,9 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
             0
         }
         WM_CLOSE => {
-            if matches!(app.job, Job::Repairing | Job::Restoring) {
+            if matches!(app.job, Job::Repairing | Job::Restoring | Job::Services) {
                 app.message(
-                    "Registry Master is still changing the registry. Please wait for it to finish before closing.",
+                    "Registry Master is still working. Please wait for it to finish before closing.",
                     MB_ICONWARNING,
                 );
                 return 0;
@@ -512,6 +569,21 @@ impl App {
             scanner_boxes: Vec::new(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
+            svc_view: SvcView::Tuneup,
+            services: Vec::new(),
+            svc_loaded: false,
+            svc_proposals: Vec::new(),
+            svc_checked: Vec::new(),
+            svc_note: String::new(),
+            svc_filling: false,
+            svc_list: std::ptr::null_mut(),
+            svc_tune_list: std::ptr::null_mut(),
+            btn_svc_refresh: std::ptr::null_mut(),
+            btn_svc_all: std::ptr::null_mut(),
+            btn_svc_none: std::ptr::null_mut(),
+            btn_svc_apply: std::ptr::null_mut(),
+            btn_svc_start: std::ptr::null_mut(),
+            btn_svc_stop: std::ptr::null_mut(),
         };
         app.create_controls();
         app
@@ -568,6 +640,27 @@ impl App {
         }
         self.ignored_list = list_view(hwnd, ID_IGNORED, 0, 0, &[("Ignored entry", 700)]);
         self.btn_unignore = button(hwnd, ID_UNIGNORE, "Stop Ignoring Highlighted", BS_PUSHBUTTON);
+
+        self.svc_list = list_view(
+            hwnd,
+            ID_SVC_LIST,
+            0,
+            0,
+            &[("Service", 300), ("Status", 110), ("Startup", 150), ("Name", 220)],
+        );
+        self.svc_tune_list = list_view(
+            hwnd,
+            ID_SVC_TUNE,
+            0,
+            LVS_EX_CHECKBOXES,
+            &[("Service", 240), ("Now", 150), ("Change to", 130), ("Why", 300)],
+        );
+        self.btn_svc_refresh = button(hwnd, ID_SVC_REFRESH, "Refresh", BS_PUSHBUTTON);
+        self.btn_svc_all = button(hwnd, ID_SVC_ALL, "Tick All", BS_PUSHBUTTON);
+        self.btn_svc_none = button(hwnd, ID_SVC_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_svc_apply = button(hwnd, ID_SVC_APPLY, "Apply Ticked", BS_PUSHBUTTON);
+        self.btn_svc_start = button(hwnd, ID_SVC_START, "Start", BS_PUSHBUTTON);
+        self.btn_svc_stop = button(hwnd, ID_SVC_STOP, "Stop", BS_PUSHBUTTON);
         self.apply_fonts();
         self.fill_backups();
         self.fill_ignored();
@@ -588,6 +681,14 @@ impl App {
             self.btn_open_backups,
             self.ignored_list,
             self.btn_unignore,
+            self.svc_list,
+            self.svc_tune_list,
+            self.btn_svc_refresh,
+            self.btn_svc_all,
+            self.btn_svc_none,
+            self.btn_svc_apply,
+            self.btn_svc_start,
+            self.btn_svc_stop,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
         all
@@ -660,6 +761,14 @@ impl App {
             Action::Elevate => self.elevate(),
             Action::OpenTool(index) => self.open_tool(index),
             Action::Refresh => self.invalidate(),
+            Action::SvcView(view) => {
+                if self.busy() {
+                    return;
+                }
+                self.svc_view = view;
+                self.sync_controls();
+                self.invalidate();
+            }
         }
     }
 
@@ -679,6 +788,9 @@ impl App {
         self.page = page;
         if matches!(page, Page::Restore | Page::Status | Page::Monitor) && !self.busy() {
             self.refresh_backups();
+        }
+        if page == Page::Services && !self.svc_loaded {
+            self.refresh_services();
         }
         self.sync_controls();
         self.invalidate();
@@ -732,6 +844,12 @@ impl App {
                 shell_open(self.hwnd, &dir.display().to_string(), None);
             }
             ID_UNIGNORE => self.unignore(),
+            ID_SVC_REFRESH => self.refresh_services(),
+            ID_SVC_ALL => self.svc_tick_all(true),
+            ID_SVC_NONE => self.svc_tick_all(false),
+            ID_SVC_APPLY => self.start_services_apply(),
+            ID_SVC_START => self.power_highlighted(true),
+            ID_SVC_STOP => self.power_highlighted(false),
             _ => {}
         }
     }
@@ -779,6 +897,42 @@ impl App {
         } else if id == ID_BACKUPS && header.code == NM_DBLCLK {
             if let Some(row) = selected_rows(self.backup_list).first() {
                 self.start_restore(*row);
+            }
+        } else if id == ID_SVC_TUNE {
+            match header.code {
+                LVN_ITEMCHANGING => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.svc_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old && (self.busy() || new == 1) {
+                            return 1;
+                        }
+                    }
+                }
+                LVN_ITEMCHANGED => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.svc_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old {
+                            if let Some(slot) = self.svc_checked.get_mut(change.iItem as usize) {
+                                *slot = new == 2;
+                            }
+                            self.update_svc_apply_label();
+                        }
+                    }
+                }
+                NM_DBLCLK => {
+                    if let Some(row) = selected_rows(self.svc_tune_list).first() {
+                        self.show_svc_proposal(*row);
+                    }
+                }
+                _ => {}
+            }
+        } else if id == ID_SVC_LIST && header.code == NM_DBLCLK {
+            if let Some(row) = selected_rows(self.svc_list).first() {
+                self.show_svc_details(*row);
             }
         }
         0
@@ -1112,6 +1266,602 @@ impl App {
                 }
             }
             MENU_IGNORE => self.ignore_rows(&rows),
+            _ => {}
+        }
+    }
+
+    // ---- services ------------------------------------------------------
+
+    fn refresh_services(&mut self) {
+        if self.busy() {
+            return;
+        }
+        self.job = Job::Services;
+        self.page = Page::Services;
+        set_progress(0, 1, "Reading the service list...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let listed = ScmServiceStore.list();
+            match listed {
+                Ok(mut services) => {
+                    sort_services(&mut services);
+                    finish_job(
+                        hwnd,
+                        JobResult::Services {
+                            op: SvcOp::Refresh,
+                            result: Ok(ServiceOutcome::default()),
+                            services,
+                        },
+                    );
+                }
+                Err(err) => finish_job(
+                    hwnd,
+                    JobResult::Services {
+                        op: SvcOp::Refresh,
+                        result: Err(err.0),
+                        services: Vec::new(),
+                    },
+                ),
+            }
+        });
+    }
+
+    fn svc_ticked(&self) -> Vec<ServiceChange> {
+        self.svc_proposals
+            .iter()
+            .zip(self.svc_checked.iter())
+            .filter(|(_, on)| **on)
+            .map(|(change, _)| change.clone())
+            .collect()
+    }
+
+    fn svc_tick_all(&mut self, on: bool) {
+        if self.busy() {
+            return;
+        }
+        for slot in self.svc_checked.iter_mut() {
+            *slot = on;
+        }
+        self.fill_services();
+    }
+
+    fn update_svc_apply_label(&self) {
+        let count = self.svc_checked.iter().filter(|on| **on).count();
+        let label = if count == 0 {
+            "Apply Ticked".to_string()
+        } else {
+            format!("Apply Ticked ({count})")
+        };
+        set_text(self.btn_svc_apply, &label);
+        unsafe {
+            EnableWindow(
+                self.btn_svc_apply,
+                (count > 0 && self.elevated && !self.busy()) as i32,
+            )
+        };
+    }
+
+    fn rebuild_proposals(&mut self) {
+        let old: Vec<(String, bool)> = self
+            .svc_proposals
+            .iter()
+            .map(|change| change.name.clone())
+            .zip(self.svc_checked.iter().copied())
+            .collect();
+        self.svc_proposals = plan_profile(&SUGGESTED, &self.services);
+        self.svc_checked = self
+            .svc_proposals
+            .iter()
+            .map(|change| {
+                old.iter()
+                    .find(|(name, _)| name.eq_ignore_ascii_case(&change.name))
+                    .map(|(_, on)| *on)
+                    .unwrap_or(false)
+            })
+            .collect();
+    }
+
+    fn start_services_apply(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if !self.elevated {
+            self.message(
+                "Changing services needs administrator rights. Use Run as administrator in the header, then try again.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let selected = self.svc_ticked();
+        if selected.is_empty() {
+            self.message(
+                "Tick the suggestions you want to apply first.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let backup_file = next_services_backup_file();
+        let mut question = format!(
+            "Set {} to start on demand (Manual)?\n\nRegistry Master saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            if selected.len() == 1 {
+                format!("{} ({})", selected[0].display_name, selected[0].from.label())
+            } else {
+                format!("these {} services", selected.len())
+            },
+            backup_file.display()
+        );
+        for change in selected.iter().take(8) {
+            question.push_str(&format!(
+                "\n{}: {} -> Manual",
+                change.display_name,
+                change.from.label()
+            ));
+        }
+        if selected.len() > 8 {
+            question.push_str(&format!("\n...and {} more", selected.len() - 8));
+        }
+        if !self.confirm(&question) {
+            return;
+        }
+        self.job = Job::Services;
+        set_progress(0, selected.len().max(1), "Saving the current start types...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let outcome = apply_start_changes(
+                &mut ScmServiceStore,
+                &WindowsRegistry,
+                &selected,
+                &backup_file,
+                &mut |done, total| {
+                    set_progress(
+                        done,
+                        total,
+                        &format!("Applying service changes ({done} of {total})..."),
+                    );
+                    post(hwnd, WM_JOB_PROGRESS);
+                },
+            );
+            let mut services = ScmServiceStore.list().unwrap_or_default();
+            sort_services(&mut services);
+            finish_job(
+                hwnd,
+                JobResult::Services {
+                    op: SvcOp::Apply,
+                    result: outcome.map_err(|err| err.0),
+                    services,
+                },
+            );
+        });
+    }
+
+    /// Start or stop the highlighted rows in All services.
+    fn power_rows(&mut self, rows: &[usize], start: bool) {
+        if self.busy() {
+            return;
+        }
+        if !self.elevated {
+            self.message(
+                "Starting and stopping services needs administrator rights. Use Run as administrator in the header, then try again.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let names: Vec<String> = rows
+            .iter()
+            .filter_map(|row| self.services.get(*row))
+            .map(|info| info.name.clone())
+            .collect();
+        if names.is_empty() {
+            self.message(
+                "Highlight a service in All services first.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let verb = if start { "Start" } else { "Stop" };
+        let mut question = if names.len() == 1 {
+            let info = self
+                .services
+                .iter()
+                .find(|info| info.name == names[0])
+                .unwrap();
+            format!(
+                "{verb} {}?\n\nIt {} now and keeps its startup type{}.",
+                info.display_name,
+                if start { "starts" } else { "stops" },
+                if start { "." } else { ". You can start it again here." }
+            )
+        } else {
+            format!(
+                "{verb} these {} services?\n\nStartup types are unchanged.",
+                names.len()
+            )
+        };
+        for name in names.iter().take(8) {
+            question.push_str(&format!("\n{name}"));
+        }
+        if names.len() > 8 {
+            question.push_str(&format!("\n...and {} more", names.len() - 8));
+        }
+        if !self.confirm(&question) {
+            return;
+        }
+        self.job = Job::Services;
+        set_progress(0, names.len().max(1), &format!("{verb}ing services..."));
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let outcome = if start {
+                start_services(&mut ScmServiceStore, &names, &mut |done, total| {
+                    set_progress(done, total, &format!("Starting services ({done} of {total})..."));
+                    post(hwnd, WM_JOB_PROGRESS);
+                })
+            } else {
+                stop_services(&mut ScmServiceStore, &names, &mut |done, total| {
+                    set_progress(done, total, &format!("Stopping services ({done} of {total})..."));
+                    post(hwnd, WM_JOB_PROGRESS);
+                })
+            };
+            let mut services = ScmServiceStore.list().unwrap_or_default();
+            sort_services(&mut services);
+            finish_job(
+                hwnd,
+                JobResult::Services {
+                    op: SvcOp::Apply,
+                    result: Ok(outcome),
+                    services,
+                },
+            );
+        });
+    }
+
+    fn power_highlighted(&mut self, start: bool) {
+        let rows = selected_rows(self.svc_list);
+        self.power_rows(&rows, start);
+    }
+
+    /// Set one startup type for the highlighted rows in All services.
+    fn set_rows(&mut self, rows: &[usize], to: StartType) {
+        if self.busy() {
+            return;
+        }
+        if !self.elevated {
+            self.message(
+                "Changing services needs administrator rights. Use Run as administrator in the header, then try again.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let changes: Vec<ServiceChange> = rows
+            .iter()
+            .filter_map(|row| self.services.get(*row))
+            .map(|info| ServiceChange {
+                name: info.name.clone(),
+                display_name: info.display_name.clone(),
+                from: info.start,
+                to,
+                why: "Chosen in All services.".into(),
+            })
+            .collect();
+        if changes.is_empty() {
+            self.message(
+                "Highlight a service in All services first.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let backup_file = next_services_backup_file();
+        let mut question = format!(
+            "Set {} to {}?\n\nRegistry Master saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            if changes.len() == 1 {
+                format!(
+                    "{} (now {})",
+                    changes[0].display_name,
+                    changes[0].from.label()
+                )
+            } else {
+                format!("these {} services", changes.len())
+            },
+            to.label(),
+            backup_file.display()
+        );
+        if to == StartType::Disabled {
+            question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
+        }
+        if !self.confirm(&question) {
+            return;
+        }
+        self.job = Job::Services;
+        set_progress(0, changes.len().max(1), "Saving the current start types...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let outcome = apply_start_changes(
+                &mut ScmServiceStore,
+                &WindowsRegistry,
+                &changes,
+                &backup_file,
+                &mut |done, total| {
+                    set_progress(
+                        done,
+                        total,
+                        &format!("Applying service changes ({done} of {total})..."),
+                    );
+                    post(hwnd, WM_JOB_PROGRESS);
+                },
+            );
+            let mut services = ScmServiceStore.list().unwrap_or_default();
+            sort_services(&mut services);
+            finish_job(
+                hwnd,
+                JobResult::Services {
+                    op: SvcOp::Apply,
+                    result: outcome.map_err(|err| err.0),
+                    services,
+                },
+            );
+        });
+    }
+
+    fn finish_services(
+        &mut self,
+        op: SvcOp,
+        result: Result<ServiceOutcome, String>,
+        services: Vec<ServiceInfo>,
+    ) {
+        match result {
+            Err(err) => {
+                self.svc_note = "Could not read or change services.".to_string();
+                self.message(
+                    &format!("Nothing was changed.\n\n{err}"),
+                    MB_ICONWARNING,
+                );
+            }
+            Ok(outcome) => {
+                if !services.is_empty() || matches!(op, SvcOp::Refresh) {
+                    self.services = services;
+                    self.svc_loaded = true;
+                }
+                self.rebuild_proposals();
+                self.fill_services();
+                match op {
+                    SvcOp::Refresh => {
+                        self.svc_note = if self.services.is_empty() {
+                            "No services listed.".to_string()
+                        } else {
+                            format!("{} services listed.", self.services.len())
+                        };
+                    }
+                    SvcOp::Apply => {
+                        self.refresh_backups();
+                        let mut lines = vec![format!("Applied: {}", outcome.applied.len())];
+                        for applied in outcome.applied.iter().take(8) {
+                            lines.push(applied.clone());
+                        }
+                        if outcome.applied.len() > 8 {
+                            lines.push(format!("...and {} more", outcome.applied.len() - 8));
+                        }
+                        if outcome.already_correct > 0 {
+                            lines.push(format!("Already set: {}", outcome.already_correct));
+                        }
+                        for refused in &outcome.refused {
+                            lines.push(format!("Refused: {refused}"));
+                        }
+                        for skipped in &outcome.not_backed_up {
+                            lines.push(format!("Not backed up, left alone: {skipped}"));
+                        }
+                        for error in outcome.errors.iter().take(5) {
+                            lines.push(format!("Failed: {error}"));
+                        }
+                        if outcome.denied > 0 {
+                            lines.push(
+                                "Windows refused some changes for lack of rights. Run as administrator and try again."
+                                    .to_string(),
+                            );
+                        }
+                        if !outcome.backup_file.as_os_str().is_empty() {
+                            lines.push(format!(
+                                "Backup: {}",
+                                outcome.backup_file.display()
+                            ));
+                        }
+                        self.svc_note = if outcome.applied.is_empty() && outcome.errors.is_empty() {
+                            "Nothing needed changing.".to_string()
+                        } else {
+                            format!(
+                                "Applied {}, refused {}, failed {}.",
+                                outcome.applied.len(),
+                                outcome.refused.len() + outcome.not_backed_up.len(),
+                                outcome.errors.len() + outcome.denied
+                            )
+                        };
+                        let icon = if outcome.applied.is_empty()
+                            && (outcome.denied > 0 || !outcome.errors.is_empty())
+                        {
+                            MB_ICONWARNING
+                        } else {
+                            MB_ICONINFORMATION
+                        };
+                        self.message(&lines.join("\n"), icon);
+                    }
+                }
+            }
+        }
+    }
+
+    fn fill_services(&mut self) {
+        self.svc_filling = true;
+        unsafe {
+            SendMessageW(self.svc_tune_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.svc_tune_list, LVM_DELETEALLITEMS, 0, 0);
+            for (row, change) in self.svc_proposals.iter().enumerate() {
+                insert_row(
+                    self.svc_tune_list,
+                    row,
+                    &[
+                        &change.display_name,
+                        change.from.label(),
+                        change.to.label(),
+                        &change.why,
+                    ],
+                );
+                let image = if self.svc_checked.get(row).copied().unwrap_or(false) {
+                    2
+                } else {
+                    1
+                };
+                set_state_image(self.svc_tune_list, row, image);
+            }
+            SendMessageW(self.svc_tune_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.svc_tune_list, std::ptr::null(), 1);
+            SendMessageW(self.svc_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.svc_list, LVM_DELETEALLITEMS, 0, 0);
+            for (row, info) in self.services.iter().enumerate() {
+                insert_row(
+                    self.svc_list,
+                    row,
+                    &[
+                        &info.display_name,
+                        info.state.label(),
+                        info.start.label(),
+                        &info.name,
+                    ],
+                );
+            }
+            SendMessageW(self.svc_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.svc_list, std::ptr::null(), 1);
+        }
+        self.svc_filling = false;
+        self.update_svc_apply_label();
+    }
+
+    fn show_svc_details(&mut self, row: usize) {
+        let Some(info) = self.services.get(row) else {
+            return;
+        };
+        let startup = if info.start == StartType::AutomaticDelayed {
+            "Automatic (delayed start)".to_string()
+        } else {
+            info.start.label().to_string()
+        };
+        self.message(
+            &format!(
+                "{}\nName: {}\nStatus: {}\nStartup: {}\n\nRight-click for Start, Stop, and startup-type changes. Startup changes save a backup first and can be undone on the Restore page.",
+                info.display_name, info.name, info.state.label(), startup
+            ),
+            MB_ICONINFORMATION,
+        );
+    }
+
+    fn show_svc_proposal(&mut self, row: usize) {
+        let Some(change) = self.svc_proposals.get(row) else {
+            return;
+        };
+        self.message(
+            &format!(
+                "{} ({})\n{} -> {}\n\n{}\n\nTick it and use Apply Ticked to change it. The old start type is backed up first.",
+                change.display_name, change.name, change.from.label(), change.to.label(), change.why
+            ),
+            MB_ICONINFORMATION,
+        );
+    }
+
+    fn services_menu(&mut self, lparam: LPARAM) {
+        let rows = selected_rows(self.svc_list);
+        if rows.is_empty() || self.busy() {
+            return;
+        }
+        let mut at = POINT {
+            x: (lparam & 0xffff) as i16 as i32,
+            y: ((lparam >> 16) & 0xffff) as i16 as i32,
+        };
+        if lparam == -1 {
+            let mut rect = RECT::default();
+            unsafe {
+                SendMessageW(self.svc_list, LVM_GETITEMRECT, rows[0], &mut rect as *mut _ as isize);
+                at = POINT {
+                    x: rect.left + self.s(24),
+                    y: rect.bottom,
+                };
+                ClientToScreen(self.svc_list, &mut at);
+            }
+        }
+        let first = &self.services[rows[0]];
+        let running = first.state == ServiceState::Running;
+        let stopped = first.state == ServiceState::Stopped;
+        let can_write = self.elevated;
+        let gray = |on: bool| if on { MF_GRAYED } else { MF_STRING };
+        let choice = unsafe {
+            let menu = CreatePopupMenu();
+            AppendMenuW(
+                menu,
+                gray(!can_write || running),
+                MENU_SVC_START,
+                wide("Start").as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                gray(!can_write || stopped),
+                MENU_SVC_STOP,
+                wide("Stop").as_ptr(),
+            );
+            AppendMenuW(menu, MF_SEPARATOR, 0, std::ptr::null());
+            AppendMenuW(
+                menu,
+                gray(!can_write),
+                MENU_SVC_AUTO,
+                wide("Set Automatic").as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                gray(!can_write),
+                MENU_SVC_AUTO_DELAYED,
+                wide("Set Automatic (Delayed)").as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                gray(!can_write),
+                MENU_SVC_MANUAL,
+                wide("Set Manual").as_ptr(),
+            );
+            AppendMenuW(
+                menu,
+                gray(!can_write),
+                MENU_SVC_DISABLED,
+                wide("Set Disabled").as_ptr(),
+            );
+            if lparam != -1 {
+                GetCursorPos(&mut at);
+            }
+            let choice = TrackPopupMenu(
+                menu,
+                TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                at.x,
+                at.y,
+                0,
+                self.hwnd,
+                std::ptr::null(),
+            );
+            DestroyMenu(menu);
+            choice as usize
+        };
+        match choice {
+            MENU_SVC_START => self.power_rows(&rows, true),
+            MENU_SVC_STOP => self.power_rows(&rows, false),
+            MENU_SVC_AUTO => self.set_rows(&rows, StartType::Automatic),
+            MENU_SVC_AUTO_DELAYED => self.set_rows(&rows, StartType::AutomaticDelayed),
+            MENU_SVC_MANUAL => self.set_rows(&rows, StartType::Manual),
+            MENU_SVC_DISABLED => self.set_rows(&rows, StartType::Disabled),
             _ => {}
         }
     }
@@ -1470,6 +2220,14 @@ impl App {
                 self.finish_restore(file, result);
                 self.refresh_backups();
             }
+            JobResult::Services {
+                op,
+                result,
+                services,
+            } => {
+                self.sync_controls();
+                self.finish_services(op, result, services);
+            }
         }
         self.sync_controls();
         self.invalidate();
@@ -1587,6 +2345,65 @@ impl App {
                     SendMessageW(self.ignored_list, LVM_SETCOLUMNWIDTH, 0, (width - self.s(24)) as isize);
                 }
             }
+            Page::Services => {
+                if matches!(self.job, Job::Services) {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
+                } else if self.svc_view == SvcView::Tuneup {
+                    visible.extend([
+                        self.svc_tune_list,
+                        self.btn_svc_all,
+                        self.btn_svc_none,
+                        self.btn_svc_refresh,
+                        self.btn_svc_apply,
+                    ]);
+                    let top = self.s(BODY_Y + 44);
+                    place(
+                        self.svc_tune_list,
+                        left,
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
+                    );
+                    let mut x = left;
+                    for (control, w) in [
+                        (self.btn_svc_all, 96),
+                        (self.btn_svc_none, 104),
+                        (self.btn_svc_refresh, 110),
+                    ] {
+                        place(control, x, button_y, self.s(w), button_h);
+                        x += self.s(w + 8);
+                    }
+                    let apply_w = self.s(220);
+                    place(self.btn_svc_apply, right - apply_w, button_y, apply_w, button_h);
+                    self.size_svc_columns(width);
+                } else {
+                    visible.extend([
+                        self.svc_list,
+                        self.btn_svc_refresh,
+                        self.btn_svc_start,
+                        self.btn_svc_stop,
+                    ]);
+                    let top = self.s(BODY_Y + 44);
+                    place(
+                        self.svc_list,
+                        left,
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
+                    );
+                    let mut x = left;
+                    for (control, w) in [
+                        (self.btn_svc_refresh, 110),
+                        (self.btn_svc_start, 110),
+                        (self.btn_svc_stop, 110),
+                    ] {
+                        place(control, x, button_y, self.s(w), button_h);
+                        x += self.s(w + 8);
+                    }
+                    self.size_svc_columns(width);
+                }
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -1601,11 +2418,42 @@ impl App {
             self.btn_ignore,
             self.btn_restore,
             self.btn_unignore,
+            self.btn_svc_refresh,
+            self.btn_svc_all,
+            self.btn_svc_none,
         ] {
             unsafe { EnableWindow(control, idle as i32) };
         }
+        let can_write = idle && self.elevated;
+        for control in [self.btn_svc_start, self.btn_svc_stop] {
+            unsafe { EnableWindow(control, can_write as i32) };
+        }
         unsafe { EnableWindow(self.list, idle as i32) };
+        unsafe { EnableWindow(self.svc_list, idle as i32) };
+        unsafe { EnableWindow(self.svc_tune_list, idle as i32) };
         self.update_repair_label();
+        self.update_svc_apply_label();
+    }
+
+    fn size_svc_columns(&self, width: i32) {
+        let now = self.s(150);
+        let change = self.s(130);
+        let why = (width - self.s(240) - now - change - self.s(26)).max(self.s(120));
+        unsafe {
+            SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 0, self.s(240) as isize);
+            SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 1, now as isize);
+            SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 2, change as isize);
+            SendMessageW(self.svc_tune_list, LVM_SETCOLUMNWIDTH, 3, why as isize);
+        }
+        let status = self.s(110);
+        let startup = self.s(150);
+        let name = (width - self.s(300) - status - startup - self.s(26)).max(self.s(120));
+        unsafe {
+            SendMessageW(self.svc_list, LVM_SETCOLUMNWIDTH, 0, self.s(300) as isize);
+            SendMessageW(self.svc_list, LVM_SETCOLUMNWIDTH, 1, status as isize);
+            SendMessageW(self.svc_list, LVM_SETCOLUMNWIDTH, 2, startup as isize);
+            SendMessageW(self.svc_list, LVM_SETCOLUMNWIDTH, 3, name as isize);
+        }
     }
 
     fn size_finding_columns(&self, width: i32) {
@@ -1659,6 +2507,7 @@ impl App {
                 Page::Scan => self.draw_scan(mem, rect),
                 Page::Restore => self.draw_restore(mem, rect),
                 Page::Settings => self.draw_settings(mem, rect),
+                Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
                 Page::About => self.draw_about(mem, rect),
@@ -1781,6 +2630,7 @@ impl App {
                 Job::Scanning => "Scanning...",
                 Job::Repairing => "Repairing...",
                 Job::Restoring => "Restoring...",
+                Job::Services => "Working...",
                 Job::Idle => "",
             };
             text(
@@ -1918,6 +2768,87 @@ impl App {
             fill(hdc, RECT { left: link.left, top: link.bottom - 1, right: link.right, bottom: link.bottom }, LINK);
         }
         self.spot(link, Action::ResetStats);
+    }
+
+    unsafe fn draw_services(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        if self.job == Job::Services {
+            self.heading(hdc, rect, "Services", None);
+            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT { left, top: self.s(BODY_Y + 48), right, bottom: self.s(BODY_Y + 74) },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS,
+            );
+            return;
+        }
+        self.heading(hdc, rect, "Services", None);
+        let line = if !self.svc_note.is_empty() {
+            self.svc_note.clone()
+        } else if !self.elevated {
+            "Listing never changes anything. Run as administrator to change services.".to_string()
+        } else {
+            "Suggested Manual starts, or every service. Listing never changes anything.".to_string()
+        };
+        self.subtitle(hdc, rect, &line);
+        let tabs = [("Suggested", SvcView::Tuneup), ("All services", SvcView::Manage)];
+        let mut x = left;
+        for (label, view) in tabs {
+            let size = measure(hdc, self.fonts.body_bold, label);
+            let tab = RECT {
+                left: x,
+                top: self.s(BODY_Y),
+                right: x + size.0 + self.s(28),
+                bottom: self.s(BODY_Y + 30),
+            };
+            let selected = self.svc_view == view;
+            let lit = lit(hover, tab);
+            round_box(
+                hdc,
+                tab,
+                self.s(14),
+                if selected {
+                    rgb(225, 236, 250)
+                } else if lit {
+                    rgb(240, 244, 250)
+                } else {
+                    rgb(248, 250, 252)
+                },
+                if selected { rgb(60, 130, 210) } else { rgb(186, 196, 210) },
+                if selected { 2 } else { 1 },
+            );
+            text(
+                hdc,
+                self.fonts.body_bold,
+                if selected { BLUE_INK } else { INK },
+                tab,
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+            );
+            self.spot(tab, Action::SvcView(view));
+            x = tab.right + self.s(8);
+        }
+        let hint = match self.svc_view {
+            SvcView::Tuneup => {
+                "Ticked suggestions are set to Manual. Everything is backed up first."
+            }
+            SvcView::Manage => {
+                "Double-click for details. Right-click to start, stop, or change the startup type."
+            }
+        };
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT { left: x + self.s(8), top: self.s(BODY_Y), right, bottom: self.s(BODY_Y + 30) },
+            hint,
+            DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
+        );
     }
 
     unsafe fn draw_scan(&mut self, hdc: HDC, rect: RECT) {
@@ -2157,7 +3088,8 @@ impl App {
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
             "Before repairing, the ticked entries are checked again, and everything about to be removed is saved to a backup first.",
-            "It never touches Winlogon, services, default-app choices, Windows Installer data, files inside the Windows folder, or built-in protocols such as http.",
+            "It never touches Winlogon, default-app choices, Windows Installer data, files inside the Windows folder, or built-in protocols such as http.",
+            "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
         ] {
             paragraph(hdc, self.fonts.body, BLUE_INK, left, left + self.s(16), y, "\u{2022}");
             y = paragraph(hdc, self.fonts.body, INK, left + self.s(16), right, y, line) + gap / 2;
@@ -2365,6 +3297,15 @@ fn local_time_text(time: SystemTime) -> String {
 
 /// `registry-master-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
 fn next_backup_file() -> PathBuf {
+    next_backup_file_with("registry-master")
+}
+
+/// `services-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
+fn next_services_backup_file() -> PathBuf {
+    next_backup_file_with("services")
+}
+
+fn next_backup_file_with(prefix: &str) -> PathBuf {
     let dir = backups_dir();
     let stamp = unsafe {
         let mut t: SYSTEMTIME = std::mem::zeroed();
@@ -2374,10 +3315,10 @@ fn next_backup_file() -> PathBuf {
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
         )
     };
-    let mut path = dir.join(format!("registry-master-{stamp}.reg"));
+    let mut path = dir.join(format!("{prefix}-{stamp}.reg"));
     let mut n = 2;
     while path.exists() {
-        path = dir.join(format!("registry-master-{stamp}-{n}.reg"));
+        path = dir.join(format!("{prefix}-{stamp}-{n}.reg"));
         n += 1;
     }
     path

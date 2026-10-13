@@ -57,11 +57,18 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window: Status, Start Scan, Restore,
-Settings, Monitor, Tools, and About.
+Settings, Services, Monitor, Tools, and About.
 
 - Status shows Scan Your Registry, Optimize Your System (a quick
   startup, uninstall, shared-DLL, and COM pass), and Monitor Your System
   cards, plus the last scan result and a statistics reset link.
+- Services has a Suggested tab (safe Automatic services you may tick to
+  set to Manual) and an All services tab (start, stop, or change the
+  startup type of a highlighted row). Every change writes a
+  `services-*.reg` backup first and can be undone on the Restore page.
+  Boot drivers and the services Windows needs to boot, update, or stay
+  secure are always refused. Listing is read-only; changing anything
+  needs administrator rights.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Registry Master health summary. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,

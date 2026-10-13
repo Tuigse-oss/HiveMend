@@ -10,12 +10,15 @@ mod pathutil;
 mod registry;
 mod rules;
 mod scanners;
+mod services;
 mod settings;
 mod sysinfo;
 mod tools;
 
 #[cfg(windows)]
 mod windows_reg;
+#[cfg(windows)]
+mod windows_services;
 
 pub use backup::{BackupInfo, BackupSummary, backup_name, list_backups, read_backup, restore_files};
 #[cfg(windows)]
@@ -30,6 +33,13 @@ pub use settings::Settings;
 pub use fs::{HostFs, MemoryFs};
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
 pub use registry::MemoryRegistry;
+pub use services::{
+    NEVER_TOUCH, SUGGESTED, MemoryServiceStore, ServiceChange, ServiceInfo, ServiceOutcome,
+    ServiceState, ServiceStore, StartType, StoreError, TuneupProfile, TuneupTarget,
+    apply_start_changes, export_start_backup, is_never_touch, plan_profile, refuse_change,
+    refuse_start, refuse_stop, service_key, sort_services, start_services, stop_services,
+    tuneup_allowed,
+};
 pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};
 #[cfg(windows)]
 pub use sysinfo::gather as gather_snapshot;
@@ -37,6 +47,8 @@ pub use tools::{WINDOWS_TOOLS, WindowsTool, expand_target, is_openable};
 
 #[cfg(windows)]
 pub use windows_reg::WindowsRegistry;
+#[cfg(windows)]
+pub use windows_services::ScmServiceStore;
 
 /// Where the window and the command line keep backups, settings, and the
 /// ignore list.
