@@ -26,11 +26,15 @@ Shell folders, `UserChoice` file associations, Winlogon, services, files inside 
 Rust 1.99.0 is pinned in `rust-toolchain.toml`.
 
 ```bash
+cargo fmt --check
+cargo clippy --all-targets -- -D warnings
 cargo test
 cargo build --release --target x86_64-pc-windows-msvc
 ```
 
 The MSVC target needs the Microsoft linker, so the release build is meant to run on Windows. From this tree, `cargo test` checks the engine with an in-memory hive.
+
+CI runs the same checks on Linux and Windows for every pull request: formatting, Clippy with warnings denied, and the tests, including live Win32 tests on the Windows runner. It also audits `Cargo.lock` against the [RustSec](https://rustsec.org) advisory database on every change and once a week.
 
 ## Use
 
@@ -113,6 +117,19 @@ files=%TEMP%\myapp|*.log
 files-rec=%TMP%\myapp|*.tmp
 value=HKCU\Software\MyApp\Settings|RecentFile1
 ```
+
+## Releases
+
+Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt` and a GitHub build provenance attestation, and the exe embeds its dependency list so it can be audited after download:
+
+```bash
+gh attestation verify hive-mend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend
+cargo audit bin hive-mend-v0.1.0-x86_64-windows.exe
+```
+
+## Security
+
+Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
 ## License
 
