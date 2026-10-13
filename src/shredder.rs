@@ -1051,3 +1051,51 @@ mod tests {
         assert_eq!(ShredMethod::SevenPass.passes(), 7);
     }
 }
+
+/// Live Windows test. Shreds one file it creates under the temp folder, so it
+/// exercises the real HostFs overwrite, verify, truncate, rename, and delete
+/// path end to end without touching anything else.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+    use crate::fs::HostFs;
+
+    #[test]
+    fn live_shred_removes_a_real_temp_file() {
+        let dir = std::env::temp_dir().join(format!("hivemend-shred-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("make temp dir");
+        let path = dir.join("secret.bin");
+        std::fs::write(&path, vec![0xABu8; 4096]).expect("write temp file");
+        let text = path.display().to_string();
+
+        // A plain temp-folder file must pass the staging gate.
+        assert!(
+            shred_allowed(&HostFs, &text).is_ok(),
+            "temp file should be shreddable"
+        );
+
+        let outcome = shred_paths(
+            &mut HostFs,
+            &[ShredTarget {
+                path: text.clone(),
+                is_dir: false,
+            }],
+            &ShredOptions {
+                method: ShredMethod::ThreePass,
+                rename: true,
+            },
+            0x1234_5678_9abc_def0,
+            &mut |_, _, _| true,
+        );
+        assert_eq!(outcome.shredded, 1, "errors: {:?}", outcome.errors);
+        assert_eq!(outcome.bytes, 4096);
+        assert!(outcome.errors.is_empty(), "errors: {:?}", outcome.errors);
+        assert!(outcome.refused.is_empty(), "refused: {:?}", outcome.refused);
+        assert!(
+            !std::path::Path::new(&text).exists(),
+            "shredded file still present"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}
