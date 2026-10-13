@@ -1,0 +1,397 @@
+#![cfg_attr(windows, windows_subsystem = "windows")]
+
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use clap::{Args, Parser, Subcommand, ValueEnum};
+use registry_master::{Engine, Exclusions, Repair, ScanOptions, ScannerId, scan};
+
+#[cfg(windows)]
+mod gui;
+
+#[cfg(windows)]
+use registry_master::{HostFs, WindowsRegistry, repair};
+#[cfg(windows)]
+use std::time::SystemTime;
+
+#[derive(Parser)]
+#[command(
+    name = "registry-master",
+    version,
+    about = "Scan and repair stale registry entries on Windows 10 and 11"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Subcommand)]
+enum Command {
+    /// List the scanner jobs.
+    Scanners(DataArgs),
+    /// Report stale entries. Does not change the registry.
+    Scan(ScanArgs),
+    /// Back up matching entries, then remove them.
+    Repair(RepairArgs),
+    /// Merge a backup written by repair and put back its shortcut copies.
+    Restore {
+        /// The .reg file in the backup folder.
+        file: PathBuf,
+    },
+    /// Run the built-in sample hive. Useful off Windows.
+    Demo,
+}
+
+#[derive(Args)]
+struct DataArgs {
+    /// Extracted legacy cleaner app folder. Loads its scan rules and ignore lists.
+    #[arg(long)]
+    data: Option<PathBuf>,
+    /// Rules XML. Replaces the built-in Windows 10/11 paths before --data is merged.
+    #[arg(long)]
+    rules: Option<PathBuf>,
+}
+
+#[derive(Args)]
+struct ScanArgs {
+    #[command(flatten)]
+    data: DataArgs,
+    /// Comma-separated scanner ids, for example SL,SUP,ARP.
+    #[arg(long, value_delimiter = ',')]
+    only: Vec<String>,
+    /// Also run Deep Scan.
+    #[arg(long)]
+    include_deep: bool,
+    /// Stay on the native registry view.
+    #[arg(long)]
+    no_wow64: bool,
+    /// Only keep findings whose location contains this text (case-insensitive).
+    #[arg(long = "match")]
+    matching: Option<String>,
+    /// Also report entries on the ignore list (C:\RegistryMaster\ignore.txt).
+    #[arg(long)]
+    no_ignore_list: bool,
+    #[arg(long, value_enum, default_value_t = Format::Text)]
+    format: Format,
+}
+
+#[derive(Args)]
+struct RepairArgs {
+    #[command(flatten)]
+    scan: ScanArgs,
+    /// Directory for the UTF-16 .reg backup. Required.
+    #[arg(long)]
+    backup_dir: PathBuf,
+    /// Apply the backup's deletions. Without this, repair only prints the plan.
+    #[arg(long)]
+    yes: bool,
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum Format {
+    Text,
+    Json,
+}
+
+fn main() -> ExitCode {
+    #[cfg(windows)]
+    if std::env::args().len() <= 1 {
+        return gui::run();
+    }
+    #[cfg(windows)]
+    attach_parent_console();
+    match real_main() {
+        Ok(code) => code,
+        Err(err) => {
+            eprintln!("registry-master: {err}");
+            ExitCode::from(1)
+        }
+    }
+}
+
+#[cfg(windows)]
+fn attach_parent_console() {
+    unsafe {
+        windows_sys::Win32::System::Console::AttachConsole(0xFFFFFFFF);
+    }
+}
+
+fn real_main() -> Result<ExitCode, registry_master::Error> {
+    let cli = Cli::parse();
+    match cli.command {
+        Command::Scanners(args) => {
+            let engine = Engine::load(args.rules.as_deref(), args.data.as_deref())?;
+            for scanner in &engine.rules.scanners {
+                let state = if scanner.enabled { "on" } else { "off" };
+                println!(
+                    "{:<5} {:<24} {state:<4} {} paths",
+                    scanner.id.code(),
+                    scanner.name,
+                    scanner.paths.len()
+                );
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        Command::Demo => {
+            let sample = registry_master::sample_world();
+            let report = scan(
+                &Engine::builtin(),
+                &sample.reg,
+                &sample.fs,
+                &ScanOptions::default(),
+            );
+            print_text(&report);
+            Ok(if report.findings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
+        }
+        Command::Restore { file } => restore_live(&file),
+        Command::Scan(args) => {
+            let engine = load_engine(&args.data)?;
+            let opts = options(&args)?;
+            let report = scan_live(&engine, &opts, &args)?;
+            emit(&report, args.format);
+            Ok(if report.findings.is_empty() {
+                ExitCode::SUCCESS
+            } else {
+                ExitCode::from(2)
+            })
+        }
+        Command::Repair(args) => {
+            let engine = load_engine(&args.scan.data)?;
+            let opts = options(&args.scan)?;
+            if !args.yes {
+                let report = scan_live(&engine, &opts, &args.scan)?;
+                emit(&report, args.scan.format);
+                let repairable = report
+                    .findings
+                    .iter()
+                    .filter(|finding| finding.repairable())
+                    .count();
+                println!(
+                    "{repairable} entries can be repaired. Re-run with --yes to write a backup and apply it."
+                );
+                return Ok(if report.findings.is_empty() {
+                    ExitCode::SUCCESS
+                } else {
+                    ExitCode::from(2)
+                });
+            }
+            repair_live(&engine, &opts, &args.scan, &args.backup_dir)
+        }
+    }
+}
+
+fn load_engine(args: &DataArgs) -> Result<Engine, registry_master::Error> {
+    Engine::load(args.rules.as_deref(), args.data.as_deref())
+}
+
+fn options(args: &ScanArgs) -> Result<ScanOptions, registry_master::Error> {
+    let mut only = Vec::new();
+    for name in &args.only {
+        let id = ScannerId::parse(name).ok_or_else(|| {
+            registry_master::Error(format!(
+                "unknown scanner '{name}'. Try: SL, RI, WF, HR, SP, SUP, ARP, VD, FX, PS, CC, DEEP"
+            ))
+        })?;
+        only.push(id);
+    }
+    Ok(ScanOptions {
+        only,
+        include_deep: args.include_deep,
+        wow64: !args.no_wow64,
+    })
+}
+
+/// Drop ignored entries and anything outside `--match`.
+fn narrow(report: &mut registry_master::ScanReport, args: &ScanArgs) {
+    if !args.no_ignore_list {
+        let ignored = Exclusions::load(&registry_master::exclusions_file()).filter(&mut report.findings);
+        if ignored > 0 {
+            report
+                .warnings
+                .push(format!("{ignored} ignored entries hidden (see --no-ignore-list)"));
+        }
+    }
+    if let Some(text) = &args.matching {
+        let needle = text.to_ascii_lowercase();
+        report.findings.retain(|finding| {
+            finding.key.to_ascii_lowercase().contains(&needle)
+                || finding
+                    .value
+                    .as_deref()
+                    .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
+        });
+    }
+}
+
+fn scan_live(
+    engine: &Engine,
+    opts: &ScanOptions,
+    args: &ScanArgs,
+) -> Result<registry_master::ScanReport, registry_master::Error> {
+    #[cfg(windows)]
+    {
+        let reg = WindowsRegistry;
+        let mut report = scan(engine, &reg, &HostFs, opts);
+        narrow(&mut report, args);
+        Ok(report)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (engine, opts, args, narrow);
+        Err(registry_master::Error(
+            "live registry scan needs Windows. Use `registry-master demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
+        ))
+    }
+}
+
+fn repair_live(
+    engine: &Engine,
+    opts: &ScanOptions,
+    args: &ScanArgs,
+    backup_dir: &std::path::Path,
+) -> Result<ExitCode, registry_master::Error> {
+    #[cfg(windows)]
+    {
+        let mut reg = WindowsRegistry;
+        let mut report = scan(engine, &reg, &HostFs, opts);
+        narrow(&mut report, args);
+        print_text(&report);
+        std::fs::create_dir_all(backup_dir)?;
+        let backup_file = backup_dir.join(registry_master::backup_name(SystemTime::now()));
+        let mut fs = HostFs;
+        let outcome = repair(&mut reg, &mut fs, &report.findings, &backup_file)?;
+        println!(
+            "backup {}  removed {}  already gone {}  left alone {}  errors {}",
+            outcome.backup_file.display(),
+            outcome.applied,
+            outcome.already_gone,
+            outcome.refused + outcome.not_backed_up,
+            outcome.errors.len()
+        );
+        if outcome.denied > 0 {
+            eprintln!(
+                "registry-master: {} entries need an elevated (Run as administrator) prompt",
+                outcome.denied
+            );
+        }
+        for err in &outcome.errors {
+            eprintln!("registry-master: {err}");
+        }
+        Ok(if outcome.errors.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = (engine, opts, args, backup_dir);
+        Err(registry_master::Error(
+            "repair of a live registry needs Windows".into(),
+        ))
+    }
+}
+
+fn restore_live(file: &std::path::Path) -> Result<ExitCode, registry_master::Error> {
+    #[cfg(windows)]
+    {
+        let text = registry_master::read_backup(file)?;
+        let summary = registry_master::BackupSummary::parse(&text);
+        registry_master::import_reg_file(file).map_err(registry_master::Error)?;
+        let (files, errors) = registry_master::restore_files(&summary);
+        println!(
+            "restored {} keys, {} values, {files} files from {}",
+            summary.keys,
+            summary.values,
+            file.display()
+        );
+        for err in &errors {
+            eprintln!("registry-master: {err}");
+        }
+        Ok(if errors.is_empty() {
+            ExitCode::SUCCESS
+        } else {
+            ExitCode::from(1)
+        })
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        Err(registry_master::Error(
+            "restoring a registry backup needs Windows".into(),
+        ))
+    }
+}
+
+fn emit(report: &registry_master::ScanReport, format: Format) {
+    match format {
+        Format::Text => print_text(report),
+        Format::Json => print_json(report),
+    }
+}
+
+fn print_text(report: &registry_master::ScanReport) {
+    if report.findings.is_empty() {
+        println!("No stale entries.");
+    }
+    for finding in &report.findings {
+        let value = finding
+            .value
+            .as_deref()
+            .filter(|name| !name.is_empty())
+            .unwrap_or("(default)");
+        let action = match &finding.repair {
+            Repair::None => "report",
+            Repair::DeleteValue { .. } => "delete value",
+            Repair::DeleteKey { .. } => "delete key",
+            Repair::DeleteFile { .. } => "delete file",
+        };
+        println!(
+            "[{}] {}  {}  {}  {}  {}",
+            finding.scanner.code(),
+            finding.scanner_name,
+            finding.key,
+            value,
+            finding.detail,
+            action
+        );
+    }
+    println!("{} findings", report.findings.len());
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+}
+
+fn print_json(report: &registry_master::ScanReport) {
+    println!("[");
+    for (index, finding) in report.findings.iter().enumerate() {
+        let comma = if index + 1 == report.findings.len() {
+            ""
+        } else {
+            ","
+        };
+        let repair = match &finding.repair {
+            Repair::None => "none",
+            Repair::DeleteValue { .. } => "delete-value",
+            Repair::DeleteKey { .. } => "delete-key",
+            Repair::DeleteFile { .. } => "delete-file",
+        };
+        println!(
+            "  {{\"scanner\":\"{}\",\"name\":\"{}\",\"key\":\"{}\",\"value\":\"{}\",\"detail\":\"{}\",\"repair\":\"{repair}\"}}{comma}",
+            finding.scanner.code(),
+            escape_json(&finding.scanner_name),
+            escape_json(&finding.key),
+            escape_json(finding.value.as_deref().unwrap_or("")),
+            escape_json(&finding.detail),
+        );
+    }
+    println!("]");
+}
+
+fn escape_json(text: &str) -> String {
+    text.replace('\\', "\\\\").replace('"', "\\\"")
+}

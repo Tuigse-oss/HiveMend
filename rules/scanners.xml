@@ -1,0 +1,148 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!--
+  Registry Master scanner paths for Windows 10 and 11.
+  Scanner ids follow the classic two-letter scheme. Paths are the public
+  registry locations those jobs use, plus the per-user keys Windows 10/11 added.
+-->
+<RegistryScanner>
+  <DB>
+    <References>
+      <Scanner ID="SL" NAME="Software Locations" STATE="1">
+        <Paths ID="1" DATA="HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"></Paths>
+        <Paths ID="3" KIND="value-name-path" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"></Paths>
+        <Paths ID="4" KIND="value-name-path" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Layers"></Paths>
+        <Paths ID="5" KIND="value-name-path" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store"></Paths>
+        <Paths ID="6" KIND="value-name-path" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\AppCompatFlags\Compatibility Assistant\Store"></Paths>
+        <Paths ID="7" KIND="mui-cache" DATA="HKEY_CURRENT_USER\Software\Classes\Local Settings\Software\Microsoft\Windows\Shell\MuiCache"></Paths>
+        <Paths ID="8" KIND="value-name-path" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\AppSwitched"></Paths>
+        <Paths ID="9" KIND="value-name-path" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\FeatureUsage\AppLaunch"></Paths>
+        <Paths ID="10" KIND="user-assist" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\UserAssist"></Paths>
+        <Paths ID="11" KIND="path-value" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Wallpapers"></Paths>
+        <Paths ID="12" KIND="path-value" DATA="HKEY_CURRENT_USER\Control Panel\Desktop"></Paths>
+        <Paths ID="13" KIND="path-value" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Lock Screen"></Paths>
+        <Paths ID="14" KIND="path-value" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Themes"></Paths>
+      </Scanner>
+      <Scanner ID="RI" NAME="Registry Integrity" STATE="1">
+        <Paths ID="1" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\User Shell Folders"></Paths>
+        <Paths ID="3" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Shell Folders"></Paths>
+      </Scanner>
+      <Scanner ID="WF" NAME="Windows Fonts" STATE="1">
+        <Paths ID="1" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Fonts"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Fonts"></Paths>
+      </Scanner>
+      <Scanner ID="HR" NAME="Help And Resources" STATE="1">
+        <Paths ID="1" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\Help"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\HTML Help"></Paths>
+        <Paths ID="3" KIND="sound-event" DATA="HKEY_CURRENT_USER\AppEvents\Schemes\Apps"></Paths>
+      </Scanner>
+      <Scanner ID="SP" NAME="Shared DLLs" STATE="1">
+        <Paths ID="1" DATA="HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs"></Paths>
+        <Paths ID="3" KIND="appinit" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Windows"></Paths>
+      </Scanner>
+      <Scanner ID="SUP" NAME="Startup Programs" STATE="1">
+        <Paths ID="1" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Run"></Paths>
+        <Paths ID="2" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\RunOnce"></Paths>
+        <Paths ID="3" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Run"></Paths>
+        <Paths ID="4" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\RunOnce"></Paths>
+        <Paths ID="5" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"></Paths>
+        <Paths ID="6" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Policies\Explorer\Run"></Paths>
+        <Paths ID="7" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows NT\CurrentVersion\Windows"></Paths>
+        <Paths ID="14" KIND="command-autorun" DATA="HKEY_CURRENT_USER\Software\Microsoft\Command Processor"></Paths>
+        <Paths ID="15" KIND="command-autorun" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Command Processor"></Paths>
+        <Paths ID="8" KIND="startup-approved" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"></Paths>
+        <Paths ID="9" KIND="startup-approved" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32"></Paths>
+        <Paths ID="10" KIND="startup-approved" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"></Paths>
+        <Paths ID="11" KIND="startup-approved" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run"></Paths>
+        <Paths ID="12" KIND="startup-approved" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\Run32"></Paths>
+        <Paths ID="13" KIND="startup-approved" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved\StartupFolder"></Paths>
+      </Scanner>
+      <Scanner ID="ARP" NAME="Add/Remove Programs" STATE="1">
+        <Paths ID="1" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"></Paths>
+        <Paths ID="2" DATA="HKEY_CURRENT_USER\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall"></Paths>
+        <Paths ID="3" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\Folders"></Paths>
+        <Paths ID="4" KIND="arp-cache" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Management\ARPCache"></Paths>
+        <Paths ID="5" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\StartMenuInternet"></Paths>
+        <Paths ID="6" KIND="start-menu-client" DATA="HKEY_CURRENT_USER\Software\Clients\StartMenuInternet"></Paths>
+        <Paths ID="7" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\Mail"></Paths>
+        <Paths ID="8" KIND="start-menu-client" DATA="HKEY_CURRENT_USER\Software\Clients\Mail"></Paths>
+        <Paths ID="9" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\Media"></Paths>
+        <Paths ID="10" KIND="start-menu-client" DATA="HKEY_CURRENT_USER\Software\Clients\Media"></Paths>
+        <Paths ID="11" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\Contacts"></Paths>
+        <Paths ID="12" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\Calendar"></Paths>
+        <Paths ID="13" KIND="start-menu-client" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Clients\IM"></Paths>
+        <Paths ID="14" KIND="installer-source" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\UserData"></Paths>
+        <Paths ID="15" KIND="firewall-rule" DATA="HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\SharedAccess\Parameters\FirewallPolicy\FirewallRules"></Paths>
+      </Scanner>
+      <Scanner ID="VD" NAME="Virtual Devices" STATE="1">
+        <Paths ID="1" DATA="HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\VirtualDeviceDrivers"></Paths>
+        <Paths ID="2" DATA="HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Services\VxD"></Paths>
+      </Scanner>
+      <Scanner ID="FX" NAME="File Extensions" STATE="1">
+        <Paths ID="1" KIND="association-toast" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\ApplicationAssociationToasts"></Paths>
+        <Paths ID="2" KIND="url-protocol" DATA="HKEY_CURRENT_USER\Software\Classes"></Paths>
+      </Scanner>
+      <Scanner ID="PS" NAME="Temp Files / Shortcuts" STATE="1"></Scanner>
+      <Scanner ID="CC" NAME="Custom Controls" STATE="1">
+        <Paths ID="1" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\*\shell"></Paths>
+        <Paths ID="2" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\Directory\shell"></Paths>
+        <Paths ID="3" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\Directory\Background\shell"></Paths>
+        <Paths ID="4" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\Drive\shell"></Paths>
+        <Paths ID="5" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\AllFilesystemObjects\shell"></Paths>
+        <Paths ID="6" KIND="shell-command" DATA="HKEY_CURRENT_USER\Software\Classes\Folder\shell"></Paths>
+        <Paths ID="7" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shell"></Paths>
+        <Paths ID="8" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Directory\shell"></Paths>
+        <Paths ID="9" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Directory\Background\shell"></Paths>
+        <Paths ID="10" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Drive\shell"></Paths>
+        <Paths ID="11" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\AllFilesystemObjects\shell"></Paths>
+        <Paths ID="12" KIND="shell-command" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Folder\shell"></Paths>
+        <Paths ID="13" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\*\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="14" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\Directory\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="15" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\Directory\Background\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="16" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\Drive\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="17" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\AllFilesystemObjects\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="18" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\Folder\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="19" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\*\shellex\DragDropHandlers"></Paths>
+        <Paths ID="20" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Classes\Directory\shellex\DragDropHandlers"></Paths>
+        <Paths ID="21" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="22" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Directory\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="23" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Directory\Background\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="24" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Drive\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="25" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\AllFilesystemObjects\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="26" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Folder\shellex\ContextMenuHandlers"></Paths>
+        <Paths ID="27" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shellex\DragDropHandlers"></Paths>
+        <Paths ID="28" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Directory\shellex\DragDropHandlers"></Paths>
+        <Paths ID="29" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shellex\PropertySheetHandlers"></Paths>
+        <Paths ID="30" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\*\shellex\CopyHookHandlers"></Paths>
+        <Paths ID="31" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellIconOverlayIdentifiers"></Paths>
+        <Paths ID="32" KIND="clsid-key" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"></Paths>
+        <Paths ID="33" KIND="clsid-key" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Browser Helper Objects"></Paths>
+        <Paths ID="34" KIND="ie-extension" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Internet Explorer\Extensions"></Paths>
+        <Paths ID="35" KIND="ie-extension" DATA="HKEY_CURRENT_USER\Software\Microsoft\Internet Explorer\Extensions"></Paths>
+        <Paths ID="36" KIND="typelib" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\TypeLib"></Paths>
+        <Paths ID="37" KIND="typelib" DATA="HKEY_CURRENT_USER\Software\Classes\TypeLib"></Paths>
+        <Paths ID="38" KIND="default-icon" DATA="HKEY_CURRENT_USER\Software\Classes"></Paths>
+        <Paths ID="39" KIND="default-icon" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes"></Paths>
+        <Paths ID="40" KIND="applications" DATA="HKEY_CURRENT_USER\Software\Classes\Applications"></Paths>
+        <Paths ID="41" KIND="applications" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Applications"></Paths>
+        <Paths ID="42" KIND="clsid-value" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellExecuteHooks"></Paths>
+        <Paths ID="43" KIND="clsid-value" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\ShellExecuteHooks"></Paths>
+        <Paths ID="44" KIND="clsid-value" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\SharedTaskScheduler"></Paths>
+        <Paths ID="45" KIND="clsid-value" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad"></Paths>
+        <Paths ID="46" KIND="clsid-value" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\ShellServiceObjectDelayLoad"></Paths>
+        <Paths ID="47" KIND="clsid-key" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ShellServiceObjects"></Paths>
+        <Paths ID="48" KIND="clsid-value" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\PreviewHandlers"></Paths>
+        <Paths ID="49" KIND="clsid-value" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Shell Extensions\Approved"></Paths>
+        <Paths ID="50" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace"></Paths>
+        <Paths ID="51" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace"></Paths>
+        <Paths ID="52" KIND="shell-handler" DATA="HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Explorer\Desktop\NameSpace"></Paths>
+        <Paths ID="53" KIND="shell-handler" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\ControlPanel\NameSpace"></Paths>
+        <Paths ID="54" KIND="autoplay" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\Handlers"></Paths>
+        <Paths ID="55" KIND="codec" DATA="HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Drivers32"></Paths>
+      </Scanner>
+      <Scanner ID="DEEP" NAME="Deep Scan" STATE="0"></Scanner>
+    </References>
+  </DB>
+</RegistryScanner>
