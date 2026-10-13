@@ -1,0 +1,76 @@
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  audit:
+    name: rustsec audit
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - run: cargo +1.99.0 install cargo-audit --version 0.22.2 --locked
+      - run: cargo +1.99.0 audit --deny warnings
+
+  build:
+    name: build and draft release
+    needs: audit
+    runs-on: windows-latest
+    permissions:
+      contents: write # create the draft release
+      id-token: write # sign the build provenance attestation
+      attestations: write
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Check the tag matches Cargo.toml
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
+          if [ "$TAG" != "v$version" ]; then
+            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+            exit 1
+          fi
+      - run: rustup toolchain install 1.99.0 --profile minimal --component clippy
+      - run: cargo +1.99.0 clippy --locked --all-targets -- -D warnings
+      - run: cargo +1.99.0 test --locked --all-targets
+      - run: cargo +1.99.0 install cargo-auditable --version 0.7.7 --locked
+      # Embeds the dependency list in the exe, so the shipped binary itself can
+      # be checked against RustSec later with `cargo audit bin`.
+      - run: cargo +1.99.0 auditable build --locked --release --target x86_64-pc-windows-msvc
+      - name: Package
+        shell: bash
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          mkdir dist
+          cp target/x86_64-pc-windows-msvc/release/hive-mend.exe "dist/hive-mend-$TAG-x86_64-windows.exe"
+          cd dist
+          sha256sum hive-mend-*.exe > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+      - name: Attest build provenance
+        # Artifact attestations are free for public repositories.
+        if: github.event.repository.visibility == 'public'
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/hive-mend-*.exe
+      - name: Create a draft release
+        # A draft stays unpublished until it is reviewed and released by hand.
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hive Mend $TAG" --generate-notes
