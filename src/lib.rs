@@ -3,6 +3,7 @@ mod demo;
 mod engine;
 mod exclude;
 mod fs;
+mod hiveinfo;
 mod ignore;
 mod lnk;
 mod model;
@@ -37,6 +38,9 @@ pub use engine::{
 pub use exclude::{Exclusion, Exclusions};
 pub use settings::Settings;
 pub use fs::{FileView, HostFs, ItemKind, MemoryFs};
+pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
+#[cfg(windows)]
+pub use hiveinfo::gather_hives;
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
 pub use privacy::{
     CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,

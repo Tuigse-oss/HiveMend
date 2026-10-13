@@ -40,6 +40,8 @@ enum Command {
     },
     /// Overwrite files so they cannot be recovered, then delete them. Cannot be undone.
     Shred(ShredArgs),
+    /// List the registry hive files and their sizes. Reads only.
+    Hives,
     /// Run the built-in sample hive. Useful off Windows.
     Demo,
 }
@@ -164,6 +166,7 @@ fn real_main() -> Result<ExitCode, registry_master::Error> {
         }
         Command::Restore { file } => restore_live(&file),
         Command::Shred(args) => shred_live(&args),
+        Command::Hives => hives_live(),
         Command::Scan(args) => {
             let engine = load_engine(&args.data)?;
             let opts = options(&args)?;
@@ -412,6 +415,30 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, registry_master::Error> {
         eprintln!("registry-master: {err}");
     }
     Ok(if outcome.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
+}
+
+fn hives_live() -> Result<ExitCode, registry_master::Error> {
+    #[cfg(windows)]
+    {
+        let inventory = registry_master::gather_hives();
+        for entry in &inventory.entries {
+            let size = entry.bytes.map(registry_master::format_bytes).unwrap_or_else(|| "unknown".into());
+            let file = if entry.file.is_empty() { "(no file)" } else { &entry.file };
+            println!("{}  {}  {}", entry.key, size, file);
+        }
+        println!(
+            "{} hives, {} total",
+            inventory.entries.len(),
+            registry_master::format_bytes(inventory.total_bytes())
+        );
+        Ok(ExitCode::SUCCESS)
+    }
+    #[cfg(not(windows))]
+    {
+        Err(registry_master::Error(
+            "reading the hive list needs Windows".into(),
+        ))
+    }
 }
 
 fn emit(report: &registry_master::ScanReport, format: Format) {

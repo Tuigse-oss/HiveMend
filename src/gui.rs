@@ -17,14 +17,14 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use registry_master::{
-    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HostFs,
-    ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
+    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
+    HostFs, ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
     SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
     ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod,
     ShredOptions, ShredOutcome, ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList,
     WindowsRegistry, WindowsSystemTargets, apply_start_changes, backups_dir, build_items,
     clean_with_progress, custom_privacy_file, decode_text_owned, exclusions_file,
-    expand_target, fixed_drives, format_bytes, format_uptime, gather_snapshot,
+    expand_target, fixed_drives, format_bytes, format_uptime, gather_hives, gather_snapshot,
     import_reg_file, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
     random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
     settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services,
@@ -4145,6 +4145,47 @@ impl App {
             text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(24) }, &value, DT_SINGLELINE | DT_END_ELLIPSIS);
             y += self.s(26);
         }
+        y += self.s(10);
+        text(hdc, self.fonts.heading, INK, RECT { left, top: y, right, bottom: y + self.s(26) }, "Registry hives", DT_SINGLELINE);
+        y += self.s(28);
+        let hives = gather_hives();
+        if hives.entries.is_empty() {
+            text(hdc, self.fonts.body, MUTED, RECT { left, top: y, right, bottom: y + self.s(24) }, "The hive list could not be read.", DT_SINGLELINE);
+            y += self.s(26);
+        } else {
+            let shown: Vec<&HiveEntry> = hives.entries.iter().take(8).collect();
+            let col_w = (right - left) / 2;
+            for (index, entry) in shown.iter().enumerate() {
+                let x = left + (index % 2) as i32 * col_w;
+                let row = y + (index / 2) as i32 * self.s(18);
+                let size = entry.bytes.map(format_bytes).unwrap_or_else(|| "unknown".to_string());
+                text(hdc, self.fonts.body_bold, INK, RECT { left: x, top: row, right: x + self.s(150), bottom: row + self.s(18) }, &hive_label(entry), DT_SINGLELINE | DT_END_ELLIPSIS);
+                text(hdc, self.fonts.body, INK, RECT { left: x + self.s(150), top: row, right: x + col_w - self.s(8), bottom: row + self.s(18) }, &size, DT_SINGLELINE | DT_END_ELLIPSIS);
+            }
+            y += ((shown.len() + 1) / 2) as i32 * self.s(18);
+            text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(22) }, "Total", DT_SINGLELINE);
+            let total = if hives.entries.len() > shown.len() {
+                format!(
+                    "{} in {} hives ({} shown; see registry-master hives)",
+                    format_bytes(hives.total_bytes()),
+                    hives.entries.len(),
+                    shown.len()
+                )
+            } else {
+                format!("{} in {} hives", format_bytes(hives.total_bytes()), hives.entries.len())
+            };
+            text(hdc, self.fonts.body, INK, RECT { left: left + label_w, top: y, right, bottom: y + self.s(22) }, &total, DT_SINGLELINE | DT_END_ELLIPSIS);
+            y += self.s(22);
+        }
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT { left, top: y, right, bottom: y + self.s(18) },
+            "Sizes only. Windows manages hive space itself; compacting needs a reboot and is not offered.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        y += self.s(20);
         y += self.s(6);
         let label = "Refresh readings";
         let size = measure(hdc, self.fonts.body, label);
@@ -4595,6 +4636,13 @@ fn edit_text(control: HWND) -> String {
 
 fn file_name(path: &str) -> String {
     path.rsplit(['\\', '/']).next().unwrap_or(path).to_string()
+}
+
+fn hive_label(entry: &HiveEntry) -> String {
+    if !entry.file.is_empty() {
+        return file_name(&entry.file);
+    }
+    entry.key.rsplit('\\').next().unwrap_or(&entry.key).to_string()
 }
 
 fn list_view(parent: HWND, id: u16, style: u32, ex_style: u32, columns: &[(&str, i32)]) -> HWND {

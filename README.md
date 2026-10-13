@@ -42,6 +42,7 @@ registry-master repair --backup-dir C:\RegistryMaster\backups
 registry-master repair --backup-dir C:\RegistryMaster\backups --yes
 registry-master shred --passes 3 C:\Users\Me\old-letters
 registry-master shred --passes 3 --yes C:\Users\Me\old-letters
+registry-master hives
 ```
 
 `scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
@@ -55,6 +56,8 @@ registry-master scan --data "C:\Path\To\Extracted\app"
 That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.dat` when they are present. Those files are not part of this repository.
 
 `registry-master demo` runs the sample hive on any operating system.
+
+`registry-master hives` lists the registry hive files and their sizes. It only reads. Offline compaction is deliberately not offered: swapping hives at reboot would silently discard everything written after the save, and Windows manages hive space itself.
 
 ## Window
 
@@ -88,7 +91,8 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   traces may survive in spare blocks the overwrite cannot reach. No
   administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
-  usage bars, plus the Registry Master health summary. It only reads.
+  usage bars, plus the Registry Master health summary and a read-only
+  registry-hive inventory with sizes. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,
   System Restore, Windows Update, and the rest). Registry Master only
   launches them.
