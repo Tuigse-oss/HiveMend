@@ -113,3 +113,13 @@ files=%TEMP%\myapp|*.log
 files-rec=%TMP%\myapp|*.tmp
 value=HKCU\Software\MyApp\Settings|RecentFile1
 ```
+
+## License
+
+Licensed under either of the MIT license ([LICENSE-MIT](LICENSE-MIT)) or
+the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your
+option. Unless you explicitly state otherwise, any contribution intentionally
+submitted for inclusion in this project is licensed the same way.
+
+Registry Master is original code with no relation to the discontinued 2005
+Scriptmation product of the same name.
