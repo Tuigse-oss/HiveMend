@@ -227,7 +227,7 @@ mod tests {
             inner,
             locked: canonical_path(&format!(r"{base}\Locked")),
         };
-        let backup = std::env::temp_dir().join("registry-master-locked-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-locked-test.reg");
         let findings = [uninstall_finding("Readable"), uninstall_finding("Locked")];
         let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &backup).unwrap();
         assert_eq!(outcome.applied, 1);

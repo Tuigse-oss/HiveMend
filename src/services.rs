@@ -205,7 +205,7 @@ impl ServiceStore for MemoryServiceStore {
     }
 }
 
-/// Services Registry Master refuses to change or stop: the RPC and logon
+/// Services Hive Mend refuses to change or stop: the RPC and logon
 /// core, the security and update stack, and session basics. Starting one
 /// is transient and stays allowed.
 pub const NEVER_TOUCH: &[&str] = &[
@@ -381,8 +381,8 @@ pub fn service_key(name: &str) -> String {
 /// reported in `unreadable` and must be left alone.
 pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-    body.push_str("; Registry Master services backup.\r\n");
-    body.push_str("; Restore it from the Restore page in Registry Master.\r\n");
+    body.push_str("; Hive Mend services backup.\r\n");
+    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
     let mut unreadable = Vec::new();
     for name in names {
         let key = service_key(name);
@@ -497,7 +497,7 @@ pub fn apply_start_changes(
         };
         if matches!(change.to, StartType::Boot | StartType::System) {
             outcome.refused.push(format!(
-                "{}: Registry Master never sets a Boot or System start",
+                "{}: Hive Mend never sets a Boot or System start",
                 info.name
             ));
             progress(index + 1, changes.len());
@@ -812,7 +812,7 @@ mod tests {
         store.insert(info("Done", StartType::Manual, ServiceState::Stopped));
         store.insert(info("Odd", StartType::Automatic, ServiceState::Stopped));
         let reg = keyed_registry();
-        let backup = std::env::temp_dir().join("registry-master-services-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-services-test.reg");
         let changes = [
             change("Good", StartType::Manual),
             change("RpcSs", StartType::Manual),
@@ -842,7 +842,7 @@ mod tests {
         let mut store = MemoryServiceStore::new();
         store.insert(info("Good", StartType::Automatic, ServiceState::Stopped));
         let reg = keyed_registry();
-        let backup = std::env::temp_dir().join("registry-master-services-boot-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-services-boot-test.reg");
         let outcome = apply_start_changes(
             &mut store,
             &reg,

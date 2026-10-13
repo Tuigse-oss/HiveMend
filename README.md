@@ -1,6 +1,6 @@
-# Registry Master
+# Hive Mend
 
-Registry Master scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup. It covers twelve scanner jobs:
+Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup. It covers twelve scanner jobs:
 
 | Id | Job |
 | --- | --- |
@@ -35,14 +35,14 @@ The MSVC target needs the Microsoft linker, so the release build is meant to run
 ## Use
 
 ```bash
-registry-master scanners
-registry-master scan
-registry-master scan --only SL,SUP,ARP
-registry-master repair --backup-dir C:\RegistryMaster\backups
-registry-master repair --backup-dir C:\RegistryMaster\backups --yes
-registry-master shred --passes 3 C:\Users\Me\old-letters
-registry-master shred --passes 3 --yes C:\Users\Me\old-letters
-registry-master hives
+hive-mend scanners
+hive-mend scan
+hive-mend scan --only SL,SUP,ARP
+hive-mend repair --backup-dir C:\HiveMend\backups
+hive-mend repair --backup-dir C:\HiveMend\backups --yes
+hive-mend shred --passes 3 C:\Users\Me\old-letters
+hive-mend shred --passes 3 --yes C:\Users\Me\old-letters
+hive-mend hives
 ```
 
 `scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
@@ -50,14 +50,14 @@ registry-master hives
 If you still have an extracted legacy cleaner `app` folder, its original rules and ignore lists can be merged in:
 
 ```bash
-registry-master scan --data "C:\Path\To\Extracted\app"
+hive-mend scan --data "C:\Path\To\Extracted\app"
 ```
 
 That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.dat` when they are present. Those files are not part of this repository.
 
-`registry-master demo` runs the sample hive on any operating system.
+`hive-mend demo` runs the sample hive on any operating system.
 
-`registry-master hives` lists the registry hive files and their sizes. It only reads. Offline compaction is deliberately not offered: swapping hives at reboot would silently discard everything written after the save, and Windows manages hive space itself.
+`hive-mend hives` lists the registry hive files and their sizes. It only reads. Offline compaction is deliberately not offered: swapping hives at reboot would silently discard everything written after the save, and Windows manages hive space itself.
 
 ## Window
 
@@ -91,10 +91,10 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   traces may survive in spare blocks the overwrite cannot reach. No
   administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
-  usage bars, plus the Registry Master health summary and a read-only
+  usage bars, plus the Hive Mend health summary and a read-only
   registry-hive inventory with sizes. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,
-  System Restore, Windows Update, and the rest). Registry Master only
+  System Restore, Windows Update, and the rest). Hive Mend only
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
@@ -102,7 +102,7 @@ Card and tile icons load from `C:\registrymasterimages` when that folder
 exists, next to a copy of the exe otherwise. The artwork is not part of
 this repository.
 
-Custom privacy items live in `C:\RegistryMaster\privacy-custom.ini`, one
+Custom privacy items live in `C:\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a
 reason shown on the Custom row.
@@ -120,6 +120,3 @@ Licensed under either of the MIT license ([LICENSE-MIT](LICENSE-MIT)) or
 the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your
 option. Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in this project is licensed the same way.
-
-Registry Master is original code with no relation to the discontinued 2005
-Scriptmation product of the same name.

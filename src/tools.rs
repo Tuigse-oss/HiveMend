@@ -1,6 +1,6 @@
 //! Windows tools shortcuts: the "Help Center" page.
 //!
-//! Every entry opens a screen that ships with Windows. Registry Master only
+//! Every entry opens a screen that ships with Windows. Hive Mend only
 //! opens them; anything changed inside one is the user's own doing in a
 //! Microsoft console. Targets use the same `%SystemRoot%` templates as the
 //! original, updated for Windows 10 and 11 (dead CPLs replaced by their

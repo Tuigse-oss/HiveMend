@@ -785,13 +785,13 @@ mod tests {
         fs.set_var("ProgramFiles", r"C:\Program Files");
         fs.add_file_bytes(r"C:\Windows\Temp\x.dat", vec![1; 4], None);
         fs.add_file_bytes(r"C:\Program Files\App\x.exe", vec![1; 4], None);
-        fs.add_file_bytes(r"C:\RegistryMaster\settings.ini", vec![1; 4], None);
+        fs.add_file_bytes(r"C:\HiveMend\settings.ini", vec![1; 4], None);
         let outcome = shred_paths(
             &mut fs,
             &[
                 target(r"C:\Windows\Temp\x.dat", false),
                 target(r"C:\Program Files\App\x.exe", false),
-                target(r"C:\RegistryMaster\settings.ini", false),
+                target(r"C:\HiveMend\settings.ini", false),
             ],
             &ShredOptions::default(),
             SEED,

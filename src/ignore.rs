@@ -64,6 +64,6 @@ mod tests {
         load_ignore_file(Path::new("/tmp/rm10/app/Data/values.dat"), false, &mut db).unwrap();
         assert!(db.key_fragments.len() > 10);
         assert!(db.skips_value("package.msi"));
-        assert!(!db.skips_key(r"HKEY_CURRENT_USER\Software\RegistryMaster"));
+        assert!(!db.skips_key(r"HKEY_CURRENT_USER\Software\HiveMend"));
     }
 }

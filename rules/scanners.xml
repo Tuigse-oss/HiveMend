@@ -1,6 +1,6 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!--
-  Registry Master scanner paths for Windows 10 and 11.
+  Hive Mend scanner paths for Windows 10 and 11.
   Scanner ids follow the classic two-letter scheme. Paths are the public
   registry locations those jobs use, plus the per-user keys Windows 10/11 added.
 -->

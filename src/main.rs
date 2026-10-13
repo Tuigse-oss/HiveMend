@@ -4,19 +4,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Args, Parser, Subcommand, ValueEnum};
-use registry_master::{Engine, Exclusions, Repair, ScanOptions, ScannerId, scan};
+use hive_mend::{Engine, Exclusions, Repair, ScanOptions, ScannerId, scan};
 
 #[cfg(windows)]
 mod gui;
 
 #[cfg(windows)]
-use registry_master::{HostFs, WindowsRegistry, repair};
+use hive_mend::{HostFs, WindowsRegistry, repair};
 #[cfg(windows)]
 use std::time::SystemTime;
 
 #[derive(Parser)]
 #[command(
-    name = "registry-master",
+    name = "hive-mend",
     version,
     about = "Scan and repair stale registry entries on Windows 10 and 11"
 )]
@@ -72,7 +72,7 @@ struct ScanArgs {
     /// Only keep findings whose location contains this text (case-insensitive).
     #[arg(long = "match")]
     matching: Option<String>,
-    /// Also report entries on the ignore list (C:\RegistryMaster\ignore.txt).
+    /// Also report entries on the ignore list (C:\HiveMend\ignore.txt).
     #[arg(long)]
     no_ignore_list: bool,
     #[arg(long, value_enum, default_value_t = Format::Text)]
@@ -111,6 +111,7 @@ enum Format {
 }
 
 fn main() -> ExitCode {
+    hive_mend::migrate_data_dir();
     #[cfg(windows)]
     if std::env::args().len() <= 1 {
         return gui::run();
@@ -120,7 +121,7 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("registry-master: {err}");
+            eprintln!("hive-mend: {err}");
             ExitCode::from(1)
         }
     }
@@ -133,7 +134,7 @@ fn attach_parent_console() {
     }
 }
 
-fn real_main() -> Result<ExitCode, registry_master::Error> {
+fn real_main() -> Result<ExitCode, hive_mend::Error> {
     let cli = Cli::parse();
     match cli.command {
         Command::Scanners(args) => {
@@ -150,7 +151,7 @@ fn real_main() -> Result<ExitCode, registry_master::Error> {
             Ok(ExitCode::SUCCESS)
         }
         Command::Demo => {
-            let sample = registry_master::sample_world();
+            let sample = hive_mend::sample_world();
             let report = scan(
                 &Engine::builtin(),
                 &sample.reg,
@@ -203,15 +204,15 @@ fn real_main() -> Result<ExitCode, registry_master::Error> {
     }
 }
 
-fn load_engine(args: &DataArgs) -> Result<Engine, registry_master::Error> {
+fn load_engine(args: &DataArgs) -> Result<Engine, hive_mend::Error> {
     Engine::load(args.rules.as_deref(), args.data.as_deref())
 }
 
-fn options(args: &ScanArgs) -> Result<ScanOptions, registry_master::Error> {
+fn options(args: &ScanArgs) -> Result<ScanOptions, hive_mend::Error> {
     let mut only = Vec::new();
     for name in &args.only {
         let id = ScannerId::parse(name).ok_or_else(|| {
-            registry_master::Error(format!(
+            hive_mend::Error(format!(
                 "unknown scanner '{name}'. Try: SL, RI, WF, HR, SP, SUP, ARP, VD, FX, PS, CC, DEEP"
             ))
         })?;
@@ -225,9 +226,9 @@ fn options(args: &ScanArgs) -> Result<ScanOptions, registry_master::Error> {
 }
 
 /// Drop ignored entries and anything outside `--match`.
-fn narrow(report: &mut registry_master::ScanReport, args: &ScanArgs) {
+fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) {
     if !args.no_ignore_list {
-        let ignored = Exclusions::load(&registry_master::exclusions_file()).filter(&mut report.findings);
+        let ignored = Exclusions::load(&hive_mend::exclusions_file()).filter(&mut report.findings);
         if ignored > 0 {
             report
                 .warnings
@@ -250,7 +251,7 @@ fn scan_live(
     engine: &Engine,
     opts: &ScanOptions,
     args: &ScanArgs,
-) -> Result<registry_master::ScanReport, registry_master::Error> {
+) -> Result<hive_mend::ScanReport, hive_mend::Error> {
     #[cfg(windows)]
     {
         let reg = WindowsRegistry;
@@ -261,8 +262,8 @@ fn scan_live(
     #[cfg(not(windows))]
     {
         let _ = (engine, opts, args, narrow);
-        Err(registry_master::Error(
-            "live registry scan needs Windows. Use `registry-master demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
+        Err(hive_mend::Error(
+            "live registry scan needs Windows. Use `hive-mend demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
         ))
     }
 }
@@ -272,7 +273,7 @@ fn repair_live(
     opts: &ScanOptions,
     args: &ScanArgs,
     backup_dir: &std::path::Path,
-) -> Result<ExitCode, registry_master::Error> {
+) -> Result<ExitCode, hive_mend::Error> {
     #[cfg(windows)]
     {
         let mut reg = WindowsRegistry;
@@ -280,7 +281,7 @@ fn repair_live(
         narrow(&mut report, args);
         print_text(&report);
         std::fs::create_dir_all(backup_dir)?;
-        let backup_file = backup_dir.join(registry_master::backup_name(SystemTime::now()));
+        let backup_file = backup_dir.join(hive_mend::backup_name(SystemTime::now()));
         let mut fs = HostFs;
         let outcome = repair(&mut reg, &mut fs, &report.findings, &backup_file)?;
         println!(
@@ -293,12 +294,12 @@ fn repair_live(
         );
         if outcome.denied > 0 {
             eprintln!(
-                "registry-master: {} entries need an elevated (Run as administrator) prompt",
+                "hive-mend: {} entries need an elevated (Run as administrator) prompt",
                 outcome.denied
             );
         }
         for err in &outcome.errors {
-            eprintln!("registry-master: {err}");
+            eprintln!("hive-mend: {err}");
         }
         Ok(if outcome.errors.is_empty() {
             ExitCode::SUCCESS
@@ -309,19 +310,19 @@ fn repair_live(
     #[cfg(not(windows))]
     {
         let _ = (engine, opts, args, backup_dir);
-        Err(registry_master::Error(
+        Err(hive_mend::Error(
             "repair of a live registry needs Windows".into(),
         ))
     }
 }
 
-fn restore_live(file: &std::path::Path) -> Result<ExitCode, registry_master::Error> {
+fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
     #[cfg(windows)]
     {
-        let text = registry_master::read_backup(file)?;
-        let summary = registry_master::BackupSummary::parse(&text);
-        registry_master::import_reg_file(file).map_err(registry_master::Error)?;
-        let (files, errors) = registry_master::restore_files(&summary);
+        let text = hive_mend::read_backup(file)?;
+        let summary = hive_mend::BackupSummary::parse(&text);
+        hive_mend::import_reg_file(file).map_err(hive_mend::Error)?;
+        let (files, errors) = hive_mend::restore_files(&summary);
         println!(
             "restored {} keys, {} values, {files} files from {}",
             summary.keys,
@@ -329,7 +330,7 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, registry_master::Err
             file.display()
         );
         for err in &errors {
-            eprintln!("registry-master: {err}");
+            eprintln!("hive-mend: {err}");
         }
         Ok(if errors.is_empty() {
             ExitCode::SUCCESS
@@ -340,19 +341,19 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, registry_master::Err
     #[cfg(not(windows))]
     {
         let _ = file;
-        Err(registry_master::Error(
+        Err(hive_mend::Error(
             "restoring a registry backup needs Windows".into(),
         ))
     }
 }
 
-fn shred_live(args: &ShredArgs) -> Result<ExitCode, registry_master::Error> {
-    use registry_master::{
+fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
+    use hive_mend::{
         FileView, HostFs, ItemKind, ShredMethod, ShredOptions, ShredTarget, format_bytes,
         shred_allowed, shred_paths,
     };
     let method = ShredMethod::from_passes(args.passes).ok_or_else(|| {
-        registry_master::Error(format!("--passes must be 1, 3, or 7, not {}", args.passes))
+        hive_mend::Error(format!("--passes must be 1, 3, or 7, not {}", args.passes))
     })?;
     let mut targets = Vec::new();
     let mut refused = Vec::new();
@@ -379,7 +380,7 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, registry_master::Error> {
             }
         }
         for drive in drives {
-            match registry_master::volume_ssd(&drive) {
+            match hive_mend::volume_ssd(&drive) {
                 Some(true) => eprintln!(
                     "warning: {drive} is a solid-state drive: shredded data may survive in spare blocks"
                 ),
@@ -404,51 +405,51 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, registry_master::Error> {
     }
     let opts = ShredOptions { method, rename: true };
     let outcome =
-        shred_paths(&mut HostFs, &targets, &opts, registry_master::random_seed(), &mut |_, _, _| {
+        shred_paths(&mut HostFs, &targets, &opts, hive_mend::random_seed(), &mut |_, _, _| {
             true
         });
     println!("shredded {} files ({})", outcome.shredded, format_bytes(outcome.bytes));
     for reason in refused.iter().chain(outcome.refused.iter()) {
-        eprintln!("registry-master: refused: {reason}");
+        eprintln!("hive-mend: refused: {reason}");
     }
     for err in &outcome.errors {
-        eprintln!("registry-master: {err}");
+        eprintln!("hive-mend: {err}");
     }
     Ok(if outcome.errors.is_empty() { ExitCode::SUCCESS } else { ExitCode::from(1) })
 }
 
-fn hives_live() -> Result<ExitCode, registry_master::Error> {
+fn hives_live() -> Result<ExitCode, hive_mend::Error> {
     #[cfg(windows)]
     {
-        let inventory = registry_master::gather_hives();
+        let inventory = hive_mend::gather_hives();
         for entry in &inventory.entries {
-            let size = entry.bytes.map(registry_master::format_bytes).unwrap_or_else(|| "unknown".into());
+            let size = entry.bytes.map(hive_mend::format_bytes).unwrap_or_else(|| "unknown".into());
             let file = if entry.file.is_empty() { "(no file)" } else { &entry.file };
             println!("{}  {}  {}", entry.key, size, file);
         }
         println!(
             "{} hives, {} total",
             inventory.entries.len(),
-            registry_master::format_bytes(inventory.total_bytes())
+            hive_mend::format_bytes(inventory.total_bytes())
         );
         Ok(ExitCode::SUCCESS)
     }
     #[cfg(not(windows))]
     {
-        Err(registry_master::Error(
+        Err(hive_mend::Error(
             "reading the hive list needs Windows".into(),
         ))
     }
 }
 
-fn emit(report: &registry_master::ScanReport, format: Format) {
+fn emit(report: &hive_mend::ScanReport, format: Format) {
     match format {
         Format::Text => print_text(report),
         Format::Json => print_json(report),
     }
 }
 
-fn print_text(report: &registry_master::ScanReport) {
+fn print_text(report: &hive_mend::ScanReport) {
     if report.findings.is_empty() {
         println!("No stale entries.");
     }
@@ -480,7 +481,7 @@ fn print_text(report: &registry_master::ScanReport) {
     }
 }
 
-fn print_json(report: &registry_master::ScanReport) {
+fn print_json(report: &hive_mend::ScanReport) {
     println!("[");
     for (index, finding) in report.findings.iter().enumerate() {
         let comma = if index + 1 == report.findings.len() {

@@ -13,7 +13,7 @@ const FILE_ARROW: &str = " => ";
 
 pub fn backup_name(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
-    format!("registry-master-{}.reg", ymd_hms(secs))
+    format!("hive-mend-{}.reg", ymd_hms(secs))
 }
 
 /// What a repair is about to remove, in `.reg` form.
@@ -45,7 +45,7 @@ pub fn files_dir(backup_file: &Path) -> PathBuf {
     let stem = backup_file
         .file_stem()
         .and_then(|stem| stem.to_str())
-        .unwrap_or("registry-master");
+        .unwrap_or("hive-mend");
     backup_file
         .parent()
         .unwrap_or(Path::new("."))
@@ -97,8 +97,8 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     values.sort_by_key(|(key, _)| key.to_ascii_lowercase());
 
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
-    body.push_str("; Registry Master backup.\r\n");
-    body.push_str("; Restore it from the Restore page in Registry Master.\r\n");
+    body.push_str("; Hive Mend backup.\r\n");
+    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
     let mut unreadable = Vec::new();
 
     for key in trees {
@@ -547,12 +547,12 @@ mod tests {
                 finding(one, Repair::DeleteFile { path: one.into(), keep_copy: true }),
                 finding(two, Repair::DeleteFile { path: two.into(), keep_copy: true }),
             ],
-            Path::new("/backups/registry-master-1.reg"),
+            Path::new("/backups/hive-mend-1.reg"),
         );
         let first = plan.copy_for(one).unwrap().to_path_buf();
         let second = plan.copy_for(two).unwrap().to_path_buf();
         assert_ne!(first, second);
-        assert!(first.starts_with("/backups/registry-master-1-files"));
+        assert!(first.starts_with("/backups/hive-mend-1-files"));
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.files.len(), 2);
         assert_eq!(summary.files[0].0, one);

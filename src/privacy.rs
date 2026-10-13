@@ -1555,7 +1555,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("registry-master-privacy-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-test.reg");
         // chrome-data is vetoed by a running browser; user-temp is not ticked.
         let procs = FakeProcs { running: vec!["chrome.exe".into()] };
         let items =
@@ -1623,7 +1623,7 @@ mod tests {
         };
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("registry-master-privacy-locked-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-locked-test.reg");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let outcome = clean_with_progress(
             &mut reg,
@@ -1680,7 +1680,7 @@ mod tests {
         assert!(privacy_file_allowed(&fs, temp, &format!(r"{temp}\a.tmp")));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Windows\Temp\a.tmp"));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Program Files\App\a.tmp"));
-        assert!(!privacy_file_allowed(&fs, temp, r"C:\RegistryMaster\backups\a.reg"));
+        assert!(!privacy_file_allowed(&fs, temp, r"C:\HiveMend\backups\a.reg"));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Users\test\a.tmp"));
     }
 
@@ -1725,7 +1725,7 @@ mod tests {
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert_eq!(report.items[0].other, 1);
         assert_eq!(report.items[1].files, 2);
-        let backup = std::env::temp_dir().join("registry-master-privacy-special-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-special-test.reg");
         let freespace =
             built.into_iter().find(|item| item.id == r"freespace-C:").expect("wipe row");
         let report = preview(&reg, &fs, &sys, &quiet(), std::slice::from_ref(&freespace));
@@ -1753,7 +1753,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("registry-master-privacy-cancel-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-cancel-test.reg");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let mut calls = 0;
         let outcome = clean_with_progress(
@@ -1792,7 +1792,7 @@ mod tests {
         assert!(!report.items[0].gated_out);
         assert_eq!(report.items[0].values, 1);
         assert!(report.items[1].gated_out);
-        let backup = std::env::temp_dir().join("registry-master-privacy-plugin-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-plugin-test.reg");
         let outcome = clean_with_progress(
             &mut reg,
             &mut MemoryFs::new(),
@@ -1829,7 +1829,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("registry-master-privacy-sidecar-test.reg");
+        let backup = std::env::temp_dir().join("hive-mend-privacy-sidecar-test.reg");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,

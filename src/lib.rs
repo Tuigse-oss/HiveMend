@@ -78,7 +78,24 @@ pub use windows_shredder::{fixed_drives, volume_ssd};
 
 /// Where the window and the command line keep backups, settings, and the
 /// ignore list.
-pub const DATA_DIR: &str = r"C:\RegistryMaster";
+pub const DATA_DIR: &str = r"C:\HiveMend";
+
+/// Pre-rename data folder, moved aside once by `migrate_data_dir`.
+const LEGACY_DATA_DIR: &str = r"C:\RegistryMaster";
+
+/// Move the pre-rename data folder into place. Best-effort: when the new
+/// folder already exists, or the move fails, the old folder is left
+/// untouched. Nothing is ever deleted.
+pub fn migrate_data_dir() {
+    if std::path::Path::new(DATA_DIR).exists() {
+        return;
+    }
+    let legacy = std::path::Path::new(LEGACY_DATA_DIR);
+    if !legacy.exists() {
+        return;
+    }
+    let _ = std::fs::rename(legacy, DATA_DIR);
+}
 
 pub fn backups_dir() -> std::path::PathBuf {
     std::path::Path::new(DATA_DIR).join("backups")

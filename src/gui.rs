@@ -16,7 +16,7 @@ use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
-use registry_master::{
+use hive_mend::{
     BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
     HostFs, ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
     SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
@@ -404,7 +404,7 @@ pub fn run() -> std::process::ExitCode {
             dwICC: ICC_LISTVIEW_CLASSES | ICC_PROGRESS_CLASS | ICC_STANDARD_CLASSES,
         };
         InitCommonControlsEx(&icc);
-        let class_name = wide("RegistryMasterWindow");
+        let class_name = wide("HiveMendWindow");
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: GetModuleHandleW(std::ptr::null()),
@@ -416,7 +416,7 @@ pub fn run() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
         let dpi = GetDpiForSystem().max(96);
-        let title = wide("Registry Master");
+        let title = wide("Hive Mend");
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             class_name.as_ptr(),
@@ -573,7 +573,7 @@ unsafe extern "system" fn wnd_proc(hwnd: HWND, msg: u32, wparam: WPARAM, lparam:
                 Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning | Job::Shredding
             ) {
                 app.message(
-                    "Registry Master is still working. Please wait for it to finish before closing.",
+                    "Hive Mend is still working. Please wait for it to finish before closing.",
                     MB_ICONWARNING,
                 );
                 return 0;
@@ -912,7 +912,7 @@ impl App {
         }
     }
 
-    /// Open a built-in Windows screen. Registry Master only launches it.
+    /// Open a built-in Windows screen. Hive Mend only launches it.
     fn open_tool(&self, index: usize) {
         if self.busy() {
             return;
@@ -1612,7 +1612,7 @@ impl App {
         }
         let backup_file = next_services_backup_file();
         let mut question = format!(
-            "Set {} to start on demand (Manual)?\n\nRegistry Master saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
                 format!("{} ({})", selected[0].display_name, selected[0].from.label())
             } else {
@@ -1787,7 +1787,7 @@ impl App {
         }
         let backup_file = next_services_backup_file();
         let mut question = format!(
-            "Set {} to {}?\n\nRegistry Master saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            "Set {} to {}?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
                 format!(
                     "{} (now {})",
@@ -2091,7 +2091,7 @@ impl App {
         }
         let backup_file = next_privacy_backup_file();
         let mut question = format!(
-            "Clean {} {}?\n\nRegistry Master saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            "Clean {} {}?\n\nHive Mend saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
             if selected.len() == 1 { "category" } else { "categories" },
             backup_file.display()
@@ -2865,7 +2865,7 @@ impl App {
         }
         let backup_file = next_backup_file();
         let mut question = format!(
-            "Repair {} {}?\n\nRegistry Master first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
+            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
             if selected.len() == 1 { "entry" } else { "entries" },
             backup_file.display()
@@ -3068,7 +3068,7 @@ impl App {
             return;
         };
         if backup.summary.machine_wide && !self.elevated {
-            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Registry Master as administrator now?";
+            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
             if self.confirm(ask) {
                 self.elevate();
             }
@@ -3229,7 +3229,7 @@ impl App {
 
     fn confirm(&self, text: &str) -> bool {
         let text = wide(text);
-        let title = wide("Registry Master");
+        let title = wide("Hive Mend");
         unsafe {
             MessageBoxW(
                 self.hwnd,
@@ -3242,7 +3242,7 @@ impl App {
 
     fn message(&self, text: &str, icon: u32) {
         let text = wide(text);
-        let title = wide("Registry Master");
+        let title = wide("Hive Mend");
         unsafe { MessageBoxW(self.hwnd, text.as_ptr(), title.as_ptr(), MB_OK | icon) };
     }
 
@@ -3623,7 +3623,7 @@ impl App {
             self.fonts.title,
             rgb(255, 255, 255),
             RECT { left: self.s(24), top: 0, right: rect.right / 2, bottom: header },
-            "Registry Master",
+            "Hive Mend",
             DT_SINGLELINE | DT_VCENTER,
         );
         let help_size = measure(hdc, self.fonts.body_bold, "Help");
@@ -3862,7 +3862,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Cleaning {
             self.heading(hdc, rect, "Privacy", None);
-            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -3896,7 +3896,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Shredding {
             self.heading(hdc, rect, "Shredder", None);
-            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -3935,7 +3935,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Services {
             self.heading(hdc, rect, "Services", None);
-            self.subtitle(hdc, rect, "Please keep Registry Master open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -4021,7 +4021,7 @@ impl App {
                 let line = if self.job == Job::Scanning {
                     "Scanning only reads the registry. Nothing is changed."
                 } else {
-                    "Please keep Registry Master open until the repair finishes."
+                    "Please keep Hive Mend open until the repair finishes."
                 };
                 self.subtitle(hdc, rect, line);
                 let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
@@ -4138,7 +4138,7 @@ impl App {
         );
         y = self.meter(hdc, left, right, label_w, y, "System drive", &disk_line, snapshot.disk_used_percent());
         y += self.s(14);
-        text(hdc, self.fonts.title, INK, RECT { left, top: y, right, bottom: y + self.s(40) }, "Registry Master Health", DT_SINGLELINE);
+        text(hdc, self.fonts.title, INK, RECT { left, top: y, right, bottom: y + self.s(40) }, "Hive Mend Health", DT_SINGLELINE);
         y += self.s(46);
         for (label, value) in self.summary_rows() {
             text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(24) }, label, DT_SINGLELINE);
@@ -4166,7 +4166,7 @@ impl App {
             text(hdc, self.fonts.body_bold, INK, RECT { left, top: y, right: left + label_w, bottom: y + self.s(22) }, "Total", DT_SINGLELINE);
             let total = if hives.entries.len() > shown.len() {
                 format!(
-                    "{} in {} hives ({} shown; see registry-master hives)",
+                    "{} in {} hives ({} shown; see hive-mend hives)",
                     format_bytes(hives.total_bytes()),
                     hives.entries.len(),
                     shown.len()
@@ -4224,7 +4224,7 @@ impl App {
 
     unsafe fn draw_tools(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Windows Tools", None);
-        self.subtitle(hdc, rect, "Screens that ship with Windows. Registry Master only opens them.");
+        self.subtitle(hdc, rect, "Screens that ship with Windows. Hive Mend only opens them.");
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
         let gap = self.s(12);
@@ -4274,7 +4274,7 @@ impl App {
 
     unsafe fn draw_about(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "About", None);
-        self.subtitle(hdc, rect, &format!("Registry Master {}", env!("CARGO_PKG_VERSION")));
+        self.subtitle(hdc, rect, &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")));
         let left = self.s(CONTENT_X);
         let icon_w = self.s(70);
         let right = (rect.right - self.s(24) - icon_w - self.s(24)).max(left + self.s(200));
@@ -4283,7 +4283,7 @@ impl App {
         }
         let gap = self.s(10);
         let mut y = self.s(BODY_Y);
-        y = paragraph(hdc, self.fonts.body, INK, left, right, y, "Registry Master finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.") + gap * 2;
+        y = paragraph(hdc, self.fonts.body, INK, left, right, y, "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.") + gap * 2;
         y = paragraph(hdc, self.fonts.heading, INK, left, right, y, "How it keeps your PC safe") + gap / 2;
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
@@ -4300,14 +4300,14 @@ impl App {
         y = paragraph(hdc, self.fonts.heading, INK, left, right, y, "Where things are kept") + gap / 2;
         for (label, value) in [
             ("Backups", backups_dir().display().to_string()),
-            ("Settings and ignore list", registry_master::DATA_DIR.to_string()),
+            ("Settings and ignore list", hive_mend::DATA_DIR.to_string()),
             ("Images", image_root().display().to_string()),
         ] {
             paragraph(hdc, self.fonts.body_bold, INK, left, left + self.s(190), y, label);
             y = paragraph(hdc, self.fonts.body, INK, left + self.s(190), right, y, &value) + gap / 2;
         }
         y += gap * 2;
-        paragraph(hdc, self.fonts.body, MUTED, left, right, y, "From a terminal, run registry-master --help for the scan, repair, restore, and shred commands.");
+        paragraph(hdc, self.fonts.body, MUTED, left, right, y, "From a terminal, run hive-mend --help for the scan, repair, restore, and shred commands.");
     }
 }
 
@@ -4497,9 +4497,9 @@ fn local_time_text(time: SystemTime) -> String {
     }
 }
 
-/// `registry-master-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
+/// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
 fn next_backup_file() -> PathBuf {
-    next_backup_file_with("registry-master")
+    next_backup_file_with("hive-mend")
 }
 
 /// `services-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.

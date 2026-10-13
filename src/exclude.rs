@@ -6,7 +6,7 @@ use std::path::Path;
 use crate::model::Finding;
 use crate::pathutil::canonical_path;
 
-const HEADER: &str = "# Registry Master ignore list.\r\n\
+const HEADER: &str = "# Hive Mend ignore list.\r\n\
 # One entry per line: a registry key or file path, then optionally a tab and a value name.\r\n";
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]

@@ -240,7 +240,7 @@ mod tests {
             key: planted.key.clone(),
             name: "Shell".into(),
         };
-        let backup = std::env::temp_dir().join("registry-master-test-backup.reg");
+        let backup = std::env::temp_dir().join("hive-mend-test-backup.reg");
         let outcome = repair(
             &mut sample.reg,
             &mut sample.fs,
