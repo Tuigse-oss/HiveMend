@@ -135,15 +135,32 @@ pub fn gather() -> SystemSnapshot {
         r"SOFTWARE\Microsoft\Windows NT\CurrentVersion",
         "CurrentBuild",
     );
-    snapshot.os = match (product, display, build) {
+    snapshot.os = os_label(product, display, build);
+
+    snapshot
+}
+
+/// Build the OS line from the registry values. Windows 11 still reports
+/// `ProductName` as "Windows 10", so promote the name when the build number
+/// is 22000 or higher; the build itself is the authoritative signal.
+fn os_label(product: Option<String>, display: Option<String>, build: Option<String>) -> String {
+    let build_num = build
+        .as_deref()
+        .and_then(|text| text.trim().parse::<u32>().ok());
+    let product = product.map(|name| {
+        if build_num.is_some_and(|num| num >= 22_000) && name.contains("Windows 10") {
+            name.replace("Windows 10", "Windows 11")
+        } else {
+            name
+        }
+    });
+    match (product, display, build) {
         (Some(product), Some(display), Some(build)) => {
             format!("{product}, version {display} (build {build})")
         }
         (Some(product), _, _) => product,
         _ => "Windows".into(),
-    };
-
-    snapshot
+    }
 }
 
 #[cfg(windows)]
@@ -197,6 +214,28 @@ mod tests {
         assert_eq!(format_uptime(60), "1m");
         assert_eq!(format_uptime(3600 + 120), "1h 2m");
         assert_eq!(format_uptime(86_400 + 3600), "1d 1h");
+    }
+
+    #[test]
+    fn os_label_promotes_windows_11_by_build() {
+        let s = |text: &str| Some(text.to_string());
+        // Win11 reports ProductName "Windows 10"; build >= 22000 promotes it.
+        assert_eq!(
+            os_label(s("Windows 10 Pro"), s("23H2"), s("22631")),
+            "Windows 11 Pro, version 23H2 (build 22631)"
+        );
+        // Genuine Windows 10 is left alone.
+        assert_eq!(
+            os_label(s("Windows 10 Pro"), s("22H2"), s("19045")),
+            "Windows 10 Pro, version 22H2 (build 19045)"
+        );
+        // A non-numeric or missing build never promotes.
+        assert_eq!(
+            os_label(s("Windows 10 Home"), s("22H2"), s("nonsense")),
+            "Windows 10 Home, version 22H2 (build nonsense)"
+        );
+        assert_eq!(os_label(s("Windows 10 Pro"), None, None), "Windows 10 Pro");
+        assert_eq!(os_label(None, None, None), "Windows");
     }
 
     #[test]
