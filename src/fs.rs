@@ -330,6 +330,37 @@ fn on_local_fixed_drive(path: &str) -> bool {
     !path.starts_with("\\\\")
 }
 
+/// Open a staged file for the shredder's overwrite, truncate, and verify
+/// passes while refusing reparse points (symlinks, junctions). `shred_allowed`
+/// checks the path with no-follow metadata, but a path could be swapped for a
+/// link between that check and this open. Opening with
+/// `FILE_FLAG_OPEN_REPARSE_POINT` grabs the link itself, never its target, and
+/// the attribute check then refuses it, so an overwrite can never be redirected
+/// into another file through a TOCTOU swap.
+#[cfg(windows)]
+fn open_regular(path: &str, write: bool) -> std::io::Result<std::fs::File> {
+    use std::os::windows::fs::{MetadataExt, OpenOptionsExt};
+    const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x0000_0400;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)?;
+    if file.metadata()?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+        return Err(std::io::Error::other("refusing a reparse point"));
+    }
+    Ok(file)
+}
+
+#[cfg(not(windows))]
+fn open_regular(path: &str, write: bool) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(write)
+        .open(path)
+}
+
 impl FileView for HostFs {
     fn exists(&self, path: &str) -> bool {
         if !on_local_fixed_drive(path) {
@@ -443,28 +474,19 @@ impl FileView for HostFs {
 
     fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
         use std::io::{Seek, SeekFrom, Write};
-        let mut file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|err| err.to_string())?;
+        let mut file = open_regular(path, true).map_err(|err| err.to_string())?;
         file.seek(SeekFrom::Start(offset))
             .map_err(|err| err.to_string())?;
         file.write_all(bytes).map_err(|err| err.to_string())
     }
 
     fn sync_file(&mut self, path: &str) -> Result<(), String> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|err| err.to_string())?;
+        let file = open_regular(path, true).map_err(|err| err.to_string())?;
         file.sync_all().map_err(|err| err.to_string())
     }
 
     fn set_len(&mut self, path: &str, len: u64) -> Result<(), String> {
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .open(path)
-            .map_err(|err| err.to_string())?;
+        let file = open_regular(path, true).map_err(|err| err.to_string())?;
         file.set_len(len).map_err(|err| err.to_string())
     }
 
@@ -484,7 +506,7 @@ impl FileView for HostFs {
 
     fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
         use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(path).ok()?;
+        let mut file = open_regular(path, false).ok()?;
         file.seek(SeekFrom::Start(offset)).ok()?;
         let mut buf = Vec::new();
         file.take(len as u64).read_to_end(&mut buf).ok()?;
