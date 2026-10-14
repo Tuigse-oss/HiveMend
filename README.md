@@ -134,7 +134,10 @@ this repository.
 Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a
-reason shown on the Custom row.
+reason shown on the Custom row. Hive Mend running as administrator leaves
+the custom list out and starts with no privacy category ticked, because
+programs running without administrator rights can edit those per-user
+files; clean custom items from a window started normally.
 
 ```ini
 file=%TEMP%\myapp\session.log
