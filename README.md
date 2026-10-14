@@ -42,14 +42,32 @@ CI runs the same checks on Linux and Windows for every pull request: formatting,
 hive-mend scanners
 hive-mend scan
 hive-mend scan --only SL,SUP,ARP
-hive-mend repair --backup-dir C:\HiveMend\backups
-hive-mend repair --backup-dir C:\HiveMend\backups --yes
+hive-mend repair
+hive-mend repair --yes
 hive-mend shred --passes 3 C:\Users\Me\old-letters
 hive-mend shred --passes 3 --yes C:\Users\Me\old-letters
 hive-mend hives
 ```
 
 `scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
+
+### Where data is kept
+
+Settings, the ignore list, custom privacy items, and backups made
+without administrator rights live in `%LOCALAPPDATA%\HiveMend`, which only
+your account can change. Backups made as administrator go to
+`%ProgramData%\HiveMend\backups`, a folder Hive Mend creates owned by
+Administrators and writable only by SYSTEM and Administrators; if that
+folder already exists with any other owner or permissions, Hive Mend
+refuses to use it rather than repair it. Running as administrator, Hive
+Mend restores only from that protected folder.
+
+Older versions kept everything in `C:\HiveMend`, which every account on
+the PC can change. Hive Mend never moves or deletes that folder. Its
+backups are still listed, marked as the old shared folder, and can be
+restored only from Hive Mend started without administrator rights, which
+can put back only your own (HKCU) entries. Settings found there are copied
+once into the per-user folder.
 
 If you still have an extracted legacy cleaner `app` folder, its original rules and ignore lists can be merged in:
 
@@ -113,7 +131,7 @@ Card and tile icons load from `C:\hivemendimages` when that folder
 exists, next to a copy of the exe otherwise. The artwork is not part of
 this repository.
 
-Custom privacy items live in `C:\HiveMend\privacy-custom.ini`, one
+Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a
 reason shown on the Custom row.

@@ -468,13 +468,15 @@ impl BackupSummary {
 #[derive(Clone, Debug)]
 pub struct BackupInfo {
     pub path: PathBuf,
+    /// Which store the file was listed from.
+    pub store: crate::store::Store,
     pub modified: Option<SystemTime>,
     pub size: u64,
     pub summary: BackupSummary,
 }
 
-/// `.reg` files in the backup folder, newest first.
-pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
+/// `.reg` files in one backup folder, newest first.
+pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -493,6 +495,7 @@ pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
             .map(|text| BackupSummary::parse(&text))
             .unwrap_or_default();
         found.push(BackupInfo {
+            store,
             modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
             size: meta.map(|meta| meta.len()).unwrap_or(0),
             path,
@@ -501,36 +504,6 @@ pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
     }
     found.sort_by_key(|info| std::cmp::Reverse(info.modified));
     found
-}
-
-/// Put back shortcut copies whose original is still missing.
-pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
-    let mut restored = 0;
-    let mut errors = Vec::new();
-    for (original, copy) in &summary.files {
-        let target = Path::new(original);
-        if target.exists() {
-            continue;
-        }
-        if !copy.exists() {
-            errors.push(format!(
-                "{original}: the saved copy {} is gone",
-                copy.display()
-            ));
-            continue;
-        }
-        if let Some(parent) = target.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            errors.push(format!("{original}: {err}"));
-            continue;
-        }
-        match std::fs::copy(copy, target) {
-            Ok(_) => restored += 1,
-            Err(err) => errors.push(format!("{original}: {err}")),
-        }
-    }
-    (restored, errors)
 }
 
 /// True when the text carries a Hive Mend marker line: the unified marker, or

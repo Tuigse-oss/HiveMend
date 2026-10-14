@@ -72,7 +72,7 @@ struct ScanArgs {
     /// Only keep findings whose location contains this text (case-insensitive).
     #[arg(long = "match")]
     matching: Option<String>,
-    /// Also report entries on the ignore list (C:\HiveMend\ignore.txt).
+    /// Also report entries on the ignore list (%LOCALAPPDATA%\HiveMend\ignore.txt).
     #[arg(long)]
     no_ignore_list: bool,
     #[arg(long, value_enum, default_value_t = Format::Text)]
@@ -83,9 +83,11 @@ struct ScanArgs {
 struct RepairArgs {
     #[command(flatten)]
     scan: ScanArgs,
-    /// Directory for the UTF-16 .reg backup. Required.
+    /// Directory for the UTF-16 .reg backup. Defaults to this account's
+    /// backup folder, or the protected store when run as administrator, the
+    /// only place an elevated restore reads from.
     #[arg(long)]
-    backup_dir: PathBuf,
+    backup_dir: Option<PathBuf>,
     /// Apply the backup's deletions. Without this, repair only prints the plan.
     #[arg(long)]
     yes: bool,
@@ -111,7 +113,7 @@ enum Format {
 }
 
 fn main() -> ExitCode {
-    hive_mend::migrate_data_dir();
+    hive_mend::adopt_legacy_settings();
     #[cfg(windows)]
     if std::env::args().len() <= 1 {
         return gui::run();
@@ -195,7 +197,11 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
                     ExitCode::from(2)
                 });
             }
-            repair_live(&engine, &opts, &args.scan, &args.backup_dir)
+            let backup_dir = match &args.backup_dir {
+                Some(dir) => dir.clone(),
+                None => hive_mend::backups_dir().map_err(hive_mend::Error)?,
+            };
+            repair_live(&engine, &opts, &args.scan, &backup_dir)
         }
     }
 }
@@ -316,16 +322,7 @@ fn repair_live(
 fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
     #[cfg(windows)]
     {
-        let text = hive_mend::read_backup(file)?;
-        if !hive_mend::is_hive_mend_backup(&text) {
-            return Err(hive_mend::Error(format!(
-                "{} is not a Hive Mend backup; refusing to restore it",
-                file.display()
-            )));
-        }
-        let summary = hive_mend::BackupSummary::parse(&text);
-        hive_mend::import_reg_file(file).map_err(hive_mend::Error)?;
-        let (files, errors) = hive_mend::restore_files(&summary);
+        let (summary, files, errors) = hive_mend::restore_backup(file).map_err(hive_mend::Error)?;
         println!(
             "restored {} keys, {} values, {files} files from {}",
             summary.keys,

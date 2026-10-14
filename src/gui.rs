@@ -18,17 +18,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::{
     BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
-    HostFs, ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
-    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
-    ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions, ShredOutcome,
-    ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
-    WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
-    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, fixed_drives,
-    format_bytes, format_uptime, gather_hives, gather_snapshot, import_reg_file,
-    is_hive_mend_backup, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
-    random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
-    settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services,
-    still_reported, stop_services, volume_ssd,
+    HostFs, ItemKind, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, RecycleItem, Repair,
+    RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions,
+    ShredOutcome, ShredTarget, StartType, Store, WINDOWS_TOOLS, WindowsProcessList,
+    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
+    backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
+    exclusions_file, expand_target, fixed_drives, format_bytes, format_uptime, gather_hives,
+    gather_snapshot, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
+    random_seed, repair_with_progress, restore_backup, scan_with_progress, settings_file,
+    shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services, still_reported,
+    stop_services, user_dir, volume_ssd,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -812,7 +812,7 @@ impl App {
             elevated: unsafe { IsUserAnAdmin() } != 0,
             settings: Settings::load(&settings_file()),
             exclusions: Exclusions::load(&exclusions_file()),
-            backups: list_backups(&backups_dir()),
+            backups: all_backups(),
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -1211,11 +1211,10 @@ impl App {
                     self.message("Pick a backup in the list first.", MB_ICONINFORMATION);
                 }
             }
-            ID_OPEN_BACKUPS => {
-                let dir = backups_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                shell_open(self.hwnd, &dir.display().to_string(), None);
-            }
+            ID_OPEN_BACKUPS => match backups_dir() {
+                Ok(dir) => shell_open(self.hwnd, &dir.display().to_string(), None),
+                Err(err) => self.message(&err, MB_ICONWARNING),
+            },
             ID_UNIGNORE => self.unignore(),
             ID_SVC_REFRESH => self.refresh_services(),
             ID_SVC_ALL => self.svc_tick_all(true),
@@ -3469,7 +3468,7 @@ impl App {
     // ---- restore -------------------------------------------------------
 
     fn refresh_backups(&mut self) {
-        self.backups = list_backups(&backups_dir());
+        self.backups = all_backups();
         self.fill_backups();
     }
 
@@ -3479,11 +3478,16 @@ impl App {
         }
         for (row, backup) in self.backups.iter().enumerate() {
             let saved = backup.modified.map(local_time_text).unwrap_or_default();
-            let name = backup
+            let mut name = backup
                 .path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
+            match backup.store {
+                Store::Protected => {}
+                Store::User => name.push_str("  (your account)"),
+                Store::Legacy => name.push_str("  (old shared folder)"),
+            }
             insert_row(
                 self.backup_list,
                 row,
@@ -3499,6 +3503,33 @@ impl App {
         let Some(backup) = self.backups.get(row).cloned() else {
             return;
         };
+        // Only the protected store is trusted by an elevated instance. Other
+        // folders can be changed by other accounts or by this account's
+        // non-elevated programs, so their backups restore only without
+        // elevation, which can change only this account's own entries.
+        if self.elevated && !backup.store.elevated_may_restore() {
+            let place = if backup.store == Store::Legacy {
+                format!(
+                    "the old shared folder {LEGACY_DIR}, which every account on this PC can change"
+                )
+            } else {
+                "your account's folder, which programs you run without administrator rights can change".to_string()
+            };
+            self.message(
+                &format!(
+                    "This backup is in {place}, so Hive Mend does not restore it with administrator rights.\n\nStart Hive Mend without administrator rights to put back the entries for your own account."
+                ),
+                MB_ICONWARNING,
+            );
+            return;
+        }
+        if backup.summary.machine_wide && !self.elevated && !backup.store.elevated_may_restore() {
+            self.message(
+                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hive Mend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
+                MB_ICONWARNING,
+            );
+            return;
+        }
         if backup.summary.machine_wide && !self.elevated {
             let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
             if self.confirm(ask) {
@@ -3521,20 +3552,7 @@ impl App {
         let hwnd = self.hwnd as isize;
         let file = backup.path.clone();
         std::thread::spawn(move || {
-            let result = read_backup(&file)
-                .map_err(|err| err.to_string())
-                .and_then(|text| {
-                    if !is_hive_mend_backup(&text) {
-                        return Err(format!(
-                            "{} is not a Hive Mend backup; refusing to restore it",
-                            file.display()
-                        ));
-                    }
-                    let summary = BackupSummary::parse(&text);
-                    import_reg_file(&file)?;
-                    let (files, errors) = restore_files(&summary);
-                    Ok((summary, files, errors))
-                });
+            let result = restore_backup(&file);
             finish_job(hwnd, JobResult::Restore { file, result });
         });
     }
@@ -5548,8 +5566,18 @@ impl App {
             "Where things are kept",
         ) + gap / 2;
         for (label, value) in [
-            ("Backups", backups_dir().display().to_string()),
-            ("Settings and ignore list", hive_mend::DATA_DIR.to_string()),
+            (
+                "Backups",
+                backups_location()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "Settings and ignore list",
+                user_dir(&HostFs)
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+            ),
             ("Images", image_root().display().to_string()),
         ] {
             paragraph(
@@ -5785,6 +5813,16 @@ fn next_services_backup_file() -> Option<PathBuf> {
     next_backup_file_with("services")
 }
 
+/// Backups from every store, newest first, each tagged with its store.
+fn all_backups() -> Vec<BackupInfo> {
+    let mut all: Vec<BackupInfo> = backup_stores()
+        .into_iter()
+        .flat_map(|(store, dir)| list_backups(&dir, store))
+        .collect();
+    all.sort_by_key(|info| std::cmp::Reverse(info.modified));
+    all
+}
+
 fn next_privacy_backup_file() -> Option<PathBuf> {
     next_backup_file_with("privacy")
 }
@@ -5794,10 +5832,9 @@ fn count(n: usize, one: &str, many: &str) -> String {
 }
 
 fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
-    let dir = backups_dir();
-    if std::fs::create_dir_all(&dir).is_err() {
+    let Ok(dir) = backups_dir() else {
         return None;
-    }
+    };
     let stamp = unsafe {
         let mut t: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut t);

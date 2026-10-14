@@ -17,6 +17,8 @@ pub enum KnownDir {
     ProgramFiles,
     ProgramFilesX86,
     ProgramData,
+    /// The running account's local application data folder.
+    LocalAppData,
 }
 
 impl KnownDir {
@@ -34,6 +36,7 @@ impl KnownDir {
             Self::ProgramFiles => "Program Files",
             Self::ProgramFilesX86 => "Program Files (x86)",
             Self::ProgramData => "ProgramData",
+            Self::LocalAppData => "Local AppData",
         }
     }
 }
@@ -61,6 +64,8 @@ pub struct DirItem {
 /// What [`FileView::pin_acquire`] grants on a pinned object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
+    /// Read only: a backup about to be restored.
+    Read,
     /// Read, write, rename, and delete: the shredder.
     Write,
     /// Read and delete: a delete that keeps a copy first.
@@ -82,6 +87,18 @@ pub struct Pinned {
     pub links: u32,
     pub hidden_system: bool,
     handle: PinHandle,
+}
+
+impl Pinned {
+    /// The open handle, for security queries on the pinned object itself.
+    #[cfg(windows)]
+    pub fn raw_handle(&self) -> Option<std::os::windows::io::RawHandle> {
+        use std::os::windows::io::AsRawHandle;
+        match &self.handle {
+            PinHandle::Host(file) => Some(file.as_raw_handle()),
+            PinHandle::Memory(_) => None,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -144,6 +161,11 @@ pub trait FileView {
     /// Copy the pinned file's bytes to a new file at `to`, creating its
     /// folders. Never overwrites.
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String>;
+    /// Create a new, empty file at `path` (creating its folders) and pin it
+    /// with write access. Never opens an existing file or a link in its place;
+    /// callers check [`Pinned::real_path`] and delete it if it landed
+    /// somewhere it should not.
+    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String>;
     fn var(&self, name: &str) -> Option<String>;
     /// Where a system folder really is. On the host this comes from the
     /// Windows APIs, never the environment, which a launcher controls. The
@@ -157,6 +179,7 @@ pub trait FileView {
             KnownDir::ProgramFiles => self.var("ProgramFiles"),
             KnownDir::ProgramFilesX86 => self.var("ProgramFiles(x86)"),
             KnownDir::ProgramData => self.var("ProgramData"),
+            KnownDir::LocalAppData => self.var("LOCALAPPDATA"),
         }
     }
 }
@@ -386,6 +409,29 @@ impl FileView for MemoryFs {
         Ok(())
     }
 
+    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
+        let key = self.resolve(path);
+        if self.nodes.contains_key(&key) {
+            return Err("target already exists".into());
+        }
+        self.ensure_parents(&key);
+        self.nodes.insert(
+            key.clone(),
+            FsNode::File {
+                bytes: Vec::new(),
+                age: None,
+            },
+        );
+        Ok(Pinned {
+            real_path: key.clone(),
+            kind: ItemKind::File,
+            len: 0,
+            links: 1,
+            hidden_system: false,
+            handle: PinHandle::Memory(key),
+        })
+    }
+
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
         let bytes = match self.nodes.get(self.pinned_key(pin)?) {
             Some(FsNode::File { bytes, .. }) => bytes.clone(),
@@ -505,7 +551,8 @@ pub fn host_known_dir(dir: KnownDir) -> Option<String> {
         GetSystemDirectoryW, GetSystemWindowsDirectoryW,
     };
     use windows_sys::Win32::UI::Shell::{
-        FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath,
+        FOLDERID_LocalAppData, FOLDERID_ProgramData, FOLDERID_ProgramFiles,
+        FOLDERID_ProgramFilesX86, SHGetKnownFolderPath,
     };
     let text = match dir {
         KnownDir::Windows | KnownDir::System => {
@@ -522,10 +569,14 @@ pub fn host_known_dir(dir: KnownDir) -> Option<String> {
             }
             String::from_utf16(&buf[..len]).ok()?
         }
-        KnownDir::ProgramFiles | KnownDir::ProgramFilesX86 | KnownDir::ProgramData => {
+        KnownDir::ProgramFiles
+        | KnownDir::ProgramFilesX86
+        | KnownDir::ProgramData
+        | KnownDir::LocalAppData => {
             let id = match dir {
                 KnownDir::ProgramFiles => &FOLDERID_ProgramFiles,
                 KnownDir::ProgramFilesX86 => &FOLDERID_ProgramFilesX86,
+                KnownDir::LocalAppData => &FOLDERID_LocalAppData,
                 _ => &FOLDERID_ProgramData,
             };
             let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
@@ -623,6 +674,13 @@ impl FileView for HostFs {
             return Err("not a host handle".into());
         };
         host::delete(file, &pin.real_path)
+    }
+
+    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
+        if let Some(parent) = Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
+        host::create_new(path)
     }
 
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
@@ -786,6 +844,7 @@ mod host {
     };
 
     const DELETE: u32 = 0x0001_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const DRIVE_FIXED: u32 = 3;
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -796,14 +855,40 @@ mod host {
     }
 
     pub fn pin(path: &str) -> Result<Pinned, String> {
-        // Read-attributes only: identifying an object must not need, or
-        // grant, any right that could change it.
+        // Read rights only: identifying an object must not need, or grant,
+        // any right that could change it. READ_CONTROL lets trust checks read
+        // the owner and DACL through this same handle; a file that does not
+        // grant it is pinned without it, and such a check then fails closed.
+        let open = |access: u32| {
+            std::fs::OpenOptions::new()
+                .access_mode(access)
+                .share_mode(SHARE_ALL)
+                .custom_flags(FLAGS)
+                .open(path)
+        };
+        let file = open(READ_CONTROL | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .or_else(|_| open(FILE_READ_ATTRIBUTES | SYNCHRONIZE))
+            .map_err(|err| err.to_string())?;
+        identify(file, path)
+    }
+
+    /// `CREATE_NEW` never opens an existing file and fails on an existing
+    /// link, so the handle is always a file this call made.
+    pub fn create_new(path: &str) -> Result<Pinned, String> {
+        // `write(true)` only satisfies std's create check; `access_mode`
+        // sets the rights actually requested.
         let file = std::fs::OpenOptions::new()
-            .access_mode(FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-            .share_mode(SHARE_ALL)
-            .custom_flags(FLAGS)
+            .write(true)
+            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE)
+            .share_mode(FILE_SHARE_READ)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .create_new(true)
             .open(path)
             .map_err(|err| err.to_string())?;
+        identify(file, path)
+    }
+
+    fn identify(file: std::fs::File, path: &str) -> Result<Pinned, String> {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
             return Err(last_error());
@@ -872,6 +957,7 @@ mod host {
         real_path: &str,
     ) -> Result<std::fs::File, String> {
         let wanted = match access {
+            Access::Read => GENERIC_READ | SYNCHRONIZE,
             Access::Write => GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
             Access::ReadDelete => GENERIC_READ | DELETE | SYNCHRONIZE,
             Access::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
@@ -998,6 +1084,23 @@ mod host {
                 ItemKind::File
             },
             len: meta.len(),
+            links: 1,
+            hidden_system: false,
+            handle: PinHandle::Host(file),
+        })
+    }
+
+    pub fn create_new(path: &str) -> Result<Pinned, String> {
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(path)
+            .map_err(|err| err.to_string())?;
+        Ok(Pinned {
+            real_path: path.to_string(),
+            kind: ItemKind::File,
+            len: 0,
             links: 1,
             hidden_system: false,
             handle: PinHandle::Host(file),

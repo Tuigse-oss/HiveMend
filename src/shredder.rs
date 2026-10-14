@@ -685,6 +685,9 @@ mod tests {
         fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
             self.inner.pin_copy_to(pin, to)
         }
+        fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
+            self.inner.pin_create_new(path)
+        }
         fn var(&self, name: &str) -> Option<String> {
             self.inner.var(name)
         }
@@ -1338,6 +1341,7 @@ mod live_tests {
         assert!(!moved.exists(), "the pinned object itself is deleted");
         assert_eq!(std::fs::read(&path).unwrap(), b"decoy");
     }
+
     #[test]
     fn live_a_staged_folder_is_shredded_and_removed_through_handles() {
         let scratch = Scratch::new("dirshred");

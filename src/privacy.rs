@@ -666,7 +666,10 @@ fn privacy_location_allowed(fs: &dyn FileView, path: &str) -> bool {
     let Ok(roots) = protected_roots(fs) else {
         return false;
     };
-    !roots.iter().any(|dir| path_under(path, dir)) && !path_under(path, crate::DATA_DIR)
+    !roots.iter().any(|dir| path_under(path, dir))
+        && !crate::store::data_roots(fs)
+            .iter()
+            .any(|dir| path_under(path, dir))
 }
 
 // ---- preview ----

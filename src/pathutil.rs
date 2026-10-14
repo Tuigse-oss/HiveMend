@@ -632,7 +632,10 @@ pub fn shred_location_allowed(
     if roots.iter().skip(1).any(|root| path_under(clean, root)) {
         return Err(format!("{path} is inside a program folder"));
     }
-    if path_under(clean, crate::DATA_DIR) {
+    if crate::store::data_roots(fs)
+        .iter()
+        .any(|root| path_under(clean, root))
+    {
         return Err(format!("{path} is inside the app data folder"));
     }
     Ok(())
