@@ -1,6 +1,10 @@
 # Hive Mend
 
-Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup. It covers twelve scanner jobs:
+Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
+
+> **Use at your own risk.** Hive Mend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but shredded files and cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+It covers twelve scanner jobs:
 
 | Id | Job |
 | --- | --- |
@@ -42,14 +46,32 @@ CI runs the same checks on Linux and Windows for every pull request: formatting,
 hive-mend scanners
 hive-mend scan
 hive-mend scan --only SL,SUP,ARP
-hive-mend repair --backup-dir C:\HiveMend\backups
-hive-mend repair --backup-dir C:\HiveMend\backups --yes
+hive-mend repair
+hive-mend repair --yes
 hive-mend shred --passes 3 C:\Users\Me\old-letters
 hive-mend shred --passes 3 --yes C:\Users\Me\old-letters
 hive-mend hives
 ```
 
 `scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
+
+### Where data is kept
+
+Settings, the ignore list, custom privacy items, and backups made
+without administrator rights live in `%LOCALAPPDATA%\HiveMend`, which only
+your account can change. Backups made as administrator go to
+`%ProgramData%\HiveMend\backups`, a folder Hive Mend creates owned by
+Administrators and writable only by SYSTEM and Administrators; if that
+folder already exists with any other owner or permissions, Hive Mend
+refuses to use it rather than repair it. Running as administrator, Hive
+Mend restores only from that protected folder.
+
+Older versions kept everything in `C:\HiveMend`, which every account on
+the PC can change. Hive Mend never moves or deletes that folder. Its
+backups are still listed, marked as the old shared folder, and can be
+restored only from Hive Mend started without administrator rights, which
+can put back only your own (HKCU) entries. Settings found there are copied
+once into the per-user folder.
 
 If you still have an extracted legacy cleaner `app` folder, its original rules and ignore lists can be merged in:
 
@@ -73,8 +95,9 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   cards, plus the last scan result and a statistics reset link.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
-  startup type of a highlighted row). Every change writes a
-  `services-*.reg` backup first and can be undone on the Restore page.
+  startup type of a highlighted row). Changing a startup type writes a
+  `services-*.reg` backup first and can be undone on the Restore page;
+  starting or stopping a service is transient and is not backed up.
   Boot drivers and the services Windows needs to boot, update, or stay
   secure are always refused. Listing is read-only; changing anything
   needs administrator rights.
@@ -83,15 +106,21 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   items, free-space wipe). Preview counts what each holds, tick what to
   clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
-  for good. History and cookie cleaning waits for a closed browser and
-  never touches saved logins, autofill, or bookmarks. Everything here is
-  user-scope, so no administrator rights are needed.
+  for good. The built-in history and cookie cleaning waits for a closed
+  browser and never touches saved logins, autofill, or bookmarks. Custom
+  items you add can name any allowed Temp or browser-profile file, so add
+  only paths you understand. The built-in categories are user-scope; the
+  optional free-space wipe runs across a whole drive. No administrator
+  rights are needed.
 - Shredder overwrites files so they cannot be recovered, then deletes
   them. Drop files onto the page, type a path and Add, or stage the
   Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The
-  confirmation names every path and cannot be undone. The Windows
-  folder, program folders, drive roots, links, and hidden system files
-  are always refused. Shredding on a solid-state drive warns that
+  confirmation lists the paths (the first ten, then a count of any rest)
+  and cannot be undone. The Windows
+  folder, program folders, drive roots, links, hidden system files, and
+  files with more than one hard link are always refused, judged by where
+  each file really is after junctions, 8.3 names, and SUBST drives are
+  resolved. Shredding on a solid-state drive warns that
   traces may survive in spare blocks the overwrite cannot reach. No
   administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
@@ -106,10 +135,13 @@ Card and tile icons load from `C:\hivemendimages` when that folder
 exists, next to a copy of the exe otherwise. The artwork is not part of
 this repository.
 
-Custom privacy items live in `C:\HiveMend\privacy-custom.ini`, one
+Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a
-reason shown on the Custom row.
+reason shown on the Custom row. Hive Mend running as administrator leaves
+the custom list out and starts with no privacy category ticked, because
+programs running without administrator rights can edit those per-user
+files; clean custom items from a window started normally.
 
 ```ini
 file=%TEMP%\myapp\session.log
@@ -120,7 +152,7 @@ value=HKCU\Software\MyApp\Settings|RecentFile1
 
 ## Releases
 
-Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt` and a GitHub build provenance attestation, and the exe embeds its dependency list so it can be audited after download:
+Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt`, the exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
 
 ```bash
 gh attestation verify hive-mend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend

@@ -134,11 +134,11 @@ impl SystemTargets for WindowsSystemTargets {
     }
 
     fn wipe_free_space(&mut self, drive: &str) -> Result<(), String> {
-        let system = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".to_string());
-        let app: Vec<u16> = format!("{system}\\System32\\cipher.exe\0")
-            .encode_utf16()
-            .collect();
-        let mut command: Vec<u16> = format!("\"{system}\\System32\\cipher.exe\" /w:{drive}\0")
+        // System32 from the API, not %SystemRoot%, so the intended cipher.exe runs.
+        let system = crate::fs::host_known_dir(crate::fs::KnownDir::System)
+            .ok_or("could not locate the System32 folder")?;
+        let app: Vec<u16> = format!("{system}\\cipher.exe\0").encode_utf16().collect();
+        let mut command: Vec<u16> = format!("\"{system}\\cipher.exe\" /w:{drive}\0")
             .encode_utf16()
             .collect();
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };

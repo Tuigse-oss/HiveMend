@@ -11,6 +11,7 @@
 //! - The window cannot be closed while a repair or restore is running.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -18,17 +19,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::{
     BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
-    HostFs, ItemKind, ItemOutcome, Preview, PrivacyItem, RecycleItem, Repair, RepairOutcome,
-    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
-    ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions, ShredOutcome,
-    ShredTarget, StartType, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry,
-    WindowsSystemTargets, apply_start_changes, backups_dir, build_items, clean_with_progress,
-    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, fixed_drives,
-    format_bytes, format_uptime, gather_hives, gather_snapshot, import_reg_file,
-    is_hive_mend_backup, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
-    random_seed, read_backup, repair_with_progress, restore_files, scan_with_progress,
-    settings_file, shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services,
-    still_reported, stop_services, volume_ssd,
+    HostFs, ItemKind, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, RecycleItem, Repair,
+    RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions,
+    ShredOutcome, ShredTarget, StartType, Store, WINDOWS_TOOLS, WindowsProcessList,
+    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
+    backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
+    exclusions_file, expand_target, fixed_drives, format_bytes, format_uptime, gather_hives,
+    gather_snapshot, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
+    random_seed, repair_with_progress, restore_backup, scan_with_progress, settings_file,
+    shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services, still_reported,
+    stop_services, user_dir, volume_ssd,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -71,7 +72,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW,
+    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW, IsWindow,
     LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
@@ -87,6 +88,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
+/// Lay out and repaint once a nested WM_SIZE or WM_DPICHANGED was deferred.
+const WM_RELAYOUT: u32 = WM_APP + 3;
+/// Re-run an action the user just confirmed (see [`App::confirm`]).
+const WM_REDO: u32 = WM_APP + 4;
+/// Apply a popup-menu choice made after its handler returned.
+const WM_MENU_PICKED: u32 = WM_APP + 5;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -321,16 +328,108 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
-// Reentrancy guard for the window procedure. Modal pumps (MessageBoxW,
-// TrackPopupMenu) and synchronous dispatches (SetWindowPos, control
-// notifications) re-enter wnd_proc while the outer handler still holds its
-// &mut App. A second &mut to the same App would be undefined behavior, so
-// nested entries never touch App: job and close messages are parked for
-// redelivery, everything else falls through to DefWindowProcW. drain_nested
-// runs after every pump to redeliver and repaint.
+// Reentrancy guard for the window procedure. Synchronous dispatches
+// (SetWindowPos, control notifications) re-enter wnd_proc while the outer
+// handler still holds its &mut App. A second &mut to the same App would be
+// undefined behavior, so nested entries never touch App: they record what
+// must not be lost in DEFERRED and fall through to DefWindowProcW. Native
+// modal loops never run under the guard: messages App never handles go to
+// DefWindowProcW before the guard is taken (title-bar drag, frame sizing,
+// system menu, caption buttons), and message boxes, confirmations, popup
+// menus, shell opens, and the UAC relaunch are queued in NATIVE and shown by
+// run_native after the handler returns. Once an outer handler returns and
+// releases the guard, flush_deferred re-posts everything recorded and runs
+// the queued native UI.
 static IN_HANDLER: AtomicBool = AtomicBool::new(false);
-static PENDING_MSG: AtomicU32 = AtomicU32::new(0);
-static PENDING_CLOSE: AtomicBool = AtomicBool::new(false);
+/// `DEFER_*` bits recorded by nested entries. One bit per kind, so a later
+/// progress tick can never overwrite a parked completion.
+static DEFERRED: AtomicU32 = AtomicU32::new(0);
+const DEFER_PROGRESS: u32 = 1;
+const DEFER_DONE: u32 = 2;
+const DEFER_CLOSE: u32 = 4;
+const DEFER_LAYOUT: u32 = 8;
+const DEFER_PAINT: u32 = 16;
+
+// Native modal UI (message boxes, confirmations, popup menus, the UAC
+// relaunch) never runs inside a handler. A handler queues it here and
+// returns; run_native shows it once the guard is released, so the modal loop
+// dispatches every message to a free handler instead of a parked one. A
+// confirmation does not resume the code that asked: on Yes the action is
+// re-run, recomputes its question from the state at that moment, and proceeds
+// only if that question and the exact targets match what was approved.
+static NATIVE: Mutex<VecDeque<Native>> = Mutex::new(VecDeque::new());
+/// True while run_native has a modal loop open; nested flushes leave the
+/// queue to it, so only one dialog is up at a time.
+static SHOWING: AtomicBool = AtomicBool::new(false);
+/// Confirmed actions waiting for WM_REDO, with their approval keys.
+static REDO: Mutex<VecDeque<(Redo, String)>> = Mutex::new(VecDeque::new());
+/// The approval key for the action WM_REDO is re-running right now.
+static APPROVED: Mutex<Option<String>> = Mutex::new(None);
+/// Menu choices waiting for WM_MENU_PICKED.
+static PICKED: Mutex<VecDeque<Picked>> = Mutex::new(VecDeque::new());
+
+enum Native {
+    Message {
+        text: String,
+        icon: u32,
+    },
+    Confirm {
+        text: String,
+        key: String,
+        redo: Redo,
+    },
+    Menu {
+        /// HMENU, owned here until shown and destroyed.
+        menu: isize,
+        at: POINT,
+        picked: Picked,
+    },
+    /// Relaunch elevated; close this window if the copy started.
+    Elevate,
+    /// Open a file, folder, or program with the shell.
+    Shell {
+        file: String,
+        args: Option<String>,
+    },
+}
+
+/// The action a confirmation guards, re-run once the user says Yes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Redo {
+    IgnoreRows(Vec<usize>),
+    ServicesApply,
+    PowerRows(Vec<usize>, bool),
+    SetRows(Vec<usize>, StartType),
+    PrivacyClean,
+    Shred,
+    Repair,
+    Restore(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuKind {
+    Findings,
+    Services,
+}
+
+/// A popup menu shown for some rows. The choice is applied only if those
+/// rows still name the same items (`identity`) when it arrives.
+#[derive(Clone, Debug)]
+struct Picked {
+    kind: MenuKind,
+    rows: Vec<usize>,
+    identity: String,
+    choice: usize,
+}
+
+fn lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The approval key for a confirmation: the question and the exact targets.
+fn approval_key(question: &str, identity: &str) -> String {
+    format!("{identity}\u{1f}{question}")
+}
 
 struct Fonts {
     title: HFONT,
@@ -486,6 +585,8 @@ unsafe extern "system" fn wnd_proc(
         }
         let app = &mut *window_app(hwnd);
         app.sync_controls();
+        drop(_guard);
+        flush_deferred(hwnd);
         return 0;
     }
     if msg == WM_GETMINMAXINFO {
@@ -498,156 +599,358 @@ unsafe extern "system" fn wnd_proc(
         return 0;
     }
     let app = window_app(hwnd);
-    if app.is_null() {
+    if app.is_null() || !app_handles(msg) {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
-    // Nested dispatch while a handler runs: park what must not be lost,
-    // default the rest, and never form a second &mut App. WM_CLOSE must
-    // not reach DefWindowProcW here — its default action destroys the
-    // window without running our WM_DESTROY cleanup.
-    let _guard = match HandlerGuard::enter() {
-        Some(guard) => guard,
-        None => {
-            if msg == WM_JOB_PROGRESS || msg == WM_JOB_DONE {
-                PENDING_MSG.store(msg, Ordering::SeqCst);
-            } else if msg == WM_CLOSE {
-                PENDING_CLOSE.store(true, Ordering::SeqCst);
-                return 0;
+    // Nested dispatch while a handler runs: record what must not be lost,
+    // default the rest, and never form a second &mut App. WM_CLOSE must not
+    // reach DefWindowProcW here — its default action destroys the window
+    // without running our WM_DESTROY cleanup.
+    let Some(guard) = HandlerGuard::enter() else {
+        let (bits, reply) = nested_reply(msg);
+        DEFERRED.fetch_or(bits, Ordering::SeqCst);
+        return match reply {
+            NestedReply::Handled => 0,
+            NestedReply::Default => DefWindowProcW(hwnd, msg, wparam, lparam),
+        };
+    };
+    let result = 'handled: {
+        let _guard = guard;
+        let app = &mut *app;
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                app.paint();
+                0
             }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            WM_SIZE | WM_RELAYOUT => {
+                app.sync_controls();
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                0
+            }
+            WM_DPICHANGED => {
+                app.set_dpi((wparam & 0xffff) as u32);
+                let rect = &*(lparam as *const RECT);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                // The nested WM_SIZE is deferred by the guard, so lay out and
+                // repaint directly instead of waiting for the flush.
+                app.sync_controls();
+                app.invalidate();
+                0
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = point(lparam);
+                app.set_hover(app.spot_at(x, y));
+                if !app.tracking {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&mut track);
+                    app.tracking = true;
+                }
+                0
+            }
+            WM_MOUSELEAVE => {
+                app.tracking = false;
+                app.set_hover(None);
+                0
+            }
+            WM_SETCURSOR => {
+                if (lparam & 0xffff) as u32 == HTCLIENT
+                    && wparam as HWND == hwnd
+                    && let Some(index) = app.hover
+                    && app.spot_enabled(index)
+                {
+                    SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                    break 'handled 1;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = point(lparam);
+                if let Some(index) = app.spot_at(x, y)
+                    && app.spot_enabled(index)
+                {
+                    let action = app.hotspots[index].action;
+                    app.perform(action);
+                }
+                0
+            }
+            WM_COMMAND => {
+                app.command((wparam & 0xffff) as u16, ((wparam >> 16) & 0xffff) as u16);
+                0
+            }
+            WM_NOTIFY => app.notify(&*(lparam as *const NMHDR), lparam),
+            WM_CONTEXTMENU => {
+                if wparam as HWND == app.list {
+                    app.findings_menu(lparam);
+                } else if wparam as HWND == app.svc_list {
+                    app.services_menu(lparam);
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                SetBkColor(wparam as HDC, BG);
+                app.bg_brush as LRESULT
+            }
+            WM_DROPFILES => {
+                let drop = wparam as HDROP;
+                app.drop_files(drop);
+                DragFinish(drop);
+                0
+            }
+            WM_JOB_PROGRESS => {
+                app.show_progress();
+                0
+            }
+            WM_JOB_DONE => {
+                if let Some(result) = RESULT.lock().ok().and_then(|mut slot| slot.take()) {
+                    app.finish(result);
+                }
+                0
+            }
+            WM_REDO => {
+                if let Some((redo, key)) = lock(&REDO).pop_front() {
+                    *lock(&APPROVED) = Some(key);
+                    app.redo(redo);
+                    *lock(&APPROVED) = None;
+                }
+                0
+            }
+            WM_MENU_PICKED => {
+                if let Some(picked) = lock(&PICKED).pop_front() {
+                    app.menu_picked(picked);
+                }
+                0
+            }
+            WM_CLOSE => {
+                if matches!(
+                    app.job,
+                    Job::Repairing
+                        | Job::Restoring
+                        | Job::Services
+                        | Job::Cleaning
+                        | Job::Shredding
+                ) {
+                    app.message(
+                        "Hive Mend is still working. Please wait for it to finish before closing.",
+                        MB_ICONWARNING,
+                    );
+                    break 'handled 0;
+                }
+                // app is dead after this point: DestroyWindow dispatches
+                // WM_DESTROY synchronously, which must run as a normal guarded
+                // entry instead of being deferred.
+                drop(_guard);
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let app = Box::from_raw(app as *mut App);
+                app.release();
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     };
-    let app = &mut *app;
+    // The guard is released here, so re-posted messages reach a free handler.
+    flush_deferred(hwnd);
+    result
+}
+
+/// Messages the window procedure acts on. Everything else goes straight to
+/// DefWindowProcW without taking the guard or borrowing App, so a native
+/// modal loop it starts (title-bar drag, frame sizing, system menu, caption
+/// buttons) is not run inside a handler.
+fn app_handles(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_ERASEBKGND
+            | WM_PAINT
+            | WM_SIZE
+            | WM_RELAYOUT
+            | WM_DPICHANGED
+            | WM_MOUSEMOVE
+            | WM_MOUSELEAVE
+            | WM_SETCURSOR
+            | WM_LBUTTONUP
+            | WM_COMMAND
+            | WM_NOTIFY
+            | WM_CONTEXTMENU
+            | WM_CTLCOLORSTATIC
+            | WM_CTLCOLORBTN
+            | WM_DROPFILES
+            | WM_JOB_PROGRESS
+            | WM_JOB_DONE
+            | WM_REDO
+            | WM_MENU_PICKED
+            | WM_CLOSE
+            | WM_DESTROY
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NestedReply {
+    /// Answered here with 0; the deferred bit carries the real work.
+    Handled,
+    /// Also passed to DefWindowProcW.
+    Default,
+}
+
+/// What a nested entry records for later, and how it answers now. Job and
+/// close messages are answered without DefWindowProcW (whose WM_CLOSE default
+/// would destroy the window behind our cleanup); a nested size or paint still
+/// gets the default and is redone once the guard is free.
+fn nested_reply(msg: u32) -> (u32, NestedReply) {
     match msg {
-        WM_ERASEBKGND => 1,
-        WM_PAINT => {
-            app.paint();
-            0
-        }
-        WM_SIZE => {
-            app.sync_controls();
-            InvalidateRect(hwnd, std::ptr::null(), 0);
-            0
-        }
-        WM_DPICHANGED => {
-            app.set_dpi((wparam & 0xffff) as u32);
-            let rect = &*(lparam as *const RECT);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            // The nested WM_SIZE is deferred by the guard, so lay out and
-            // repaint directly instead of relying on it.
-            app.sync_controls();
-            app.invalidate();
-            0
-        }
-        WM_MOUSEMOVE => {
-            let (x, y) = point(lparam);
-            app.set_hover(app.spot_at(x, y));
-            if !app.tracking {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut track);
-                app.tracking = true;
-            }
-            0
-        }
-        WM_MOUSELEAVE => {
-            app.tracking = false;
-            app.set_hover(None);
-            0
-        }
-        WM_SETCURSOR => {
-            if (lparam & 0xffff) as u32 == HTCLIENT
-                && wparam as HWND == hwnd
-                && let Some(index) = app.hover
-                && app.spot_enabled(index)
-            {
-                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
-                return 1;
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_LBUTTONUP => {
-            let (x, y) = point(lparam);
-            if let Some(index) = app.spot_at(x, y)
-                && app.spot_enabled(index)
-            {
-                let action = app.hotspots[index].action;
-                app.perform(action);
-            }
-            0
-        }
-        WM_COMMAND => {
-            app.command((wparam & 0xffff) as u16, ((wparam >> 16) & 0xffff) as u16);
-            0
-        }
-        WM_NOTIFY => app.notify(&*(lparam as *const NMHDR), lparam),
-        WM_CONTEXTMENU => {
-            if wparam as HWND == app.list {
-                app.findings_menu(lparam);
-            } else if wparam as HWND == app.svc_list {
-                app.services_menu(lparam);
-            }
-            0
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            SetBkColor(wparam as HDC, BG);
-            app.bg_brush as LRESULT
-        }
-        WM_DROPFILES => {
-            let drop = wparam as HDROP;
-            app.drop_files(drop);
-            DragFinish(drop);
-            0
-        }
-        WM_JOB_PROGRESS => {
-            app.show_progress();
-            0
-        }
-        WM_JOB_DONE => {
-            if let Some(result) = RESULT.lock().ok().and_then(|mut slot| slot.take()) {
-                app.finish(result);
-            }
-            0
-        }
-        WM_CLOSE => {
-            if matches!(
-                app.job,
-                Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning | Job::Shredding
-            ) {
-                app.message(
-                    "Hive Mend is still working. Please wait for it to finish before closing.",
-                    MB_ICONWARNING,
-                );
-                return 0;
-            }
-            // app is dead after this point: DestroyWindow dispatches
-            // WM_DESTROY synchronously, which must run as a normal guarded
-            // entry instead of being deferred.
-            drop(_guard);
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            let app = Box::from_raw(app as *mut App);
-            app.release();
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_JOB_PROGRESS => (DEFER_PROGRESS, NestedReply::Handled),
+        WM_JOB_DONE => (DEFER_DONE, NestedReply::Handled),
+        WM_CLOSE => (DEFER_CLOSE, NestedReply::Handled),
+        WM_SIZE | WM_DPICHANGED | WM_RELAYOUT => (DEFER_LAYOUT, NestedReply::Default),
+        WM_PAINT => (DEFER_PAINT, NestedReply::Default),
+        _ => (0, NestedReply::Default),
     }
+}
+
+/// The messages to re-post for a set of deferred bits, in delivery order.
+/// Paint is not a message here: it is an invalidation.
+fn deferred_messages(bits: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    if bits & DEFER_LAYOUT != 0 {
+        out.push(WM_RELAYOUT);
+    }
+    if bits & DEFER_PROGRESS != 0 {
+        out.push(WM_JOB_PROGRESS);
+    }
+    if bits & DEFER_DONE != 0 {
+        out.push(WM_JOB_DONE);
+    }
+    if bits & DEFER_CLOSE != 0 {
+        out.push(WM_CLOSE);
+    }
+    out
+}
+
+/// Re-post what nested entries deferred. Posting (rather than handling
+/// here) means each message is dispatched later by a pump with no handler
+/// active, so it takes the guard normally.
+fn flush_deferred(hwnd: HWND) {
+    let bits = DEFERRED.swap(0, Ordering::SeqCst);
+    for message in deferred_messages(bits) {
+        unsafe { PostMessageW(hwnd, message, 0, 0) };
+    }
+    if bits & DEFER_PAINT != 0 {
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+    }
+    run_native(hwnd);
+}
+
+/// Show queued native UI, one item at a time, with no handler active. Runs
+/// only from flush_deferred, after the guard is released. A flush nested in
+/// one of these modal loops leaves the queue to the loop already running.
+fn run_native(hwnd: HWND) {
+    if SHOWING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let title = wide("Hive Mend");
+    while let Some(next) = lock(&NATIVE).pop_front() {
+        if unsafe { IsWindow(hwnd) } == 0 {
+            if let Native::Menu { menu, .. } = next {
+                unsafe { DestroyMenu(menu as HMENU) };
+            }
+            continue;
+        }
+        match next {
+            Native::Message { text, icon } => unsafe {
+                MessageBoxW(hwnd, wide(&text).as_ptr(), title.as_ptr(), MB_OK | icon);
+            },
+            Native::Confirm { text, key, redo } => {
+                let yes = unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&text).as_ptr(),
+                        title.as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                    ) == IDYES
+                };
+                if yes {
+                    lock(&REDO).push_back((redo, key));
+                    unsafe { PostMessageW(hwnd, WM_REDO, 0, 0) };
+                }
+            }
+            Native::Menu {
+                menu,
+                at,
+                mut picked,
+            } => {
+                let choice = unsafe {
+                    let choice = TrackPopupMenu(
+                        menu as HMENU,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        at.x,
+                        at.y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    );
+                    DestroyMenu(menu as HMENU);
+                    choice as usize
+                };
+                if choice != 0 {
+                    picked.choice = choice;
+                    lock(&PICKED).push_back(picked);
+                    unsafe { PostMessageW(hwnd, WM_MENU_PICKED, 0, 0) };
+                }
+            }
+            Native::Elevate => {
+                let exe = wide(&exe_path().display().to_string());
+                let result = unsafe {
+                    ShellExecuteW(
+                        hwnd,
+                        wide("runas").as_ptr(),
+                        exe.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                // Above 32 means the elevated copy started. Otherwise the
+                // prompt was declined.
+                if result as isize > 32 {
+                    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                }
+            }
+            Native::Shell { file, args } => {
+                let file = wide(&file);
+                let args = args.as_deref().map(wide);
+                unsafe {
+                    ShellExecuteW(
+                        hwnd,
+                        wide("open").as_ptr(),
+                        file.as_ptr(),
+                        args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+    }
+    SHOWING.store(false, Ordering::SeqCst);
 }
 
 fn window_app(hwnd: HWND) -> *mut App {
@@ -670,20 +973,6 @@ impl Drop for HandlerGuard {
     fn drop(&mut self) {
         IN_HANDLER.store(false, Ordering::SeqCst);
     }
-}
-
-/// Redeliver messages parked during a modal pump and force the repaint
-/// that nested WM_PAINTs skipped. Runs after every MessageBoxW and
-/// TrackPopupMenu, while still inside the outer handler.
-fn drain_nested(hwnd: HWND) {
-    let pending = PENDING_MSG.swap(0, Ordering::SeqCst);
-    if pending != 0 {
-        unsafe { PostMessageW(hwnd, pending, 0, 0) };
-    }
-    if PENDING_CLOSE.swap(false, Ordering::SeqCst) {
-        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
-    }
-    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
 impl App {
@@ -715,7 +1004,7 @@ impl App {
             elevated: unsafe { IsUserAnAdmin() } != 0,
             settings: Settings::load(&settings_file()),
             exclusions: Exclusions::load(&exclusions_file()),
-            backups: list_backups(&backups_dir()),
+            backups: all_backups(),
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -1033,8 +1322,20 @@ impl App {
         let Some(tool) = WINDOWS_TOOLS.get(index) else {
             return;
         };
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        shell_open(self.hwnd, &expand_target(tool.target, &root), None);
+        // The Windows folder from the API, not %SystemRoot%, so the intended
+        // native tool opens. Without it, a path-based tool is not launched.
+        let root = hive_mend::host_known_dir(hive_mend::KnownDir::Windows);
+        let target = match root {
+            Some(root) => expand_target(tool.target, &root),
+            None if !tool.target.to_ascii_lowercase().contains("%systemroot%") => {
+                tool.target.to_string()
+            }
+            None => {
+                self.message("Could not locate the Windows folder.", MB_ICONWARNING);
+                return;
+            }
+        };
+        shell_open(self.hwnd, &target, None);
     }
 
     fn go(&mut self, page: Page) {
@@ -1102,11 +1403,10 @@ impl App {
                     self.message("Pick a backup in the list first.", MB_ICONINFORMATION);
                 }
             }
-            ID_OPEN_BACKUPS => {
-                let dir = backups_dir();
-                let _ = std::fs::create_dir_all(&dir);
-                shell_open(self.hwnd, &dir.display().to_string(), None);
-            }
+            ID_OPEN_BACKUPS => match backups_dir() {
+                Ok(dir) => shell_open(self.hwnd, &dir.display().to_string(), None),
+                Err(err) => self.message(&err, MB_ICONWARNING),
+            },
             ID_UNIGNORE => self.unignore(),
             ID_SVC_REFRESH => self.refresh_services(),
             ID_SVC_ALL => self.svc_tick_all(true),
@@ -1493,7 +1793,7 @@ impl App {
             rows.len(),
             if rows.len() == 1 { "entry" } else { "entries" }
         );
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::IgnoreRows(rows.to_vec())) {
             return;
         }
         for row in rows {
@@ -1594,7 +1894,7 @@ impl App {
         } else {
             format!("Ignore these {} entries", rows.len())
         };
-        let choice = unsafe {
+        let menu = unsafe {
             let menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, MENU_DETAILS, wide("Details...").as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_COPY, wide("Copy location").as_ptr());
@@ -1609,19 +1909,28 @@ impl App {
             if lparam != -1 {
                 GetCursorPos(&mut at);
             }
-            let choice = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                at.x,
-                at.y,
-                0,
-                self.hwnd,
-                std::ptr::null(),
-            );
-            DestroyMenu(menu);
-            choice as usize
+            menu
         };
-        drain_nested(self.hwnd);
+        // Shown by run_native after this handler returns; the choice comes
+        // back as WM_MENU_PICKED and applies only to the same items.
+        let identity = self.menu_identity(MenuKind::Findings, &rows);
+        lock(&NATIVE).push_back(Native::Menu {
+            menu: menu as isize,
+            at,
+            picked: Picked {
+                kind: MenuKind::Findings,
+                rows,
+                identity,
+                choice: 0,
+            },
+        });
+    }
+
+    fn findings_choice(&mut self, rows: &[usize], choice: usize) {
+        let Some(first) = rows.first().and_then(|row| self.findings.get(*row)) else {
+            return;
+        };
+        let is_file = matches!(first.repair, Repair::DeleteFile { .. });
         match choice {
             MENU_DETAILS => self.show_details(rows[0]),
             MENU_COPY => {
@@ -1642,7 +1951,7 @@ impl App {
                     open_in_regedit(self.hwnd, &finding.key);
                 }
             }
-            MENU_IGNORE => self.ignore_rows(&rows),
+            MENU_IGNORE => self.ignore_rows(rows),
             _ => {}
         }
     }
@@ -1760,9 +2069,15 @@ impl App {
             );
             return;
         }
-        let backup_file = next_services_backup_file();
+        let Some(backup_file) = next_services_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
-            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
                 format!(
                     "{} ({})",
@@ -1772,7 +2087,10 @@ impl App {
             } else {
                 format!("these {} services", selected.len())
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         for change in selected.iter().take(8) {
             question.push_str(&format!(
@@ -1784,7 +2102,8 @@ impl App {
         if selected.len() > 8 {
             question.push_str(&format!("\n...and {} more", selected.len() - 8));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::ServicesApply) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Services;
@@ -1882,7 +2201,7 @@ impl App {
         if names.len() > 8 {
             question.push_str(&format!("\n...and {} more", names.len() - 8));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::PowerRows(rows.to_vec(), start)) {
             return;
         }
         self.job = Job::Services;
@@ -1959,9 +2278,15 @@ impl App {
             );
             return;
         }
-        let backup_file = next_services_backup_file();
+        let Some(backup_file) = next_services_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
-            "Set {} to {}?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            "Set {} to {}?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
                 format!(
                     "{} (now {})",
@@ -1972,12 +2297,16 @@ impl App {
                 format!("these {} services", changes.len())
             },
             to.label(),
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         if to == StartType::Disabled {
             question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::SetRows(rows.to_vec(), to)) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Services;
@@ -2058,6 +2387,9 @@ impl App {
                         for skipped in &outcome.not_backed_up {
                             lines.push(format!("Not backed up, left alone: {skipped}"));
                         }
+                        for pending in outcome.unconfirmed.iter().take(5) {
+                            lines.push(format!("Not confirmed: {pending}"));
+                        }
                         for error in outcome.errors.iter().take(5) {
                             lines.push(format!("Failed: {error}"));
                         }
@@ -2070,18 +2402,24 @@ impl App {
                         if !outcome.backup_file.as_os_str().is_empty() {
                             lines.push(format!("Backup: {}", outcome.backup_file.display()));
                         }
-                        self.svc_note = if outcome.applied.is_empty() && outcome.errors.is_empty() {
+                        self.svc_note = if outcome.applied.is_empty()
+                            && outcome.errors.is_empty()
+                            && outcome.unconfirmed.is_empty()
+                        {
                             "Nothing needed changing.".to_string()
                         } else {
                             format!(
-                                "Applied {}, refused {}, failed {}.",
+                                "Applied {}, refused {}, failed {}, not confirmed {}.",
                                 outcome.applied.len(),
                                 outcome.refused.len() + outcome.not_backed_up.len(),
-                                outcome.errors.len() + outcome.denied
+                                outcome.errors.len() + outcome.denied,
+                                outcome.unconfirmed.len()
                             )
                         };
                         let icon = if outcome.applied.is_empty()
-                            && (outcome.denied > 0 || !outcome.errors.is_empty())
+                            && (outcome.denied > 0
+                                || !outcome.errors.is_empty()
+                                || !outcome.unconfirmed.is_empty())
                         {
                             MB_ICONWARNING
                         } else {
@@ -2098,13 +2436,30 @@ impl App {
 
     fn rebuild_privacy(&mut self) {
         let mut items = build_items(&WindowsSystemTargets);
-        if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
+        // The custom list and the remembered ticks live in the per-user
+        // folder, which programs running without elevation can edit. An
+        // elevated window acts on neither: it starts with nothing ticked and
+        // shows why the custom list is left out.
+        if self.elevated {
+            if custom_privacy_file().exists() {
+                let mut custom = parse_custom("", &HostFs);
+                custom.warnings.push(
+                    "Custom items are not used while Hive Mend runs as administrator. Start it without administrator rights to clean them."
+                        .to_string(),
+                );
+                items.push(custom);
+            }
+        } else if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
             let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
             if !custom.targets.is_empty() || !custom.warnings.is_empty() {
                 items.push(custom);
             }
         }
-        let ticked: Vec<String> = self.settings.privacy_ticked.clone();
+        let ticked: Vec<String> = if self.elevated {
+            Vec::new()
+        } else {
+            self.settings.privacy_ticked.clone()
+        };
         self.priv_checked = items
             .iter()
             .map(|item| ticked.iter().any(|id| id == &item.id))
@@ -2116,6 +2471,11 @@ impl App {
     }
 
     fn save_priv_ticks(&mut self) {
+        // An elevated window never stores ticks for the per-user settings,
+        // so it cannot change what a later window starts with.
+        if self.elevated {
+            return;
+        }
         self.settings.privacy_ticked = self
             .priv_items
             .iter()
@@ -2275,16 +2635,25 @@ impl App {
             );
             return;
         }
-        let backup_file = next_privacy_backup_file();
+        let Some(backup_file) = next_privacy_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
-            "Clean {} {}?\n\nHive Mend saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            "Clean {} {}?\n\nHive Mend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
             if selected.len() == 1 {
                 "category"
             } else {
                 "categories"
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         let shown = selected.iter().take(10);
         for item in shown {
@@ -2300,7 +2669,8 @@ impl App {
         if selected.len() > 10 {
             question.push_str(&format!("\n...and {} more", selected.len() - 10));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::PrivacyClean) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Cleaning;
@@ -2778,7 +3148,7 @@ impl App {
         if ticked.len() > 10 {
             question.push_str(&format!("\n...and {} more", ticked.len() - 10));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Shred) {
             return;
         }
         self.job = Job::Shredding;
@@ -3044,7 +3414,7 @@ impl App {
         let stopped = first.state == ServiceState::Stopped;
         let can_write = self.elevated;
         let gray = |on: bool| if on { MF_GRAYED } else { MF_STRING };
-        let choice = unsafe {
+        let menu = unsafe {
             let menu = CreatePopupMenu();
             AppendMenuW(
                 menu,
@@ -3086,26 +3456,31 @@ impl App {
             if lparam != -1 {
                 GetCursorPos(&mut at);
             }
-            let choice = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                at.x,
-                at.y,
-                0,
-                self.hwnd,
-                std::ptr::null(),
-            );
-            DestroyMenu(menu);
-            choice as usize
+            menu
         };
-        drain_nested(self.hwnd);
+        // Shown by run_native after this handler returns; the choice comes
+        // back as WM_MENU_PICKED and applies only to the same items.
+        let identity = self.menu_identity(MenuKind::Services, &rows);
+        lock(&NATIVE).push_back(Native::Menu {
+            menu: menu as isize,
+            at,
+            picked: Picked {
+                kind: MenuKind::Services,
+                rows,
+                identity,
+                choice: 0,
+            },
+        });
+    }
+
+    fn services_choice(&mut self, rows: &[usize], choice: usize) {
         match choice {
-            MENU_SVC_START => self.power_rows(&rows, true),
-            MENU_SVC_STOP => self.power_rows(&rows, false),
-            MENU_SVC_AUTO => self.set_rows(&rows, StartType::Automatic),
-            MENU_SVC_AUTO_DELAYED => self.set_rows(&rows, StartType::AutomaticDelayed),
-            MENU_SVC_MANUAL => self.set_rows(&rows, StartType::Manual),
-            MENU_SVC_DISABLED => self.set_rows(&rows, StartType::Disabled),
+            MENU_SVC_START => self.power_rows(rows, true),
+            MENU_SVC_STOP => self.power_rows(rows, false),
+            MENU_SVC_AUTO => self.set_rows(rows, StartType::Automatic),
+            MENU_SVC_AUTO_DELAYED => self.set_rows(rows, StartType::AutomaticDelayed),
+            MENU_SVC_MANUAL => self.set_rows(rows, StartType::Manual),
+            MENU_SVC_DISABLED => self.set_rows(rows, StartType::Disabled),
             _ => {}
         }
     }
@@ -3124,16 +3499,25 @@ impl App {
             );
             return;
         }
-        let backup_file = next_backup_file();
+        let Some(backup_file) = next_backup_file() else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
         let mut question = format!(
-            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
+            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
             if selected.len() == 1 {
                 "entry"
             } else {
                 "entries"
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         let permanent = selected.iter().filter(|f| f.permanent()).count();
         if permanent > 0 {
@@ -3148,7 +3532,8 @@ impl App {
                 "\n\n{admin} of these are machine-wide. Without administrator rights Windows will refuse them and they will stay as they are."
             ));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Repair) {
+            discard_reserved_backup(&backup_file);
             return;
         }
         self.job = Job::Repairing;
@@ -3323,7 +3708,7 @@ impl App {
     // ---- restore -------------------------------------------------------
 
     fn refresh_backups(&mut self) {
-        self.backups = list_backups(&backups_dir());
+        self.backups = all_backups();
         self.fill_backups();
     }
 
@@ -3333,11 +3718,16 @@ impl App {
         }
         for (row, backup) in self.backups.iter().enumerate() {
             let saved = backup.modified.map(local_time_text).unwrap_or_default();
-            let name = backup
+            let mut name = backup
                 .path
                 .file_name()
                 .map(|name| name.to_string_lossy().to_string())
                 .unwrap_or_default();
+            match backup.store {
+                Store::Protected => {}
+                Store::User => name.push_str("  (your account)"),
+                Store::Legacy => name.push_str("  (old shared folder)"),
+            }
             insert_row(
                 self.backup_list,
                 row,
@@ -3353,9 +3743,36 @@ impl App {
         let Some(backup) = self.backups.get(row).cloned() else {
             return;
         };
+        // Only the protected store is trusted by an elevated instance. Other
+        // folders can be changed by other accounts or by this account's
+        // non-elevated programs, so their backups restore only without
+        // elevation, which can change only this account's own entries.
+        if self.elevated && !backup.store.elevated_may_restore() {
+            let place = if backup.store == Store::Legacy {
+                format!(
+                    "the old shared folder {LEGACY_DIR}, which every account on this PC can change"
+                )
+            } else {
+                "your account's folder, which programs you run without administrator rights can change".to_string()
+            };
+            self.message(
+                &format!(
+                    "This backup is in {place}, so Hive Mend does not restore it with administrator rights.\n\nStart Hive Mend without administrator rights to put back the entries for your own account."
+                ),
+                MB_ICONWARNING,
+            );
+            return;
+        }
+        if backup.summary.machine_wide && !self.elevated && !backup.store.elevated_may_restore() {
+            self.message(
+                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hive Mend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
+                MB_ICONWARNING,
+            );
+            return;
+        }
         if backup.summary.machine_wide && !self.elevated {
             let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
-            if self.confirm(ask) {
+            if self.confirm(ask, Redo::Restore(row)) {
                 self.elevate();
             }
             return;
@@ -3365,7 +3782,7 @@ impl App {
             "Restore the backup saved {saved}?\n\nThis puts back {}. Entries that exist now are overwritten with the saved copy.",
             contents(&backup.summary)
         );
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Restore(row)) {
             return;
         }
         self.job = Job::Restoring;
@@ -3375,20 +3792,7 @@ impl App {
         let hwnd = self.hwnd as isize;
         let file = backup.path.clone();
         std::thread::spawn(move || {
-            let result = read_backup(&file)
-                .map_err(|err| err.to_string())
-                .and_then(|text| {
-                    if !is_hive_mend_backup(&text) {
-                        return Err(format!(
-                            "{} is not a Hive Mend backup; refusing to restore it",
-                            file.display()
-                        ));
-                    }
-                    let summary = BackupSummary::parse(&text);
-                    import_reg_file(&file)?;
-                    let (files, errors) = restore_files(&summary);
-                    Ok((summary, files, errors))
-                });
+            let result = restore_backup(&file);
             finish_job(hwnd, JobResult::Restore { file, result });
         });
     }
@@ -3477,23 +3881,9 @@ impl App {
         if self.busy() || self.elevated {
             return;
         }
-        let exe = wide(&exe_path().display().to_string());
-        let result = unsafe {
-            ShellExecuteW(
-                self.hwnd,
-                wide("runas").as_ptr(),
-                exe.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        // Above 32 means the elevated copy started. Otherwise the prompt was declined.
-        if result as isize > 32 {
-            // Ask for the close instead of destroying synchronously: a
-            // nested WM_DESTROY would run while this handler is live.
-            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
-        }
+        // ShellExecuteW waits on the UAC prompt; it runs from run_native,
+        // outside any handler.
+        lock(&NATIVE).push_back(Native::Elevate);
     }
 
     // ---- jobs ----------------------------------------------------------
@@ -3555,26 +3945,127 @@ impl App {
         self.invalidate();
     }
 
-    fn confirm(&self, text: &str) -> bool {
-        let text = wide(text);
-        let title = wide("Hive Mend");
-        let yes = unsafe {
-            MessageBoxW(
-                self.hwnd,
-                text.as_ptr(),
-                title.as_ptr(),
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-            ) == IDYES
-        };
-        drain_nested(self.hwnd);
-        yes
+    /// True only while `redo` is being re-run after the user said Yes to
+    /// this exact question for these exact targets. Otherwise the question
+    /// is queued for after the handler returns and this returns false, so the
+    /// caller backs out as it would on No; on Yes the action runs again.
+    fn confirm(&self, text: &str, redo: Redo) -> bool {
+        let key = approval_key(text, &self.redo_identity(&redo));
+        if lock(&APPROVED).take().as_deref() == Some(key.as_str()) {
+            return true;
+        }
+        lock(&NATIVE).push_back(Native::Confirm {
+            text: text.to_string(),
+            key,
+            redo,
+        });
+        false
     }
 
+    /// Queue a message box for after the handler returns.
     fn message(&self, text: &str, icon: u32) {
-        let text = wide(text);
-        let title = wide("Hive Mend");
-        unsafe { MessageBoxW(self.hwnd, text.as_ptr(), title.as_ptr(), MB_OK | icon) };
-        drain_nested(self.hwnd);
+        lock(&NATIVE).push_back(Native::Message {
+            text: text.to_string(),
+            icon,
+        });
+    }
+
+    /// What an action would act on right now, so an approval given for one
+    /// set of targets is never spent on another.
+    fn redo_identity(&self, redo: &Redo) -> String {
+        let finding = |finding: &Finding| format!("{}|{:?}", finding.key, finding.value);
+        let ticked = |checked: &[bool], index: usize| checked.get(index).copied().unwrap_or(false);
+        let parts: Vec<String> = match redo {
+            Redo::IgnoreRows(rows) => rows
+                .iter()
+                .filter_map(|row| self.findings.get(*row))
+                .map(finding)
+                .collect(),
+            Redo::Repair => self
+                .findings
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.checked, *index))
+                .map(|(_, item)| finding(item))
+                .collect(),
+            Redo::ServicesApply => self
+                .svc_proposals
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.svc_checked, *index))
+                .map(|(_, change)| format!("{}>{:?}", change.name, change.to))
+                .collect(),
+            Redo::PowerRows(rows, _) | Redo::SetRows(rows, _) => rows
+                .iter()
+                .filter_map(|row| self.services.get(*row))
+                .map(|info| info.name.clone())
+                .collect(),
+            Redo::PrivacyClean => self
+                .priv_items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.priv_checked, *index))
+                .map(|(_, item)| item.id.clone())
+                .collect(),
+            Redo::Shred => self
+                .shred_rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.shred_checked, *index))
+                .map(|(_, row)| row.target.path.clone())
+                .collect(),
+            Redo::Restore(row) => self
+                .backups
+                .get(*row)
+                .map(|backup| backup.path.display().to_string())
+                .into_iter()
+                .collect(),
+        };
+        format!("{redo:?}\u{1e}{}", parts.join("\u{1e}"))
+    }
+
+    fn redo(&mut self, redo: Redo) {
+        match redo {
+            Redo::IgnoreRows(rows) => self.ignore_rows(&rows),
+            Redo::ServicesApply => self.start_services_apply(),
+            Redo::PowerRows(rows, start) => self.power_rows(&rows, start),
+            Redo::SetRows(rows, to) => self.set_rows(&rows, to),
+            Redo::PrivacyClean => self.start_privacy_clean(),
+            Redo::Shred => self.start_shred(),
+            Redo::Repair => self.start_repair(),
+            Redo::Restore(row) => self.start_restore(row),
+        }
+    }
+
+    /// The items a popup menu's rows name right now.
+    fn menu_identity(&self, kind: MenuKind, rows: &[usize]) -> String {
+        match kind {
+            MenuKind::Findings => rows
+                .iter()
+                .filter_map(|row| self.findings.get(*row))
+                .map(|finding| format!("{}|{:?}", finding.key, finding.value))
+                .collect::<Vec<_>>()
+                .join("\u{1e}"),
+            MenuKind::Services => rows
+                .iter()
+                .filter_map(|row| self.services.get(*row))
+                .map(|info| info.name.clone())
+                .collect::<Vec<_>>()
+                .join("\u{1e}"),
+        }
+    }
+
+    fn menu_picked(&mut self, picked: Picked) {
+        if self.busy()
+            || picked.rows.is_empty()
+            || self.menu_identity(picked.kind, &picked.rows) != picked.identity
+        {
+            return;
+        }
+        match picked.kind {
+            MenuKind::Findings => self.findings_choice(&picked.rows, picked.choice),
+            MenuKind::Services => self.services_choice(&picked.rows, picked.choice),
+        }
     }
 
     // ---- layout --------------------------------------------------------
@@ -5362,7 +5853,16 @@ impl App {
             right,
             y,
             "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
-        ) + gap * 2;
+        ) + gap / 2;
+        y = paragraph(
+            hdc,
+            self.fonts.body_bold,
+            INK,
+            left,
+            right,
+            y,
+            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0).",
+        ) + gap;
         y = paragraph(
             hdc,
             self.fonts.heading,
@@ -5375,8 +5875,8 @@ impl App {
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
-            "Before repairing, the ticked entries are checked again, and everything about to be removed is saved to a backup first.",
-            "It never touches Winlogon, default-app choices, Windows Installer data, files inside the Windows folder, or built-in protocols such as http.",
+            "Before repairing, the ticked entries are checked again. Registry entries and shortcuts are saved to a backup first; old temporary files are deleted for good and are not backed up.",
+            "It never touches Winlogon, default-app choices, the services Windows needs to boot or stay secure, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",
         ] {
@@ -5402,8 +5902,18 @@ impl App {
             "Where things are kept",
         ) + gap / 2;
         for (label, value) in [
-            ("Backups", backups_dir().display().to_string()),
-            ("Settings and ignore list", hive_mend::DATA_DIR.to_string()),
+            (
+                "Backups",
+                backups_location()
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+            ),
+            (
+                "Settings and ignore list",
+                user_dir(&HostFs)
+                    .map(|dir| dir.display().to_string())
+                    .unwrap_or_default(),
+            ),
             ("Images", image_root().display().to_string()),
         ] {
             paragraph(
@@ -5425,7 +5935,7 @@ impl App {
                 &value,
             ) + gap / 2;
         }
-        y += gap * 2;
+        y += gap / 2;
         paragraph(
             hdc,
             self.fonts.body,
@@ -5628,17 +6138,28 @@ fn local_time_text(time: SystemTime) -> String {
     }
 }
 
-/// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
-fn next_backup_file() -> PathBuf {
+/// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, reserved so a name is never
+/// reused; `None` when no name could be reserved.
+fn next_backup_file() -> Option<PathBuf> {
     next_backup_file_with("hive-mend")
 }
 
-/// `services-YYYYMMDD-HHMMSS.reg` in local time, never reusing a name.
-fn next_services_backup_file() -> PathBuf {
+/// `services-YYYYMMDD-HHMMSS.reg` in local time, reserved; `None` on failure.
+fn next_services_backup_file() -> Option<PathBuf> {
     next_backup_file_with("services")
 }
 
-fn next_privacy_backup_file() -> PathBuf {
+/// Backups from every store, newest first, each tagged with its store.
+fn all_backups() -> Vec<BackupInfo> {
+    let mut all: Vec<BackupInfo> = backup_stores()
+        .into_iter()
+        .flat_map(|(store, dir)| list_backups(&dir, store))
+        .collect();
+    all.sort_by_key(|info| std::cmp::Reverse(info.modified));
+    all
+}
+
+fn next_privacy_backup_file() -> Option<PathBuf> {
     next_backup_file_with("privacy")
 }
 
@@ -5646,8 +6167,10 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn next_backup_file_with(prefix: &str) -> PathBuf {
-    let dir = backups_dir();
+fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
+    let Ok(dir) = backups_dir() else {
+        return None;
+    };
     let stamp = unsafe {
         let mut t: SYSTEMTIME = std::mem::zeroed();
         GetLocalTime(&mut t);
@@ -5656,13 +6179,40 @@ fn next_backup_file_with(prefix: &str) -> PathBuf {
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
         )
     };
-    let mut path = dir.join(format!("{prefix}-{stamp}.reg"));
-    let mut n = 2;
-    while path.exists() {
-        path = dir.join(format!("{prefix}-{stamp}-{n}.reg"));
-        n += 1;
+    // Reserve the name by creating the (empty) file now, so a second window
+    // choosing a name in the same second cannot land on this one and later
+    // overwrite its backup. A cancelled job removes the placeholder with
+    // `discard_reserved_backup`. Return None rather than an unreserved name:
+    // the caller aborts the job instead of writing a backup it never reserved.
+    for attempt in 0..10_000u32 {
+        let name = if attempt == 0 {
+            format!("{prefix}-{stamp}.reg")
+        } else {
+            format!("{prefix}-{stamp}-{}.reg", attempt + 1)
+        };
+        let path = dir.join(name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Some(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(_) => return None,
+        }
     }
-    path
+    None
+}
+
+/// Remove a just-reserved backup placeholder after the user cancels. Only an
+/// empty file is removed, so a real backup is never deleted.
+fn discard_reserved_backup(path: &std::path::Path) {
+    if std::fs::metadata(path)
+        .map(|meta| meta.len() == 0)
+        .unwrap_or(false)
+    {
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 // ---- Win32 helpers -----------------------------------------------------
@@ -6077,19 +6627,13 @@ fn copy_text(hwnd: HWND, value: &str) {
     }
 }
 
-fn shell_open(hwnd: HWND, file: &str, args: Option<&str>) {
-    let file = wide(file);
-    let args = args.map(wide);
-    unsafe {
-        ShellExecuteW(
-            hwnd,
-            wide("open").as_ptr(),
-            file.as_ptr(),
-            args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
-    }
+/// Queue a shell open for after the handler returns: ShellExecuteW can pump
+/// messages (its own error dialog, a DDE or COM wait).
+fn shell_open(_hwnd: HWND, file: &str, args: Option<&str>) {
+    lock(&NATIVE).push_back(Native::Shell {
+        file: file.to_string(),
+        args: args.map(str::to_string),
+    });
 }
 
 /// Registry Editor opens at its saved `LastKey`, so set that and start it.
@@ -6147,5 +6691,85 @@ fn load_bitmap(name: &str) -> HBITMAP {
             0,
             LR_LOADFROMFILE | LR_CREATEDIBSECTION,
         ) as HBITMAP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVING, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
+    };
+
+    #[test]
+    fn modal_loop_starters_never_take_the_guard() {
+        // Dragging the title bar or a frame edge runs DefWindowProcW's modal
+        // loop from these. If they took the guard, every message that loop
+        // dispatches (a job finishing, WM_CLOSE, WM_SIZE) would be nested.
+        for msg in [
+            WM_NCLBUTTONDOWN,
+            WM_SYSCOMMAND,
+            WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE,
+            WM_MOVING,
+            WM_SIZING,
+        ] {
+            assert!(!app_handles(msg), "message {msg:#x} must stay default-only");
+        }
+        for msg in [WM_JOB_DONE, WM_JOB_PROGRESS, WM_CLOSE, WM_SIZE, WM_RELAYOUT] {
+            assert!(app_handles(msg), "message {msg:#x} must reach App");
+        }
+    }
+
+    #[test]
+    fn a_progress_tick_cannot_overwrite_a_parked_completion() {
+        // Completion, then a late progress tick, then close and a resize, all
+        // while a modal pump holds the guard: every one must be redelivered.
+        let mut bits = 0;
+        for msg in [WM_JOB_DONE, WM_JOB_PROGRESS, WM_CLOSE, WM_SIZE, WM_PAINT] {
+            bits |= nested_reply(msg).0;
+        }
+        assert_eq!(
+            deferred_messages(bits),
+            vec![WM_RELAYOUT, WM_JOB_PROGRESS, WM_JOB_DONE, WM_CLOSE]
+        );
+        assert_ne!(bits & DEFER_PAINT, 0);
+    }
+
+    #[test]
+    fn an_approval_covers_only_the_same_question_and_targets() {
+        let approved = approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\B");
+        assert_eq!(
+            approved,
+            approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\B")
+        );
+        // Same question, different entries ticked by the time it re-runs.
+        assert_ne!(
+            approved,
+            approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\C")
+        );
+        // Same entries, but the question now says something else.
+        assert_ne!(
+            approved,
+            approval_key(
+                "Repair 2 entries? 1 is machine-wide.",
+                "Repair|HKCU\\A|HKCU\\B"
+            )
+        );
+    }
+
+    #[test]
+    fn redo_and_menu_messages_reach_app() {
+        assert!(app_handles(WM_REDO));
+        assert!(app_handles(WM_MENU_PICKED));
+    }
+
+    #[test]
+    fn nested_close_and_job_messages_skip_the_default_handler() {
+        // DefWindowProcW's WM_CLOSE destroys the window behind our cleanup.
+        assert_eq!(nested_reply(WM_CLOSE).1, NestedReply::Handled);
+        assert_eq!(nested_reply(WM_JOB_DONE).1, NestedReply::Handled);
+        assert_eq!(nested_reply(WM_SIZE).1, NestedReply::Default);
+        assert_eq!(nested_reply(WM_SYSCOMMAND), (0, NestedReply::Default));
     }
 }

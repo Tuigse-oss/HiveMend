@@ -130,12 +130,25 @@ impl From<StoreError> for Error {
     }
 }
 
+/// How a start or stop request ended. Only `Reached` counts as done: the
+/// service control manager accepts a request long before the service gets
+/// there, and a service can stall pending or fall back to where it was.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Transition {
+    /// The service control manager reported the requested state.
+    Reached,
+    /// It was already in the requested state; nothing was sent.
+    AlreadyThere,
+    /// The request was accepted but the wait ended in this other state
+    /// (`Other` covers still-pending and an unreadable status).
+    NotReached(ServiceState),
+}
+
 pub trait ServiceStore {
     fn list(&self) -> Result<Vec<ServiceInfo>, Error>;
     fn set_start(&mut self, name: &str, to: StartType) -> Result<(), StoreError>;
-    /// `Ok(true)` when the state changed, `Ok(false)` when it already had it.
-    fn start(&mut self, name: &str) -> Result<bool, StoreError>;
-    fn stop(&mut self, name: &str) -> Result<bool, StoreError>;
+    fn start(&mut self, name: &str) -> Result<Transition, StoreError>;
+    fn stop(&mut self, name: &str) -> Result<Transition, StoreError>;
 }
 
 /// In-memory store for tests. Pure plumbing; the refusal rules live in
@@ -179,27 +192,35 @@ impl ServiceStore for MemoryServiceStore {
         }
     }
 
-    fn start(&mut self, name: &str) -> Result<bool, StoreError> {
+    fn start(&mut self, name: &str) -> Result<Transition, StoreError> {
         match self.find_mut(name) {
             None => Err(StoreError::new(format!("{name}: no such service"))),
             Some(info) if info.start == StartType::Disabled => {
                 Err(StoreError::new("cannot start a disabled service"))
             }
-            Some(info) if info.state == ServiceState::Running => Ok(false),
+            Some(info) if info.state == ServiceState::Running => Ok(Transition::AlreadyThere),
+            // A test service that cannot settle, standing in for one stuck
+            // start-pending or one that exits as soon as it starts.
+            Some(info) if info.state == ServiceState::Other => {
+                Ok(Transition::NotReached(ServiceState::Other))
+            }
             Some(info) => {
                 info.state = ServiceState::Running;
-                Ok(true)
+                Ok(Transition::Reached)
             }
         }
     }
 
-    fn stop(&mut self, name: &str) -> Result<bool, StoreError> {
+    fn stop(&mut self, name: &str) -> Result<Transition, StoreError> {
         match self.find_mut(name) {
             None => Err(StoreError::new(format!("{name}: no such service"))),
-            Some(info) if info.state == ServiceState::Stopped => Ok(false),
+            Some(info) if info.state == ServiceState::Stopped => Ok(Transition::AlreadyThere),
+            Some(info) if info.state == ServiceState::Other => {
+                Ok(Transition::NotReached(ServiceState::Other))
+            }
             Some(info) => {
                 info.state = ServiceState::Stopped;
-                Ok(true)
+                Ok(Transition::Reached)
             }
         }
     }
@@ -381,6 +402,8 @@ pub fn service_key(name: &str) -> String {
 /// reported in `unreadable` and must be left alone.
 pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
+    // The unified marker Restore validates, plus a line naming the kind.
+    body.push_str("; Hive Mend backup.\r\n");
     body.push_str("; Hive Mend services backup.\r\n");
     body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
     let mut unreadable = Vec::new();
@@ -461,6 +484,9 @@ pub struct ServiceOutcome {
     pub not_backed_up: Vec<String>,
     pub denied: usize,
     pub errors: Vec<String>,
+    /// Start or stop requests Windows accepted but the service never
+    /// confirmed: `Name: last state`. Not counted as applied.
+    pub unconfirmed: Vec<String>,
 }
 
 /// Write the backup, then apply each start-type change the backup covers.
@@ -570,10 +596,15 @@ pub fn start_services(
             continue;
         }
         match store.start(&info.name) {
-            Ok(true) => outcome
+            Ok(Transition::Reached) => outcome
                 .applied
                 .push(format!("{}: started", info.display_name)),
-            Ok(false) => outcome.already_correct += 1,
+            Ok(Transition::AlreadyThere) => outcome.already_correct += 1,
+            Ok(Transition::NotReached(state)) => outcome.unconfirmed.push(format!(
+                "{}: not started, last seen {}",
+                info.display_name,
+                state.label()
+            )),
             Err(err) => {
                 if err.denied {
                     outcome.denied += 1;
@@ -622,10 +653,15 @@ pub fn stop_services(
             continue;
         }
         match store.stop(&info.name) {
-            Ok(true) => outcome
+            Ok(Transition::Reached) => outcome
                 .applied
                 .push(format!("{}: stopped", info.display_name)),
-            Ok(false) => outcome.already_correct += 1,
+            Ok(Transition::AlreadyThere) => outcome.already_correct += 1,
+            Ok(Transition::NotReached(state)) => outcome.unconfirmed.push(format!(
+                "{}: not stopped, last seen {}",
+                info.display_name,
+                state.label()
+            )),
             Err(err) => {
                 if err.denied {
                     outcome.denied += 1;
@@ -771,6 +807,8 @@ mod tests {
         );
         assert!(plan.body.contains("\"Start\"=dword:00000002"));
         assert!(plan.body.contains("\"DelayedAutostart\"=dword:00000001"));
+        // The exported services backup must be one Restore will accept.
+        assert!(crate::backup::is_hive_mend_backup(&plan.body));
         assert_eq!(plan.unreadable.len(), 1);
         assert!(!plan.covers(&service_key("Missing")));
         assert!(plan.covers(&service_key("DiagTrack")));
@@ -794,10 +832,10 @@ mod tests {
             "names match case-insensitively"
         );
         assert!(store.set_start("Missing", StartType::Manual).is_err());
-        assert!(store.start("Fax").unwrap());
-        assert!(!store.start("Fax").unwrap());
-        assert!(store.stop("Fax").unwrap());
-        assert!(!store.stop("Fax").unwrap());
+        assert_eq!(store.start("Fax").unwrap(), Transition::Reached);
+        assert_eq!(store.start("Fax").unwrap(), Transition::AlreadyThere);
+        assert_eq!(store.stop("Fax").unwrap(), Transition::Reached);
+        assert_eq!(store.stop("Fax").unwrap(), Transition::AlreadyThere);
         assert!(store.start("Old").unwrap_err().message.contains("disabled"));
     }
 
@@ -903,6 +941,21 @@ mod tests {
         assert_eq!(started.applied.len(), 1);
         assert_eq!(started.already_correct, 1);
         assert_eq!(started.refused.len(), 1);
+    }
+
+    #[test]
+    fn a_service_that_never_settles_is_not_counted_as_done() {
+        // Windows accepted the request but the service stayed pending (or fell
+        // back). Only a confirmed final state may count as applied.
+        let mut store = MemoryServiceStore::new();
+        store.insert(info("Stuck", StartType::Manual, ServiceState::Other));
+        let started = start_services(&mut store, &["Stuck".into()], &mut |_, _| {});
+        assert!(started.applied.is_empty());
+        assert_eq!(started.unconfirmed.len(), 1);
+        assert!(started.unconfirmed[0].contains("not started"));
+        let stopped = stop_services(&mut store, &["Stuck".into()], &mut |_, _| {});
+        assert!(stopped.applied.is_empty());
+        assert_eq!(stopped.unconfirmed.len(), 1);
     }
 
     #[test]

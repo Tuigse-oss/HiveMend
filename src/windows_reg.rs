@@ -1,5 +1,8 @@
 use std::ptr;
 
+use windows_sys::Wdk::System::Registry::{
+    KeyFlagsInformation, KeyNameInformation, NtDeleteKey, NtQueryKey,
+};
 use windows_sys::Win32::Foundation::{
     ERROR_ACCESS_DENIED, ERROR_FILE_NOT_FOUND, ERROR_MORE_DATA, ERROR_NO_MORE_ITEMS,
     ERROR_PATH_NOT_FOUND, ERROR_SUCCESS,
@@ -7,8 +10,8 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
     HKEY_USERS, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
-    REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_MULTI_SZ, REG_SZ, RegCloseKey, RegDeleteTreeW,
-    RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
+    REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_LINK, REG_MULTI_SZ, REG_OPTION_OPEN_LINK, REG_SZ,
+    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
 };
 
 use crate::model::{RegValue, ValueKind};
@@ -16,6 +19,14 @@ use crate::pathutil::canonical_path;
 use crate::registry::{RegError, Registry};
 
 const DELETE_ACCESS: u32 = 0x0001_0000;
+/// `KEY_FLAGS_INFORMATION.KeyFlags` bit for a symbolic-link key.
+const REG_FLAG_LINK: u32 = 0x2;
+/// Links one path may cross. Windows' own chains are two deep
+/// (`Hardware Profiles\Current` -> `CurrentControlSet` -> `ControlSetNNN`).
+const MAX_LINK_HOPS: usize = 4;
+/// Matches the backup's export depth: a delete never goes deeper than a
+/// backup could have saved.
+const MAX_DELETE_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsRegistry;
@@ -38,35 +49,7 @@ impl Drop for Opened {
 impl Registry for WindowsRegistry {
     fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
         let opened = open(path, false)?;
-        let mut names = Vec::new();
-        let mut index = 0u32;
-        loop {
-            let mut name = [0u16; 256];
-            let mut len = name.len() as u32;
-            let rc = unsafe {
-                RegEnumKeyExW(
-                    opened.key,
-                    index,
-                    name.as_mut_ptr(),
-                    &mut len,
-                    ptr::null(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                    ptr::null_mut(),
-                )
-            };
-            if rc == ERROR_NO_MORE_ITEMS {
-                break;
-            }
-            if rc != ERROR_SUCCESS {
-                return Err(RegError::Message(format!(
-                    "RegEnumKeyExW {path} failed ({rc})"
-                )));
-            }
-            names.push(String::from_utf16_lossy(&name[..len as usize]));
-            index = index.saturating_add(1);
-        }
-        Ok(names)
+        enum_subkeys(opened.key, path)
     }
 
     fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
@@ -110,6 +93,13 @@ impl Registry for WindowsRegistry {
     }
 
     fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        // An embedded NUL would truncate the name at the Win32 boundary and
+        // could address a different value, so refuse it before opening.
+        if name.contains('\0') {
+            return Err(RegError::Message(format!(
+                "{path}: value name contains a NUL and cannot be addressed safely"
+            )));
+        }
         let opened = open(path, true)?;
         let wide = wide(name);
         let rc = unsafe { RegDeleteValueW(opened.key, wide.as_ptr()) };
@@ -127,17 +117,107 @@ impl Registry for WindowsRegistry {
 
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
         let (parent, leaf) = split_parent(path)?;
-        let opened = open(&parent, true)?;
-        let wide = wide(&leaf);
-        let rc = unsafe { RegDeleteTreeW(opened.key, wide.as_ptr()) };
-        if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
-            return Err(RegError::NotFound);
+        let parent = open(&parent, false)?;
+        let root = open_child(
+            parent.key,
+            &leaf,
+            KEY_READ | DELETE_ACCESS | KEY_WOW64_64KEY,
+        )
+        .map_err(|fail| fail.into_error(path))?;
+        // Pin the whole subtree first, refusing any link in it, and only
+        // then delete through the pinned handles. RegDeleteTreeW reopens by
+        // name and follows links, so a link anywhere below would have it
+        // empty the link's target instead of this tree.
+        let tree = pin_subtree(root, &canonical_path(path), 0)?;
+        delete_pinned(tree)
+    }
+}
+
+/// One key of a subtree pinned for deletion: its handle, opened without
+/// following links, and its children.
+struct Pinned {
+    key: Opened,
+    path: String,
+    children: Vec<Pinned>,
+}
+
+fn pin_subtree(key: Opened, path: &str, depth: usize) -> Result<Pinned, RegError> {
+    if depth > MAX_DELETE_DEPTH {
+        return Err(RegError::Message(format!("{path}: nested too deeply")));
+    }
+    if is_link(key.key)? {
+        return Err(RegError::Message(format!(
+            "{path} is a registry link; links are never deleted or followed"
+        )));
+    }
+    let mut children = Vec::new();
+    for name in enum_subkeys(key.key, path)? {
+        let child_path = format!("{path}\\{name}");
+        if name.contains('\0') {
+            return Err(RegError::Message(format!(
+                "{child_path}: key name contains a NUL and cannot be addressed safely"
+            )));
+        }
+        let child = open_child(key.key, &name, KEY_READ | DELETE_ACCESS | KEY_WOW64_64KEY)
+            .map_err(|fail| fail.into_error(&child_path))?;
+        children.push(pin_subtree(child, &child_path, depth + 1)?);
+    }
+    Ok(Pinned {
+        key,
+        path: path.to_string(),
+        children,
+    })
+}
+
+/// Delete a pinned subtree deepest-first through the held handles. A key that
+/// gained a child since it was pinned refuses to go, so nothing unpinned is
+/// ever removed.
+fn delete_pinned(tree: Pinned) -> Result<(), RegError> {
+    for child in tree.children {
+        delete_pinned(child)?;
+    }
+    let status = unsafe { NtDeleteKey(tree.key.key as _) };
+    if status < 0 {
+        const STATUS_ACCESS_DENIED: i32 = 0xC000_0022_u32 as i32;
+        let message = format!("deleting {} failed (NTSTATUS {status:#x})", tree.path);
+        if status == STATUS_ACCESS_DENIED {
+            return Err(RegError::Denied(message));
+        }
+        return Err(RegError::Message(message));
+    }
+    Ok(())
+}
+
+fn enum_subkeys(key: HKEY, path: &str) -> Result<Vec<String>, RegError> {
+    let mut names = Vec::new();
+    let mut index = 0u32;
+    loop {
+        let mut name = [0u16; 256];
+        let mut len = name.len() as u32;
+        let rc = unsafe {
+            RegEnumKeyExW(
+                key,
+                index,
+                name.as_mut_ptr(),
+                &mut len,
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if rc == ERROR_NO_MORE_ITEMS {
+            break;
         }
         if rc != ERROR_SUCCESS {
-            return Err(failure(rc, format!("RegDeleteTreeW {path} failed ({rc})")));
+            return Err(RegError::Message(format!(
+                "RegEnumKeyExW {path} failed ({rc})"
+            )));
         }
-        Ok(())
+        names.push(String::from_utf16_lossy(&name[..len as usize]));
+        index = index.saturating_add(1);
     }
+    Ok(names)
 }
 
 fn failure(rc: u32, message: String) -> RegError {
@@ -151,6 +231,14 @@ fn failure(rc: u32, message: String) -> RegError {
 /// Reads the whole value. A backup that dropped part of a value would put
 /// back something different from what repair removed.
 fn read_value(opened: &Opened, name: &str, kind: u32, size: u32) -> Result<ValueKind, RegError> {
+    // An embedded NUL truncates the name at the Win32 boundary, so re-querying
+    // by it could read a different value. Refuse rather than back up the wrong
+    // bytes; the key is then reported unreadable and left alone.
+    if name.contains('\0') {
+        return Err(RegError::Message(format!(
+            "value name {name:?} contains a NUL and cannot be read back safely"
+        )));
+    }
     let mut bytes = vec![0u8; size as usize];
     let mut got = size;
     let mut read_kind = kind;
@@ -176,18 +264,69 @@ fn read_value(opened: &Opened, name: &str, kind: u32, size: u32) -> Result<Value
 
 fn decode_value(kind: u32, bytes: &[u8]) -> ValueKind {
     match kind {
-        REG_SZ => ValueKind::Sz(decode_sz(bytes)),
-        REG_EXPAND_SZ => ValueKind::ExpandSz(decode_sz(bytes)),
-        REG_DWORD if bytes.len() >= 4 => {
+        // Keep decoded text only when it re-encodes to the exact original
+        // bytes. A non-canonical string (odd length, a missing or extra NUL,
+        // bytes after the terminator, or unpaired UTF-16) is preserved raw, so
+        // a backup round-trips the value rather than silently rewriting it.
+        REG_SZ => round_trip_sz(bytes)
+            .map(ValueKind::Sz)
+            .unwrap_or_else(|| other(kind, bytes)),
+        REG_EXPAND_SZ => round_trip_sz(bytes)
+            .map(ValueKind::ExpandSz)
+            .unwrap_or_else(|| other(kind, bytes)),
+        // A DWORD is exactly four bytes. Any other length keeps its raw bytes.
+        REG_DWORD if bytes.len() == 4 => {
             ValueKind::Dword(u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
         }
-        REG_MULTI_SZ => ValueKind::MultiSz(decode_multi(bytes)),
+        REG_MULTI_SZ => {
+            let parts = decode_multi(bytes);
+            if multi_sz_bytes(&parts) == bytes {
+                ValueKind::MultiSz(parts)
+            } else {
+                other(kind, bytes)
+            }
+        }
         REG_BINARY => ValueKind::Binary(bytes.to_vec()),
-        _ => ValueKind::Other {
-            kind,
-            bytes: bytes.to_vec(),
-        },
+        _ => other(kind, bytes),
     }
+}
+
+fn other(kind: u32, bytes: &[u8]) -> ValueKind {
+    ValueKind::Other {
+        kind,
+        bytes: bytes.to_vec(),
+    }
+}
+
+/// Re-encode a UTF-16 string the way a canonical REG_SZ is stored.
+fn sz_bytes(text: &str) -> Vec<u8> {
+    let mut out = Vec::with_capacity(text.len() * 2 + 2);
+    for unit in text.encode_utf16() {
+        out.extend(unit.to_le_bytes());
+    }
+    out.extend([0, 0]);
+    out
+}
+
+/// Decode a REG_SZ/REG_EXPAND_SZ buffer only when the decode is reversible:
+/// the decoded text must re-encode to the exact original bytes.
+fn round_trip_sz(bytes: &[u8]) -> Option<String> {
+    let text = decode_sz(bytes);
+    (sz_bytes(&text) == bytes).then_some(text)
+}
+
+/// Re-encode a MULTI_SZ the way a canonical value is stored: each element
+/// NUL-terminated, then a final NUL.
+fn multi_sz_bytes(parts: &[String]) -> Vec<u8> {
+    let mut out = Vec::new();
+    for part in parts {
+        for unit in part.encode_utf16() {
+            out.extend(unit.to_le_bytes());
+        }
+        out.extend([0, 0]);
+    }
+    out.extend([0, 0]);
+    out
 }
 
 fn decode_sz(bytes: &[u8]) -> String {
@@ -229,43 +368,80 @@ fn decode_multi(bytes: &[u8]) -> Vec<String> {
     parts
 }
 
+/// Open a key without following any registry symbolic link implicitly. The
+/// path is walked one component at a time with `REG_OPTION_OPEN_LINK`; a
+/// component that is a link is crossed only when it is one Windows itself
+/// defines and points where Windows points it ([`system_link_target`]), and
+/// the walk then restarts from that target. Any other link is refused, so a
+/// read, backup, or delete always reaches the key its path names.
 fn open(path: &str, write: bool) -> Result<Opened, RegError> {
-    let path = canonical_path(path);
+    let mut access = KEY_READ | KEY_WOW64_64KEY;
+    if write {
+        access |= KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS;
+    }
+    let original = canonical_path(path);
+    let mut current = original.clone();
+    for _ in 0..=MAX_LINK_HOPS {
+        match walk(&current, access)? {
+            Walk::Reached(key) => return Ok(key),
+            Walk::Crossed(next) => current = next,
+        }
+    }
+    Err(RegError::Message(format!(
+        "{original}: too many registry links to follow"
+    )))
+}
+
+enum Walk {
+    Reached(Opened),
+    /// A system link was crossed; continue from this path.
+    Crossed(String),
+}
+
+fn walk(path: &str, access: u32) -> Result<Walk, RegError> {
     let mut parts = path.split('\\');
     let hive_name = parts
         .next()
         .ok_or_else(|| RegError::Message(format!("empty registry path {path}")))?;
     let hive = hive(hive_name)
         .ok_or_else(|| RegError::Message(format!("unknown registry hive in {path}")))?;
-    let subkey = parts.collect::<Vec<_>>().join("\\");
-    if subkey.is_empty() {
-        return Ok(Opened {
-            key: hive,
-            close: false,
-        });
-    }
-    let mut access = KEY_READ | KEY_WOW64_64KEY;
-    if write {
-        access |= KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS;
-    }
-    match open_raw(hive, &subkey, access) {
-        Ok(key) => Ok(Opened { key, close: true }),
-        Err(OpenFail::Missing) => Err(RegError::NotFound),
-        Err(OpenFail::Code(_code)) if access & KEY_WOW64_64KEY != 0 => {
-            match open_raw(hive, &subkey, access & !KEY_WOW64_64KEY) {
-                Ok(key) => Ok(Opened { key, close: true }),
-                Err(OpenFail::Missing) => Err(RegError::NotFound),
-                Err(OpenFail::Code(code)) => Err(failure(
-                    code,
-                    format!("RegOpenKeyExW {path} failed ({code})"),
-                )),
-            }
+    let parts: Vec<&str> = parts.collect();
+    let mut current = Opened {
+        key: hive,
+        close: false,
+    };
+    for (index, part) in parts.iter().enumerate() {
+        let last = index + 1 == parts.len();
+        // Every component needs KEY_QUERY_VALUE to read a link's target.
+        let want = if last {
+            access | KEY_QUERY_VALUE
+        } else {
+            KEY_QUERY_VALUE | KEY_WOW64_64KEY
+        };
+        let next = open_child(current.key, part, want).map_err(|fail| fail.into_error(path))?;
+        if is_link(next.key)? {
+            let target = link_target(next.key)
+                .ok_or_else(|| RegError::Message(format!("{path}: unreadable registry link")))?;
+            let parent = key_name(current.key).unwrap_or_default();
+            let Some(mapped) = system_link_target(&parent, part, &target) else {
+                let walked = std::iter::once(hive_name)
+                    .chain(parts[..=index].iter().copied())
+                    .collect::<Vec<_>>()
+                    .join("\\");
+                return Err(RegError::Message(format!(
+                    "{walked} is a registry link to {target}; links are not followed"
+                )));
+            };
+            let rest = parts[index + 1..].join("\\");
+            return Ok(Walk::Crossed(if rest.is_empty() {
+                mapped
+            } else {
+                format!("{mapped}\\{rest}")
+            }));
         }
-        Err(OpenFail::Code(code)) => Err(failure(
-            code,
-            format!("RegOpenKeyExW {path} failed ({code})"),
-        )),
+        current = next;
     }
+    Ok(Walk::Reached(current))
 }
 
 enum OpenFail {
@@ -273,16 +449,209 @@ enum OpenFail {
     Code(u32),
 }
 
-fn open_raw(hive: HKEY, subkey: &str, access: u32) -> Result<HKEY, OpenFail> {
-    let wide = wide(subkey);
-    let mut opened = ptr::null_mut();
-    let rc = unsafe { RegOpenKeyExW(hive, wide.as_ptr(), 0, access, &mut opened) };
-    if rc == ERROR_SUCCESS && !opened.is_null() {
-        Ok(opened)
-    } else if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
-        Err(OpenFail::Missing)
+impl OpenFail {
+    fn into_error(self, path: &str) -> RegError {
+        match self {
+            OpenFail::Missing => RegError::NotFound,
+            OpenFail::Code(code) => failure(code, format!("RegOpenKeyExW {path} failed ({code})")),
+        }
+    }
+}
+
+/// Open one child of `parent` without following it if it is a link. A
+/// name with an embedded NUL or separator is refused: it would address a
+/// different key than the one listed.
+fn open_child(parent: HKEY, name: &str, access: u32) -> Result<Opened, OpenFail> {
+    if name.is_empty() || name.contains('\0') || name.contains('\\') {
+        return Err(OpenFail::Code(ERROR_PATH_NOT_FOUND));
+    }
+    let open = |access: u32| {
+        let wide = wide(name);
+        let mut opened = ptr::null_mut();
+        let rc = unsafe {
+            RegOpenKeyExW(
+                parent,
+                wide.as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                access,
+                &mut opened,
+            )
+        };
+        if rc == ERROR_SUCCESS && !opened.is_null() {
+            Ok(Opened {
+                key: opened,
+                close: true,
+            })
+        } else if rc == ERROR_FILE_NOT_FOUND || rc == ERROR_PATH_NOT_FOUND {
+            Err(OpenFail::Missing)
+        } else {
+            Err(OpenFail::Code(rc))
+        }
+    };
+    match open(access) {
+        Err(OpenFail::Code(_)) if access & KEY_WOW64_64KEY != 0 => open(access & !KEY_WOW64_64KEY),
+        other => other,
+    }
+}
+
+/// True when the key itself is a symbolic link, from the kernel's key flags
+/// rather than from a value anyone could write.
+fn is_link(key: HKEY) -> Result<bool, RegError> {
+    let mut info = [0u32; 3];
+    let mut got = 0u32;
+    let status = unsafe {
+        NtQueryKey(
+            key as _,
+            KeyFlagsInformation,
+            info.as_mut_ptr() as *mut _,
+            std::mem::size_of_val(&info) as u32,
+            &mut got,
+        )
+    };
+    if status < 0 {
+        return Err(RegError::Message(format!(
+            "could not read registry key flags (NTSTATUS {status:#x})"
+        )));
+    }
+    Ok(info[1] & REG_FLAG_LINK != 0)
+}
+
+/// A link key's `SymbolicLinkValue`: a native path such as
+/// `\REGISTRY\MACHINE\SYSTEM\ControlSet001`.
+fn link_target(key: HKEY) -> Option<String> {
+    let name = wide("SymbolicLinkValue");
+    let mut buf = vec![0u16; 1024];
+    let mut len = (buf.len() * 2) as u32;
+    let mut kind = 0u32;
+    let rc = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            ptr::null(),
+            &mut kind,
+            buf.as_mut_ptr() as *mut u8,
+            &mut len,
+        )
+    };
+    if rc != ERROR_SUCCESS || kind != REG_LINK || !len.is_multiple_of(2) {
+        return None;
+    }
+    buf.truncate(len as usize / 2);
+    while buf.last() == Some(&0) {
+        buf.pop();
+    }
+    String::from_utf16(&buf).ok()
+}
+
+/// The kernel's name for an open key, such as `\REGISTRY\USER\S-1-5-21-...`.
+fn key_name(key: HKEY) -> Option<String> {
+    let mut buf = vec![0u32; 1024];
+    let mut got = 0u32;
+    let status = unsafe {
+        NtQueryKey(
+            key as _,
+            KeyNameInformation,
+            buf.as_mut_ptr() as *mut _,
+            (buf.len() * 4) as u32,
+            &mut got,
+        )
+    };
+    if status < 0 {
+        return None;
+    }
+    let bytes = buf[0] as usize;
+    let units = unsafe { std::slice::from_raw_parts(buf.as_ptr().add(1) as *const u16, bytes / 2) };
+    String::from_utf16(units).ok()
+}
+
+/// Where a Windows-defined registry link may lead, as a hive path, or `None`
+/// for any other link. `parent` is the kernel name of the key holding the
+/// link, `name` the link's own name, and `target` its `SymbolicLinkValue`.
+/// Each rule pins both where the link sits and exactly where it points:
+///
+/// - `SYSTEM\CurrentControlSet` -> `SYSTEM\ControlSetNNN`
+/// - `SYSTEM\ControlSetNNN\Hardware Profiles\Current` ->
+///   `SYSTEM\CurrentControlSet\Hardware Profiles\NNNN`
+/// - a user hive's `Software\Classes` -> that same user's `_Classes` hive
+/// - `SOFTWARE\WOW6432Node\Classes` -> `SOFTWARE\Classes\Wow6432Node`
+/// - a WOW64 shared key, `<root>\WOW6432Node\<rel>` -> `<root>\<rel>`: the
+///   same key in the native view, for the machine and user software and
+///   classes roots
+pub(crate) fn system_link_target(parent: &str, name: &str, target: &str) -> Option<String> {
+    let parent = parent.to_ascii_uppercase();
+    let name = name.to_ascii_uppercase();
+    let upper = target.to_ascii_uppercase();
+    if wow64_shared_key(&format!("{parent}\\{name}"), &upper) {
+        return hive_path(target);
+    }
+    let digits = |text: &str, count: usize| {
+        text.len() == count && text.bytes().all(|byte| byte.is_ascii_digit())
+    };
+    let ok = match (parent.as_str(), name.as_str()) {
+        ("\\REGISTRY\\MACHINE\\SYSTEM", "CURRENTCONTROLSET") => upper
+            .strip_prefix("\\REGISTRY\\MACHINE\\SYSTEM\\CONTROLSET")
+            .is_some_and(|rest| digits(rest, 3)),
+        (_, "CURRENT") => {
+            parent
+                .strip_prefix("\\REGISTRY\\MACHINE\\SYSTEM\\CONTROLSET")
+                .and_then(|rest| rest.strip_suffix("\\HARDWARE PROFILES"))
+                .is_some_and(|set| digits(set, 3))
+                && upper
+                    .strip_prefix(
+                        "\\REGISTRY\\MACHINE\\SYSTEM\\CURRENTCONTROLSET\\HARDWARE PROFILES\\",
+                    )
+                    .is_some_and(|profile| digits(profile, 4))
+        }
+        (_, "CLASSES") if parent == "\\REGISTRY\\MACHINE\\SOFTWARE\\WOW6432NODE" => {
+            upper == "\\REGISTRY\\MACHINE\\SOFTWARE\\CLASSES\\WOW6432NODE"
+        }
+        (_, "CLASSES") => parent
+            .strip_prefix("\\REGISTRY\\USER\\")
+            .and_then(|rest| rest.strip_suffix("\\SOFTWARE"))
+            .is_some_and(|sid| {
+                sid.starts_with("S-1-")
+                    && !sid.contains('\\')
+                    && upper == format!("\\REGISTRY\\USER\\{sid}_CLASSES")
+            }),
+        _ => false,
+    };
+    if !ok {
+        return None;
+    }
+    hive_path(target)
+}
+
+/// True for a WOW64 shared key: a link in the 32-bit view whose target is the
+/// very same path in the native view. Both arguments are upper-case.
+fn wow64_shared_key(link: &str, target: &str) -> bool {
+    const NODE: &str = "\\WOW6432NODE\\";
+    let Some(at) = link.find(NODE) else {
+        return false;
+    };
+    let (root, rel) = (&link[..at], &link[at + NODE.len()..]);
+    if rel.is_empty() || rel.contains(NODE) {
+        return false;
+    }
+    let user_root = root.strip_prefix("\\REGISTRY\\USER\\").is_some_and(|rest| {
+        rest.strip_suffix("\\SOFTWARE")
+            .or_else(|| rest.strip_suffix("_CLASSES"))
+            .is_some_and(|sid| sid.starts_with("S-1-") && !sid.contains('\\'))
+    });
+    let machine_root =
+        root == "\\REGISTRY\\MACHINE\\SOFTWARE" || root == "\\REGISTRY\\MACHINE\\SOFTWARE\\CLASSES";
+    (user_root || machine_root) && target == format!("{root}\\{rel}")
+}
+
+/// Map a native `\REGISTRY\...` path to a hive path, keeping its spelling.
+fn hive_path(target: &str) -> Option<String> {
+    let upper = target.to_ascii_uppercase();
+    let rest = |prefix: &str| target.get(prefix.len()..).map(str::to_string);
+    if upper.starts_with("\\REGISTRY\\MACHINE\\") {
+        rest("\\REGISTRY\\MACHINE\\").map(|rest| format!("HKEY_LOCAL_MACHINE\\{rest}"))
+    } else if upper.starts_with("\\REGISTRY\\USER\\") {
+        rest("\\REGISTRY\\USER\\").map(|rest| format!("HKEY_USERS\\{rest}"))
     } else {
-        Err(OpenFail::Code(rc))
+        None
     }
 }
 
@@ -320,10 +689,62 @@ fn wide(text: &str) -> Vec<u16> {
 #[cfg(all(test, windows))]
 mod live_tests {
     use super::*;
+    use crate::model::ValueKind;
     use windows_sys::Win32::System::Registry::{
-        KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD, REG_SZ, RegCreateKeyExW, RegDeleteKeyExW,
+        KEY_ALL_ACCESS, KEY_CREATE_LINK, KEY_WOW64_64KEY, KEY_WRITE, REG_DWORD,
+        REG_OPTION_CREATE_LINK, REG_OPTION_VOLATILE, REG_SZ, RegCreateKeyExW, RegDeleteKeyExW,
         RegSetValueExW,
     };
+
+    #[test]
+    fn canonical_sz_round_trips_but_noncanonical_is_preserved_raw() {
+        // Canonical `AB\0`.
+        assert_eq!(
+            decode_value(REG_SZ, &sz_bytes("AB")),
+            ValueKind::Sz("AB".into())
+        );
+        // No trailing NUL: preserved raw so the backup keeps the exact bytes.
+        assert!(matches!(
+            decode_value(REG_SZ, &[0x41, 0, 0x42, 0]),
+            ValueKind::Other { .. }
+        ));
+        // Bytes after the terminator: preserved raw.
+        let mut trailing = sz_bytes("AB");
+        trailing.extend([0x43, 0]);
+        assert!(matches!(
+            decode_value(REG_SZ, &trailing),
+            ValueKind::Other { .. }
+        ));
+        // Odd length: preserved raw.
+        assert!(matches!(
+            decode_value(REG_SZ, &[0x41, 0, 0x42]),
+            ValueKind::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn dword_must_be_exactly_four_bytes() {
+        assert_eq!(decode_value(REG_DWORD, &[1, 0, 0, 0]), ValueKind::Dword(1));
+        assert!(matches!(
+            decode_value(REG_DWORD, &[1, 0, 0, 0, 0]),
+            ValueKind::Other { .. }
+        ));
+        assert!(matches!(
+            decode_value(REG_DWORD, &[1, 0]),
+            ValueKind::Other { .. }
+        ));
+    }
+
+    #[test]
+    fn delete_value_refuses_a_name_with_an_embedded_nul() {
+        // The guard returns before the key is opened, so no registry access
+        // happens; a NUL must never reach the NUL-terminated Win32 call.
+        let mut reg = WindowsRegistry;
+        let err = reg
+            .delete_value(r"HKCU\Software\HiveMendTest\Nope", "abc\0tail")
+            .unwrap_err();
+        assert!(matches!(err, RegError::Message(msg) if msg.contains("NUL")));
+    }
 
     struct TestKey {
         root: String,
@@ -429,5 +850,326 @@ mod live_tests {
         let reg = WindowsRegistry;
         assert!(reg.subkeys(r"HKCU\Software\HiveMendNoSuchKey").is_err());
         assert!(reg.values(r"HKCU\Software\HiveMendNoSuchKey").is_err());
+    }
+
+    #[test]
+    fn only_windows_defined_links_with_their_own_targets_are_crossed() {
+        let sid = "S-1-5-21-1-2-3-1001";
+        let user_software = format!(r"\REGISTRY\USER\{sid}\Software");
+        assert_eq!(
+            system_link_target(
+                r"\REGISTRY\MACHINE\SYSTEM",
+                "CurrentControlSet",
+                r"\Registry\Machine\SYSTEM\ControlSet001"
+            )
+            .as_deref(),
+            Some(r"HKEY_LOCAL_MACHINE\SYSTEM\ControlSet001")
+        );
+        assert_eq!(
+            system_link_target(
+                r"\REGISTRY\MACHINE\SYSTEM\ControlSet002\Hardware Profiles",
+                "Current",
+                r"\Registry\Machine\SYSTEM\CurrentControlSet\Hardware Profiles\0001"
+            )
+            .as_deref(),
+            Some(r"HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Hardware Profiles\0001")
+        );
+        assert_eq!(
+            system_link_target(
+                &user_software,
+                "Classes",
+                &format!(r"\Registry\User\{sid}_Classes")
+            ),
+            Some(format!(r"HKEY_USERS\{sid}_Classes"))
+        );
+        assert_eq!(
+            system_link_target(
+                r"\REGISTRY\MACHINE\SOFTWARE\WOW6432Node",
+                "Classes",
+                r"\REGISTRY\MACHINE\SOFTWARE\Classes\Wow6432Node"
+            )
+            .as_deref(),
+            Some(r"HKEY_LOCAL_MACHINE\SOFTWARE\Classes\Wow6432Node")
+        );
+        // Right place, wrong target; or a target that only looks right.
+        for (parent, name, target) in [
+            (
+                r"\REGISTRY\MACHINE\SYSTEM",
+                "CurrentControlSet",
+                r"\REGISTRY\MACHINE\SOFTWARE",
+            ),
+            (
+                r"\REGISTRY\MACHINE\SYSTEM",
+                "CurrentControlSet",
+                r"\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services",
+            ),
+            (
+                r"\REGISTRY\MACHINE\SYSTEM",
+                "CurrentControlSet",
+                r"\REGISTRY\MACHINE\SYSTEM\ControlSet01",
+            ),
+            (
+                user_software.as_str(),
+                "Classes",
+                r"\REGISTRY\USER\S-1-5-18_Classes",
+            ),
+            (
+                user_software.as_str(),
+                "Classes",
+                r"\REGISTRY\MACHINE\SOFTWARE\Classes",
+            ),
+        ] {
+            assert!(
+                system_link_target(parent, name, target).is_none(),
+                "{parent}\\{name} -> {target}"
+            );
+        }
+        // WOW64 shared keys: the 32-bit view links to the same native path.
+        assert_eq!(
+            system_link_target(
+                r"\REGISTRY\MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion",
+                "App Paths",
+                r"\REGISTRY\MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
+            )
+            .as_deref(),
+            Some(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths")
+        );
+        assert!(
+            system_link_target(
+                r"\REGISTRY\MACHINE\SOFTWARE\Classes\Wow6432Node",
+                "TypeLib",
+                r"\REGISTRY\MACHINE\SOFTWARE\Classes\TypeLib"
+            )
+            .is_some()
+        );
+        for (parent, name, target) in [
+            // Shared-key shape, but pointing somewhere else.
+            (
+                r"\REGISTRY\MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion",
+                "App Paths",
+                r"\REGISTRY\MACHINE\SYSTEM\ControlSet001\Services",
+            ),
+            (
+                r"\REGISTRY\MACHINE\SOFTWARE\WOW6432Node",
+                "Vendor",
+                r"\REGISTRY\MACHINE\SOFTWARE\Other",
+            ),
+            // A Wow6432Node segment under some other root.
+            (
+                r"\REGISTRY\MACHINE\SYSTEM\Wow6432Node",
+                "Services",
+                r"\REGISTRY\MACHINE\SYSTEM\Services",
+            ),
+        ] {
+            assert!(
+                system_link_target(parent, name, target).is_none(),
+                "{parent}\\{name} -> {target}"
+            );
+        }
+        // A link anywhere else is never crossed, whatever it points at.
+        assert!(
+            system_link_target(
+                &format!(r"\REGISTRY\USER\{sid}\Software\Vendor"),
+                "CurrentControlSet",
+                r"\REGISTRY\MACHINE\SYSTEM\ControlSet001"
+            )
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn live_reads_cross_the_windows_defined_links() {
+        let reg = WindowsRegistry;
+        let services = reg
+            .subkeys(r"HKLM\SYSTEM\CurrentControlSet\Services")
+            .expect("CurrentControlSet link is crossed");
+        assert!(
+            services
+                .iter()
+                .any(|name| name.eq_ignore_ascii_case("RpcSs"))
+        );
+        reg.subkeys(r"HKCU\Software\Classes")
+            .expect("per-user Classes link is crossed");
+        reg.subkeys(r"HKLM\SOFTWARE\WOW6432Node\Classes")
+            .expect("WOW6432Node Classes link is crossed");
+        reg.values(r"HKCR\.txt").expect("merged classes view opens");
+    }
+
+    #[test]
+    fn live_every_control_set_protects_services_and_session_manager() {
+        let reg = WindowsRegistry;
+        let mut sets: Vec<String> = reg
+            .subkeys(r"HKLM\SYSTEM")
+            .expect("list SYSTEM")
+            .into_iter()
+            .filter(|name| {
+                name.len() == 13
+                    && name[..10].eq_ignore_ascii_case("ControlSet")
+                    && name[10..].bytes().all(|byte| byte.is_ascii_digit())
+            })
+            .collect();
+        assert!(!sets.is_empty(), "no numbered control sets found");
+        // The live CurrentControlSet link resolves to one of them.
+        let current = open_child(
+            HKEY_LOCAL_MACHINE,
+            "SYSTEM",
+            KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+        )
+        .ok()
+        .and_then(|system| open_child(system.key, "CurrentControlSet", KEY_QUERY_VALUE).ok())
+        .expect("open CurrentControlSet as a link");
+        assert!(is_link(current.key).unwrap());
+        let target = link_target(current.key).expect("link target");
+        let mapped = system_link_target(r"\REGISTRY\MACHINE\SYSTEM", "CurrentControlSet", &target)
+            .expect("live target is accepted");
+        assert!(
+            sets.iter().any(
+                |set| mapped.eq_ignore_ascii_case(&format!(r"HKEY_LOCAL_MACHINE\SYSTEM\{set}"))
+            ),
+            "{mapped} not among {sets:?}"
+        );
+        sets.push("CurrentControlSet".into());
+        for set in &sets {
+            for key in [
+                format!(r"HKLM\SYSTEM\{set}\Services\RpcSs"),
+                format!(r"HKLM\SYSTEM\{set}\Services\RpcSs\Parameters"),
+                format!(r"HKLM\SYSTEM\{set}\Control\Session Manager"),
+                format!(r"HKLM\SYSTEM\{set}\Control\SafeBoot\Minimal"),
+            ] {
+                assert!(crate::pathutil::is_protected_key(&key), "{key}");
+                assert!(!crate::pathutil::key_delete_allowed(&key), "{key}");
+            }
+        }
+    }
+
+    /// A throwaway HKCU tree holding `Target` (with a value) and `Link`, a
+    /// registry symbolic link to it. Drop removes the link itself first,
+    /// through a no-follow handle, then the tree.
+    struct LinkedKeys {
+        root: String,
+    }
+
+    impl LinkedKeys {
+        fn create() -> Self {
+            let root = format!(r"HKCU\Software\HiveMendLinkTest{}", std::process::id());
+            let subkey = root.strip_prefix("HKCU\\").unwrap().to_string();
+            // The guard exists before any setup step can fail, so a failed
+            // assert still cleans up.
+            let keys = Self { root };
+            let create = |path: &str, options: u32, access: u32| unsafe {
+                let mut key: HKEY = ptr::null_mut();
+                let rc = RegCreateKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(path).as_ptr(),
+                    0,
+                    ptr::null(),
+                    options,
+                    access | KEY_WOW64_64KEY,
+                    ptr::null(),
+                    &mut key,
+                    ptr::null_mut(),
+                );
+                assert_eq!(rc, ERROR_SUCCESS, "creating {path} failed");
+                Opened { key, close: true }
+            };
+            let target = create(&format!(r"{subkey}\Target"), 0, KEY_WRITE | KEY_QUERY_VALUE);
+            let text: Vec<u16> = wide("keep me");
+            unsafe {
+                RegSetValueExW(
+                    target.key,
+                    wide("Keep").as_ptr(),
+                    0,
+                    REG_SZ,
+                    text.as_ptr() as *const u8,
+                    (text.len() * 2) as u32,
+                );
+            }
+            let native = key_name(target.key).expect("target kernel name");
+            drop(create(&format!(r"{subkey}\Holder"), 0, KEY_WRITE));
+            let link = create(
+                &format!(r"{subkey}\Holder\Link"),
+                REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
+                KEY_ALL_ACCESS | KEY_CREATE_LINK,
+            );
+            let units: Vec<u16> = native.encode_utf16().collect();
+            let rc = unsafe {
+                RegSetValueExW(
+                    link.key,
+                    wide("SymbolicLinkValue").as_ptr(),
+                    0,
+                    REG_LINK,
+                    units.as_ptr() as *const u8,
+                    (units.len() * 2) as u32,
+                )
+            };
+            assert_eq!(rc, ERROR_SUCCESS, "link target setup failed");
+            keys
+        }
+
+        fn path(&self, rest: &str) -> String {
+            format!(r"{}\{rest}", self.root)
+        }
+    }
+
+    impl Drop for LinkedKeys {
+        fn drop(&mut self) {
+            let subkey = self.root.strip_prefix("HKCU\\").unwrap().to_string();
+            // Walk to Holder one component at a time, then delete Link itself
+            // through a no-follow handle so its target is untouched.
+            let mut parent = Opened {
+                key: HKEY_CURRENT_USER,
+                close: false,
+            };
+            for part in subkey.split('\\').chain(["Holder"]) {
+                match open_child(parent.key, part, KEY_READ) {
+                    Ok(next) => parent = next,
+                    Err(_) => break,
+                }
+            }
+            if let Ok(link) = open_child(parent.key, "Link", DELETE_ACCESS | KEY_READ) {
+                unsafe { NtDeleteKey(link.key as _) };
+            }
+            let mut reg = WindowsRegistry;
+            let _ = reg.delete_tree(&self.root);
+            let subkey = match self.root.strip_prefix("HKCU\\") {
+                Some(rest) => rest,
+                None => return,
+            };
+            let wide = wide(subkey);
+            unsafe {
+                RegDeleteKeyExW(HKEY_CURRENT_USER, wide.as_ptr(), KEY_WOW64_64KEY, 0);
+            }
+        }
+    }
+
+    #[test]
+    fn live_a_planted_link_is_never_followed_or_deleted_through() {
+        let keys = LinkedKeys::create();
+        let mut reg = WindowsRegistry;
+        let link = keys.path(r"Holder\Link");
+        // Reads through the link are refused, not redirected.
+        let err = reg.values(&link).unwrap_err();
+        assert!(
+            matches!(&err, RegError::Message(msg) if msg.contains("registry link")),
+            "{err:?}"
+        );
+        // A value delete through it is refused and the target keeps its value.
+        assert!(reg.delete_value(&link, "Keep").is_err());
+        // Deleting the link, or a tree holding it, is refused before anything
+        // is removed: RegDeleteTreeW would have emptied the target instead.
+        assert!(reg.delete_tree(&link).is_err());
+        assert!(reg.delete_tree(&keys.path("Holder")).is_err());
+        let kept = reg
+            .values(&keys.path("Target"))
+            .expect("target still readable");
+        assert!(
+            kept.iter()
+                .any(|value| value.name == "Keep" && value.data == ValueKind::Sz("keep me".into()))
+        );
+        assert!(
+            reg.subkeys(&keys.path("Holder"))
+                .unwrap()
+                .contains(&"Link".to_string())
+        );
     }
 }

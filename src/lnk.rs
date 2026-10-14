@@ -41,9 +41,16 @@ pub fn lnk_target(bytes: &[u8]) -> Option<String> {
         .position(|byte| *byte == 0)
         .map(|index| local_off + index)
         .unwrap_or(info_size);
-    let text = String::from_utf8_lossy(&info[local_off..end])
-        .trim()
-        .to_string();
+    let raw = &info[local_off..end];
+    // The local base path here is ANSI, in the machine's code page. Without
+    // that code page a non-ASCII name cannot be reconstructed, and a lossy
+    // UTF-8 decode would invent a different path that then looks missing and
+    // gets the working shortcut deleted. Decode ASCII only; a non-ASCII
+    // ANSI-only link yields no target, so it is left alone, not repaired.
+    if !raw.is_ascii() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(raw).trim().to_string();
     if text.is_empty() { None } else { Some(text) }
 }
 
@@ -92,5 +99,42 @@ mod tests {
     fn reads_the_local_path_from_a_shortcut() {
         let bytes = sample_lnk(r"C:\Missing\old.exe");
         assert_eq!(lnk_target(&bytes).as_deref(), Some(r"C:\Missing\old.exe"));
+    }
+
+    /// Build a shortcut whose ANSI local path is the given raw bytes, so a
+    /// non-ASCII (code-page) byte can be injected that a `&str` could not hold.
+    fn ansi_lnk(path: &[u8]) -> Vec<u8> {
+        let header_size = 28u32;
+        let local_off = header_size;
+        let info_size = header_size + path.len() as u32 + 1;
+        let mut info = Vec::new();
+        info.extend(info_size.to_le_bytes());
+        info.extend(header_size.to_le_bytes());
+        info.extend(1u32.to_le_bytes());
+        info.extend(0u32.to_le_bytes());
+        info.extend(local_off.to_le_bytes());
+        info.extend(0u32.to_le_bytes());
+        info.extend(0u32.to_le_bytes());
+        info.extend(path);
+        info.push(0);
+        let mut bytes = vec![0u8; 76];
+        bytes[0..4].copy_from_slice(&0x4Cu32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&0x2u32.to_le_bytes());
+        bytes.extend(info);
+        bytes
+    }
+
+    #[test]
+    fn ascii_ansi_path_still_reads() {
+        let bytes = ansi_lnk(br"C:\Apps\plain.exe");
+        assert_eq!(lnk_target(&bytes).as_deref(), Some(r"C:\Apps\plain.exe"));
+    }
+
+    #[test]
+    fn non_ascii_ansi_path_is_left_alone() {
+        // `café.exe` in Windows-1252: the 0xE9 byte is not valid UTF-8 and has
+        // no meaning without the code page, so the target is not guessed.
+        let bytes = ansi_lnk(b"C:\\Apps\\caf\xE9.exe");
+        assert_eq!(lnk_target(&bytes), None);
     }
 }

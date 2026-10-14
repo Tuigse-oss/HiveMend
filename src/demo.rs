@@ -34,7 +34,11 @@ pub fn sample_world() -> Sample {
         sample_lnk(r"C:\Missing\old.exe"),
         None,
     );
-    fs.add_file(r"C:\Users\Ada\AppData\Local\Temp\old.tmp");
+    fs.add_file_bytes(
+        r"C:\Users\Ada\AppData\Local\Temp\old.tmp",
+        Vec::new(),
+        Some(Duration::from_secs(3 * 86_400)),
+    );
     fs.add_file_bytes(
         r"C:\Users\Ada\AppData\Local\Temp\fresh.tmp",
         Vec::new(),

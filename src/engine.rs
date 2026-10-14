@@ -1,10 +1,12 @@
 use std::path::Path;
 
 use crate::backup::{BackupPlan, export_backup, write_backup};
-use crate::fs::FileView;
+use crate::fs::{Access, FileView, ItemKind};
 use crate::ignore::{IgnoreDb, load_ignore_file};
 use crate::model::{Error, Finding, Repair, ScanOptions, ScannerId};
-use crate::pathutil::{canonical_path, file_delete_allowed, is_protected_key, key_delete_allowed};
+use crate::pathutil::{
+    canonical_path, file_delete_allowed, is_protected_key, key_delete_allowed, under_windows_dir,
+};
 use crate::registry::{RegError, Registry};
 use crate::rules::{RuleSet, builtin_deep_roots, decode_text_owned, load_rules_file};
 use crate::scanners::{ScanCtx, run_scanner};
@@ -218,6 +220,52 @@ mod tests {
         }
     }
 
+    fn temp_file_finding(path: &str) -> Finding {
+        Finding {
+            scanner: ScannerId::TempShortcuts,
+            scanner_name: "Temp files".into(),
+            key: path.into(),
+            value: None,
+            detail: "temporary file".into(),
+            repair: Repair::DeleteFile {
+                path: path.into(),
+                keep_copy: false,
+            },
+        }
+    }
+
+    #[test]
+    fn file_delete_checks_where_the_file_really_is() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\me\AppData\Local\Temp";
+        fs.add_file_bytes(&format!(r"{temp}\real.tmp"), vec![1; 4], None);
+        // A temp-looking path that really leads into System32 and into a
+        // documents folder: both spellings pass the textual rule.
+        fs.add_file_bytes(r"C:\Windows\System32\kernel.dll", vec![2; 4], None);
+        fs.add_file_bytes(r"C:\Users\me\Documents\thesis.docx", vec![3; 4], None);
+        fs.add_alias(&format!(r"{temp}\sys"), r"C:\Windows\System32");
+        fs.add_alias(&format!(r"{temp}\docs"), r"C:\Users\me\Documents");
+        let backup = std::env::temp_dir().join(format!(
+            "hive-mend-pinned-delete-{}.reg",
+            std::process::id()
+        ));
+        let findings = [
+            temp_file_finding(&format!(r"{temp}\real.tmp")),
+            temp_file_finding(&format!(r"{temp}\sys\kernel.dll")),
+            temp_file_finding(&format!(r"{temp}\docs\thesis.docx")),
+        ];
+        let outcome = repair(&mut MemoryRegistry::new(), &mut fs, &findings, &backup).unwrap();
+        let _ = std::fs::remove_file(&backup);
+        assert_eq!(outcome.applied, 1);
+        assert_eq!(outcome.refused, 2);
+        assert!(!fs.exists(&format!(r"{temp}\real.tmp")));
+        assert_eq!(fs.read(r"C:\Windows\System32\kernel.dll"), Some(vec![2; 4]));
+        assert_eq!(
+            fs.read(r"C:\Users\me\Documents\thesis.docx"),
+            Some(vec![3; 4])
+        );
+    }
+
     #[test]
     fn repair_leaves_alone_what_the_backup_could_not_read() {
         let mut inner = MemoryRegistry::new();
@@ -415,31 +463,61 @@ fn apply(
             if !file_delete_allowed(path) {
                 return Applied::Refused;
             }
-            if *keep_copy {
-                let Some(copy) = plan.copy_for(path) else {
-                    return Applied::NotBackedUp;
-                };
-                let copy = copy.to_string_lossy().to_string();
-                if let Err(err) = fs.copy_file(path, &copy) {
-                    if err.contains("not found") || err.contains("os error 2") {
-                        return Applied::AlreadyGone;
-                    }
-                    return Applied::Failed {
-                        message: format!("could not save a copy first: {err}"),
-                        denied: false,
-                    };
+            let copy = if *keep_copy {
+                match plan.copy_for(path) {
+                    Some(copy) => Some(copy.to_string_lossy().to_string()),
+                    None => return Applied::NotBackedUp,
                 }
-            }
-            match fs.remove_file(path) {
-                Ok(()) => Applied::Removed,
-                Err(err) if err.contains("not found") || err.contains("os error 2") => {
-                    Applied::AlreadyGone
-                }
-                Err(err) => Applied::Failed {
-                    denied: err.contains("os error 5"),
-                    message: err,
-                },
-            }
+            } else {
+                None
+            };
+            delete_file_pinned(fs, path, copy.as_deref())
         }
+    }
+}
+
+/// Delete a stale shortcut or temp file through one checked handle. The
+/// object is pinned first, the same rules are applied to the real path
+/// Windows reports for it (so a junction, link, or 8.3 name cannot carry the
+/// delete somewhere the spelling would never be allowed), and the copy and
+/// the delete both go through that handle.
+fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> Applied {
+    let mut pin = match fs.pin(path) {
+        Ok(pin) => pin,
+        Err(err) if err.contains("not found") || err.contains("os error 2") => {
+            return Applied::AlreadyGone;
+        }
+        Err(_) => return Applied::Refused,
+    };
+    let real = pin.real_path.clone();
+    if pin.kind != ItemKind::File || !file_delete_allowed(&real) || under_windows_dir(&*fs, &real) {
+        return Applied::Refused;
+    }
+    let access = if copy.is_some() {
+        Access::ReadDelete
+    } else {
+        Access::Delete
+    };
+    if let Err(err) = fs.pin_acquire(&mut pin, access) {
+        return Applied::Failed {
+            denied: err.contains("os error 5"),
+            message: err,
+        };
+    }
+    if let Some(copy) = copy
+        && let Err(err) = fs.pin_copy_to(&pin, copy)
+    {
+        return Applied::Failed {
+            message: format!("could not save a copy first: {err}"),
+            denied: false,
+        };
+    }
+    match fs.pin_delete(pin) {
+        Ok(()) => Applied::Removed,
+        Err(err) if err.contains("not found") || err.contains("os error 2") => Applied::AlreadyGone,
+        Err(err) => Applied::Failed {
+            denied: err.contains("os error 5"),
+            message: err,
+        },
     }
 }

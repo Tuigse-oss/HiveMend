@@ -15,6 +15,7 @@ mod scanners;
 mod services;
 mod settings;
 mod shredder;
+mod store;
 mod sysinfo;
 mod tools;
 
@@ -31,7 +32,7 @@ mod windows_shredder;
 pub use backup::import_reg_file;
 pub use backup::{
     BackupInfo, BackupSummary, backup_name, is_hive_mend_backup, list_backups, read_backup,
-    restore_files,
+    reserve_backup_path,
 };
 pub use demo::sample_world;
 pub use engine::{
@@ -39,7 +40,9 @@ pub use engine::{
     still_reported,
 };
 pub use exclude::{Exclusion, Exclusions};
-pub use fs::{FileView, HostFs, ItemKind, MemoryFs};
+#[cfg(windows)]
+pub use fs::host_known_dir;
+pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 #[cfg(windows)]
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
@@ -54,7 +57,7 @@ pub use registry::MemoryRegistry;
 pub use rules::decode_text_owned;
 pub use services::{
     MemoryServiceStore, NEVER_TOUCH, SUGGESTED, ServiceChange, ServiceInfo, ServiceOutcome,
-    ServiceState, ServiceStore, StartType, StoreError, TuneupProfile, TuneupTarget,
+    ServiceState, ServiceStore, StartType, StoreError, Transition, TuneupProfile, TuneupTarget,
     apply_start_changes, export_start_backup, is_never_touch, plan_profile, refuse_change,
     refuse_start, refuse_stop, service_key, sort_services, start_services, stop_services,
     tuneup_allowed,
@@ -79,39 +82,10 @@ pub use windows_services::ScmServiceStore;
 #[cfg(windows)]
 pub use windows_shredder::{fixed_drives, volume_ssd};
 
-/// Where the window and the command line keep backups, settings, and the
-/// ignore list.
-pub const DATA_DIR: &str = r"C:\HiveMend";
-
-/// Pre-rename data folder, moved aside once by `migrate_data_dir`.
-const LEGACY_DATA_DIR: &str = r"C:\RegistryMaster";
-
-/// Move the pre-rename data folder into place. Best-effort: when the new
-/// folder already exists, or the move fails, the old folder is left
-/// untouched. Nothing is ever deleted.
-pub fn migrate_data_dir() {
-    if std::path::Path::new(DATA_DIR).exists() {
-        return;
-    }
-    let legacy = std::path::Path::new(LEGACY_DATA_DIR);
-    if !legacy.exists() {
-        return;
-    }
-    let _ = std::fs::rename(legacy, DATA_DIR);
-}
-
-pub fn backups_dir() -> std::path::PathBuf {
-    std::path::Path::new(DATA_DIR).join("backups")
-}
-
-pub fn exclusions_file() -> std::path::PathBuf {
-    std::path::Path::new(DATA_DIR).join("ignore.txt")
-}
-
-pub fn settings_file() -> std::path::PathBuf {
-    std::path::Path::new(DATA_DIR).join("settings.ini")
-}
-
-pub fn custom_privacy_file() -> std::path::PathBuf {
-    std::path::Path::new(DATA_DIR).join("privacy-custom.ini")
-}
+#[cfg(windows)]
+pub use store::restore_backup;
+pub use store::{
+    LEGACY_DIR, Store, adopt_legacy_settings, backup_stores, backups_dir, backups_location,
+    custom_privacy_file, elevated, exclusions_file, protected_dir, restore_files, settings_file,
+    user_dir,
+};

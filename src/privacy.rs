@@ -13,9 +13,12 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backup::{export_repairs, write_backup};
-use crate::fs::{FileView, ItemKind};
+use crate::fs::{Access, FileView, ItemKind};
 use crate::model::{Error, Repair};
-use crate::pathutil::{canonical_path, expand_env, is_protected_key, normalize_fs, system_root};
+use crate::pathutil::{
+    canonical_path, expand_env, has_unsafe_fs_component, is_protected_key, normalize_fs,
+    path_under, protected_roots,
+};
 use crate::registry::{RegError, Registry};
 
 /// Processes that veto a category while they run, lowercase exe names.
@@ -71,9 +74,14 @@ impl ValueMatch {
     fn matches(&self, name: &str) -> bool {
         match self {
             Self::PrefixDigits(prefix) => {
+                // Compare as bytes: a `name[..prefix.len()]` slice would panic
+                // when that offset falls inside a multi-byte character (an
+                // ordinary Unicode registry value name such as `éé`).
+                let name = name.as_bytes();
+                let prefix = prefix.as_bytes();
                 name.len() > prefix.len()
                     && name[..prefix.len()].eq_ignore_ascii_case(prefix)
-                    && name[prefix.len()..].chars().all(|ch| ch.is_ascii_digit())
+                    && name[prefix.len()..].iter().all(u8::is_ascii_digit)
             }
             Self::Exact(names) => names.iter().any(|want| want.eq_ignore_ascii_case(name)),
         }
@@ -642,31 +650,26 @@ pub fn privacy_reg_allowed(key: &str) -> bool {
 /// program folders and the app's own data dir, and inside the resolved root.
 fn privacy_file_allowed(fs: &dyn FileView, root: &str, path: &str) -> bool {
     let path = normalize_fs(path);
-    if !looks_absolute(&path) || path.contains("..") {
+    if !looks_absolute(&path) || path.contains("..") || has_unsafe_fs_component(&path) {
         return false;
     }
-    let lower = path.to_ascii_lowercase();
-    let root = normalize_fs(root).to_ascii_lowercase();
-    if lower != root && !lower.starts_with(&(root + "\\")) {
+    if !path_under(&path, root) {
         return false;
     }
-    let sys = normalize_fs(&system_root(fs)).to_ascii_lowercase();
-    if lower == sys || lower.starts_with(&(sys + "\\")) {
+    privacy_location_allowed(fs, &path)
+}
+
+/// Outside the Windows, Program Files, and ProgramData folders (located by
+/// API; a folder that cannot be located refuses everything) and outside the
+/// app data folder.
+fn privacy_location_allowed(fs: &dyn FileView, path: &str) -> bool {
+    let Ok(roots) = protected_roots(fs) else {
         return false;
-    }
-    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(dir) = fs.var(var) {
-            let dir = normalize_fs(&dir).to_ascii_lowercase();
-            if !dir.is_empty() && (lower == dir || lower.starts_with(&(dir + "\\"))) {
-                return false;
-            }
-        }
-    }
-    let data = normalize_fs(crate::DATA_DIR).to_ascii_lowercase();
-    if lower == data || lower.starts_with(&(data + "\\")) {
-        return false;
-    }
-    true
+    };
+    !roots.iter().any(|dir| path_under(path, dir))
+        && !crate::store::data_roots(fs)
+            .iter()
+            .any(|dir| path_under(path, dir))
 }
 
 // ---- preview ----
@@ -1346,11 +1349,39 @@ fn delete_file(
         done.note(format!("refused: {}", hit.path));
         return;
     }
-    if fs.is_dir(&hit.path) {
+    // Pin the object and check where it really is: the root and the file are
+    // both resolved, so a junction or link inside a cache folder cannot carry
+    // the delete outside it. The delete goes through the checked handle.
+    let mut pin = match fs.pin(&hit.path) {
+        Ok(pin) => pin,
+        Err(err) if err.contains("not found") || err.contains("os error 2") => {
+            done.already_gone += 1;
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {}: {err}", hit.path));
+            return;
+        }
+    };
+    if pin.kind != ItemKind::File {
         done.note(format!("not a file: {}", hit.path));
         return;
     }
-    match fs.remove_file(&hit.path) {
+    let real_root = fs
+        .pin(root)
+        .map(|pin| pin.real_path)
+        .unwrap_or_else(|_| root.to_string());
+    if !privacy_file_allowed(fs, &real_root, &pin.real_path) {
+        done.note(format!(
+            "refused: {} (it resolves to {})",
+            hit.path, pin.real_path
+        ));
+        return;
+    }
+    let result = fs
+        .pin_acquire(&mut pin, Access::Delete)
+        .and_then(|()| fs.pin_delete(pin));
+    match result {
         Ok(()) => {
             done.files += 1;
             done.bytes += hit.bytes;
@@ -1543,6 +1574,18 @@ mod tests {
     use crate::model::ValueKind;
     use crate::registry::MemoryRegistry;
 
+    #[test]
+    fn prefix_digits_handles_unicode_names_without_panicking() {
+        let spec = ValueMatch::PrefixDigits("url".into());
+        // A multi-byte name whose byte length exceeds the prefix must not
+        // panic on a non-boundary slice, and must not match.
+        assert!(!spec.matches("éé"));
+        assert!(!spec.matches("url"));
+        assert!(!spec.matches("urlx"));
+        assert!(spec.matches("url1"));
+        assert!(spec.matches("URL42"));
+    }
+
     struct FakeProcs {
         running: Vec<String>,
     }
@@ -1634,7 +1677,7 @@ mod tests {
     }
 
     fn seed_fs() -> MemoryFs {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("TEMP", r"C:\Users\test\AppData\Local\Temp");
         fs.set_var("TMP", r"C:\Users\test\AppData\Local\Temp");
         fs.set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
@@ -1913,6 +1956,50 @@ mod tests {
     }
 
     #[test]
+    fn a_cache_file_that_resolves_outside_its_root_is_not_deleted() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let root = r"C:\Users\me\AppData\Local\Temp";
+        fs.add_file_bytes(&format!(r"{root}\ok.tmp"), vec![1; 8], None);
+        fs.add_file_bytes(r"C:\Users\me\Documents\keep.txt", vec![2; 8], None);
+        fs.add_alias(&format!(r"{root}\out"), r"C:\Users\me\Documents");
+        let mut done = ItemOutcome::blank("test");
+        let mut errors = Vec::new();
+        for path in [format!(r"{root}\ok.tmp"), format!(r"{root}\out\keep.txt")] {
+            let hit = FileHit { path, bytes: 8 };
+            delete_file(&mut fs, root, &hit, &mut done, &mut errors);
+        }
+        assert_eq!(done.files, 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            done.restricted
+                .iter()
+                .any(|note| note.contains("resolves to"))
+        );
+        assert_eq!(fs.read(r"C:\Users\me\Documents\keep.txt"), Some(vec![2; 8]));
+    }
+
+    #[test]
+    fn file_gate_refuses_everything_when_a_system_folder_is_unknown() {
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let file = format!(r"{temp}\a.tmp");
+        assert!(privacy_file_allowed(
+            &MemoryFs::with_windows_dirs(),
+            temp,
+            &file
+        ));
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.set_var("ProgramFiles(x86)", "");
+        assert!(!privacy_file_allowed(&fs, temp, &file));
+        // ProgramData is protected for privacy deletes too.
+        let data = r"C:\ProgramData\Vendor";
+        assert!(!privacy_file_allowed(
+            &MemoryFs::with_windows_dirs(),
+            data,
+            &format!(r"{data}\x.log")
+        ));
+    }
+
+    #[test]
     fn masks_match_dos_style_case_insensitively() {
         assert!(mask_matches("anything", "*.*"));
         assert!(mask_matches("F_000001", "*.*"));
@@ -1927,7 +2014,7 @@ mod tests {
     #[test]
     fn unresolved_vars_report_restricted_not_silent() {
         let reg = seed_reg();
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("SystemRoot", r"C:\Windows");
         let sys = FakeSys::default();
         let report = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
@@ -2039,7 +2126,7 @@ mod tests {
         let backup = std::env::temp_dir().join("hive-mend-privacy-plugin-test.reg");
         let outcome = clean_with_progress(
             &mut reg,
-            &mut MemoryFs::new(),
+            &mut MemoryFs::with_windows_dirs(),
             &mut FakeSys::default(),
             &quiet(),
             &items,
@@ -2054,7 +2141,7 @@ mod tests {
 
     #[test]
     fn firefox_profiles_come_from_ini_and_folder() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("APPDATA", r"C:\Users\test\AppData\Roaming");
         let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
         fs.add_file_bytes(

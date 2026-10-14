@@ -1,4 +1,4 @@
-use crate::fs::FileView;
+use crate::fs::{FileView, ItemKind, KnownDir, is_drive_absolute};
 
 pub fn canonical_hive(name: &str) -> Option<&'static str> {
     match name.to_ascii_uppercase().as_str() {
@@ -12,9 +12,13 @@ pub fn canonical_hive(name: &str) -> Option<&'static str> {
 }
 
 pub fn canonical_path(path: &str) -> String {
-    let trimmed = path.trim().trim_matches(['\\', '/']);
+    // Split on backslash only. A forward slash is a legal character inside a
+    // registry key name (for example a `text/html` content-type key), so
+    // treating it as a separator would rename the key and make a backup miss
+    // the real child that repair then deletes with its parent.
+    let trimmed = path.trim().trim_matches('\\');
     let mut parts: Vec<String> = trimmed
-        .split(['\\', '/'])
+        .split('\\')
         .filter(|part| !part.is_empty())
         .map(str::to_string)
         .collect();
@@ -100,8 +104,31 @@ fn var_aliases(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// A system folder as the refusal checks must see it: from the Windows APIs
+/// on the host, and only when it is a fully qualified drive path.
+pub fn known_root(fs: &dyn FileView, dir: KnownDir) -> Option<String> {
+    let root = normalize_fs(&fs.known_dir(dir)?);
+    let root = root.trim_end_matches('\\').to_string();
+    is_drive_absolute(&root).then_some(root)
+}
+
+/// Every folder a delete or shred must stay out of, or an error naming the
+/// one that could not be located. A missing root refuses the operation
+/// instead of silently dropping that protection.
+pub fn protected_roots(fs: &dyn FileView) -> Result<Vec<String>, String> {
+    KnownDir::PROTECTED
+        .iter()
+        .map(|dir| {
+            known_root(fs, *dir)
+                .ok_or_else(|| format!("the {} folder could not be located", dir.label()))
+        })
+        .collect()
+}
+
+/// The Windows folder for locating files during a scan. Refusal checks use
+/// [`protected_roots`] or [`under_windows_dir`], which fail closed instead.
 pub fn system_root(fs: &dyn FileView) -> String {
-    lookup_var(fs, "SystemRoot").unwrap_or_else(|| "C:\\Windows".to_string())
+    known_root(fs, KnownDir::Windows).unwrap_or_else(|| "C:\\Windows".to_string())
 }
 
 pub fn normalize_fs(path: &str) -> String {
@@ -113,10 +140,40 @@ pub fn normalize_fs(path: &str) -> String {
     out
 }
 
+/// True when a path component would make the resolved target differ from its
+/// spelling, so a textual refusal check cannot be trusted. Win32 strips a
+/// trailing dot or space from each component, and `.`/`..` walk the tree, so
+/// `C:\.` and `C:\.\Windows` name the drive root and the Windows folder while
+/// reading as something the protected-root prefixes do not match. This is a
+/// fail-closed interim guard, not a full reparse/alias resolver.
+pub fn has_unsafe_fs_component(path: &str) -> bool {
+    let norm = normalize_fs(path);
+    let rest = match norm.split_once(":\\") {
+        Some((_, rest)) => rest,
+        None => norm.strip_prefix("\\\\").unwrap_or(norm.as_str()),
+    };
+    rest.split('\\')
+        .any(|part| part == "." || part == ".." || part.ends_with('.') || part.ends_with(' '))
+}
+
+/// True when `path` is inside the Windows folder, or when that folder cannot
+/// be located: scanners skip such paths, so an unknown root errs toward
+/// leaving things alone.
 pub fn under_windows_dir(fs: &dyn FileView, path: &str) -> bool {
-    let root = normalize_fs(&system_root(fs)).to_ascii_lowercase();
+    let Some(root) = known_root(fs, KnownDir::Windows) else {
+        return true;
+    };
+    path_under(path, &root)
+}
+
+/// Case-insensitive `path == root` or `path` inside `root`, after
+/// normalizing separators.
+pub fn path_under(path: &str, root: &str) -> bool {
+    let root = normalize_fs(root)
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
     let path = normalize_fs(path).to_ascii_lowercase();
-    path == root || path.starts_with(&(root + "\\"))
+    !root.is_empty() && (path == root || path.starts_with(&(root + "\\")))
 }
 
 /// True unless the file is verifiably gone. A path with an unresolved
@@ -308,8 +365,12 @@ fn find_later_path(text: &str) -> Option<usize> {
 
 fn push_path(found: &mut Vec<String>, raw: &str) {
     let mut path = raw.trim().trim_matches('"').to_string();
-    if let Some((left, _)) = path.rsplit_once(',')
+    // A trailing `,<index>` is an icon or resource index (`shell32.dll,-57`).
+    // Strip only a numeric suffix: a comma can also sit inside a real file
+    // name (`Tool,Pro.exe`), and truncating there invents a missing path.
+    if let Some((left, index)) = path.rsplit_once(',')
         && (left.contains('\\') || left.contains(':'))
+        && is_resource_index(index)
     {
         path = left.to_string();
     }
@@ -332,6 +393,40 @@ fn push_path(found: &mut Vec<String>, raw: &str) {
     if looks_like_path {
         found.push(normalize_fs(&path));
     }
+}
+
+/// From the paths pulled out of a single command, the ones whose absence means
+/// the command is broken: the program it launches (the first path) and any
+/// code file it loads. A data or output argument — a `--log out.txt` path — is
+/// not a dependency, so a present program with a missing data argument is not
+/// stale and must not be offered for deletion.
+pub fn command_dependencies(paths: &[String]) -> Vec<String> {
+    paths
+        .iter()
+        .enumerate()
+        .filter(|(index, path)| *index == 0 || is_code_file(path))
+        .map(|(_, path)| path.clone())
+        .collect()
+}
+
+/// A file a command executes or loads, by extension: programs, libraries,
+/// drivers, scripts. Data and document files are not code.
+fn is_code_file(path: &str) -> bool {
+    let name = path.rsplit(['\\', '/']).next().unwrap_or(path);
+    let lower = name.to_ascii_lowercase();
+    const CODE: &[&str] = &[
+        ".exe", ".dll", ".ocx", ".sys", ".drv", ".vxd", ".scr", ".com", ".cpl", ".bat", ".cmd",
+        ".pif", ".msc",
+    ];
+    CODE.iter().any(|ext| lower.ends_with(ext))
+}
+
+/// A `,<index>` suffix on a command is a resource or icon index, always a
+/// (possibly negative) integer. A comma followed by anything else belongs to
+/// the file name.
+fn is_resource_index(text: &str) -> bool {
+    let digits = text.strip_prefix('-').unwrap_or(text);
+    !digits.is_empty() && digits.bytes().all(|byte| byte.is_ascii_digit())
 }
 
 fn has_extension(path: &str) -> bool {
@@ -395,14 +490,28 @@ pub fn bare_name_present(fs: &dyn FileView, name: &str) -> bool {
         .any(|dir| file_present(fs, &format!("{dir}\\{name}")))
 }
 
+/// `SYSTEM\<control set>\Services\...` under any control set the service
+/// control manager keeps: `CurrentControlSet` and the numbered `ControlSet001`,
+/// `ControlSet002`, ... clones. A rules file that names a numbered set would
+/// otherwise reach a service the `CurrentControlSet` spelling protects.
+fn under_any_services(lower: &str) -> bool {
+    lower.contains("\\currentcontrolset\\services\\")
+        || lower.split("\\controlset").skip(1).any(|segment| {
+            let digits = segment.bytes().take_while(u8::is_ascii_digit).count();
+            digits > 0 && segment[digits..].starts_with("\\services\\")
+        })
+}
+
 pub fn is_protected_key(path: &str) -> bool {
     let lower = canonical_path(path).to_ascii_lowercase();
     if lower.contains("\\services\\vxd\\") || lower.contains("\\firewallpolicy\\firewallrules") {
         return false;
     }
+    if under_any_services(&lower) {
+        return true;
+    }
     const BLOCKS: &[&str] = &[
         "\\winlogon",
-        "\\currentcontrolset\\services\\",
         "\\control\\session manager",
         "\\component based servicing",
         "\\windows\\currentversion\\sidebyside",
@@ -464,7 +573,7 @@ pub fn needs_admin(target: &str) -> bool {
 
 pub fn file_delete_allowed(path: &str) -> bool {
     let lower = normalize_fs(path).to_ascii_lowercase();
-    if lower.ends_with("\\desktop.ini") {
+    if lower.ends_with("\\desktop.ini") || has_unsafe_fs_component(path) {
         return false;
     }
     lower.contains("\\temp\\")
@@ -476,7 +585,6 @@ pub fn file_delete_allowed(path: &str) -> bool {
 /// the Windows, program, and app-data folders may shred. Errors name the
 /// rule that fired and are absolute: no caller may override a refusal.
 pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), String> {
-    use crate::fs::ItemKind;
     let clean = normalize_fs(path);
     let bytes = clean.as_bytes();
     let absolute = bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\';
@@ -485,6 +593,11 @@ pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), Str
     }
     if clean.len() == 3 {
         return Err("a drive root cannot be shredded".to_string());
+    }
+    // `C:\.`, trailing dots or spaces, and the like resolve to a different
+    // object than they spell, so no textual root check below can be trusted.
+    if has_unsafe_fs_component(&clean) {
+        return Err(format!("{path} has an ambiguous path component"));
     }
     match fs.kind_of(&clean) {
         ItemKind::File | ItemKind::Dir => {}
@@ -498,26 +611,74 @@ pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), Str
     if fs.is_hidden_system(&clean) {
         return Err(format!("{path} is a hidden system file"));
     }
-    let lower = clean.to_ascii_lowercase();
-    let under = |root: &str| {
-        let root = normalize_fs(root).to_ascii_lowercase();
-        lower == root || lower.starts_with(&(root + "\\"))
-    };
-    if under(&system_root(fs)) {
+    shred_location_allowed(fs, path, &clean)
+}
+
+/// The location rules of [`shred_allowed`], applied to `clean`: outside the
+/// Windows, Program Files, and ProgramData folders (located by API, refusing
+/// when one cannot be found) and outside the app data folder. `shred_file`
+/// runs this again on the path Windows reports for the opened file.
+pub fn shred_location_allowed(
+    fs: &dyn crate::fs::FileView,
+    path: &str,
+    clean: &str,
+) -> Result<(), String> {
+    let roots = protected_roots(fs).map_err(|why| format!("{path} refused: {why}"))?;
+    if let Some(windows) = roots.first()
+        && path_under(clean, windows)
+    {
         return Err(format!("{path} is inside the Windows folder"));
     }
-    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
-        if let Some(dir) = fs.var(var)
-            && !dir.is_empty()
-            && under(&dir)
-        {
-            return Err(format!("{path} is inside a program folder"));
-        }
+    if roots.iter().skip(1).any(|root| path_under(clean, root)) {
+        return Err(format!("{path} is inside a program folder"));
     }
-    if under(crate::DATA_DIR) {
+    if crate::store::data_roots(fs)
+        .iter()
+        .any(|root| path_under(clean, root))
+    {
         return Err(format!("{path} is inside the app data folder"));
     }
     Ok(())
+}
+
+/// Pin a staged shred target and check the object itself, not just its
+/// spelling: [`shred_allowed`] on the path, then the same location rules on
+/// the real path Windows reports for the open handle (junctions, links, 8.3
+/// names, and SUBST resolved). A file with more than one hard link is refused,
+/// since overwriting it would change every other name too. Only then is write
+/// or delete access gained, on that same handle.
+pub fn pin_for_shred(
+    fs: &mut dyn FileView,
+    path: &str,
+    want: ItemKind,
+) -> Result<crate::fs::Pinned, String> {
+    shred_allowed(&*fs, path)?;
+    let mut pin = fs.pin(path).map_err(|err| format!("{path}: {err}"))?;
+    if pin.kind != want {
+        return Err(format!("{path} changed since staging"));
+    }
+    if pin.hidden_system {
+        return Err(format!("{path} is a hidden system file"));
+    }
+    let real = normalize_fs(&pin.real_path);
+    if !is_drive_absolute(&real) {
+        return Err(format!("{path} resolves to {real}, not a local path"));
+    }
+    shred_location_allowed(&*fs, path, &real)
+        .map_err(|why| format!("{why} (it resolves to {real})"))?;
+    if pin.kind == ItemKind::File && pin.links > 1 {
+        return Err(format!(
+            "{path} has other hard links; shredding it would overwrite them too"
+        ));
+    }
+    let access = if want == ItemKind::File {
+        crate::fs::Access::Write
+    } else {
+        crate::fs::Access::Delete
+    };
+    fs.pin_acquire(&mut pin, access)
+        .map_err(|err| format!("{path}: {err}"))?;
+    Ok(pin)
 }
 
 pub fn looks_like_stored_path(text: &str) -> bool {
@@ -626,5 +787,106 @@ mod tests {
         assert!(!key_delete_allowed(
             r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths"
         ));
+    }
+
+    #[test]
+    fn canonical_path_keeps_forward_slashes_in_key_names() {
+        assert_eq!(
+            canonical_path(r"HKCR\MIME\Database\Content Type\text/html"),
+            r"HKEY_CLASSES_ROOT\MIME\Database\Content Type\text/html"
+        );
+    }
+
+    #[test]
+    fn command_dependencies_drop_data_arguments_but_keep_code() {
+        let with_log = vec![
+            r"C:\Apps\runner.exe".to_string(),
+            r"C:\Logs\next.log".to_string(),
+        ];
+        assert_eq!(
+            command_dependencies(&with_log),
+            vec![r"C:\Apps\runner.exe".to_string()]
+        );
+        // A loaded library is still a dependency.
+        let with_dll = vec![
+            r"C:\Apps\host.exe".to_string(),
+            r"C:\Apps\plugin.dll".to_string(),
+        ];
+        assert_eq!(command_dependencies(&with_dll), with_dll);
+    }
+
+    #[test]
+    fn keeps_a_comma_inside_a_file_name_but_strips_an_icon_index() {
+        assert_eq!(
+            paths_in_command(r"C:\Apps\Tool,Pro.exe"),
+            vec![r"C:\Apps\Tool,Pro.exe"]
+        );
+        assert_eq!(
+            paths_in_command(r"C:\Windows\System32\shell32.dll,-57"),
+            vec![r"C:\Windows\System32\shell32.dll"]
+        );
+    }
+
+    #[test]
+    fn protects_services_under_a_numbered_control_set() {
+        assert!(is_protected_key(
+            r"HKLM\SYSTEM\ControlSet001\Services\Dnscache"
+        ));
+        assert!(is_protected_key(
+            r"HKLM\SYSTEM\CurrentControlSet\Services\Dnscache"
+        ));
+        // VxD cleanup stays allowed under any control set.
+        assert!(!is_protected_key(
+            r"HKLM\SYSTEM\ControlSet002\Services\VxD\Old"
+        ));
+    }
+
+    #[test]
+    fn flags_dot_and_trailing_dot_components() {
+        assert!(has_unsafe_fs_component(r"C:\."));
+        assert!(has_unsafe_fs_component(r"C:\.\Windows\System32\x.dll"));
+        assert!(has_unsafe_fs_component(r"C:\Apps\bad. \child.txt"));
+        assert!(!has_unsafe_fs_component(
+            r"C:\Users\Me\AppData\Local\Temp\a.tmp"
+        ));
+    }
+
+    #[test]
+    fn a_missing_protected_root_refuses_instead_of_dropping_the_check() {
+        // ProgramData is not defined: the gate must refuse, not skip it.
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.set_var("ProgramFiles", r"C:\Program Files");
+        fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
+        fs.add_file(r"C:\ProgramData\Vendor\x.dat");
+        fs.add_file(r"C:\Docs\a.txt");
+        let err = shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").unwrap_err();
+        assert!(err.contains("could not be located"), "{err}");
+        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_err());
+        fs.set_var("ProgramData", r"C:\ProgramData");
+        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_ok());
+        assert!(shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").is_err());
+    }
+
+    #[test]
+    fn a_relative_or_ambiguous_windows_root_is_not_trusted() {
+        // A root that is not a plain drive path cannot anchor a refusal, so
+        // scanners treat everything as inside it and leave it alone.
+        for root in ["Windows", r"\Windows", r"C:\.\Windows", r"C:\Windows.", ""] {
+            let mut fs = MemoryFs::new();
+            fs.set_var("SystemRoot", root);
+            assert!(known_root(&fs, KnownDir::Windows).is_none(), "{root:?}");
+            assert!(under_windows_dir(&fs, r"C:\Docs\a.txt"), "{root:?}");
+        }
+        let fs = MemoryFs::with_windows_dirs();
+        assert!(under_windows_dir(&fs, r"C:\WINDOWS\System32\x.dll"));
+        assert!(!under_windows_dir(&fs, r"C:\WindowsApps\x.dll"));
+    }
+
+    #[test]
+    fn shred_refuses_dot_root_and_dot_traversal() {
+        let fs = MemoryFs::new();
+        assert!(shred_allowed(&fs, r"C:\.").is_err());
+        assert!(shred_allowed(&fs, r"C:\.\Windows\System32\drivers\etc\hosts").is_err());
     }
 }

@@ -94,7 +94,8 @@ pub fn gather() -> SystemSnapshot {
         }
     }
 
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
+    let system_root = crate::fs::host_known_dir(crate::fs::KnownDir::Windows)
+        .unwrap_or_else(|| r"C:\Windows".into());
     let drive = system_root
         .chars()
         .next()

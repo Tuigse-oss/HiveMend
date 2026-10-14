@@ -14,10 +14,46 @@ const FILE_ARROW: &str = " => ";
 /// without it, so a stray Regedit export or downloaded tweak can never be
 /// merged by mistake. It is a mistake-guard, not a signature.
 const BACKUP_MARKER: &str = "; Hive Mend backup.";
+/// Service start-type backups carried their own marker before the markers were
+/// unified. Restore still accepts it so a services backup written by an older
+/// build can be undone.
+const SERVICES_BACKUP_MARKER: &str = "; Hive Mend services backup.";
 
 pub fn backup_name(now: SystemTime) -> String {
     let secs = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
     format!("hive-mend-{}.reg", ymd_hms(secs))
+}
+
+/// Reserve a unique backup path by creating the file now. Two repairs within
+/// the same second would otherwise derive the same second-resolution name and
+/// the second would truncate the first, destroying its recovery record. The
+/// returned file exists (empty); the caller fills it with [`write_backup`],
+/// and its sidecar directory is derived from this unique name.
+pub fn reserve_backup_path(dir: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
+    std::fs::create_dir_all(dir)?;
+    let base = backup_name(now);
+    let stem = base.strip_suffix(".reg").unwrap_or(&base);
+    for attempt in 0..10_000u32 {
+        let name = if attempt == 0 {
+            base.clone()
+        } else {
+            format!("{stem}-{attempt}.reg")
+        };
+        let path = dir.join(&name);
+        match std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(&path)
+        {
+            Ok(_) => return Ok(path),
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(err) => return Err(err),
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::AlreadyExists,
+        "could not reserve a unique backup name",
+    ))
 }
 
 /// What a repair is about to remove, in `.reg` form.
@@ -133,6 +169,16 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     }
 
     for (key, names) in values {
+        // A single value backup must validate names too: a Run value whose
+        // name holds CR/LF or trailing whitespace cannot round-trip, so the
+        // whole key is marked uncovered and repair leaves every value under it.
+        if unrepresentable_name(&key) || names.iter().any(|name| unrepresentable_name(name)) {
+            body.push_str(&format!(
+                "\r\n; not backed up, left alone: {key}: a value name cannot be represented in a .reg backup\r\n"
+            ));
+            unreadable.push(key);
+            continue;
+        }
         match reg.values(&key) {
             Ok(present) => {
                 body.push_str(&format!("\r\n[{key}]\r\n"));
@@ -208,6 +254,24 @@ fn export_tree(
         return Err(RegError::Message(format!("{path} is nested too deeply")));
     }
     let values = reg.values(path)?;
+    // A key or value name with a control character (CR, LF, NUL, ...) cannot
+    // be written as an exact quoted `.reg` name, so the backup would not round
+    // trip. Refuse the whole key rather than let repair delete something the
+    // backup cannot put back.
+    if unrepresentable_name(path) {
+        return Err(RegError::Message(format!(
+            "{path}: key name cannot be represented in a .reg backup"
+        )));
+    }
+    if let Some(value) = values
+        .iter()
+        .find(|value| unrepresentable_name(&value.name))
+    {
+        return Err(RegError::Message(format!(
+            "{path}: value name {:?} cannot be represented in a .reg backup",
+            value.name
+        )));
+    }
     body.push_str(&format!("[{}]\r\n", canonical_path(path)));
     for value in values {
         body.push_str(&format_value(&value));
@@ -222,9 +286,17 @@ fn export_tree(
     for child in children {
         let child_path = format!("{}\\{child}", canonical_path(path));
         match export_tree(reg, &child_path, depth + 1, body) {
-            // Removed by someone else while we read it. Nothing to save.
-            Err(RegError::NotFound) => {}
-            other => other?,
+            Ok(()) => {}
+            // A child that was just listed but cannot be read back (a name
+            // canonicalization would alter, such as trailing whitespace, or a
+            // child removed mid-read) must not be silently dropped: delete_tree
+            // would still remove it with no backup. Fail the key's coverage.
+            Err(RegError::NotFound) => {
+                return Err(RegError::Message(format!(
+                    "{child_path}: a listed subkey could not be backed up"
+                )));
+            }
+            Err(err) => return Err(err),
         }
     }
     Ok(())
@@ -258,6 +330,20 @@ fn format_value(value: &RegValue) -> String {
 
 fn escape_reg(text: &str) -> String {
     text.replace('\\', "\\\\").replace('"', "\\\"")
+}
+
+/// A control character (below U+0020) in a key or value name cannot survive a
+/// quoted `.reg` round trip: CR/LF break the line, NUL truncates on import.
+fn has_control_char(text: &str) -> bool {
+    text.chars().any(|ch| (ch as u32) < 0x20)
+}
+
+/// A key or value name this backup cannot reproduce byte-for-byte, so repair
+/// must leave it alone: a control character breaks or truncates the `.reg`
+/// line, and leading or trailing whitespace is dropped when the path is
+/// canonicalized, so the name written would not match the name removed.
+fn unrepresentable_name(name: &str) -> bool {
+    has_control_char(name) || name != name.trim()
 }
 
 fn utf16_bytes(text: &str) -> Vec<u8> {
@@ -382,13 +468,15 @@ impl BackupSummary {
 #[derive(Clone, Debug)]
 pub struct BackupInfo {
     pub path: PathBuf,
+    /// Which store the file was listed from.
+    pub store: crate::store::Store,
     pub modified: Option<SystemTime>,
     pub size: u64,
     pub summary: BackupSummary,
 }
 
-/// `.reg` files in the backup folder, newest first.
-pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
+/// `.reg` files in one backup folder, newest first.
+pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -407,6 +495,7 @@ pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
             .map(|text| BackupSummary::parse(&text))
             .unwrap_or_default();
         found.push(BackupInfo {
+            store,
             modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
             size: meta.map(|meta| meta.len()).unwrap_or(0),
             path,
@@ -417,39 +506,13 @@ pub fn list_backups(dir: &Path) -> Vec<BackupInfo> {
     found
 }
 
-/// Put back shortcut copies whose original is still missing.
-pub fn restore_files(summary: &BackupSummary) -> (usize, Vec<String>) {
-    let mut restored = 0;
-    let mut errors = Vec::new();
-    for (original, copy) in &summary.files {
-        let target = Path::new(original);
-        if target.exists() {
-            continue;
-        }
-        if !copy.exists() {
-            errors.push(format!(
-                "{original}: the saved copy {} is gone",
-                copy.display()
-            ));
-            continue;
-        }
-        if let Some(parent) = target.parent()
-            && let Err(err) = std::fs::create_dir_all(parent)
-        {
-            errors.push(format!("{original}: {err}"));
-            continue;
-        }
-        match std::fs::copy(copy, target) {
-            Ok(_) => restored += 1,
-            Err(err) => errors.push(format!("{original}: {err}")),
-        }
-    }
-    (restored, errors)
-}
-
-/// True when the text carries the backup marker line.
+/// True when the text carries a Hive Mend marker line: the unified marker, or
+/// the older services-only marker so a services backup can still be restored.
 pub fn is_hive_mend_backup(text: &str) -> bool {
-    text.lines().any(|line| line.trim() == BACKUP_MARKER)
+    text.lines().any(|line| {
+        let line = line.trim();
+        line == BACKUP_MARKER || line == SERVICES_BACKUP_MARKER
+    })
 }
 
 /// Merge a `.reg` file with the 64-bit `reg.exe`, the same as Regedit's Merge.
@@ -466,8 +529,11 @@ pub fn import_reg_file(path: &Path) -> Result<(), String> {
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let reg_exe = Path::new(&system_root).join("System32").join("reg.exe");
+    // System32 from the API, not %SystemRoot%: an elevated restore must run
+    // the real reg.exe, whatever environment launched this process.
+    let system = crate::fs::host_known_dir(crate::fs::KnownDir::System)
+        .ok_or("could not locate the System32 folder")?;
+    let reg_exe = Path::new(&system).join("reg.exe");
     let output = std::process::Command::new(reg_exe)
         .arg("import")
         .arg(path)
@@ -530,6 +596,108 @@ mod tests {
             "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\X]\r\n"
         ));
         assert!(!is_hive_mend_backup(""));
+    }
+
+    #[test]
+    fn restore_accepts_the_services_backup_marker() {
+        // New services backups carry the unified marker.
+        assert!(is_hive_mend_backup(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n"
+        ));
+        // Older services backups carried only their own marker; still accepted.
+        assert!(is_hive_mend_backup(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend services backup.\r\n"
+        ));
+    }
+
+    #[test]
+    fn reserve_backup_path_never_reuses_a_name() {
+        let dir = std::env::temp_dir().join(format!("hivemend-reserve-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        let now = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
+        let first = reserve_backup_path(&dir, now).unwrap();
+        let second = reserve_backup_path(&dir, now).unwrap();
+        assert_ne!(first, second);
+        assert!(first.exists() && second.exists());
+        // The matching sidecar directories differ too.
+        assert_ne!(files_dir(&first), files_dir(&second));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn a_control_char_value_name_leaves_the_key_uncovered() {
+        let mut reg = MemoryRegistry::new();
+        let key = r"HKCU\Software\Weird";
+        reg.set_sz(key, "ok", "fine");
+        reg.set_sz(key, "bad\nname", "x");
+        let plan = export_repairs(
+            &reg,
+            &[Repair::DeleteKey { key: key.into() }],
+            Path::new("t.reg"),
+        );
+        // The key cannot round-trip, so repair must leave it alone.
+        assert!(!plan.covers(key));
+        assert!(
+            plan.unreadable
+                .iter()
+                .any(|bad| bad.eq_ignore_ascii_case(&canonical_path(key)))
+        );
+    }
+
+    #[test]
+    fn a_control_char_in_a_deletevalue_name_leaves_the_key_uncovered() {
+        // The single-value backup path must validate names too, not only the
+        // whole-key export.
+        let mut reg = MemoryRegistry::new();
+        let key = r"HKCU\Software\Run";
+        reg.set_sz(key, "Good", "x");
+        reg.set_sz(key, "Bad\r\nEntry", "y");
+        let plan = export_repairs(
+            &reg,
+            &[Repair::DeleteValue {
+                key: key.into(),
+                name: "Bad\r\nEntry".into(),
+            }],
+            Path::new("t.reg"),
+        );
+        assert!(!plan.covers(key));
+    }
+
+    #[test]
+    fn a_subkey_name_that_cannot_be_reproduced_leaves_the_parent_uncovered() {
+        use crate::model::RegValue;
+        use crate::registry::{RegError, Registry};
+
+        // A registry whose parent lists a child whose name ends in a space —
+        // a name canonicalization would alter, so it cannot be backed up.
+        struct TrailingSpace;
+        impl Registry for TrailingSpace {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                if canonical_path(path).eq_ignore_ascii_case(r"HKEY_CURRENT_USER\Software\App") {
+                    Ok(vec!["Saved ".to_string()])
+                } else {
+                    Ok(Vec::new())
+                }
+            }
+            fn values(&self, _path: &str) -> Result<Vec<RegValue>, RegError> {
+                Ok(Vec::new())
+            }
+            fn delete_value(&mut self, _path: &str, _name: &str) -> Result<(), RegError> {
+                Ok(())
+            }
+            fn delete_tree(&mut self, _path: &str) -> Result<(), RegError> {
+                Ok(())
+            }
+        }
+
+        let parent = r"HKCU\Software\App";
+        let plan = export_repairs(
+            &TrailingSpace,
+            &[Repair::DeleteKey { key: parent.into() }],
+            Path::new("t.reg"),
+        );
+        // The listed child could not be exported, so the whole tree is left.
+        assert!(!plan.covers(parent));
     }
 
     #[test]

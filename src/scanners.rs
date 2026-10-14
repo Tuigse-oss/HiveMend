@@ -5,9 +5,9 @@ use crate::model::{
     Finding, PathKind, RegValue, Repair, RulePath, ScannerDef, ScannerId, ValueKind,
 };
 use crate::pathutil::{
-    bare_name_present, canonical_path, expand_env, file_delete_allowed, file_present, hive_views,
-    is_protected_key, key_delete_allowed, looks_like_stored_path, paths_in_command, system_root,
-    under_windows_dir,
+    bare_name_present, canonical_path, command_dependencies, expand_env, file_delete_allowed,
+    file_present, hive_views, is_protected_key, key_delete_allowed, looks_like_stored_path,
+    paths_in_command, system_root, under_windows_dir,
 };
 use crate::registry::{RegError, Registry};
 
@@ -490,14 +490,16 @@ fn temp_and_shortcuts(ctx: &mut ScanCtx<'_>, scanner: &ScannerDef, findings: &mu
             if item.name.eq_ignore_ascii_case("desktop.ini") {
                 continue;
             }
-            if item
+            // Delete only files proven to be at least a day old. An unreadable
+            // or future last-write time yields no age, and must not pass as old.
+            if !item
                 .age
-                .is_some_and(|age| age.as_secs() < TEMP_MIN_AGE_SECS)
+                .is_some_and(|age| age.as_secs() >= TEMP_MIN_AGE_SECS)
             {
                 continue;
             }
             let path = format!("{dir}\\{}", item.name);
-            if !file_delete_allowed(&path) {
+            if !file_delete_allowed(&path) || under_windows_dir(ctx.fs, &path) {
                 continue;
             }
             push_file(findings, scanner, &path, "temporary file".into(), false);
@@ -677,9 +679,11 @@ fn every_outside_path_missing(ctx: &ScanCtx<'_>, paths: &[String]) -> Option<Str
 }
 
 fn missing_outside(ctx: &ScanCtx<'_>, paths: &[String]) -> Vec<String> {
+    // Only the program and the code files a command loads count. A present
+    // program with a missing data or output argument is not a broken command.
     let mut missing = Vec::new();
-    for path in paths {
-        let expanded = expand_env(ctx.fs, path);
+    for path in command_dependencies(paths) {
+        let expanded = expand_env(ctx.fs, &path);
         if expanded.contains('%')
             || skip_text(ctx, &expanded)
             || under_windows_dir(ctx.fs, &expanded)
@@ -2504,5 +2508,65 @@ mod tests {
                 .iter()
                 .all(|finding| !finding.key.to_ascii_lowercase().ends_with("\\live"))
         );
+    }
+
+    #[test]
+    fn a_present_program_with_a_missing_data_argument_is_not_stale() {
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.add_file(r"C:\Apps\runner.exe");
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run",
+            "App",
+            r#""C:\Apps\runner.exe" --log "C:\Logs\gone.log""#,
+        );
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .all(|finding| finding.value.as_deref() != Some("App")),
+            "a working Run entry was flagged over a missing data argument"
+        );
+    }
+
+    #[test]
+    fn temp_sweep_needs_a_known_old_age() {
+        use std::time::Duration;
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.set_var("TEMP", r"C:\Users\Ada\AppData\Local\Temp");
+        // Two days old: eligible.
+        fs.add_file_bytes(
+            r"C:\Users\Ada\AppData\Local\Temp\old.tmp",
+            Vec::new(),
+            Some(Duration::from_secs(2 * 86_400)),
+        );
+        // No readable/positive age (a future or unreadable stamp): kept.
+        fs.add_file_bytes(
+            r"C:\Users\Ada\AppData\Local\Temp\mystery.tmp",
+            Vec::new(),
+            None,
+        );
+
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &MemoryRegistry::new(),
+            &fs,
+            &ScanOptions::default(),
+        );
+        let keys: Vec<String> = report
+            .findings
+            .iter()
+            .map(|finding| finding.key.to_ascii_lowercase())
+            .collect();
+        assert!(keys.iter().any(|key| key.ends_with("\\old.tmp")));
+        assert!(!keys.iter().any(|key| key.ends_with("\\mystery.tmp")));
     }
 }
