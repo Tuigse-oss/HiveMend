@@ -1,4 +1,4 @@
-//! Hive Mend's artwork, drawn in code: Celtic and Scottish symbols for each
+//! Hivemend's artwork, drawn in code: Celtic and Scottish symbols for each
 //! tool, rendered with anti-aliasing at whatever pixel size the window needs.
 //! Nothing is loaded from disk, so the exe carries its own art and it stays
 //! sharp at every display scale.

@@ -1,6 +1,6 @@
 # Security Policy
 
-Hive Mend changes the Windows registry, services, and files, so security
+Hivemend changes the Windows registry, services, and files, so security
 problems in it are taken seriously.
 
 ## Supported versions

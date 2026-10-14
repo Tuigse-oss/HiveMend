@@ -1,4 +1,4 @@
-//! Where Hive Mend keeps its data, split by trust.
+//! Where Hivemend keeps its data, split by trust.
 //!
 //! - Per-user data (settings, the ignore list, custom privacy targets, and
 //!   backups written without elevation) lives in the account's Local AppData.
@@ -62,7 +62,7 @@ pub fn protected_dir(fs: &dyn FileView) -> Option<PathBuf> {
     known_root(fs, KnownDir::ProgramData).map(|root| Path::new(&root).join(APP))
 }
 
-/// Every folder Hive Mend keeps data in. Shred and privacy deletes refuse all
+/// Every folder Hivemend keeps data in. Shred and privacy deletes refuse all
 /// of them; one that cannot be located is simply not listed, because the
 /// protected roots check already refuses everything when ProgramData or the
 /// other system folders are unknown.
@@ -233,14 +233,14 @@ pub fn read_restorable(
         return Err(format!("{shown} is not a plain single-name file"));
     }
     if pin.len > MAX_BACKUP_BYTES {
-        return Err(format!("{shown} is too large to be a Hive Mend backup"));
+        return Err(format!("{shown} is too large to be a Hivemend backup"));
     }
     let real = pin.real_path.clone();
     if elevated {
         if store_of(&*fs, &real) != Store::Protected {
             return Err(format!(
                 "{shown} is not in the protected backup store, so it is not restored with \
-                 administrator rights. Restore it from Hive Mend started without \
+                 administrator rights. Restore it from Hivemend started without \
                  administrator rights; that can put back only your own (HKCU) entries."
             ));
         }
@@ -340,7 +340,7 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
     let text = crate::rules::decode_text_owned(bytes.clone());
     if !is_hive_mend_backup(&text) {
         return Err(format!(
-            "{} is not a Hive Mend backup; refusing to restore it",
+            "{} is not a Hivemend backup; refusing to restore it",
             file.display()
         ));
     }
@@ -547,9 +547,7 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
             // Plain and callback allow entries carry the SID right after the
             // mask; any other allow-type entry granting a write is refused.
             if header.AceType != 0 && header.AceType != 9 {
-                return Err(format!(
-                    "{shown} has an access entry Hive Mend cannot check"
-                ));
+                return Err(format!("{shown} has an access entry Hivemend cannot check"));
             }
             let sid = sid_text(unsafe { (ace as *mut u8).add(8) } as PSID);
             let creator_owner = sid == "S-1-3-0" && header.AceFlags & INHERIT_ONLY != 0;

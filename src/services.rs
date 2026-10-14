@@ -226,7 +226,7 @@ impl ServiceStore for MemoryServiceStore {
     }
 }
 
-/// Services Hive Mend refuses to change or stop: the RPC and logon
+/// Services Hivemend refuses to change or stop: the RPC and logon
 /// core, the security and update stack, and session basics. Starting one
 /// is transient and stays allowed.
 pub const NEVER_TOUCH: &[&str] = &[
@@ -405,7 +405,7 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
     // The unified marker Restore validates, plus a line naming the kind.
     body.push_str("; Hive Mend backup.\r\n");
     body.push_str("; Hive Mend services backup.\r\n");
-    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
+    body.push_str("; Restore it from the Restore page in Hivemend.\r\n");
     let mut unreadable = Vec::new();
     for name in names {
         let key = service_key(name);
@@ -525,7 +525,7 @@ pub fn apply_start_changes(
         };
         if matches!(change.to, StartType::Boot | StartType::System) {
             outcome.refused.push(format!(
-                "{}: Hive Mend never sets a Boot or System start",
+                "{}: Hivemend never sets a Boot or System start",
                 info.name
             ));
             progress(index + 1, changes.len());

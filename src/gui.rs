@@ -555,7 +555,7 @@ pub fn run() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
         let dpi = GetDpiForSystem().max(96);
-        let title = wide("Hive Mend");
+        let title = wide("Hivemend");
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             class_name.as_ptr(),
@@ -761,7 +761,7 @@ unsafe extern "system" fn wnd_proc(
                         | Job::Shredding
                 ) {
                     app.message(
-                        "Hive Mend is still working. Please wait for it to finish before closing.",
+                        "Hivemend is still working. Please wait for it to finish before closing.",
                         MB_ICONWARNING,
                     );
                     break 'handled 0;
@@ -882,7 +882,7 @@ fn run_native(hwnd: HWND) {
     if SHOWING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let title = wide("Hive Mend");
+    let title = wide("Hivemend");
     while let Some(next) = lock(&NATIVE).pop_front() {
         if unsafe { IsWindow(hwnd) } == 0 {
             if let Native::Menu { menu, .. } = next {
@@ -1335,7 +1335,7 @@ impl App {
         }
     }
 
-    /// Open a built-in Windows screen. Hive Mend only launches it.
+    /// Open a built-in Windows screen. Hivemend only launches it.
     fn open_tool(&self, index: usize) {
         if self.busy() {
             return;
@@ -2098,7 +2098,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            "Set {} to start on demand (Manual)?\n\nHivemend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
                 format!(
                     "{} ({})",
@@ -2307,7 +2307,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to {}?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            "Set {} to {}?\n\nHivemend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
                 format!(
                     "{} (now {})",
@@ -2465,7 +2465,7 @@ impl App {
             if custom_privacy_file().exists() {
                 let mut custom = parse_custom("", &HostFs);
                 custom.warnings.push(
-                    "Custom items are not used while Hive Mend runs as administrator. Start it without administrator rights to clean them."
+                    "Custom items are not used while Hivemend runs as administrator. Start it without administrator rights to clean them."
                         .to_string(),
                 );
                 items.push(custom);
@@ -2664,7 +2664,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Clean {} {}?\n\nHive Mend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            "Clean {} {}?\n\nHivemend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
             if selected.len() == 1 {
                 "category"
@@ -3528,7 +3528,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
+            "Repair {} {}?\n\nHivemend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
             if selected.len() == 1 {
                 "entry"
@@ -3778,7 +3778,7 @@ impl App {
             };
             self.message(
                 &format!(
-                    "This backup is in {place}, so Hive Mend does not restore it with administrator rights.\n\nStart Hive Mend without administrator rights to put back the entries for your own account."
+                    "This backup is in {place}, so Hivemend does not restore it with administrator rights.\n\nStart Hivemend without administrator rights to put back the entries for your own account."
                 ),
                 MB_ICONWARNING,
             );
@@ -3786,13 +3786,13 @@ impl App {
         }
         if backup.summary.machine_wide && !self.elevated && !backup.store.elevated_may_restore() {
             self.message(
-                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hive Mend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
+                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hivemend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
                 MB_ICONWARNING,
             );
             return;
         }
         if backup.summary.machine_wide && !self.elevated {
-            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
+            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hivemend as administrator now?";
             if self.confirm(ask, Redo::Restore(row)) {
                 self.elevate();
             }
@@ -4578,7 +4578,7 @@ impl App {
                 right: rect.right / 2,
                 bottom: header,
             },
-            "Hive Mend",
+            "Hivemend",
             DT_SINGLELINE | DT_VCENTER,
         );
         let help_size = measure(hdc, self.fonts.body, "Help");
@@ -5197,7 +5197,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Cleaning {
             self.heading(hdc, rect, "Privacy", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hivemend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5241,7 +5241,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Shredding {
             self.heading(hdc, rect, "Shredder", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hivemend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5290,7 +5290,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Services {
             self.heading(hdc, rect, "Services", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hivemend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5398,7 +5398,7 @@ impl App {
                 let line = if self.job == Job::Scanning {
                     "Scanning only reads the registry. Nothing is changed."
                 } else {
-                    "Please keep Hive Mend open until the repair finishes."
+                    "Please keep Hivemend open until the repair finishes."
                 };
                 self.subtitle(hdc, rect, line);
                 let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
@@ -5644,7 +5644,7 @@ impl App {
                 right,
                 bottom: y + self.s(40),
             },
-            "Hive Mend Health",
+            "Hivemend Health",
             DT_SINGLELINE,
         );
         y += self.s(46);
@@ -5917,7 +5917,7 @@ impl App {
         self.subtitle(
             hdc,
             rect,
-            "Screens that ship with Windows. Hive Mend only opens them.",
+            "Screens that ship with Windows. Hivemend only opens them.",
         );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
@@ -5992,7 +5992,7 @@ impl App {
             hdc,
             rect,
             &format!(
-                "Hive Mend {} \u{00b7} a TUIGSE LLC project",
+                "Hivemend {} \u{00b7} a TUIGSE LLC project",
                 env!("CARGO_PKG_VERSION")
             ),
         );
@@ -6037,7 +6037,7 @@ impl App {
             left,
             right,
             y,
-            "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
+            "Hivemend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
         ) + gap / 2;
         y = paragraph(
             hdc,

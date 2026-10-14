@@ -1,8 +1,8 @@
-# Hive Mend
+# Hivemend
 
-Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
+Hivemend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
 
-> **Use at your own risk.** Hive Mend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but shredded files and cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+> **Use at your own risk.** Hivemend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but shredded files and cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 It covers twelve scanner jobs:
 
@@ -43,14 +43,14 @@ CI runs the same checks on Linux and Windows for every pull request: formatting,
 ## Use
 
 ```bash
-hive-mend scanners
-hive-mend scan
-hive-mend scan --only SL,SUP,ARP
-hive-mend repair
-hive-mend repair --yes
-hive-mend shred --passes 3 C:\Users\Me\old-letters
-hive-mend shred --passes 3 --yes C:\Users\Me\old-letters
-hive-mend hives
+hivemend scanners
+hivemend scan
+hivemend scan --only SL,SUP,ARP
+hivemend repair
+hivemend repair --yes
+hivemend shred --passes 3 C:\Users\Me\old-letters
+hivemend shred --passes 3 --yes C:\Users\Me\old-letters
+hivemend hives
 ```
 
 `scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
@@ -60,30 +60,30 @@ hive-mend hives
 Settings, the ignore list, custom privacy items, and backups made
 without administrator rights live in `%LOCALAPPDATA%\HiveMend`, which only
 your account can change. Backups made as administrator go to
-`%ProgramData%\HiveMend\backups`, a folder Hive Mend creates owned by
+`%ProgramData%\HiveMend\backups`, a folder Hivemend creates owned by
 Administrators and writable only by SYSTEM and Administrators; if that
-folder already exists with any other owner or permissions, Hive Mend
+folder already exists with any other owner or permissions, Hivemend
 refuses to use it rather than repair it. Running as administrator, Hive
 Mend restores only from that protected folder.
 
 Older versions kept everything in `C:\HiveMend`, which every account on
-the PC can change. Hive Mend never moves or deletes that folder. Its
+the PC can change. Hivemend never moves or deletes that folder. Its
 backups are still listed, marked as the old shared folder, and can be
-restored only from Hive Mend started without administrator rights, which
+restored only from Hivemend started without administrator rights, which
 can put back only your own (HKCU) entries. Settings found there are copied
 once into the per-user folder.
 
 If you still have an extracted legacy cleaner `app` folder, its original rules and ignore lists can be merged in:
 
 ```bash
-hive-mend scan --data "C:\Path\To\Extracted\app"
+hivemend scan --data "C:\Path\To\Extracted\app"
 ```
 
 That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.dat` when they are present. Those files are not part of this repository.
 
-`hive-mend demo` runs the sample hive on any operating system.
+`hivemend demo` runs the sample hive on any operating system.
 
-`hive-mend hives` lists the registry hive files and their sizes. It only reads. Offline compaction is deliberately not offered: swapping hives at reboot would silently discard everything written after the save, and Windows manages hive space itself.
+`hivemend hives` lists the registry hive files and their sizes. It only reads. Offline compaction is deliberately not offered: swapping hives at reboot would silently discard everything written after the save, and Windows manages hive space itself.
 
 ## Window
 
@@ -126,10 +126,10 @@ Restore, Privacy, Shredder, Services, Monitor, Tools, Settings, and About.
   traces may survive in spare blocks the overwrite cannot reach. No
   administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
-  usage bars, plus the Hive Mend health summary and a read-only
+  usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.
 - Tools opens screens that ship with Windows (Device Manager, Services,
-  System Restore, Windows Update, and the rest). Hive Mend only
+  System Restore, Windows Update, and the rest). Hivemend only
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
@@ -141,7 +141,7 @@ rendered at the screen's own scale. Nothing is loaded from image files.
 Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a
-reason shown on the Custom row. Hive Mend running as administrator leaves
+reason shown on the Custom row. Hivemend running as administrator leaves
 the custom list out and starts with no privacy category ticked, because
 programs running without administrator rights can edit those per-user
 files; clean custom items from a window started normally.
@@ -158,8 +158,8 @@ value=HKCU\Software\MyApp\Settings|RecentFile1
 Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt`, the exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
 
 ```bash
-gh attestation verify hive-mend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend
-cargo audit bin hive-mend-v0.1.0-x86_64-windows.exe
+gh attestation verify Hivemend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend
+cargo audit bin Hivemend-v0.1.0-x86_64-windows.exe
 ```
 
 ## Security
@@ -170,7 +170,7 @@ Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.
 
 <img src="docs/tuigse-emblem.png" width="96" alt="TUIGSE LLC emblem">
 
-Hive Mend is a TUIGSE LLC project.
+Hivemend is a TUIGSE LLC project.
 
 ## License
 

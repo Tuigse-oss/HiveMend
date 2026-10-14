@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 #[derive(Parser)]
 #[command(
-    name = "hive-mend",
+    name = "hivemend",
     version,
     about = "Scan and repair stale registry entries on Windows 10 and 11"
 )]
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
             ExitCode::from(1)
         }
     }
@@ -265,7 +265,7 @@ fn scan_live(
     {
         let _ = (engine, opts, args, narrow);
         Err(hive_mend::Error(
-            "live registry scan needs Windows. Use `hive-mend demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
+            "live registry scan needs Windows. Use `hivemend demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
         ))
     }
 }
@@ -297,12 +297,12 @@ fn repair_live(
         );
         if outcome.denied > 0 {
             eprintln!(
-                "hive-mend: {} entries need an elevated (Run as administrator) prompt",
+                "hivemend: {} entries need an elevated (Run as administrator) prompt",
                 outcome.denied
             );
         }
         for err in &outcome.errors {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
         }
         Ok(if outcome.errors.is_empty() {
             ExitCode::SUCCESS
@@ -330,7 +330,7 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
             file.display()
         );
         for err in &errors {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
         }
         Ok(if errors.is_empty() {
             ExitCode::SUCCESS
@@ -428,10 +428,10 @@ fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
         format_bytes(outcome.bytes)
     );
     for reason in refused.iter().chain(outcome.refused.iter()) {
-        eprintln!("hive-mend: refused: {reason}");
+        eprintln!("hivemend: refused: {reason}");
     }
     for err in &outcome.errors {
-        eprintln!("hive-mend: {err}");
+        eprintln!("hivemend: {err}");
     }
     Ok(if outcome.errors.is_empty() {
         ExitCode::SUCCESS

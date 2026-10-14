@@ -1,6 +1,6 @@
 //! Windows tools shortcuts: the "Help Center" page.
 //!
-//! Every entry opens a screen that ships with Windows. Hive Mend only
+//! Every entry opens a screen that ships with Windows. Hivemend only
 //! opens them; anything changed inside one is the user's own doing in a
 //! Microsoft console. Targets use the same `%SystemRoot%` templates as the
 //! original, updated for Windows 10 and 11 (dead CPLs replaced by their
@@ -14,7 +14,7 @@ pub struct WindowsTool {
     pub name: &'static str,
     /// One-line description shown under the name.
     pub description: &'static str,
-    /// The Hive Mend icon shown on the tile.
+    /// The Hivemend icon shown on the tile.
     pub icon: Icon,
     /// `%SystemRoot%` template, plain exe name, or Settings URI.
     pub target: &'static str,

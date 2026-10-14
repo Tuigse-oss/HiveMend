@@ -148,7 +148,7 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
     body.push_str(BACKUP_MARKER);
     body.push_str("\r\n");
-    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
+    body.push_str("; Restore it from the Restore page in Hivemend.\r\n");
     let mut unreadable = Vec::new();
 
     for key in trees {
@@ -506,7 +506,7 @@ pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
     found
 }
 
-/// True when the text carries a Hive Mend marker line: the unified marker, or
+/// True when the text carries a Hivemend marker line: the unified marker, or
 /// the older services-only marker so a services backup can still be restored.
 pub fn is_hive_mend_backup(text: &str) -> bool {
     text.lines().any(|line| {
@@ -523,7 +523,7 @@ pub fn import_reg_file(path: &Path) -> Result<(), String> {
         read_backup(path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
     if !is_hive_mend_backup(&text) {
         return Err(format!(
-            "{} is not a Hive Mend backup; refusing to merge it",
+            "{} is not a Hivemend backup; refusing to merge it",
             path.display()
         ));
     }
@@ -712,7 +712,7 @@ mod tests {
         )
         .unwrap();
         let err = import_reg_file(&path).unwrap_err();
-        assert!(err.contains("not a Hive Mend backup"), "unexpected: {err}");
+        assert!(err.contains("not a Hivemend backup"), "unexpected: {err}");
         // Must fail before reg.exe is ever invoked: safe on any platform.
         std::fs::remove_dir_all(&dir).ok();
     }
