@@ -87,12 +87,14 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 
 ## Window
 
-Double-clicking the exe opens the window: Status, Start Scan, Restore,
-Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
+Double-clicking the exe opens the window. The left rail lists Home, Scan,
+Restore, Privacy, Shredder, Services, Monitor, Tools, Settings, and About.
 
-- Status shows Scan Your Registry, Optimize Your System (a quick
-  startup, uninstall, shared-DLL, and COM pass), and Monitor Your System
-  cards, plus the last scan result and a statistics reset link.
+- Home leads with the registry's status (healthy, stale entries found, or
+  not scanned yet) and a Scan now button, then tiles for Privacy,
+  Shredder, Optimize (a quick startup, uninstall, shared-DLL, and COM
+  pass), Monitor, Restore, and Windows Tools, and a line of statistics
+  with a reset link.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
   startup type of a highlighted row). Changing a startup type writes a

@@ -37,11 +37,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-    CreatePen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
+    CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HBITMAP, HBRUSH, HDC, HFONT,
-    InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetTextColor, TRANSPARENT, TRIVERTEX,
+    HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -147,10 +146,10 @@ const MENU_SVC_MANUAL: usize = 15;
 const MENU_SVC_DISABLED: usize = 16;
 
 /// Layout is designed at 96 DPI and scaled.
-const HEADER_H: i32 = 72;
+const HEADER_H: i32 = 56;
 const SIDEBAR_W: i32 = 172;
 const CONTENT_X: i32 = 196;
-const FOOTER_H: i32 = 8;
+const FOOTER_H: i32 = 0;
 const TITLE_Y: i32 = HEADER_H + 14;
 const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
@@ -158,15 +157,22 @@ const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
 const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 18;
 
-const BG: u32 = rgb(255, 255, 255);
-const SIDEBAR_BG: u32 = rgb(234, 241, 236);
+/// The window background; cards and tiles sit on it as white surfaces.
+const BG: u32 = rgb(245, 247, 246);
+const SURFACE: u32 = rgb(255, 255, 255);
+const BORDER: u32 = rgb(222, 229, 224);
+/// The primary action colour (Scan now, the open page's marker).
+const ACCENT_GREEN: u32 = rgb(24, 122, 66);
+const ACCENT_GREEN_HOVER: u32 = rgb(16, 100, 52);
+/// Soft green fill for the open page and hovered tiles.
+const ACCENT_TINT: u32 = rgb(224, 240, 229);
+const HOVER_TINT: u32 = rgb(232, 238, 234);
+const SIDEBAR_BG: u32 = rgb(238, 242, 239);
 const INK: u32 = rgb(28, 28, 28);
 const MUTED: u32 = rgb(88, 98, 92);
 const LINK: u32 = rgb(22, 110, 56);
 /// Deep Celtic green, the theme colour shared with the icons in `art`.
 const THEME_INK: u32 = rgb(22, 86, 48);
-/// Gold, the icons' accent colour.
-const ACCENT: u32 = rgb(166, 118, 22);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -182,17 +188,17 @@ enum Page {
     About,
 }
 
-const NAV: &[(&str, Page)] = &[
-    ("Status", Page::Status),
-    ("Start Scan", Page::Scan),
-    ("Restore", Page::Restore),
-    ("Settings", Page::Settings),
-    ("Services", Page::Services),
-    ("Privacy", Page::Privacy),
-    ("Shredder", Page::Shredder),
-    ("Monitor", Page::Monitor),
-    ("Tools", Page::Tools),
-    ("About", Page::About),
+const NAV: &[(&str, Page, Icon)] = &[
+    ("Home", Page::Status, Icon::Logo),
+    ("Scan", Page::Scan, Icon::Scan),
+    ("Restore", Page::Restore, Icon::Restore),
+    ("Privacy", Page::Privacy, Icon::Privacy),
+    ("Shredder", Page::Shredder, Icon::Shredder),
+    ("Services", Page::Services, Icon::Optimize),
+    ("Monitor", Page::Monitor, Icon::Monitor),
+    ("Tools", Page::Tools, Icon::Tools),
+    ("Settings", Page::Settings, Icon::Settings),
+    ("About", Page::About, Icon::About),
 ];
 
 /// Friendly names and what each scanner looks at, for Settings.
@@ -449,6 +455,8 @@ struct App {
     bg_brush: HBRUSH,
     /// Icons rendered by `art` at the pixel sizes drawn so far.
     art: HashMap<(Icon, i32), HBITMAP>,
+    /// Anti-aliased corner sprites for rounded boxes, by radius and colours.
+    corners: HashMap<(i32, u32, u32, i32, u32), HBITMAP>,
     hotspots: Vec<HotSpot>,
     hover: Option<usize>,
     tracking: bool,
@@ -994,6 +1002,7 @@ impl App {
             fonts: make_fonts(dpi),
             bg_brush: unsafe { CreateSolidBrush(BG) },
             art: HashMap::new(),
+            corners: HashMap::new(),
             hotspots: Vec::new(),
             hover: None,
             tracking: false,
@@ -1264,7 +1273,7 @@ impl App {
     }
 
     fn release(self) {
-        for bitmap in self.art.values() {
+        for bitmap in self.art.values().chain(self.corners.values()) {
             if !bitmap.is_null() {
                 unsafe { DeleteObject(*bitmap) };
             }
@@ -4536,30 +4545,16 @@ impl App {
 
     unsafe fn draw_chrome(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         let header = self.s(HEADER_H);
-        // A lighter top half over a deeper bottom half gives the header its gloss.
-        gradient(
+        // A clean title bar: logo, name, a hairline beneath.
+        fill(
             hdc,
             RECT {
                 left: 0,
                 top: 0,
                 right: rect.right,
-                bottom: header / 2,
-            },
-            (34, 112, 62),
-            (80, 154, 96),
-            false,
-        );
-        gradient(
-            hdc,
-            RECT {
-                left: 0,
-                top: header / 2,
-                right: rect.right,
                 bottom: header,
             },
-            (16, 78, 42),
-            (44, 124, 70),
-            false,
+            SURFACE,
         );
         fill(
             hdc,
@@ -4569,14 +4564,16 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            rgb(12, 56, 30),
+            BORDER,
         );
+        let logo = self.s(30);
+        self.draw_icon(hdc, Icon::Logo, self.s(20), (header - logo) / 2, logo);
         text(
             hdc,
-            self.fonts.title,
-            rgb(255, 255, 255),
+            self.fonts.heading,
+            INK,
             RECT {
-                left: self.s(24),
+                left: self.s(20) + logo + self.s(12),
                 top: 0,
                 right: rect.right / 2,
                 bottom: header,
@@ -4584,81 +4581,65 @@ impl App {
             "Hive Mend",
             DT_SINGLELINE | DT_VCENTER,
         );
-        let help_size = measure(hdc, self.fonts.body_bold, "Help");
+        let help_size = measure(hdc, self.fonts.body, "Help");
         let help = RECT {
-            left: rect.right - self.s(20) - help_size.0,
+            left: rect.right - self.s(24) - help_size.0,
             top: header / 2 - self.s(13),
-            right: rect.right - self.s(20),
+            right: rect.right - self.s(24),
             bottom: header / 2 + self.s(13),
         };
         let help_lit = lit(hover, help);
         text(
             hdc,
-            self.fonts.body_bold,
-            if help_lit {
-                rgb(255, 255, 255)
-            } else {
-                rgb(222, 240, 226)
-            },
+            self.fonts.body,
+            if help_lit { ACCENT_GREEN } else { MUTED },
             help,
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
         );
-        if help_lit {
-            fill(
-                hdc,
-                RECT {
-                    left: help.left,
-                    top: help.bottom - 1,
-                    right: help.right,
-                    bottom: help.bottom,
-                },
-                rgb(255, 255, 255),
-            );
-        }
         self.spot(help, Action::Page(Page::About));
-        let badge = RECT {
-            left: rect.right - self.s(260),
-            top: 0,
-            right: help.left - self.s(16),
-            bottom: header,
-        };
+        let right_edge = help.left - self.s(20);
         if self.elevated {
+            let label = "Administrator";
+            let size = measure(hdc, self.fonts.small, label);
+            let badge = RECT {
+                left: right_edge - size.0 - self.s(20),
+                top: header / 2 - self.s(12),
+                right: right_edge,
+                bottom: header / 2 + self.s(12),
+            };
+            self.panel(hdc, badge, self.s(12), ACCENT_TINT, ACCENT_TINT, 0, SURFACE);
             text(
                 hdc,
                 self.fonts.small,
-                rgb(226, 242, 230),
+                THEME_INK,
                 badge,
-                "Running as administrator",
-                DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
             );
         } else {
             let label = "Run as administrator";
-            let size = measure(hdc, self.fonts.body_bold, label);
+            let size = measure(hdc, self.fonts.body, label);
             let link = RECT {
-                left: badge.right - size.0 - self.s(24),
-                top: header / 2 - self.s(17),
-                right: badge.right,
-                bottom: header / 2 + self.s(17),
+                left: right_edge - size.0 - self.s(28),
+                top: header / 2 - self.s(16),
+                right: right_edge,
+                bottom: header / 2 + self.s(16),
             };
             let lit = lit(hover, link);
-            bubble(
+            self.panel(
                 hdc,
                 link,
-                self.s(16),
-                (255, 255, 255),
-                if lit {
-                    (226, 240, 230)
-                } else {
-                    (244, 234, 200)
-                },
-                rgb(196, 156, 56),
+                self.s(8),
+                if lit { ACCENT_TINT } else { SURFACE },
+                ACCENT_GREEN,
                 1,
+                SURFACE,
             );
             text(
                 hdc,
-                self.fonts.body_bold,
-                THEME_INK,
+                self.fonts.body,
+                ACCENT_GREEN,
                 link,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -4666,78 +4647,83 @@ impl App {
             self.spot(link, Action::Elevate);
         }
 
+        // The navigation rail: icon and label per page; the open page gets
+        // a soft green fill and an accent bar.
         let side = RECT {
             left: 0,
             top: header,
             right: self.s(SIDEBAR_W),
-            bottom: rect.bottom - self.s(FOOTER_H),
+            bottom: rect.bottom,
         };
         fill(hdc, side, SIDEBAR_BG);
         fill(
             hdc,
             RECT {
-                left: side.right,
+                left: side.right - 1,
                 top: header,
-                right: side.right + 1,
+                right: side.right,
                 bottom: side.bottom,
             },
-            rgb(198, 214, 202),
+            BORDER,
         );
-        gradient(
-            hdc,
-            RECT {
-                left: 0,
-                top: rect.bottom - self.s(FOOTER_H),
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            (236, 214, 70),
-            (90, 176, 72),
-            false,
-        );
-        let mut y = header + self.s(20);
-        for (label, page) in NAV {
-            let pill = RECT {
-                left: self.s(16),
+        let mut y = header + self.s(14);
+        for (label, page, icon) in NAV {
+            let item = RECT {
+                left: self.s(10),
                 top: y,
-                right: self.s(SIDEBAR_W - 16),
+                right: self.s(SIDEBAR_W - 10),
                 bottom: y + self.s(38),
             };
             let selected = self.page == *page;
-            let lit = lit(hover, pill);
-            // Glossy bubble buttons: gold for the open page, green on hover.
-            let (bottom, border, width) = if selected {
-                ((240, 220, 150), rgb(166, 124, 34), 2)
-            } else if lit {
-                ((206, 234, 214), rgb(46, 130, 76), 1)
-            } else {
-                ((228, 238, 230), rgb(176, 192, 182), 1)
-            };
-            bubble(
+            let lit = lit(hover, item);
+            if selected || lit {
+                let tint = if selected { ACCENT_TINT } else { HOVER_TINT };
+                self.panel(hdc, item, self.s(8), tint, tint, 0, SIDEBAR_BG);
+            }
+            if selected {
+                let bar_h = self.s(16);
+                self.panel(
+                    hdc,
+                    RECT {
+                        left: item.left,
+                        top: item.top + (self.s(38) - bar_h) / 2,
+                        right: item.left + self.s(4),
+                        bottom: item.top + (self.s(38) + bar_h) / 2,
+                    },
+                    self.s(2),
+                    ACCENT_GREEN,
+                    ACCENT_GREEN,
+                    0,
+                    ACCENT_TINT,
+                );
+            }
+            let icon_px = self.s(22);
+            self.draw_icon(
                 hdc,
-                pill,
-                self.s(38),
-                (255, 255, 255),
-                bottom,
-                border,
-                width,
+                *icon,
+                item.left + self.s(14),
+                item.top + (self.s(38) - icon_px) / 2,
+                icon_px,
             );
-            let font = if selected {
-                self.fonts.body_bold
-            } else {
-                self.fonts.body
-            };
-            let label = label.replace("&&", "&");
             text(
                 hdc,
-                font,
+                if selected {
+                    self.fonts.body_bold
+                } else {
+                    self.fonts.body
+                },
                 if selected { THEME_INK } else { INK },
-                pill,
-                &label,
-                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+                RECT {
+                    left: item.left + self.s(14) + icon_px + self.s(12),
+                    top: item.top,
+                    right: item.right - self.s(8),
+                    bottom: item.bottom,
+                },
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
-            self.spot(pill, Action::Page(*page));
-            y += self.s(46);
+            self.spot(item, Action::Page(*page));
+            y += self.s(42);
         }
         if self.busy() {
             let note = match self.job {
@@ -4765,6 +4751,109 @@ impl App {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
+    /// A rounded box with anti-aliased corners: `fill`, an optional
+    /// `border` `width` pixels thick, drawn over a `behind` background.
+    unsafe fn panel(
+        &mut self,
+        hdc: HDC,
+        rect: RECT,
+        radius: i32,
+        fill_color: u32,
+        border: u32,
+        width: i32,
+        behind: u32,
+    ) {
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let r = radius.min(w / 2).min(h / 2).max(1);
+        let key = (r, fill_color, border, width, behind);
+        let sprite = *self.corners.entry(key).or_insert_with(|| {
+            let part = |c: u32| {
+                (
+                    (c & 0xff) as u8,
+                    ((c >> 8) & 0xff) as u8,
+                    ((c >> 16) & 0xff) as u8,
+                )
+            };
+            dib(
+                &hive_mend::art::corner_sprite(
+                    r as usize,
+                    part(fill_color),
+                    part(border),
+                    width as f32,
+                    part(behind),
+                ),
+                r * 2,
+            )
+        });
+        // Body, then the straight edges, then the four corner quarters.
+        fill(
+            hdc,
+            RECT {
+                left: rect.left + r,
+                top: rect.top,
+                right: rect.right - r,
+                bottom: rect.bottom,
+            },
+            fill_color,
+        );
+        fill(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: rect.top + r,
+                right: rect.right,
+                bottom: rect.bottom - r,
+            },
+            fill_color,
+        );
+        if width > 0 {
+            for edge in [
+                (rect.left + r, rect.top, rect.right - r, rect.top + width),
+                (
+                    rect.left + r,
+                    rect.bottom - width,
+                    rect.right - r,
+                    rect.bottom,
+                ),
+                (rect.left, rect.top + r, rect.left + width, rect.bottom - r),
+                (
+                    rect.right - width,
+                    rect.top + r,
+                    rect.right,
+                    rect.bottom - r,
+                ),
+            ] {
+                fill(
+                    hdc,
+                    RECT {
+                        left: edge.0,
+                        top: edge.1,
+                        right: edge.2,
+                        bottom: edge.3,
+                    },
+                    border,
+                );
+            }
+        }
+        if sprite.is_null() {
+            return;
+        }
+        let mem = CreateCompatibleDC(hdc);
+        let old = SelectObject(mem, sprite);
+        for (dx, dy, sx, sy) in [
+            (rect.left, rect.top, 0, 0),
+            (rect.right - r, rect.top, r, 0),
+            (rect.left, rect.bottom - r, 0, r),
+            (rect.right - r, rect.bottom - r, r, r),
+        ] {
+            BitBlt(hdc, dx, dy, r, r, mem, sx, sy, SRCCOPY);
+        }
+        SelectObject(mem, old);
+        DeleteDC(mem);
+    }
+
     unsafe fn heading(&self, hdc: HDC, rect: RECT, title: &str, accent: Option<&str>) {
         let left = self.s(CONTENT_X);
         let top = self.s(TITLE_Y);
@@ -4787,7 +4876,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.title,
-                ACCENT,
+                INK,
                 RECT {
                     left: x,
                     top,
@@ -4853,206 +4942,204 @@ impl App {
         ]
     }
 
-    /// One glossy action button on the Status page. `main` marks the
-    /// headline tool with a gold rim and a single-line description.
-    unsafe fn action_card(
-        &mut self,
-        hdc: HDC,
-        card: RECT,
-        hover: Option<RECT>,
-        (icon, title, subtitle, action): (Icon, &str, &str, Action),
-        main: bool,
-    ) {
-        let disabled = action.starts_job() && self.busy();
-        let lit = !disabled && lit(hover, card);
-        let (top, bottom, border, width) = if lit {
-            ((255, 255, 255), (204, 232, 212), rgb(46, 130, 76), 2)
-        } else if main {
-            ((255, 255, 255), (238, 232, 206), rgb(196, 156, 56), 2)
-        } else {
-            ((255, 255, 255), (228, 238, 230), rgb(176, 196, 182), 1)
-        };
-        bubble(hdc, card, self.s(22), top, bottom, border, width);
-        let card_h = card.bottom - card.top;
-        let icon_px = self.s(56).min(card_h - self.s(16));
-        self.draw_icon(
-            hdc,
-            icon,
-            card.left + self.s(14),
-            card.top + (card_h - icon_px) / 2,
-            icon_px,
-        );
-        let text_left = card.left + self.s(14) + icon_px + self.s(14);
-        let color = if disabled { MUTED } else { THEME_INK };
-        text(
-            hdc,
-            self.fonts.heading,
-            color,
-            RECT {
-                left: text_left,
-                top: card.top + self.s(12),
-                right: card.right - self.s(14),
-                bottom: card.top + self.s(42),
-            },
-            title,
-            DT_SINGLELINE | DT_END_ELLIPSIS,
-        );
-        let (font, flags) = if main {
-            (self.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS)
-        } else {
-            (self.fonts.small, DT_WORDBREAK | DT_END_ELLIPSIS)
-        };
-        text(
-            hdc,
-            font,
-            MUTED,
-            RECT {
-                left: text_left,
-                top: card.top + self.s(42),
-                right: card.right - self.s(14),
-                bottom: card.bottom - self.s(6),
-            },
-            subtitle,
-            flags,
-        );
-        self.spot(card, action);
-    }
-
+    /// The home page: a status banner with the one primary action, then the
+    /// other tools as tiles, then a quiet line of statistics.
     unsafe fn draw_status(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
-        self.heading(hdc, rect, "Select an", Some("Action"));
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
-        // Hive Mend's main tool spans the row; the other four sit in pairs
-        // beneath it, so privacy cleaning and shredding are in plain view.
-        let gap = self.s(12);
-        let card_h = self.s(84);
-        let mut y = self.s(HEADER_H + 64);
-        self.action_card(
-            hdc,
-            RECT {
-                left,
-                top: y,
-                right,
-                bottom: y + card_h,
-            },
-            hover,
-            (
-                Icon::Scan,
-                "Scan Your Registry",
-                "Find entries left behind by programs that are no longer installed",
-                Action::ScanAll,
-            ),
-            true,
-        );
-        y += card_h + gap;
-        let half = (right - left - gap) / 2;
-        let rows = [
-            [
-                (
-                    Icon::Privacy,
-                    "Clean Privacy Traces",
-                    "Browser history, temp files, and recent-file lists",
-                    Action::Page(Page::Privacy),
-                ),
-                (
-                    Icon::Shredder,
-                    "Shred Files",
-                    "Overwrite files so they can never be recovered",
-                    Action::Page(Page::Shredder),
-                ),
-            ],
-            [
-                (
-                    Icon::Optimize,
-                    "Optimize Your System",
-                    "Quick check of startup, uninstall, DLL, and COM entries",
-                    Action::Optimize,
-                ),
-                (
-                    Icon::Monitor,
-                    "Monitor Your System",
-                    "Memory, disk space, and uptime at a glance",
-                    Action::Page(Page::Monitor),
-                ),
-            ],
-        ];
-        for row in rows {
-            for (column, card) in row.into_iter().enumerate() {
-                let card_left = left + column as i32 * (half + gap);
-                self.action_card(
-                    hdc,
-                    RECT {
-                        left: card_left,
-                        top: y,
-                        right: card_left + half,
-                        bottom: y + card_h,
-                    },
-                    hover,
-                    card,
-                    false,
-                );
-            }
-            y += card_h + gap;
-        }
+        let mut y = self.s(TITLE_Y);
 
-        y += self.s(10);
+        // Status banner.
+        let banner = RECT {
+            left,
+            top: y,
+            right,
+            bottom: y + self.s(120),
+        };
+        self.panel(hdc, banner, self.s(10), SURFACE, BORDER, 1, BG);
+        let (badge, headline, detail) = self.status_text();
+        let badge_px = self.s(72);
+        self.draw_icon(
+            hdc,
+            badge,
+            banner.left + self.s(22),
+            banner.top + (self.s(120) - badge_px) / 2,
+            badge_px,
+        );
+        let button = RECT {
+            left: banner.right - self.s(22) - self.s(150),
+            top: banner.top + (self.s(120) - self.s(42)) / 2,
+            right: banner.right - self.s(22),
+            bottom: banner.top + (self.s(120) + self.s(42)) / 2,
+        };
+        let text_left = banner.left + self.s(22) + badge_px + self.s(20);
         text(
             hdc,
             self.fonts.title,
             INK,
             RECT {
+                left: text_left,
+                top: banner.top + self.s(24),
+                right: button.left - self.s(16),
+                bottom: banner.top + self.s(62),
+            },
+            &headline,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        text(
+            hdc,
+            self.fonts.body,
+            MUTED,
+            RECT {
+                left: text_left,
+                top: banner.top + self.s(64),
+                right: button.left - self.s(16),
+                bottom: banner.bottom - self.s(12),
+            },
+            &detail,
+            DT_WORDBREAK | DT_END_ELLIPSIS,
+        );
+        let disabled = self.busy();
+        let button_lit = !disabled && lit(hover, button);
+        let fill_color = if disabled {
+            rgb(160, 176, 166)
+        } else if button_lit {
+            ACCENT_GREEN_HOVER
+        } else {
+            ACCENT_GREEN
+        };
+        self.panel(hdc, button, self.s(8), fill_color, fill_color, 0, SURFACE);
+        text(
+            hdc,
+            self.fonts.body_bold,
+            SURFACE,
+            button,
+            "Scan now",
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+        );
+        self.spot(button, Action::ScanAll);
+        y = banner.bottom + self.s(22);
+
+        // Tools grid.
+        text(
+            hdc,
+            self.fonts.heading,
+            INK,
+            RECT {
                 left,
                 top: y,
                 right,
-                bottom: y + self.s(40),
+                bottom: y + self.s(28),
             },
-            "Status & Summary",
+            "Tools",
             DT_SINGLELINE,
         );
-        y += self.s(46);
-        let label_w = self.s(150);
-        for (label, value) in self.summary_rows() {
+        y += self.s(36);
+        let tiles = [
+            (Icon::Privacy, "Privacy", Action::Page(Page::Privacy)),
+            (Icon::Shredder, "Shredder", Action::Page(Page::Shredder)),
+            (Icon::Optimize, "Optimize", Action::Optimize),
+            (Icon::Monitor, "Monitor", Action::Page(Page::Monitor)),
+            (Icon::Restore, "Restore", Action::Page(Page::Restore)),
+            (Icon::Tools, "Windows Tools", Action::Page(Page::Tools)),
+        ];
+        let gap = self.s(14);
+        let tile_w = (right - left - gap * 2) / 3;
+        let tile_h = self.s(104);
+        for (index, (icon, label, action)) in tiles.into_iter().enumerate() {
+            let column = (index % 3) as i32;
+            let row = (index / 3) as i32;
+            let tile = RECT {
+                left: left + column * (tile_w + gap),
+                top: y + row * (tile_h + gap),
+                right: left + column * (tile_w + gap) + tile_w,
+                bottom: y + row * (tile_h + gap) + tile_h,
+            };
+            let disabled = action.starts_job() && self.busy();
+            let tile_lit = !disabled && lit(hover, tile);
+            self.panel(
+                hdc,
+                tile,
+                self.s(10),
+                if tile_lit { ACCENT_TINT } else { SURFACE },
+                if tile_lit { ACCENT_GREEN } else { BORDER },
+                1,
+                BG,
+            );
+            let icon_px = self.s(48);
+            self.draw_icon(
+                hdc,
+                icon,
+                tile.left + (tile_w - icon_px) / 2,
+                tile.top + self.s(14),
+                icon_px,
+            );
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                if disabled { MUTED } else { INK },
                 RECT {
-                    left,
-                    top: y,
-                    right: left + label_w,
-                    bottom: y + self.s(24),
+                    left: tile.left + self.s(6),
+                    top: tile.top + self.s(14) + icon_px + self.s(8),
+                    right: tile.right - self.s(6),
+                    bottom: tile.bottom - self.s(6),
                 },
                 label,
-                DT_SINGLELINE,
+                DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS,
             );
-            text(
-                hdc,
-                self.fonts.body,
-                INK,
-                RECT {
-                    left: left + label_w,
-                    top: y,
-                    right,
-                    bottom: y + self.s(24),
-                },
-                &value,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            y += self.s(26);
+            self.spot(tile, action);
         }
-        y += self.s(6);
-        let mut x = left;
-        if self.scanned && self.page == Page::Status {
-            let label = "View scan results";
-            let size = measure(hdc, self.fonts.body, label);
+        y += tile_h * 2 + gap + self.s(18);
+
+        // Statistics, quietly.
+        let rows = self.summary_rows();
+        let stats = rows
+            .iter()
+            .filter(|(label, _)| matches!(*label, "Last repair" | "Backups" | "Ignored"))
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("   \u{00b7}   ");
+        let stats_size = measure(hdc, self.fonts.small, &stats);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(22),
+            },
+            &stats,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        let mut x = left + stats_size.0 + self.s(24);
+        let mut links: Vec<(&str, Action)> = Vec::new();
+        if self.scanned {
+            links.push(("View scan results", Action::Page(Page::Scan)));
+        }
+        links.push(("Reset statistics", Action::ResetStats));
+        for (label, action) in links {
+            let size = measure(hdc, self.fonts.small, label);
+            if x + size.0 > right {
+                break;
+            }
             let link = RECT {
                 left: x,
                 top: y,
                 right: x + size.0,
                 bottom: y + size.1,
             };
-            text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
-            if lit(hover, link) {
+            let link_lit = lit(hover, link);
+            text(
+                hdc,
+                self.fonts.small,
+                if link_lit { ACCENT_GREEN_HOVER } else { LINK },
+                link,
+                label,
+                DT_SINGLELINE,
+            );
+            if link_lit {
                 fill(
                     hdc,
                     RECT {
@@ -5061,34 +5148,48 @@ impl App {
                         right: link.right,
                         bottom: link.bottom,
                     },
-                    LINK,
+                    ACCENT_GREEN_HOVER,
                 );
             }
-            self.spot(link, Action::Page(Page::Scan));
-            x = link.right + self.s(24);
+            self.spot(link, action);
+            x = link.right + self.s(20);
         }
-        let label = "Click to reset statistics";
-        let size = measure(hdc, self.fonts.body, label);
-        let link = RECT {
-            left: x,
-            top: y,
-            right: x + size.0,
-            bottom: y + size.1,
+    }
+
+    /// The home banner's badge, headline, and detail line.
+    fn status_text(&self) -> (Icon, String, String) {
+        let when = if self.settings.last_scan.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", self.settings.last_scan)
         };
-        text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
-        if lit(hover, link) {
-            fill(
-                hdc,
-                RECT {
-                    left: link.left,
-                    top: link.bottom - 1,
-                    right: link.right,
-                    bottom: link.bottom,
-                },
-                LINK,
+        if self.job == Job::Scanning {
+            return (
+                Icon::StatusUnknown,
+                "Scanning your registry...".to_string(),
+                "Results appear on the Scan page when it finishes.".to_string(),
             );
         }
-        self.spot(link, Action::ResetStats);
+        match self.settings.last_problems {
+            None => (
+                Icon::StatusUnknown,
+                "No scan yet".to_string(),
+                "Scan to find registry entries, shortcuts, and temp files left behind by programs that are no longer installed.".to_string(),
+            ),
+            Some(0) => (
+                Icon::StatusOk,
+                "Your registry looks healthy".to_string(),
+                format!("The last scan{when} found no stale entries."),
+            ),
+            Some(count) => (
+                Icon::StatusWarn,
+                format!(
+                    "{count} stale {} found",
+                    if count == 1 { "entry" } else { "entries" }
+                ),
+                format!("From the last scan{when}. Scan again to review and repair them."),
+            ),
+        }
     }
 
     unsafe fn draw_privacy(&mut self, hdc: HDC, rect: RECT) {
@@ -5230,7 +5331,7 @@ impl App {
             };
             let selected = self.svc_view == view;
             let lit = lit(hover, tab);
-            round_box(
+            self.panel(
                 hdc,
                 tab,
                 self.s(14),
@@ -5246,7 +5347,8 @@ impl App {
                 } else {
                     rgb(184, 198, 188)
                 },
-                if selected { 2 } else { 1 },
+                1,
+                BG,
             );
             text(
                 hdc,
@@ -5778,13 +5880,14 @@ impl App {
                 ..bar
             }
         };
-        round_box(
+        self.panel(
             hdc,
             track,
             self.s(6),
             rgb(236, 242, 238),
             rgb(184, 198, 188),
             1,
+            BG,
         );
         let color = if used >= 90 {
             rgb(200, 60, 60)
@@ -5835,21 +5938,14 @@ impl App {
                 bottom: y + row_h,
             };
             let lit = lit(hover, tile);
-            round_box(
+            self.panel(
                 hdc,
                 tile,
-                self.s(12),
-                if lit {
-                    rgb(236, 246, 238)
-                } else {
-                    rgb(249, 251, 249)
-                },
-                if lit {
-                    rgb(46, 130, 76)
-                } else {
-                    rgb(184, 198, 188)
-                },
-                if lit { 2 } else { 1 },
+                self.s(10),
+                if lit { ACCENT_TINT } else { SURFACE },
+                if lit { ACCENT_GREEN } else { BORDER },
+                1,
+                BG,
             );
             let icon_size = self.s(40);
             self.draw_icon(
@@ -6525,64 +6621,6 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: u32) {
     DeleteObject(brush);
 }
 
-unsafe fn round_box(hdc: HDC, rect: RECT, radius: i32, fill_color: u32, border: u32, width: i32) {
-    let pen = CreatePen(0, width, border);
-    let brush = CreateSolidBrush(fill_color);
-    let old_pen = SelectObject(hdc, pen);
-    let old_brush = SelectObject(hdc, brush);
-    RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius,
-        radius,
-    );
-    SelectObject(hdc, old_pen);
-    SelectObject(hdc, old_brush);
-    DeleteObject(pen);
-    DeleteObject(brush);
-}
-
-unsafe fn gradient(hdc: HDC, rect: RECT, start: (u8, u8, u8), end: (u8, u8, u8), vertical: bool) {
-    let mut vert = [
-        TRIVERTEX {
-            x: rect.left,
-            y: rect.top,
-            Red: (start.0 as u16) << 8,
-            Green: (start.1 as u16) << 8,
-            Blue: (start.2 as u16) << 8,
-            Alpha: 0,
-        },
-        TRIVERTEX {
-            x: rect.right,
-            y: rect.bottom,
-            Red: (end.0 as u16) << 8,
-            Green: (end.1 as u16) << 8,
-            Blue: (end.2 as u16) << 8,
-            Alpha: 0,
-        },
-    ];
-    let mut mesh = windows_sys::Win32::Graphics::Gdi::GRADIENT_RECT {
-        UpperLeft: 0,
-        LowerRight: 1,
-    };
-    let mode = if vertical {
-        GRADIENT_FILL_RECT_V
-    } else {
-        GRADIENT_FILL_RECT_H
-    };
-    GradientFill(
-        hdc,
-        vert.as_mut_ptr(),
-        2,
-        &mut mesh as *mut _ as *mut _,
-        1,
-        mode,
-    );
-}
-
 unsafe fn text(hdc: HDC, font: HFONT, color: u32, rect: RECT, value: &str, flags: u32) {
     let old = SelectObject(hdc, font);
     SetTextColor(hdc, color);
@@ -6721,66 +6759,6 @@ unsafe fn logo_icon(size: i32) -> windows_sys::Win32::UI::WindowsAndMessaging::H
     DeleteObject(color);
     DeleteObject(mask);
     icon
-}
-
-/// A glossy "bubble" button: a vertical gradient from `top` to `bottom`, a
-/// lighter sheen over the upper half, and a rounded outline.
-unsafe fn bubble(
-    hdc: HDC,
-    rect: RECT,
-    radius: i32,
-    top: (u8, u8, u8),
-    bottom: (u8, u8, u8),
-    border: u32,
-    width: i32,
-) {
-    use windows_sys::Win32::Graphics::Gdi::{
-        CreateRoundRectRgn, GetStockObject, NULL_BRUSH, SelectClipRgn,
-    };
-    let lighten = |c: (u8, u8, u8), t: f32| {
-        let up = |v: u8| (v as f32 + (255.0 - v as f32) * t) as u8;
-        (up(c.0), up(c.1), up(c.2))
-    };
-    let region = CreateRoundRectRgn(
-        rect.left,
-        rect.top,
-        rect.right + 1,
-        rect.bottom + 1,
-        radius,
-        radius,
-    );
-    SelectClipRgn(hdc, region);
-    gradient(hdc, rect, top, bottom, true);
-    let middle = rect.top + (rect.bottom - rect.top) * 9 / 20;
-    gradient(
-        hdc,
-        RECT {
-            left: rect.left,
-            top: rect.top,
-            right: rect.right,
-            bottom: middle,
-        },
-        lighten(top, 0.85),
-        lighten(top, 0.35),
-        true,
-    );
-    SelectClipRgn(hdc, std::ptr::null_mut());
-    DeleteObject(region);
-    let pen = CreatePen(0, width, border);
-    let old_pen = SelectObject(hdc, pen);
-    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius,
-        radius,
-    );
-    SelectObject(hdc, old_pen);
-    SelectObject(hdc, old_brush);
-    DeleteObject(pen);
 }
 
 fn copy_text(hwnd: HWND, value: &str) {

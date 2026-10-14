@@ -20,10 +20,17 @@ pub enum Icon {
     Restore,
     Settings,
     About,
+    Tools,
+    /// Home-page status: the last scan found nothing.
+    StatusOk,
+    /// Home-page status: the last scan found stale entries.
+    StatusWarn,
+    /// Home-page status: no scan yet.
+    StatusUnknown,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 9] = [
+    pub const ALL: [Icon; 13] = [
         Icon::Logo,
         Icon::Scan,
         Icon::Optimize,
@@ -33,6 +40,10 @@ impl Icon {
         Icon::Restore,
         Icon::Settings,
         Icon::About,
+        Icon::Tools,
+        Icon::StatusOk,
+        Icon::StatusWarn,
+        Icon::StatusUnknown,
     ];
 
     pub fn name(self) -> &'static str {
@@ -46,6 +57,10 @@ impl Icon {
             Icon::Restore => "restore",
             Icon::Settings => "settings",
             Icon::About => "about",
+            Icon::Tools => "tools",
+            Icon::StatusOk => "status-ok",
+            Icon::StatusWarn => "status-warn",
+            Icon::StatusUnknown => "status-unknown",
         }
     }
 }
@@ -518,6 +533,10 @@ fn draw(icon: Icon, size: usize) -> Canvas {
         Icon::Restore => restore(&mut cv),
         Icon::Settings => settings(&mut cv),
         Icon::About => about(&mut cv),
+        Icon::Tools => tools(&mut cv),
+        Icon::StatusOk => status(&mut cv, Status::Ok),
+        Icon::StatusWarn => status(&mut cv, Status::Warn),
+        Icon::StatusUnknown => status(&mut cv, Status::Unknown),
     }
     cv
 }
@@ -858,6 +877,122 @@ fn about(cv: &mut Canvas) {
         .collect();
     let rim = cv.stroke(&rim_pts, 1.4, true);
     cv.paint(&rim, GREEN_DARK);
+}
+
+/// An open-ended spanner with a green, gold-banded grip.
+fn tools(cv: &mut Canvas) {
+    cv.shadow((50.0, 92.0), 32.0, 4.5);
+    let head = (66.0, 32.0);
+    // The handle runs from the head down to the lower left.
+    let handle = [(58.0, 40.0), (22.0, 76.0)];
+    cv.ribbon(&handle, 11.0, 1.4, GOLD, GOLD_DARK, false);
+    let grip = [(44.0, 54.0), (22.0, 76.0)];
+    let grip_edge = cv.stroke(&grip, 13.8, false);
+    cv.paint(&grip_edge, INK);
+    let grip_fill = cv.stroke(&grip, 11.0, false);
+    cv.paint_with(&grip_fill, vgrad(GREEN, GREEN_DARK, 50.0, 80.0));
+    for t in [0.3f32, 0.65] {
+        let c = (44.0 - 22.0 * t, 54.0 + 22.0 * t);
+        let band = cv.stroke(
+            &[(c.0 - 4.0, c.1 - 4.0), (c.0 + 4.0, c.1 + 4.0)],
+            2.2,
+            false,
+        );
+        cv.paint(&band, GOLD_LIGHT);
+    }
+    // The open jaw: a thick ring with its mouth to the upper right.
+    let jaw = arc(head, 15.0, 0.0 + 30.0, 360.0 - 60.0, 120);
+    cv.ribbon(&jaw, 11.0, 1.4, GOLD, GOLD_DARK, false);
+    let end = cv.circle((22.0, 76.0), 5.4);
+    cv.paint(&end, INK);
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Status {
+    Ok,
+    Warn,
+    Unknown,
+}
+
+/// A status badge: a roundel with a check, an exclamation mark, or a
+/// question mark.
+fn status(cv: &mut Canvas, state: Status) {
+    let c = (50.0, 50.0);
+    let (top, bottom, rim, mark) = match state {
+        Status::Ok => (GREEN, GREEN_DARK, GOLD, rgb(255, 255, 255)),
+        Status::Warn => (GOLD_LIGHT, GOLD, GOLD_DARK, INK),
+        Status::Unknown => (
+            rgb(214, 222, 216),
+            rgb(168, 180, 172),
+            rgb(132, 146, 138),
+            INK,
+        ),
+    };
+    let disc = cv.circle(c, 44.0);
+    cv.paint_with(&disc, vgrad(top, bottom, 6.0, 94.0));
+    let ring = cv.stroke(&arc(c, 44.0, 0.0, 360.0, 180), 5.0, true);
+    cv.paint(&ring, rim);
+    let inner = cv.stroke(&arc(c, 36.5, 0.0, 360.0, 180), 1.6, true);
+    cv.paint(&inner, with_alpha(rim, 0.8));
+    match state {
+        Status::Ok => {
+            let check = cv.stroke(&[(31.0, 52.0), (45.0, 66.0), (70.0, 36.0)], 10.0, false);
+            cv.paint(&check, mark);
+        }
+        Status::Warn => {
+            let bar = cv.stroke(&[(50.0, 26.0), (50.0, 56.0)], 10.0, false);
+            cv.paint(&bar, mark);
+            let dot = cv.circle((50.0, 71.0), 6.0);
+            cv.paint(&dot, mark);
+        }
+        Status::Unknown => {
+            let mut hook = arc((50.0, 38.0), 12.0, 200.0, 420.0, 60);
+            hook.push((50.0, 56.0));
+            let curve = cv.stroke(&hook, 9.0, false);
+            cv.paint(&curve, mark);
+            let dot = cv.circle((50.0, 71.0), 5.6);
+            cv.paint(&dot, mark);
+        }
+    }
+}
+
+/// One anti-aliased circle `2 * radius` pixels square, opaque BGRA: a `fill`
+/// disc inside a `border` ring `border_px` thick, over `behind`. Its four
+/// quarters become the corners of a smoothly rounded rectangle.
+pub fn corner_sprite(
+    radius: usize,
+    fill: (u8, u8, u8),
+    border: (u8, u8, u8),
+    border_px: f32,
+    behind: (u8, u8, u8),
+) -> Vec<u8> {
+    let n = radius * 2;
+    let r = radius as f32;
+    let mut out = Vec::with_capacity(n * n * 4);
+    for y in 0..n {
+        for x in 0..n {
+            let (mut f, mut b) = (0.0f32, 0.0f32);
+            for s in 0..SS * SS {
+                let px = x as f32 + ((s % SS) as f32 + 0.5) / SS as f32;
+                let py = y as f32 + ((s / SS) as f32 + 0.5) / SS as f32;
+                let d = ((px - r).powi(2) + (py - r).powi(2)).sqrt();
+                if d <= r - border_px {
+                    f += 1.0;
+                } else if d <= r {
+                    b += 1.0;
+                }
+            }
+            let total = (SS * SS) as f32;
+            let (f, b) = (f / total, b / total);
+            let o = 1.0 - f - b;
+            let blend = |i: usize| {
+                let c = |t: (u8, u8, u8)| [t.0, t.1, t.2][i] as f32;
+                (c(fill) * f + c(border) * b + c(behind) * o).round() as u8
+            };
+            out.extend([blend(2), blend(1), blend(0), 255]);
+        }
+    }
+    out
 }
 
 /// Minimal PNG encoder (stored deflate blocks), for previews and tests.
