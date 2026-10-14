@@ -521,3 +521,59 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
         },
     }
 }
+
+/// Live Windows test: a stale-file repair whose path runs through a junction
+/// into System32 is refused by the object's real path. The target,
+/// ntoskrnl.exe, is owned by TrustedInstaller, so even an elevated run could
+/// not change it if the check regressed.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+    use crate::fs::{HostFs, KnownDir, host_known_dir};
+    use crate::model::ScannerId;
+    use crate::registry::MemoryRegistry;
+
+    #[test]
+    fn live_a_temp_path_through_a_junction_into_system32_is_refused() {
+        let system = host_known_dir(KnownDir::System).unwrap();
+        let victim = Path::new(&system).join("ntoskrnl.exe");
+        let before = std::fs::metadata(&victim).expect("ntoskrnl.exe metadata");
+        let dir = std::env::temp_dir().join(format!("hivemend-junction-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("j");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&system)
+            .output()
+            .expect("run mklink");
+        let spelled = link.join("ntoskrnl.exe").display().to_string();
+        let finding = Finding {
+            scanner: ScannerId::TempShortcuts,
+            scanner_name: "Temp files".into(),
+            key: spelled.clone(),
+            value: None,
+            detail: "temporary file".into(),
+            repair: Repair::DeleteFile {
+                path: spelled,
+                keep_copy: false,
+            },
+        };
+        let backup = dir.join("backup.reg");
+        let outcome = repair(
+            &mut MemoryRegistry::new(),
+            &mut HostFs,
+            std::slice::from_ref(&finding),
+            &backup,
+        );
+        // remove_dir_all removes the junction itself, never its target.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        let outcome = outcome.expect("repair runs");
+        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.refused, 1, "errors: {:?}", outcome.errors);
+        let after = std::fs::metadata(&victim).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+}

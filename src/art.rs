@@ -16,7 +16,6 @@ pub enum Icon {
     Optimize,
     Monitor,
     Privacy,
-    Shredder,
     Restore,
     Settings,
     About,
@@ -33,13 +32,12 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 14] = [
+    pub const ALL: [Icon; 13] = [
         Icon::Logo,
         Icon::Scan,
         Icon::Optimize,
         Icon::Monitor,
         Icon::Privacy,
-        Icon::Shredder,
         Icon::Restore,
         Icon::Settings,
         Icon::About,
@@ -57,7 +55,6 @@ impl Icon {
             Icon::Optimize => "optimize",
             Icon::Monitor => "monitor",
             Icon::Privacy => "privacy",
-            Icon::Shredder => "shredder",
             Icon::Restore => "restore",
             Icon::Settings => "settings",
             Icon::About => "about",
@@ -137,8 +134,6 @@ const STRAW_DARK: Rgba = rgb(118, 78, 28);
 const SILVER_LIGHT: Rgba = rgb(244, 246, 248);
 const SILVER: Rgba = rgb(170, 178, 188);
 const SILVER_DARK: Rgba = rgb(92, 100, 112);
-const PAPER: Rgba = rgb(252, 250, 242);
-const HILT: Rgba = rgb(40, 34, 32);
 const HEATHER: Rgba = rgb(128, 70, 150);
 const HEATHER_LIGHT: Rgba = rgb(186, 128, 204);
 const SHADOW: Rgba = Rgba(0.0, 0.0, 0.0, 0.16);
@@ -538,7 +533,6 @@ fn draw(icon: Icon, size: usize) -> Canvas {
         Icon::Optimize => optimize(&mut cv),
         Icon::Monitor => monitor(&mut cv),
         Icon::Privacy => privacy(&mut cv),
-        Icon::Shredder => shredder(&mut cv),
         Icon::Restore => restore(&mut cv),
         Icon::Settings => settings(&mut cv),
         Icon::About => about(&mut cv),
@@ -706,66 +700,6 @@ fn privacy(cv: &mut Canvas) {
     cv.paint(&rim, GOLD);
     let knot = torus_knot((50.0, 47.0), 25.0, 3.0, 4.0, 480);
     cv.knot(&knot, 3.4, 0.9, GOLD_LIGHT, GOLD_DARK);
-}
-
-/// A sgian-dubh cutting through a sheet that is coming apart in strips.
-fn shredder(cv: &mut Canvas) {
-    cv.shadow((50.0, 93.0), 34.0, 4.5);
-    let edge = rgb(112, 112, 104);
-    // The sheet, whole at the top and fanning out in strips below.
-    let sheet = [(16.0, 8.0), (66.0, 8.0), (66.0, 50.0), (16.0, 50.0)];
-    let sheet_mask = cv.polygon(&sheet);
-    cv.paint_with(&sheet_mask, vgrad(PAPER, rgb(236, 232, 220), 8.0, 50.0));
-    let sheet_edge = cv.stroke(
-        &[(16.0, 50.0), (16.0, 8.0), (66.0, 8.0), (66.0, 50.0)],
-        2.0,
-        false,
-    );
-    cv.paint(&sheet_edge, edge);
-    for line_y in [18.0, 26.0, 34.0, 42.0] {
-        let line = cv.stroke(&[(23.0, line_y), (59.0, line_y)], 2.2, false);
-        cv.paint(&line, rgb(176, 186, 180));
-    }
-    for (k, len) in [34.0f32, 28.0, 38.0, 26.0, 32.0].into_iter().enumerate() {
-        let x = 16.0 + k as f32 * 10.0;
-        let lean = (k as f32 - 2.0) * 2.4;
-        let strip = [
-            (x, 50.0),
-            (x + 8.0, 50.0),
-            (x + 8.0 + lean, 50.0 + len),
-            (x + lean, 50.0 + len),
-        ];
-        let strip_mask = cv.polygon(&strip);
-        cv.paint_with(&strip_mask, vgrad(rgb(236, 232, 220), PAPER, 50.0, 88.0));
-        let strip_edge = cv.stroke(&strip, 1.6, true);
-        cv.paint(&strip_edge, edge);
-    }
-    // The knife: a broad blade, a gold collar, a dark hilt with a gold band,
-    // and a gold pommel.
-    let blade = [(92.0, 6.0), (62.0, 50.0), (52.0, 40.0)];
-    let blade_mask = cv.polygon(&blade);
-    cv.paint_with(&blade_mask, vgrad(SILVER_LIGHT, SILVER, 6.0, 50.0));
-    let blade_edge = cv.stroke(&blade, 1.8, true);
-    cv.paint(&blade_edge, SILVER_DARK);
-    let fuller = cv.stroke(&[(88.0, 11.0), (59.0, 44.0)], 1.4, false);
-    cv.paint(&fuller, SILVER_DARK);
-    let collar_line = [(51.0, 53.0), (61.0, 43.0)];
-    let collar_edge = cv.stroke(&collar_line, 7.5, false);
-    cv.paint(&collar_edge, GOLD_DARK);
-    let collar = cv.stroke(&collar_line, 5.0, false);
-    cv.paint(&collar, GOLD);
-    let hilt_line = [(52.0, 52.0), (30.0, 74.0)];
-    let hilt_edge = cv.stroke(&hilt_line, 14.0, false);
-    cv.paint(&hilt_edge, INK);
-    let hilt = cv.stroke(&hilt_line, 11.0, false);
-    cv.paint_with(&hilt, vgrad(rgb(84, 72, 66), HILT, 50.0, 76.0));
-    let band = cv.stroke(&[(44.5, 59.5), (37.5, 66.5)], 3.2, false);
-    let band = and(&band, &cv.stroke(&hilt_line, 11.0, false));
-    cv.paint(&band, GOLD);
-    let pommel = cv.circle((27.5, 76.5), 8.0);
-    cv.paint(&pommel, GOLD_DARK);
-    let pommel_face = cv.circle((27.5, 76.5), 6.4);
-    cv.paint_with(&pommel_face, vgrad(GOLD_LIGHT, GOLD, 70.0, 83.0));
 }
 
 /// A Celtic spiral that turns back on itself into an arrow: undo.

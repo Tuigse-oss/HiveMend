@@ -2,7 +2,7 @@
 
 Hivemend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
 
-> **Use at your own risk.** Hivemend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but shredded files and cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+> **Use at your own risk.** Hivemend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
 It covers twelve scanner jobs:
 
@@ -48,12 +48,10 @@ hivemend scan
 hivemend scan --only SL,SUP,ARP
 hivemend repair
 hivemend repair --yes
-hivemend shred --passes 3 C:\Users\Me\old-letters
-hivemend shred --passes 3 --yes C:\Users\Me\old-letters
 hivemend hives
 ```
 
-`scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes. `shred` without `--yes` prints what it would shred and what it refuses. With `--yes` it overwrites the files (1, 3, or 7 passes), renames, and deletes them. Shredding cannot be undone and no backup is possible.
+`scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes.
 
 ### Where data is kept
 
@@ -88,11 +86,11 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window. The left rail lists Home, Scan,
-Restore, Privacy, Shredder, Services, Monitor, Tools, Settings, and About.
+Restore, Privacy, Services, Monitor, Tools, Settings, and About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
-  Shredder, Optimize (a quick startup, uninstall, shared-DLL, and COM
+  Services, Quick Scan (a fast startup, uninstall, shared-DLL, and COM
   pass), Monitor, Restore, and Windows Tools, and a line of statistics
   with a reset link.
 - Services has a Suggested tab (safe Automatic services you may tick to
@@ -114,18 +112,10 @@ Restore, Privacy, Shredder, Services, Monitor, Tools, Settings, and About.
   only paths you understand. The built-in categories are user-scope, and
   no administrator rights are needed. There is no free-space wipe:
   overwriting a drive's empty space does not reliably erase anything on
-  SSD or NVMe drives and only adds wear.
-- Shredder overwrites files so they cannot be recovered, then deletes
-  them. Drop files onto the page, type a path and Add, or stage the
-  Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The
-  confirmation lists the paths (the first ten, then a count of any rest)
-  and cannot be undone. The Windows
-  folder, program folders, drive roots, links, hidden system files, and
-  files with more than one hard link are always refused, judged by where
-  each file really is after junctions, 8.3 names, and SUBST drives are
-  resolved. Shredding on a solid-state drive warns that
-  traces may survive in spare blocks the overwrite cannot reach. No
-  administrator rights are needed for your own files.
+  SSD or NVMe drives and only adds wear. For the same reason there is no
+  file shredder: on solid-state drives a normal delete is cleared by the
+  drive itself (TRIM), and BitLocker or Device Encryption is what keeps
+  deleted data unreadable.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.

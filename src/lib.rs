@@ -15,7 +15,6 @@ mod rules;
 mod scanners;
 mod services;
 mod settings;
-mod shredder;
 mod store;
 mod sysinfo;
 mod tools;
@@ -26,8 +25,6 @@ mod windows_privacy;
 mod windows_reg;
 #[cfg(windows)]
 mod windows_services;
-#[cfg(windows)]
-mod windows_shredder;
 
 #[cfg(windows)]
 pub use backup::import_reg_file;
@@ -48,7 +45,6 @@ pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
-pub use pathutil::shred_allowed;
 pub use privacy::{
     CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,
     PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,
@@ -64,11 +60,6 @@ pub use services::{
     tuneup_allowed,
 };
 pub use settings::Settings;
-pub use shredder::{
-    RecycleItem, ShredMethod, ShredOptions, ShredOutcome, ShredTarget, list_recycle_bin,
-    random_seed, recycle_display_name, recycle_pairs, seek_penalty_false, shred_paths,
-    shred_recycle_items,
-};
 #[cfg(windows)]
 pub use sysinfo::gather as gather_snapshot;
 pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};
@@ -80,8 +71,6 @@ pub use windows_privacy::{WindowsProcessList, WindowsSystemTargets};
 pub use windows_reg::WindowsRegistry;
 #[cfg(windows)]
 pub use windows_services::ScmServiceStore;
-#[cfg(windows)]
-pub use windows_shredder::{fixed_drives, volume_ssd};
 
 #[cfg(windows)]
 pub use store::restore_backup;

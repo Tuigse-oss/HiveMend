@@ -38,8 +38,6 @@ enum Command {
         /// The .reg file in the backup folder.
         file: PathBuf,
     },
-    /// Overwrite files so they cannot be recovered, then delete them. Cannot be undone.
-    Shred(ShredArgs),
     /// List the registry hive files and their sizes. Reads only.
     Hives,
     /// Run the built-in sample hive. Useful off Windows.
@@ -89,19 +87,6 @@ struct RepairArgs {
     #[arg(long)]
     backup_dir: Option<PathBuf>,
     /// Apply the backup's deletions. Without this, repair only prints the plan.
-    #[arg(long)]
-    yes: bool,
-}
-
-#[derive(Args)]
-struct ShredArgs {
-    /// Files or folders to shred. Shredding cannot be undone.
-    #[arg(required = true)]
-    paths: Vec<PathBuf>,
-    /// Overwrite passes: 1, 3, or 7.
-    #[arg(long, default_value_t = 3)]
-    passes: u8,
-    /// Shred without asking. Without this, shred only prints the plan.
     #[arg(long)]
     yes: bool,
 }
@@ -164,7 +149,6 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
             })
         }
         Command::Restore { file } => restore_live(&file),
-        Command::Shred(args) => shred_live(&args),
         Command::Hives => hives_live(),
         Command::Scan(args) => {
             let engine = load_engine(&args.data)?;
@@ -345,99 +329,6 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
             "restoring a registry backup needs Windows".into(),
         ))
     }
-}
-
-fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
-    use hive_mend::{
-        FileView, HostFs, ItemKind, ShredMethod, ShredOptions, ShredTarget, format_bytes,
-        shred_allowed, shred_paths,
-    };
-    let method = ShredMethod::from_passes(args.passes).ok_or_else(|| {
-        hive_mend::Error(format!("--passes must be 1, 3, or 7, not {}", args.passes))
-    })?;
-    let mut targets = Vec::new();
-    let mut refused = Vec::new();
-    for path in &args.paths {
-        let text = path.display().to_string();
-        match shred_allowed(&HostFs, &text) {
-            Ok(()) => targets.push(ShredTarget {
-                path: text.clone(),
-                is_dir: HostFs.kind_of(&text) == ItemKind::Dir,
-            }),
-            Err(reason) => refused.push(reason),
-        }
-    }
-    #[cfg(windows)]
-    {
-        let mut drives: Vec<String> = Vec::new();
-        for target in &targets {
-            let bytes = target.path.trim().as_bytes();
-            if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
-                if !drives.contains(&drive) {
-                    drives.push(drive);
-                }
-            }
-        }
-        for drive in drives {
-            match hive_mend::volume_ssd(&drive) {
-                Some(true) => eprintln!(
-                    "warning: {drive} is a solid-state drive: shredded data may survive in spare blocks"
-                ),
-                None => eprintln!("warning: could not tell whether {drive} is solid-state"),
-                Some(false) => {}
-            }
-        }
-    }
-    if !args.yes {
-        for target in &targets {
-            println!(
-                "{}  {}",
-                if target.is_dir { "folder" } else { "file" },
-                target.path
-            );
-        }
-        for reason in &refused {
-            println!("refused  {reason}");
-        }
-        println!(
-            "{} items would be shredded with {} (cannot be undone). Re-run with --yes to shred.",
-            targets.len(),
-            method.label()
-        );
-        return Ok(if targets.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(2)
-        });
-    }
-    let opts = ShredOptions {
-        method,
-        rename: true,
-    };
-    let outcome = shred_paths(
-        &mut HostFs,
-        &targets,
-        &opts,
-        hive_mend::random_seed(),
-        &mut |_, _, _| true,
-    );
-    println!(
-        "shredded {} files ({})",
-        outcome.shredded,
-        format_bytes(outcome.bytes)
-    );
-    for reason in refused.iter().chain(outcome.refused.iter()) {
-        eprintln!("hivemend: refused: {reason}");
-    }
-    for err in &outcome.errors {
-        eprintln!("hivemend: {err}");
-    }
-    Ok(if outcome.errors.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
 }
 
 fn hives_live() -> Result<ExitCode, hive_mend::Error> {

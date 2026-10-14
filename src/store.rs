@@ -62,7 +62,7 @@ pub fn protected_dir(fs: &dyn FileView) -> Option<PathBuf> {
     known_root(fs, KnownDir::ProgramData).map(|root| Path::new(&root).join(APP))
 }
 
-/// Every folder Hivemend keeps data in. Shred and privacy deletes refuse all
+/// Every folder Hivemend keeps data in. Privacy deletes refuse all
 /// of them; one that cannot be located is simply not listed, because the
 /// protected roots check already refuses everything when ProgramData or the
 /// other system folders are unknown.
@@ -687,20 +687,17 @@ mod tests {
     }
 
     #[test]
-    fn every_data_folder_is_refused_for_shred_and_privacy_deletes() {
-        let mut fs = fs();
+    fn every_data_folder_is_a_data_root() {
+        let fs = fs();
+        let roots = data_roots(&fs);
         for path in [
             format!(r"{LOCAL}\HiveMend\settings.ini"),
             r"C:\HiveMend\backups\old.reg".to_string(),
             r"C:\ProgramData\HiveMend\backups\new.reg".to_string(),
         ] {
-            fs.add_file_bytes(&path, vec![1], None);
-            assert!(
-                crate::pathutil::shred_allowed(&fs, &path).is_err(),
-                "{path}"
-            );
+            assert!(roots.iter().any(|root| path_under(&path, root)), "{path}");
         }
-        assert_eq!(data_roots(&fs).len(), 3);
+        assert_eq!(roots.len(), 3);
     }
 }
 

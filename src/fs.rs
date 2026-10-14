@@ -66,8 +66,6 @@ pub struct DirItem {
 pub enum Access {
     /// Read only: a backup about to be restored.
     Read,
-    /// Read, write, rename, and delete: the shredder.
-    Write,
     /// Read and delete: a delete that keeps a copy first.
     ReadDelete,
     /// Delete only.
@@ -122,7 +120,7 @@ pub trait FileView {
     fn read(&self, path: &str) -> Option<Vec<u8>>;
     fn list(&self, dir: &str) -> Vec<DirItem>;
     /// Precise kind for a staged path. Unknown paths report `Other`, which
-    /// the shredder refuses, so an answer that cannot be known is safe.
+    /// callers treat as unsafe to act on, so an answer that cannot be known is safe.
     fn kind_of(&self, path: &str) -> ItemKind {
         if self.is_dir(path) {
             ItemKind::Dir
@@ -150,12 +148,8 @@ pub trait FileView {
     fn pin_read_at(&self, pin: &Pinned, offset: u64, len: usize) -> Option<Vec<u8>>;
     /// Overwrite `bytes.len()` bytes at `offset`. May extend a short file.
     fn pin_write_at(&mut self, pin: &Pinned, offset: u64, bytes: &[u8]) -> Result<(), String>;
-    /// Flush buffers and metadata for a shredded file.
+    /// Flush buffers and metadata for a written file.
     fn pin_sync(&mut self, pin: &Pinned) -> Result<(), String>;
-    /// Truncate (or zero-extend) a file.
-    fn pin_set_len(&mut self, pin: &Pinned, len: u64) -> Result<(), String>;
-    /// Rename within the object's own folder. Refuses an existing name.
-    fn pin_rename(&mut self, pin: &mut Pinned, name: &str) -> Result<(), String>;
     /// Delete the pinned file, or empty folder.
     fn pin_delete(&mut self, pin: Pinned) -> Result<(), String>;
     /// Copy the pinned file's bytes to a new file at `to`, creating its
@@ -211,7 +205,7 @@ impl MemoryFs {
     }
 
     /// A test filesystem with the standard Windows folders defined, as every
-    /// delete and shred check requires them.
+    /// delete check requires them.
     pub fn with_windows_dirs() -> Self {
         let mut fs = Self::new();
         fs.set_var("SystemRoot", r"C:\Windows");
@@ -360,37 +354,6 @@ impl FileView for MemoryFs {
             Some(FsNode::File { .. }) => Ok(()),
             _ => Err("file not found (os error 2)".into()),
         }
-    }
-
-    fn pin_set_len(&mut self, pin: &Pinned, len: u64) -> Result<(), String> {
-        let key = self.pinned_key(pin)?.to_string();
-        match self.nodes.get_mut(&key) {
-            Some(FsNode::File { bytes, .. }) => {
-                bytes.resize(len as usize, 0);
-                Ok(())
-            }
-            _ => Err("file not found (os error 2)".into()),
-        }
-    }
-
-    fn pin_rename(&mut self, pin: &mut Pinned, name: &str) -> Result<(), String> {
-        if name.is_empty() || name.contains(['\\', '/']) {
-            return Err("not a plain file name".into());
-        }
-        let from = self.pinned_key(pin)?.to_string();
-        let (dir, _) = from.rsplit_once('\\').ok_or("no parent folder")?;
-        let to = format!("{dir}\\{}", norm(name));
-        if self.nodes.contains_key(&to) {
-            return Err("target already exists".into());
-        }
-        let node = self
-            .nodes
-            .remove(&from)
-            .ok_or("file not found (os error 2)")?;
-        self.nodes.insert(to.clone(), node);
-        pin.real_path = to.clone();
-        pin.handle = PinHandle::Memory(to);
-        Ok(())
     }
 
     fn pin_delete(&mut self, pin: Pinned) -> Result<(), String> {
@@ -648,27 +611,6 @@ impl FileView for HostFs {
         file.sync_all().map_err(|err| err.to_string())
     }
 
-    fn pin_set_len(&mut self, pin: &Pinned, len: u64) -> Result<(), String> {
-        let PinHandle::Host(file) = &pin.handle else {
-            return Err("not a host handle".into());
-        };
-        file.set_len(len).map_err(|err| err.to_string())
-    }
-
-    fn pin_rename(&mut self, pin: &mut Pinned, name: &str) -> Result<(), String> {
-        if name.is_empty() || name.contains(['\\', '/', ':']) {
-            return Err("not a plain file name".into());
-        }
-        let PinHandle::Host(file) = &pin.handle else {
-            return Err("not a host handle".into());
-        };
-        host::rename(file, &pin.real_path, name)?;
-        if let Some((dir, _)) = pin.real_path.rsplit_once('\\') {
-            pin.real_path = format!("{dir}\\{name}");
-        }
-        Ok(())
-    }
-
     fn pin_delete(&mut self, pin: Pinned) -> Result<(), String> {
         let PinHandle::Host(file) = pin.handle else {
             return Err("not a host handle".into());
@@ -832,23 +774,18 @@ mod host {
     use super::{Access, ItemKind, PinHandle, Pinned};
     use std::os::windows::fs::{FileExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
-    use windows_sys::Win32::Foundation::{
-        GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
-    };
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
-        FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle,
-        GetFinalPathNameByHandleW, ReOpenFile, SetFileInformationByHandle, VOLUME_NAME_DOS,
+        FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
+        FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+        ReOpenFile, SetFileInformationByHandle, VOLUME_NAME_DOS,
     };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
-    const FILE_TRAVERSE: u32 = 0x0000_0020;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const DRIVE_FIXED: u32 = 3;
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -962,7 +899,6 @@ mod host {
     ) -> Result<std::fs::File, String> {
         let wanted = match access {
             Access::Read => GENERIC_READ | SYNCHRONIZE,
-            Access::Write => GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
             Access::ReadDelete => GENERIC_READ | DELETE | SYNCHRONIZE,
             Access::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         };
@@ -1014,83 +950,6 @@ mod host {
 
     pub fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
         file.seek_write(buf, offset)
-    }
-
-    /// Rename through the handle within its own folder. A bare name with no
-    /// root directory would be resolved against the process's current
-    /// directory, so the file's parent folder is opened (never following a
-    /// link), checked to still be the file's real parent, and passed as
-    /// `RootDirectory`. Never replaces an existing name.
-    pub fn rename(file: &std::fs::File, path: &str, name: &str) -> Result<(), String> {
-        let current = final_path(file)?;
-        let (parent, _) = current
-            .rsplit_once('\\')
-            .ok_or_else(|| format!("{path}: no parent folder"))?;
-        let parent_path = if parent.len() == 2 {
-            format!("{parent}\\")
-        } else {
-            parent.to_string()
-        };
-        let dir = std::fs::OpenOptions::new()
-            .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
-            .share_mode(SHARE_ALL)
-            .custom_flags(FLAGS)
-            .open(&parent_path)
-            .map_err(|err| format!("{path}: {err}"))?;
-        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
-        if unsafe { GetFileInformationByHandle(dir.as_raw_handle() as _, &mut info) } == 0 {
-            return Err(format!("{path}: {}", last_error()));
-        }
-        let attrs = info.dwFileAttributes;
-        if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
-            return Err(format!("{path}: its folder is not a plain folder"));
-        }
-        let dir_real = final_path(&dir)?;
-        let still_inside = final_path(file)?.rsplit_once('\\').is_some_and(|(now, _)| {
-            now.trim_end_matches('\\')
-                .eq_ignore_ascii_case(dir_real.trim_end_matches('\\'))
-        });
-        if !still_inside {
-            return Err(format!("{path} moved while it was being renamed"));
-        }
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
-        let len_at = std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength);
-        let root_at = std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory);
-        let size = name_at + (units.len() + 1) * 2;
-        // u64 storage keeps the struct's handle field aligned. Zeroed flags
-        // mean ReplaceIfExists is false.
-        let mut buf = vec![0u64; size.div_ceil(8)];
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 8) };
-        let root = dir.as_raw_handle() as usize;
-        bytes[root_at..root_at + std::mem::size_of::<usize>()].copy_from_slice(&root.to_ne_bytes());
-        bytes[len_at..len_at + 4].copy_from_slice(&((units.len() * 2) as u32).to_le_bytes());
-        for (index, unit) in units.iter().enumerate() {
-            let at = name_at + index * 2;
-            bytes[at..at + 2].copy_from_slice(&unit.to_le_bytes());
-        }
-        // SetFileInformationByHandle refuses a RootDirectory, so call the
-        // native API it wraps; FILE_RENAME_INFORMATION has the same layout.
-        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-        let status = unsafe {
-            NtSetInformationFile(
-                file.as_raw_handle() as _,
-                &mut status_block,
-                buf.as_ptr() as *const _,
-                size as u32,
-                FileRenameInformation,
-            )
-        };
-        drop(dir);
-        if status < 0 {
-            let code = unsafe { RtlNtStatusToDosError(status) };
-            return Err(format!(
-                "{path}: {}",
-                std::io::Error::from_raw_os_error(code as i32)
-            ));
-        }
-        Ok(())
     }
 
     /// Mark the pinned object for deletion through its handle; it goes when
@@ -1171,14 +1030,6 @@ mod host {
 
     pub fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
         file.write_at(buf, offset)
-    }
-
-    pub fn rename(_file: &std::fs::File, path: &str, name: &str) -> Result<(), String> {
-        let to = std::path::Path::new(path).with_file_name(name);
-        if to.exists() {
-            return Err("target already exists".into());
-        }
-        std::fs::rename(path, to).map_err(|err| err.to_string())
     }
 
     pub fn delete(_file: std::fs::File, path: &str) -> Result<(), String> {
@@ -1303,5 +1154,27 @@ mod live_tests {
         let _ = std::fs::remove_dir_all(&dir);
         assert!(made.status.success());
         assert!(err.unwrap_err().contains("never followed"));
+    }
+
+    #[test]
+    fn live_a_file_swapped_after_pinning_is_not_the_one_deleted() {
+        let dir = std::env::temp_dir().join(format!("hivemend-swap-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("target.tmp");
+        let moved = dir.join("moved.tmp");
+        std::fs::write(&path, b"pinned").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&path.display().to_string()).expect("pin");
+        fs.pin_acquire(&mut pin, Access::Delete)
+            .expect("delete access");
+        // Swap: the pinned file moves away and a decoy takes its name.
+        std::fs::rename(&path, &moved).expect("move pinned file");
+        std::fs::write(&path, b"decoy").unwrap();
+        fs.pin_delete(pin).expect("delete through the pin");
+        let moved_gone = !moved.exists();
+        let decoy = std::fs::read(&path).ok();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(moved_gone, "the pinned object itself is deleted");
+        assert_eq!(decoy, Some(b"decoy".to_vec()), "the decoy is untouched");
     }
 }

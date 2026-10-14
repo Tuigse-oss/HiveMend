@@ -1,4 +1,4 @@
-use crate::fs::{FileView, ItemKind, KnownDir, is_drive_absolute};
+use crate::fs::{FileView, KnownDir, is_drive_absolute};
 
 pub fn canonical_hive(name: &str) -> Option<&'static str> {
     match name.to_ascii_uppercase().as_str() {
@@ -112,7 +112,7 @@ pub fn known_root(fs: &dyn FileView, dir: KnownDir) -> Option<String> {
     is_drive_absolute(&root).then_some(root)
 }
 
-/// Every folder a delete or shred must stay out of, or an error naming the
+/// Every folder a delete must stay out of, or an error naming the
 /// one that could not be located. A missing root refuses the operation
 /// instead of silently dropping that protection.
 pub fn protected_roots(fs: &dyn FileView) -> Result<Vec<String>, String> {
@@ -581,106 +581,6 @@ pub fn file_delete_allowed(path: &str) -> bool {
         || lower.contains("\\desktop\\")
 }
 
-/// Shredder staging gate. Only absolute local files and folders outside
-/// the Windows, program, and app-data folders may shred. Errors name the
-/// rule that fired and are absolute: no caller may override a refusal.
-pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), String> {
-    let clean = normalize_fs(path);
-    let bytes = clean.as_bytes();
-    let absolute = bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\';
-    if !absolute || clean.contains("..") {
-        return Err(format!("{path} is not an absolute local path"));
-    }
-    if clean.len() == 3 {
-        return Err("a drive root cannot be shredded".to_string());
-    }
-    // `C:\.`, trailing dots or spaces, and the like resolve to a different
-    // object than they spell, so no textual root check below can be trusted.
-    if has_unsafe_fs_component(&clean) {
-        return Err(format!("{path} has an ambiguous path component"));
-    }
-    match fs.kind_of(&clean) {
-        ItemKind::File | ItemKind::Dir => {}
-        ItemKind::Other => {
-            if !fs.exists(&clean) {
-                return Err(format!("{path} does not exist"));
-            }
-            return Err(format!("{path} is a link; links are never followed"));
-        }
-    }
-    if fs.is_hidden_system(&clean) {
-        return Err(format!("{path} is a hidden system file"));
-    }
-    shred_location_allowed(fs, path, &clean)
-}
-
-/// The location rules of [`shred_allowed`], applied to `clean`: outside the
-/// Windows, Program Files, and ProgramData folders (located by API, refusing
-/// when one cannot be found) and outside the app data folder. `shred_file`
-/// runs this again on the path Windows reports for the opened file.
-pub fn shred_location_allowed(
-    fs: &dyn crate::fs::FileView,
-    path: &str,
-    clean: &str,
-) -> Result<(), String> {
-    let roots = protected_roots(fs).map_err(|why| format!("{path} refused: {why}"))?;
-    if let Some(windows) = roots.first()
-        && path_under(clean, windows)
-    {
-        return Err(format!("{path} is inside the Windows folder"));
-    }
-    if roots.iter().skip(1).any(|root| path_under(clean, root)) {
-        return Err(format!("{path} is inside a program folder"));
-    }
-    if crate::store::data_roots(fs)
-        .iter()
-        .any(|root| path_under(clean, root))
-    {
-        return Err(format!("{path} is inside the app data folder"));
-    }
-    Ok(())
-}
-
-/// Pin a staged shred target and check the object itself, not just its
-/// spelling: [`shred_allowed`] on the path, then the same location rules on
-/// the real path Windows reports for the open handle (junctions, links, 8.3
-/// names, and SUBST resolved). A file with more than one hard link is refused,
-/// since overwriting it would change every other name too. Only then is write
-/// or delete access gained, on that same handle.
-pub fn pin_for_shred(
-    fs: &mut dyn FileView,
-    path: &str,
-    want: ItemKind,
-) -> Result<crate::fs::Pinned, String> {
-    shred_allowed(&*fs, path)?;
-    let mut pin = fs.pin(path).map_err(|err| format!("{path}: {err}"))?;
-    if pin.kind != want {
-        return Err(format!("{path} changed since staging"));
-    }
-    if pin.hidden_system {
-        return Err(format!("{path} is a hidden system file"));
-    }
-    let real = normalize_fs(&pin.real_path);
-    if !is_drive_absolute(&real) {
-        return Err(format!("{path} resolves to {real}, not a local path"));
-    }
-    shred_location_allowed(&*fs, path, &real)
-        .map_err(|why| format!("{why} (it resolves to {real})"))?;
-    if pin.kind == ItemKind::File && pin.links > 1 {
-        return Err(format!(
-            "{path} has other hard links; shredding it would overwrite them too"
-        ));
-    }
-    let access = if want == ItemKind::File {
-        crate::fs::Access::Write
-    } else {
-        crate::fs::Access::Delete
-    };
-    fs.pin_acquire(&mut pin, access)
-        .map_err(|err| format!("{path}: {err}"))?;
-    Ok(pin)
-}
-
 pub fn looks_like_stored_path(text: &str) -> bool {
     let text = text.trim().trim_matches('"');
     let text = text.strip_prefix('@').unwrap_or(text);
@@ -852,20 +752,16 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_protected_root_refuses_instead_of_dropping_the_check() {
-        // ProgramData is not defined: the gate must refuse, not skip it.
+    fn a_missing_protected_root_is_an_error_not_a_skipped_check() {
+        // ProgramData is not defined: the roots refuse instead of shrinking.
         let mut fs = MemoryFs::new();
         fs.set_var("SystemRoot", r"C:\Windows");
         fs.set_var("ProgramFiles", r"C:\Program Files");
         fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
-        fs.add_file(r"C:\ProgramData\Vendor\x.dat");
-        fs.add_file(r"C:\Docs\a.txt");
-        let err = shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").unwrap_err();
-        assert!(err.contains("could not be located"), "{err}");
-        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_err());
+        let err = protected_roots(&fs).unwrap_err();
+        assert!(err.contains("ProgramData"), "{err}");
         fs.set_var("ProgramData", r"C:\ProgramData");
-        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_ok());
-        assert!(shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").is_err());
+        assert_eq!(protected_roots(&fs).unwrap().len(), 4);
     }
 
     #[test]
@@ -881,12 +777,5 @@ mod tests {
         let fs = MemoryFs::with_windows_dirs();
         assert!(under_windows_dir(&fs, r"C:\WINDOWS\System32\x.dll"));
         assert!(!under_windows_dir(&fs, r"C:\WindowsApps\x.dll"));
-    }
-
-    #[test]
-    fn shred_refuses_dot_root_and_dot_traversal() {
-        let fs = MemoryFs::new();
-        assert!(shred_allowed(&fs, r"C:\.").is_err());
-        assert!(shred_allowed(&fs, r"C:\.\Windows\System32\drivers\etc\hosts").is_err());
     }
 }
