@@ -1,6 +1,7 @@
 pub mod art;
 mod backup;
 mod demo;
+mod diskspace;
 mod engine;
 mod exclude;
 mod fs;
@@ -37,6 +38,11 @@ pub use backup::{
     reserve_backup_path, write_backup,
 };
 pub use demo::sample_world;
+#[cfg(windows)]
+pub use diskspace::HostLister;
+pub use diskspace::{
+    BigFile, DirLister, DirNode, DiskEntry, DiskReport, FileKind, LARGEST_KEPT, analyze,
+};
 pub use engine::{
     Engine, RepairOutcome, ScanReport, repair, repair_with_progress, scan, scan_with_progress,
     still_reported,
@@ -72,7 +78,7 @@ pub use startup::{
 };
 #[cfg(windows)]
 pub use sysinfo::gather as gather_snapshot;
-pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};
+pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, group_digits, percent};
 pub use tools::{WINDOWS_TOOLS, WindowsTool, expand_target, is_openable};
 
 #[cfg(windows)]

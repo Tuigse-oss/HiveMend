@@ -39,6 +39,19 @@ pub fn percent(part: u64, total: u64) -> u64 {
 }
 
 /// `15360` becomes `15.0 MB`; bytes stay bare below one kilobyte.
+/// `1234567` as `1,234,567`.
+pub fn group_digits(number: u64) -> String {
+    let digits = number.to_string();
+    let mut out = String::new();
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
+}
+
 pub fn format_bytes(bytes: u64) -> String {
     const UNITS: [&str; 5] = ["B", "KB", "MB", "GB", "TB"];
     if bytes < 1024 {
@@ -208,6 +221,14 @@ mod tests {
         assert_eq!(format_bytes(1024 * 1024 * 512), "512 MB");
         assert_eq!(format_bytes(1024 * 1024 * 1536), "1.5 GB");
         assert_eq!(format_bytes(1024_u64.pow(4)), "1 TB");
+    }
+
+    #[test]
+    fn counts_are_grouped_in_thousands() {
+        assert_eq!(group_digits(0), "0");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(1000), "1,000");
+        assert_eq!(group_digits(1948380), "1,948,380");
     }
 
     #[test]

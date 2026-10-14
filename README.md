@@ -86,8 +86,8 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window. The left rail lists Home, Scan,
-Restore, Privacy, Startup, Programs, Services, Monitor, Tools, Settings, and
-About.
+Restore, Privacy, Startup, Programs, Disk Space, Services, Monitor, Tools,
+Settings, and About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
@@ -138,6 +138,11 @@ About.
   administrator, it only starts uninstallers kept in the Windows or
   Program Files folders, and leaves programs installed just for your
   account to a normal window.
+- Disk Space adds up a fixed drive or your user folder and lists the
+  biggest folders (double-click or Enter to go in, Backspace to go up),
+  the 100 largest files, and the space by kind of file. Sizes are file
+  sizes. Junctions and symbolic links are never followed, so nothing is
+  counted twice. It only reads; Open in Explorer is the only action.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.

@@ -26,9 +26,9 @@ use hive_mend::{
     WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
     backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
     exclusions_file, expand_target, format_bytes, format_uptime, gather_hives, gather_snapshot,
-    list_backups, parse_custom, plan_profile, preview, repair_with_progress, restore_backup,
-    scan_with_progress, settings_file, sort_services, start_services, still_reported,
-    stop_services, user_dir,
+    group_digits, list_backups, parse_custom, plan_profile, preview, repair_with_progress,
+    restore_backup, scan_with_progress, settings_file, sort_services, start_services,
+    still_reported, stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -55,13 +55,14 @@ use windows_sys::Win32::UI::Controls::{
     LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT,
     LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
-    LVN_ITEMCHANGING, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK,
-    NMHDR, NMLISTVIEW, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
+    LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR, NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS,
+    PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    EnableWindow, GetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -111,6 +112,9 @@ const ID_PG_UNINSTALL: u16 = 1610;
 const ID_PG_OPEN: u16 = 1611;
 const ID_PG_REFRESH: u16 = 1612;
 const ID_PG_LIST: u16 = 2011;
+const ID_DS_UP: u16 = 1620;
+const ID_DS_OPEN: u16 = 1621;
+const ID_DS_LIST: u16 = 2012;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -128,6 +132,7 @@ const ID_IGNORED: u16 = 2003;
 const ID_SVC_LIST: u16 = 2004;
 const ID_SVC_TUNE: u16 = 2005;
 const ID_PRIV_LIST: u16 = 2006;
+const IDOK: u16 = 1;
 const IDCANCEL: u16 = 2;
 
 const MENU_DETAILS: usize = 1;
@@ -182,6 +187,7 @@ enum Page {
     Privacy,
     Startup,
     Programs,
+    DiskSpace,
     Monitor,
     Tools,
     About,
@@ -194,6 +200,7 @@ const NAV: &[(&str, Page, Icon)] = &[
     ("Privacy", Page::Privacy, Icon::Privacy),
     ("Startup", Page::Startup, Icon::Startup),
     ("Programs", Page::Programs, Icon::Programs),
+    ("Disk Space", Page::DiskSpace, Icon::DiskSpace),
     ("Services", Page::Services, Icon::Optimize),
     ("Monitor", Page::Monitor, Icon::Monitor),
     ("Tools", Page::Tools, Icon::Tools),
@@ -244,6 +251,23 @@ enum Job {
     Restoring,
     Services,
     Cleaning,
+    Analyzing,
+}
+
+/// Disk Space page views.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiskView {
+    Folders,
+    Files,
+    Kinds,
+}
+
+/// What a Disk Space row stands for.
+#[derive(Clone, Copy)]
+enum DiskRow {
+    Folder(usize),
+    File(usize),
+    Kind,
 }
 
 /// Services page views: suggested Manual starts, or every service.
@@ -270,6 +294,8 @@ enum Action {
     OpenTool(usize),
     Refresh,
     SvcView(SvcView),
+    DiskRoot(usize),
+    DiskView(DiskView),
 }
 
 impl Action {
@@ -307,6 +333,9 @@ enum JobResult {
     },
     Privacy {
         result: Result<CleanOutcome, String>,
+    },
+    Disk {
+        report: Box<hive_mend::DiskReport>,
     },
 }
 
@@ -491,6 +520,16 @@ struct App {
     btn_pg_uninstall: HWND,
     btn_pg_open: HWND,
     btn_pg_refresh: HWND,
+    disk_roots: Vec<(String, String)>,
+    disk_report: Option<Box<hive_mend::DiskReport>>,
+    disk_root: Option<usize>,
+    disk_at: usize,
+    disk_view: DiskView,
+    disk_rows: Vec<DiskRow>,
+    disk_note: String,
+    disk_list: HWND,
+    btn_ds_up: HWND,
+    btn_ds_open: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -1024,6 +1063,16 @@ impl App {
             btn_pg_uninstall: std::ptr::null_mut(),
             btn_pg_open: std::ptr::null_mut(),
             btn_pg_refresh: std::ptr::null_mut(),
+            disk_roots: Vec::new(),
+            disk_report: None,
+            disk_root: None,
+            disk_at: 0,
+            disk_view: DiskView::Folders,
+            disk_rows: Vec::new(),
+            disk_note: String::new(),
+            disk_list: std::ptr::null_mut(),
+            btn_ds_up: std::ptr::null_mut(),
+            btn_ds_open: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1143,6 +1192,15 @@ impl App {
         self.btn_pg_uninstall = button(hwnd, ID_PG_UNINSTALL, "Uninstall", BS_PUSHBUTTON);
         self.btn_pg_open = button(hwnd, ID_PG_OPEN, "Open Install Folder", BS_PUSHBUTTON);
         self.btn_pg_refresh = button(hwnd, ID_PG_REFRESH, "Refresh", BS_PUSHBUTTON);
+        self.disk_list = list_view(
+            hwnd,
+            ID_DS_LIST,
+            LVS_SINGLESEL,
+            0,
+            &[("Name", 380), ("Size", 100), ("Share", 80), ("Files", 100)],
+        );
+        self.btn_ds_up = button(hwnd, ID_DS_UP, "Up One Level", BS_PUSHBUTTON);
+        self.btn_ds_open = button(hwnd, ID_DS_OPEN, "Open in Explorer", BS_PUSHBUTTON);
         self.chk_restore_point = button(
             hwnd,
             ID_RESTORE_POINT,
@@ -1252,6 +1310,9 @@ impl App {
             self.btn_pg_uninstall,
             self.btn_pg_open,
             self.btn_pg_refresh,
+            self.disk_list,
+            self.btn_ds_up,
+            self.btn_ds_open,
         ]);
         all
     }
@@ -1339,6 +1400,16 @@ impl App {
             Action::Elevate => self.elevate(),
             Action::OpenTool(index) => self.open_tool(index),
             Action::Refresh => self.invalidate(),
+            Action::DiskRoot(index) => self.start_disk(index),
+            Action::DiskView(view) => {
+                if self.busy() {
+                    return;
+                }
+                self.disk_view = view;
+                self.fill_disk();
+                self.sync_controls();
+                self.invalidate();
+            }
             Action::SvcView(view) => {
                 if self.busy() {
                     return;
@@ -1385,6 +1456,9 @@ impl App {
         if page == Page::Programs && !self.busy() {
             // Every visit: an uninstaller may have finished since.
             self.refresh_programs();
+        }
+        if page == Page::DiskSpace && self.disk_roots.is_empty() {
+            self.disk_roots = disk_roots();
         }
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
@@ -1445,6 +1519,30 @@ impl App {
                 self.open_program_folder();
                 return;
             }
+            ID_DS_UP => {
+                if let Some(parent) = self
+                    .disk_report
+                    .as_ref()
+                    .and_then(|report| report.nodes.get(self.disk_at))
+                    .and_then(|node| node.parent)
+                {
+                    self.disk_at = parent;
+                    self.disk_view = DiskView::Folders;
+                    self.fill_disk();
+                    self.sync_controls();
+                    self.invalidate();
+                }
+                return;
+            }
+            ID_DS_OPEN => {
+                self.open_disk_row();
+                return;
+            }
+            // Enter, which IsDialogMessage turns into IDOK.
+            IDOK if self.page == Page::DiskSpace && unsafe { GetFocus() } == self.disk_list => {
+                self.open_disk_selection();
+                return;
+            }
             ID_PG_REFRESH => {
                 self.refresh_programs();
                 self.invalidate();
@@ -1476,6 +1574,10 @@ impl App {
                 } else if self.job == Job::Cleaning {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping after this category...");
+                    self.show_progress();
+                } else if self.job == Job::Analyzing {
+                    CANCEL.store(true, Ordering::SeqCst);
+                    progress_text("Stopping...");
                     self.show_progress();
                 }
             }
@@ -1545,6 +1647,14 @@ impl App {
                 }
                 _ => {}
             }
+        } else if id == ID_DS_LIST && header.code == LVN_KEYDOWN {
+            // Backspace goes up a level, as in Explorer.
+            let key = unsafe { &*(lparam as *const NMLVKEYDOWN) };
+            if { key.wVKey } == 0x08 {
+                self.command(ID_DS_UP, 0);
+            }
+        } else if id == ID_DS_LIST && matches!(header.code, NM_DBLCLK | NM_RETURN) {
+            self.open_disk_selection();
         } else if id == ID_BACKUPS && header.code == NM_DBLCLK {
             if let Some(row) = selected_rows(self.backup_list).first() {
                 self.start_restore(*row);
@@ -3179,6 +3289,170 @@ impl App {
         }
     }
 
+    // ---- disk space ----------------------------------------------------
+
+    fn start_disk(&mut self, index: usize) {
+        if self.busy() {
+            return;
+        }
+        let Some((_, root)) = self.disk_roots.get(index).cloned() else {
+            return;
+        };
+        self.job = Job::Analyzing;
+        self.disk_root = Some(index);
+        self.disk_report = None;
+        self.disk_view = DiskView::Folders;
+        CANCEL.store(false, Ordering::SeqCst);
+        let used = drive_used_bytes(&root).max(1);
+        set_progress(0, 1000, &format!("Reading {root}..."));
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            let report =
+                hive_mend::analyze(&hive_mend::HostLister, &root, &mut |files, bytes, dir| {
+                    if last.elapsed() >= std::time::Duration::from_millis(200) {
+                        last = std::time::Instant::now();
+                        let done = (bytes.saturating_mul(1000) / used).min(990) as usize;
+                        set_progress(
+                            done,
+                            1000,
+                            &format!(
+                                "{} in {} files so far. Reading {dir}",
+                                format_bytes(bytes),
+                                group_digits(files)
+                            ),
+                        );
+                        post(hwnd, WM_JOB_PROGRESS);
+                    }
+                    !CANCEL.load(Ordering::SeqCst)
+                });
+            finish_job(
+                hwnd,
+                JobResult::Disk {
+                    report: Box::new(report),
+                },
+            );
+        });
+    }
+
+    fn fill_disk(&mut self) {
+        let Some(report) = self.disk_report.as_ref() else {
+            return;
+        };
+        let total = report.nodes[0].bytes.max(1);
+        let share = |bytes: u64| format!("{:.1}%", bytes as f64 * 100.0 / total as f64);
+        let mut rows: Vec<(DiskRow, [String; 4])> = Vec::new();
+        match self.disk_view {
+            DiskView::Folders => {
+                let here = report.nodes[self.disk_at].bytes.max(1);
+                for child in report.children_by_size(self.disk_at) {
+                    let node = &report.nodes[child];
+                    rows.push((
+                        DiskRow::Folder(child),
+                        [
+                            node.name.clone(),
+                            format_bytes(node.bytes),
+                            format!("{:.1}%", node.bytes as f64 * 100.0 / here as f64),
+                            group_digits(node.files),
+                        ],
+                    ));
+                }
+                let own = report.nodes[self.disk_at].bytes
+                    - report.nodes[self.disk_at]
+                        .children
+                        .iter()
+                        .map(|child| report.nodes[*child].bytes)
+                        .sum::<u64>();
+                if own > 0 {
+                    rows.push((
+                        DiskRow::Kind,
+                        [
+                            "(files in this folder)".to_string(),
+                            format_bytes(own),
+                            format!("{:.1}%", own as f64 * 100.0 / here as f64),
+                            String::new(),
+                        ],
+                    ));
+                }
+            }
+            DiskView::Files => {
+                for (index, file) in report.largest.iter().enumerate() {
+                    rows.push((
+                        DiskRow::File(index),
+                        [
+                            file.path.clone(),
+                            format_bytes(file.bytes),
+                            share(file.bytes),
+                            String::new(),
+                        ],
+                    ));
+                }
+            }
+            DiskView::Kinds => {
+                let mut kinds = report.kinds.clone();
+                kinds.sort_by_key(|kind| std::cmp::Reverse(kind.1));
+                for (kind, bytes, files) in kinds {
+                    rows.push((
+                        DiskRow::Kind,
+                        [
+                            kind.label().to_string(),
+                            format_bytes(bytes),
+                            share(bytes),
+                            group_digits(files),
+                        ],
+                    ));
+                }
+            }
+        }
+        unsafe {
+            SendMessageW(self.disk_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.disk_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, (_, cells)) in rows.iter().enumerate() {
+            let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
+            insert_row(self.disk_list, row, &cells);
+        }
+        self.disk_rows = rows.into_iter().map(|(row, _)| row).collect();
+        unsafe {
+            SendMessageW(self.disk_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.disk_list, std::ptr::null(), 1);
+        }
+    }
+
+    /// Go into the highlighted folder, or show the highlighted file.
+    fn open_disk_selection(&mut self) {
+        let row = selected_rows(self.disk_list).first().copied();
+        match row.and_then(|row| self.disk_rows.get(row).copied()) {
+            Some(DiskRow::Folder(node)) => {
+                self.disk_at = node;
+                self.fill_disk();
+                self.sync_controls();
+                self.invalidate();
+            }
+            Some(DiskRow::File(_)) => self.open_disk_row(),
+            _ => {}
+        }
+    }
+
+    fn open_disk_row(&mut self) {
+        let Some(report) = self.disk_report.as_ref() else {
+            return;
+        };
+        let row = selected_rows(self.disk_list).first().copied();
+        let arg = match row.and_then(|row| self.disk_rows.get(row).copied()) {
+            Some(DiskRow::Folder(node)) => format!("\"{}\"", report.path_of(node)),
+            Some(DiskRow::File(index)) => match report.largest.get(index) {
+                Some(file) => format!("/select,\"{}\"", file.path),
+                None => return,
+            },
+            _ => format!("\"{}\"", report.path_of(self.disk_at)),
+        };
+        shell_open(self.hwnd, "explorer.exe", Some(&arg));
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -3835,6 +4109,36 @@ impl App {
                 self.sync_controls();
                 self.finish_services(op, result, services);
             }
+            JobResult::Disk { report } => {
+                let unread = if report.unreadable > 0 {
+                    format!(
+                        " {} could not be read{}.",
+                        count_of(report.unreadable, "folder", "folders"),
+                        if self.elevated {
+                            ""
+                        } else {
+                            " (Run as administrator to include more)"
+                        }
+                    )
+                } else {
+                    String::new()
+                };
+                self.disk_note = format!(
+                    "{}{} holds {} in {}.{unread}",
+                    if report.canceled {
+                        "Stopped early: "
+                    } else {
+                        ""
+                    },
+                    report.path_of(0),
+                    format_bytes(report.nodes[0].bytes),
+                    count_of(report.nodes[0].files, "file", "files"),
+                );
+                self.disk_at = 0;
+                self.disk_report = Some(report);
+                self.sync_controls();
+                self.fill_disk();
+            }
             JobResult::Privacy { result } => {
                 self.sync_controls();
                 self.finish_privacy(result);
@@ -4301,6 +4605,42 @@ impl App {
                 let name_w = (width - self.s(180 + 95 + 80 + 120 + 26)).max(self.s(160));
                 unsafe { SendMessageW(self.programs_list, LVM_SETCOLUMNWIDTH, 0, name_w as isize) };
             }
+            Page::DiskSpace => {
+                if self.job == Job::Analyzing {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 52), width, self.s(22));
+                    visible.push(self.btn_cancel);
+                    place(
+                        self.btn_cancel,
+                        left,
+                        self.s(BODY_Y + 124),
+                        self.s(110),
+                        button_h,
+                    );
+                } else if self.disk_report.is_some() {
+                    visible.extend([self.disk_list, self.btn_ds_up, self.btn_ds_open]);
+                    let top = self.s(BODY_Y + 44);
+                    place(
+                        self.disk_list,
+                        left,
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
+                    );
+                    place(self.btn_ds_up, left, button_y, self.s(130), button_h);
+                    place(
+                        self.btn_ds_open,
+                        left + self.s(138),
+                        button_y,
+                        self.s(160),
+                        button_h,
+                    );
+                    let name_w = (width - self.s(100 + 80 + 100 + 26)).max(self.s(160));
+                    unsafe { SendMessageW(self.disk_list, LVM_SETCOLUMNWIDTH, 0, name_w as isize) };
+                    let can_go_up = self.disk_view == DiskView::Folders && self.disk_at != 0;
+                    unsafe { EnableWindow(self.btn_ds_up, i32::from(can_go_up)) };
+                }
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -4420,6 +4760,7 @@ impl App {
                 Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Startup => self.draw_startup(mem, rect),
                 Page::Programs => self.draw_programs(mem, rect),
+                Page::DiskSpace => self.draw_disk(mem, rect, previous_hover),
                 Page::Privacy => self.draw_privacy(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
@@ -4629,6 +4970,7 @@ impl App {
                 Job::Restoring => "Restoring...",
                 Job::Services => "Working...",
                 Job::Cleaning => "Cleaning...",
+                Job::Analyzing => "Reading sizes...",
                 Job::Idle => "",
             };
             text(
@@ -5176,6 +5518,140 @@ impl App {
             "Highlight a program, then Uninstall to start its own uninstaller. Store apps are in Settings > Apps.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+    }
+
+    unsafe fn draw_disk(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        self.heading(hdc, rect, "Disk Space", None);
+        let inside = self
+            .disk_report
+            .as_ref()
+            .filter(|_| self.disk_at != 0 && self.disk_view == DiskView::Folders)
+            .map(|report| {
+                let node = &report.nodes[self.disk_at];
+                format!(
+                    "{} holds {} in {}.",
+                    report.path_of(self.disk_at),
+                    format_bytes(node.bytes),
+                    count_of(node.files, "file", "files")
+                )
+            });
+        let line = if self.job == Job::Analyzing {
+            "Reading folder sizes. Nothing is changed.".to_string()
+        } else if let Some(inside) = inside {
+            inside
+        } else if !self.disk_note.is_empty() {
+            self.disk_note.clone()
+        } else {
+            "See what takes up space. Hivemend only reads here; it never deletes anything."
+                .to_string()
+        };
+        self.subtitle(hdc, rect, &line);
+        // Drive pills on the left; view pills on the right once there is a
+        // report.
+        let mut x = left;
+        let roots = self.disk_roots.clone();
+        for (index, (label, _)) in roots.iter().enumerate() {
+            let selected = self.disk_root == Some(index);
+            x = self.pill(hdc, x, label, selected, hover, Action::DiskRoot(index));
+        }
+        if self.job == Job::Analyzing {
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 84),
+                    right,
+                    bottom: self.s(BODY_Y + 110),
+                },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            return;
+        }
+        if self.disk_report.is_none() {
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 120),
+                },
+                "Pick a drive or your user folder above. Hivemend adds up every folder without following links, then lists the biggest folders, the largest files, and the space by kind of file.",
+                DT_WORDBREAK | DT_NOPREFIX,
+            );
+            return;
+        }
+        let views = [
+            ("Folders", DiskView::Folders),
+            ("Largest files", DiskView::Files),
+            ("File types", DiskView::Kinds),
+        ];
+        let widths: i32 = views
+            .iter()
+            .map(|(label, _)| measure(hdc, self.fonts.body_bold, label).0 + self.s(28 + 8))
+            .sum();
+        let mut x = (right - widths + self.s(8)).max(x + self.s(16));
+        for (label, view) in views {
+            let selected = self.disk_view == view;
+            x = self.pill(hdc, x, label, selected, hover, Action::DiskView(view));
+        }
+    }
+
+    /// A rounded tab-like button; returns where the next one starts.
+    unsafe fn pill(
+        &mut self,
+        hdc: HDC,
+        x: i32,
+        label: &str,
+        selected: bool,
+        hover: Option<RECT>,
+        action: Action,
+    ) -> i32 {
+        let size = measure(hdc, self.fonts.body_bold, label);
+        let tab = RECT {
+            left: x,
+            top: self.s(BODY_Y),
+            right: x + size.0 + self.s(28),
+            bottom: self.s(BODY_Y + 30),
+        };
+        let lit = lit(hover, tab);
+        self.panel(
+            hdc,
+            tab,
+            self.s(14),
+            if selected {
+                rgb(222, 240, 226)
+            } else if lit {
+                rgb(240, 247, 241)
+            } else {
+                rgb(249, 251, 249)
+            },
+            if selected {
+                rgb(46, 130, 76)
+            } else {
+                rgb(184, 198, 188)
+            },
+            1,
+            BG,
+        );
+        text(
+            hdc,
+            self.fonts.body_bold,
+            if selected { THEME_INK } else { INK },
+            tab,
+            label,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
+        );
+        self.spot(tab, action);
+        tab.right + self.s(8)
     }
 
     unsafe fn draw_services(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
@@ -6682,6 +7158,52 @@ fn copy_text(hwnd: HWND, value: &str) {
 
 /// Queue a shell open for after the handler returns: ShellExecuteW can pump
 /// messages (its own error dialog, a DDE or COM wait).
+/// `1 file`, `2 files`, `1,000 files`.
+fn count_of(count: u64, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        group_digits(count),
+        if count == 1 { one } else { many }
+    )
+}
+
+/// The fixed drives, then the user's own folder, as Disk Space choices.
+fn disk_roots() -> Vec<(String, String)> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    let mask = unsafe { GetLogicalDrives() };
+    let mut roots = Vec::new();
+    for letter in 0..26u8 {
+        if mask & (1 << letter) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + letter) as char);
+        if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } == DRIVE_FIXED {
+            roots.push((root[..2].to_string(), root));
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE")
+        && profile.as_bytes().get(1) == Some(&b':')
+    {
+        roots.push(("Your user folder".to_string(), profile));
+    }
+    roots
+}
+
+/// Bytes in use on the drive holding `path`, for the progress bar.
+fn drive_used_bytes(path: &str) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let Some(drive) = path.get(..2) else {
+        return 0;
+    };
+    let root = wide(&format!("{drive}\\"));
+    let (mut caller, mut total, mut free) = (0u64, 0u64, 0u64);
+    if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut caller, &mut total, &mut free) } == 0 {
+        return 0;
+    }
+    total.saturating_sub(free)
+}
+
 fn shell_open(_hwnd: HWND, file: &str, args: Option<&str>) {
     lock(&NATIVE).push_back(Native::Shell {
         file: file.to_string(),
