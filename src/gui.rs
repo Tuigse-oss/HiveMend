@@ -101,6 +101,7 @@ const ID_RESTORE: u16 = 1101;
 const ID_OPEN_BACKUPS: u16 = 1102;
 const ID_UNIGNORE: u16 = 1103;
 const ID_SCANNER_BASE: u16 = 1200;
+const ID_RESTORE_POINT: u16 = 1150;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -141,7 +142,9 @@ const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
 const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
-const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 18;
+/// The restore-point checkbox sits under the scanner grid.
+const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6;
+const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52;
 
 /// The window background; cards and tiles sit on it as white surfaces.
 const BG: u32 = rgb(245, 247, 246);
@@ -277,6 +280,8 @@ enum JobResult {
         result: Result<RepairOutcome, String>,
         /// Ticked rows a fresh scan no longer reported.
         fixed_meanwhile: Vec<Finding>,
+        /// What happened with the Windows restore point, if one was asked for.
+        restore_note: Option<String>,
     },
     Restore {
         file: PathBuf,
@@ -455,6 +460,7 @@ struct App {
     btn_restore: HWND,
     btn_open_backups: HWND,
     scanner_boxes: Vec<(ScannerId, HWND)>,
+    chk_restore_point: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -972,6 +978,7 @@ impl App {
             btn_restore: std::ptr::null_mut(),
             btn_open_backups: std::ptr::null_mut(),
             scanner_boxes: Vec::new(),
+            chk_restore_point: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1059,6 +1066,20 @@ impl App {
             unsafe { SendMessageW(check, BM_SETCHECK, state, 0) };
             self.scanner_boxes.push((*id, check));
         }
+        self.chk_restore_point = button(
+            hwnd,
+            ID_RESTORE_POINT,
+            "Create a Windows restore point before repairs (needs administrator rights)",
+            BS_AUTOCHECKBOX,
+        );
+        unsafe {
+            SendMessageW(
+                self.chk_restore_point,
+                BM_SETCHECK,
+                (!self.settings.skip_restore_point) as usize,
+                0,
+            )
+        };
         self.ignored_list = list_view(hwnd, ID_IGNORED, 0, 0, &[("Ignored entry", 700)]);
         self.btn_unignore = button(
             hwnd,
@@ -1143,6 +1164,7 @@ impl App {
             self.btn_priv_clean,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
+        all.push(self.chk_restore_point);
         all
     }
 
@@ -1287,6 +1309,14 @@ impl App {
                 let (scanner, check) = self.scanner_boxes[index];
                 let on = unsafe { SendMessageW(check, BM_GETCHECK, 0, 0) } == 1;
                 self.settings.set_enabled(scanner, on);
+                self.save_settings();
+            }
+            return;
+        }
+        if id == ID_RESTORE_POINT {
+            if code == BN_CLICKED {
+                let on = unsafe { SendMessageW(self.chk_restore_point, BM_GETCHECK, 0, 0) } == 1;
+                self.settings.skip_restore_point = !on;
                 self.save_settings();
             }
             return;
@@ -2968,6 +2998,8 @@ impl App {
         self.show_progress();
         self.invalidate();
         let hwnd = self.hwnd as isize;
+        // Windows only creates restore points for administrators.
+        let make_point = self.elevated && !self.settings.skip_restore_point;
         std::thread::spawn(move || {
             let engine = match Engine::try_builtin() {
                 Ok(engine) => engine,
@@ -2977,6 +3009,7 @@ impl App {
                         JobResult::Repair {
                             result: Err(format!("Could not load the scanner rules: {err}")),
                             fixed_meanwhile: Vec::new(),
+                            restore_note: None,
                         },
                     );
                     return;
@@ -3013,16 +3046,24 @@ impl App {
                 .filter(|finding| !confirmed.contains(finding))
                 .cloned()
                 .collect();
+            let mut restore_note = None;
             let result = if confirmed.is_empty() {
                 Ok(RepairOutcome {
                     backup_file: PathBuf::new(),
                     ..RepairOutcome::default()
                 })
             } else {
+                let point = if make_point {
+                    set_progress(1, 3, "Creating a Windows restore point...");
+                    post(hwnd, WM_JOB_PROGRESS);
+                    Some(hive_mend::restorepoint::begin("Hivemend repair"))
+                } else {
+                    None
+                };
                 set_progress(1, 3, "Saving the backup...");
                 post(hwnd, WM_JOB_PROGRESS);
                 let total = confirmed.len();
-                repair_with_progress(
+                let repaired = repair_with_progress(
                     &mut WindowsRegistry,
                     &mut HostFs,
                     &confirmed,
@@ -3036,13 +3077,28 @@ impl App {
                         post(hwnd, WM_JOB_PROGRESS);
                     },
                 )
-                .map_err(|err| format!("The backup could not be written: {err}"))
+                .map_err(|err| format!("The backup could not be written: {err}"));
+                restore_note = match point {
+                    Some(Ok(point)) => {
+                        let changed = repaired.as_ref().is_ok_and(|outcome| outcome.applied > 0);
+                        hive_mend::restorepoint::end(point, changed);
+                        changed.then(|| {
+                            "Windows also saved a restore point before the repair. (Windows keeps at most one a day, so it may reuse today's.)".to_string()
+                        })
+                    }
+                    Some(Err(why)) => Some(format!(
+                        "No Windows restore point was made: {why}. The registry backup was saved as usual."
+                    )),
+                    None => None,
+                };
+                repaired
             };
             finish_job(
                 hwnd,
                 JobResult::Repair {
                     result,
                     fixed_meanwhile,
+                    restore_note,
                 },
             );
         });
@@ -3052,6 +3108,7 @@ impl App {
         &mut self,
         result: Result<RepairOutcome, String>,
         fixed_meanwhile: Vec<Finding>,
+        restore_note: Option<String>,
     ) {
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -3072,6 +3129,9 @@ impl App {
         self.drop_rows(&rows);
         let already = outcome.already_gone + fixed_meanwhile.len();
         let mut lines = vec![format!("Removed: {}", outcome.applied)];
+        if let Some(note) = restore_note {
+            lines.push(note);
+        }
         if already > 0 {
             lines.push(format!(
                 "Already fixed before repair reached them: {already}"
@@ -3340,9 +3400,10 @@ impl App {
             JobResult::Repair {
                 result,
                 fixed_meanwhile,
+                restore_note,
             } => {
                 self.sync_controls();
-                self.finish_repair(result, fixed_meanwhile);
+                self.finish_repair(result, fixed_meanwhile, restore_note);
             }
             JobResult::Restore { file, result } => {
                 self.sync_controls();
@@ -3605,6 +3666,14 @@ impl App {
                         self.s(26),
                     );
                 }
+                visible.push(self.chk_restore_point);
+                place(
+                    self.chk_restore_point,
+                    left,
+                    self.s(SETTINGS_RESTORE_POINT_Y),
+                    width - self.s(12),
+                    self.s(26),
+                );
                 let ignored_top = self.s(SETTINGS_IGNORED_Y + 62);
                 visible.extend([self.ignored_list, self.btn_unignore]);
                 place(

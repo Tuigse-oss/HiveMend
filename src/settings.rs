@@ -14,6 +14,9 @@ pub struct Settings {
     pub last_repair: String,
     /// Privacy category ids left ticked. Empty means nothing ticked.
     pub privacy_ticked: Vec<String>,
+    /// Repairs skip the Windows restore point. Off by default: an elevated
+    /// repair asks Windows for one first.
+    pub skip_restore_point: bool,
 }
 
 impl Settings {
@@ -38,6 +41,7 @@ impl Settings {
                         .filter(|id| !id.is_empty())
                         .collect();
                 }
+                "restore_point" => settings.skip_restore_point = value == "0",
                 _ => {}
             }
         }
@@ -65,6 +69,9 @@ impl Settings {
             text.push_str(&format!("last_problems={count}\r\n"));
         }
         text.push_str(&format!("last_repair={}\r\n", one_line(&self.last_repair)));
+        if self.skip_restore_point {
+            text.push_str("restore_point=0\r\n");
+        }
         if !self.privacy_ticked.is_empty() {
             text.push_str(&format!(
                 "privacy_ticked={}\r\n",
@@ -122,5 +129,12 @@ mod tests {
         assert_eq!(again.last_repair, "Removed 3 Backup x");
         assert_eq!(again.privacy_ticked, ["user-temp", "clipboard"]);
         assert!(Settings::default().privacy_ticked.is_empty());
+        // Restore points are on unless turned off, and the choice is kept.
+        assert!(!Settings::default().skip_restore_point);
+        let off = Settings {
+            skip_restore_point: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&off.to_text()).skip_restore_point);
     }
 }

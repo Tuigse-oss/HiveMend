@@ -11,6 +11,8 @@ mod model;
 mod pathutil;
 mod privacy;
 mod registry;
+#[cfg(windows)]
+pub mod restorepoint;
 mod rules;
 mod scanners;
 mod services;

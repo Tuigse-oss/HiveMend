@@ -93,6 +93,11 @@ Restore, Privacy, Services, Monitor, Tools, Settings, and About.
   Services, Quick Scan (a fast startup, uninstall, shared-DLL, and COM
   pass), Monitor, Restore, and Windows Tools, and a line of statistics
   with a reset link.
+- Repairs run as administrator first ask Windows for a System Restore
+  point ("Hivemend repair"), on top of Hivemend's own `.reg` backup. It
+  needs System Protection turned on for the system drive, and Windows
+  makes at most one a day; if none is made the repair still proceeds and
+  says why. Settings can turn this off.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
   startup type of a highlighted row). Changing a startup type writes a
