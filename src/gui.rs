@@ -2436,13 +2436,30 @@ impl App {
 
     fn rebuild_privacy(&mut self) {
         let mut items = build_items(&WindowsSystemTargets);
-        if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
+        // The custom list and the remembered ticks live in the per-user
+        // folder, which programs running without elevation can edit. An
+        // elevated window acts on neither: it starts with nothing ticked and
+        // shows why the custom list is left out.
+        if self.elevated {
+            if custom_privacy_file().exists() {
+                let mut custom = parse_custom("", &HostFs);
+                custom.warnings.push(
+                    "Custom items are not used while Hive Mend runs as administrator. Start it without administrator rights to clean them."
+                        .to_string(),
+                );
+                items.push(custom);
+            }
+        } else if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
             let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
             if !custom.targets.is_empty() || !custom.warnings.is_empty() {
                 items.push(custom);
             }
         }
-        let ticked: Vec<String> = self.settings.privacy_ticked.clone();
+        let ticked: Vec<String> = if self.elevated {
+            Vec::new()
+        } else {
+            self.settings.privacy_ticked.clone()
+        };
         self.priv_checked = items
             .iter()
             .map(|item| ticked.iter().any(|id| id == &item.id))
@@ -2454,6 +2471,11 @@ impl App {
     }
 
     fn save_priv_ticks(&mut self) {
+        // An elevated window never stores ticks for the per-user settings,
+        // so it cannot change what a later window starts with.
+        if self.elevated {
+            return;
+        }
         self.settings.privacy_ticked = self
             .priv_items
             .iter()
