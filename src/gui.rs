@@ -107,6 +107,10 @@ const ID_SU_DISABLE: u16 = 1601;
 const ID_SU_OPEN: u16 = 1602;
 const ID_SU_REFRESH: u16 = 1603;
 const ID_SU_LIST: u16 = 2010;
+const ID_PG_UNINSTALL: u16 = 1610;
+const ID_PG_OPEN: u16 = 1611;
+const ID_PG_REFRESH: u16 = 1612;
+const ID_PG_LIST: u16 = 2011;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -177,6 +181,7 @@ enum Page {
     Services,
     Privacy,
     Startup,
+    Programs,
     Monitor,
     Tools,
     About,
@@ -188,6 +193,7 @@ const NAV: &[(&str, Page, Icon)] = &[
     ("Restore", Page::Restore, Icon::Restore),
     ("Privacy", Page::Privacy, Icon::Privacy),
     ("Startup", Page::Startup, Icon::Startup),
+    ("Programs", Page::Programs, Icon::Programs),
     ("Services", Page::Services, Icon::Optimize),
     ("Monitor", Page::Monitor, Icon::Monitor),
     ("Tools", Page::Tools, Icon::Tools),
@@ -394,6 +400,7 @@ enum Redo {
     Repair,
     Restore(usize),
     Startup(Vec<usize>, bool),
+    Uninstall(usize),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -477,6 +484,13 @@ struct App {
     btn_su_disable: HWND,
     btn_su_open: HWND,
     btn_su_refresh: HWND,
+    programs: Vec<hive_mend::InstalledProgram>,
+    programs_loaded: bool,
+    programs_note: String,
+    programs_list: HWND,
+    btn_pg_uninstall: HWND,
+    btn_pg_open: HWND,
+    btn_pg_refresh: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -1003,6 +1017,13 @@ impl App {
             btn_su_disable: std::ptr::null_mut(),
             btn_su_open: std::ptr::null_mut(),
             btn_su_refresh: std::ptr::null_mut(),
+            programs: Vec::new(),
+            programs_loaded: false,
+            programs_note: String::new(),
+            programs_list: std::ptr::null_mut(),
+            btn_pg_uninstall: std::ptr::null_mut(),
+            btn_pg_open: std::ptr::null_mut(),
+            btn_pg_refresh: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1106,6 +1127,22 @@ impl App {
         self.btn_su_disable = button(hwnd, ID_SU_DISABLE, "Disable", BS_PUSHBUTTON);
         self.btn_su_open = button(hwnd, ID_SU_OPEN, "Open File Location", BS_PUSHBUTTON);
         self.btn_su_refresh = button(hwnd, ID_SU_REFRESH, "Refresh", BS_PUSHBUTTON);
+        self.programs_list = list_view(
+            hwnd,
+            ID_PG_LIST,
+            LVS_SINGLESEL,
+            0,
+            &[
+                ("Name", 260),
+                ("Publisher", 180),
+                ("Installed", 95),
+                ("Size", 80),
+                ("Version", 120),
+            ],
+        );
+        self.btn_pg_uninstall = button(hwnd, ID_PG_UNINSTALL, "Uninstall", BS_PUSHBUTTON);
+        self.btn_pg_open = button(hwnd, ID_PG_OPEN, "Open Install Folder", BS_PUSHBUTTON);
+        self.btn_pg_refresh = button(hwnd, ID_PG_REFRESH, "Refresh", BS_PUSHBUTTON);
         self.chk_restore_point = button(
             hwnd,
             ID_RESTORE_POINT,
@@ -1211,6 +1248,10 @@ impl App {
             self.btn_su_disable,
             self.btn_su_open,
             self.btn_su_refresh,
+            self.programs_list,
+            self.btn_pg_uninstall,
+            self.btn_pg_open,
+            self.btn_pg_refresh,
         ]);
         all
     }
@@ -1341,6 +1382,10 @@ impl App {
         if page == Page::Startup && !self.startup_loaded {
             self.refresh_startup();
         }
+        if page == Page::Programs && !self.busy() {
+            // Every visit: an uninstaller may have finished since.
+            self.refresh_programs();
+        }
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
@@ -1388,6 +1433,20 @@ impl App {
             }
             ID_SU_REFRESH => {
                 self.refresh_startup();
+                self.invalidate();
+                return;
+            }
+            ID_PG_UNINSTALL => {
+                let rows = selected_rows(self.programs_list);
+                self.uninstall_program(&rows);
+                return;
+            }
+            ID_PG_OPEN => {
+                self.open_program_folder();
+                return;
+            }
+            ID_PG_REFRESH => {
+                self.refresh_programs();
                 self.invalidate();
                 return;
             }
@@ -3001,6 +3060,125 @@ impl App {
         }
     }
 
+    // ---- programs ------------------------------------------------------
+
+    fn refresh_programs(&mut self) {
+        self.programs = hive_mend::list_programs(&WindowsRegistry);
+        self.programs_loaded = true;
+        let total: u64 = self
+            .programs
+            .iter()
+            .filter_map(|program| program.size)
+            .sum();
+        self.programs_note = format!(
+            "{} programs installed, using about {} by their own estimates.",
+            self.programs.len(),
+            hive_mend::format_bytes(total)
+        );
+        unsafe {
+            SendMessageW(self.programs_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.programs_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, program) in self.programs.iter().enumerate() {
+            let size = program
+                .size
+                .map(hive_mend::format_bytes)
+                .unwrap_or_default();
+            insert_row(
+                self.programs_list,
+                row,
+                &[
+                    &program.name,
+                    &program.publisher,
+                    &program.installed,
+                    &size,
+                    &program.version,
+                ],
+            );
+        }
+        unsafe {
+            SendMessageW(self.programs_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.programs_list, std::ptr::null(), 1);
+        }
+    }
+
+    /// Start the highlighted program's own uninstaller, after a confirmation.
+    fn uninstall_program(&mut self, rows: &[usize]) {
+        if self.busy() {
+            return;
+        }
+        let Some(&row) = rows.first() else {
+            self.message("Highlight a program first.", MB_ICONINFORMATION);
+            return;
+        };
+        let Some(program) = self.programs.get(row).cloned() else {
+            return;
+        };
+        if self.elevated && program.scope == hive_mend::ProgramScope::User {
+            self.message(
+                &format!(
+                    "{} is installed just for your account. Open Hivemend without administrator rights to uninstall it.",
+                    program.name
+                ),
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let launch = match hive_mend::uninstall_launch(&HostFs, &program.uninstall, self.elevated) {
+            Ok(launch) => launch,
+            Err(err) => {
+                self.message(
+                    &format!(
+                        "Hivemend cannot start the uninstaller for {}: {err}.\n\nYou can try Settings > Apps > Installed apps instead.",
+                        program.name
+                    ),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        };
+        let question = format!(
+            "Start the uninstaller for {}?\n\n{} {}\n\nThis runs the program's own uninstaller with the command it registered. Most ask before removing anything, but a silent one (such as /S) removes the program right away. Programs are not backed up.",
+            program.name, launch.exe, launch.params
+        );
+        if !self.confirm(&question, Redo::Uninstall(row)) {
+            return;
+        }
+        let params = (!launch.params.is_empty()).then_some(launch.params.as_str());
+        shell_open(self.hwnd, &launch.exe, params);
+        self.programs_note = format!(
+            "Started the uninstaller for {}. Click Refresh when it finishes.",
+            program.name
+        );
+        self.invalidate();
+    }
+
+    fn open_program_folder(&mut self) {
+        let Some(program) = selected_rows(self.programs_list)
+            .first()
+            .and_then(|row| self.programs.get(*row))
+            .cloned()
+        else {
+            self.message("Highlight a program first.", MB_ICONINFORMATION);
+            return;
+        };
+        let folder = program.install_location.trim_end_matches('\\').to_string();
+        if folder.as_bytes().get(1) == Some(&b':') && std::path::Path::new(&folder).is_dir() {
+            shell_open(self.hwnd, "explorer.exe", Some(&format!("\"{folder}\"")));
+            return;
+        }
+        match hive_mend::uninstall_launch(&HostFs, &program.uninstall, false) {
+            Ok(launch) => {
+                let arg = format!("/select,\"{}\"", launch.exe);
+                shell_open(self.hwnd, "explorer.exe", Some(&arg));
+            }
+            Err(_) => self.message(
+                &format!("{} did not record where it is installed.", program.name),
+                MB_ICONINFORMATION,
+            ),
+        }
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -3721,6 +3899,12 @@ impl App {
                 .filter_map(|row| self.startup_items.get(*row))
                 .map(|item| format!("{}|{}", item.approved_key, item.name))
                 .collect(),
+            Redo::Uninstall(row) => self
+                .programs
+                .get(*row)
+                .map(|program| format!("{}|{}", program.key, program.uninstall))
+                .into_iter()
+                .collect(),
             Redo::PowerRows(rows, _) | Redo::SetRows(rows, _) => rows
                 .iter()
                 .filter_map(|row| self.services.get(*row))
@@ -3753,6 +3937,7 @@ impl App {
             Redo::Repair => self.start_repair(),
             Redo::Restore(row) => self.start_restore(row),
             Redo::Startup(rows, enable) => self.toggle_startup(&rows, enable),
+            Redo::Uninstall(row) => self.uninstall_program(&[row]),
         }
     }
 
@@ -4082,6 +4267,40 @@ impl App {
                     SendMessageW(self.startup_list, LVM_SETCOLUMNWIDTH, 3, command_w as isize)
                 };
             }
+            Page::Programs => {
+                visible.extend([
+                    self.programs_list,
+                    self.btn_pg_uninstall,
+                    self.btn_pg_open,
+                    self.btn_pg_refresh,
+                ]);
+                let top = self.s(LIST_Y);
+                place(
+                    self.programs_list,
+                    left,
+                    top,
+                    width,
+                    (button_y - self.s(14) - top).max(self.s(80)),
+                );
+                place(self.btn_pg_uninstall, left, button_y, self.s(110), button_h);
+                place(
+                    self.btn_pg_open,
+                    left + self.s(118),
+                    button_y,
+                    self.s(170),
+                    button_h,
+                );
+                let refresh_w = self.s(110);
+                place(
+                    self.btn_pg_refresh,
+                    right - refresh_w,
+                    button_y,
+                    refresh_w,
+                    button_h,
+                );
+                let name_w = (width - self.s(180 + 95 + 80 + 120 + 26)).max(self.s(160));
+                unsafe { SendMessageW(self.programs_list, LVM_SETCOLUMNWIDTH, 0, name_w as isize) };
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -4200,6 +4419,7 @@ impl App {
                 Page::Settings => self.draw_settings(mem, rect),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Startup => self.draw_startup(mem, rect),
+                Page::Programs => self.draw_programs(mem, rect),
                 Page::Privacy => self.draw_privacy(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
@@ -4931,6 +5151,29 @@ impl App {
                 bottom: self.s(BODY_Y + 22),
             },
             "Highlight items, then Enable or Disable. Disabling keeps the program installed, like Task Manager's Startup tab.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_programs(&mut self, hdc: HDC, rect: RECT) {
+        self.heading(hdc, rect, "Programs", None);
+        let line = if self.programs_note.is_empty() {
+            "The programs installed on this PC.".to_string()
+        } else {
+            self.programs_note.clone()
+        };
+        self.subtitle(hdc, rect, &line);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: self.s(CONTENT_X),
+                top: self.s(BODY_Y),
+                right: rect.right - self.s(24),
+                bottom: self.s(BODY_Y + 22),
+            },
+            "Highlight a program, then Uninstall to start its own uninstaller. Store apps are in Settings > Apps.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }

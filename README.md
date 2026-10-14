@@ -86,7 +86,8 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window. The left rail lists Home, Scan,
-Restore, Privacy, Startup, Services, Monitor, Tools, Settings, and About.
+Restore, Privacy, Startup, Programs, Services, Monitor, Tools, Settings, and
+About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
@@ -128,6 +129,15 @@ Restore, Privacy, Startup, Services, Monitor, Tools, Settings, and About.
   the two always agree. The previous switches are saved to a
   `startup-*.reg` backup first and can be undone on the Restore page.
   Items that start for all users need administrator rights.
+- Programs lists installed programs as Programs and Features does
+  (name, publisher, install date, size, version) and starts a program's
+  own uninstaller; Hivemend never removes program files itself. The
+  registered command is resolved to one existing `.exe` (a bare tool name
+  such as `MsiExec.exe` only from System32, an app alias such as
+  `winget.exe` only from your WindowsApps folder) or refused. Run as
+  administrator, it only starts uninstallers kept in the Windows or
+  Program Files folders, and leaves programs installed just for your
+  account to a normal window.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.

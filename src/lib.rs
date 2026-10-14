@@ -10,6 +10,7 @@ mod lnk;
 mod model;
 mod pathutil;
 mod privacy;
+mod programs;
 mod registry;
 #[cfg(windows)]
 pub mod restorepoint;
@@ -54,6 +55,7 @@ pub use privacy::{
     PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,
     mask_matches, parse_custom, preview, privacy_reg_allowed, uninstall_present,
 };
+pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
 pub use registry::MemoryRegistry;
 pub use rules::decode_text_owned;
 pub use services::{
