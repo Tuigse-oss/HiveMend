@@ -11,6 +11,7 @@
 //! - The window cannot be closed while a repair or restore is running.
 #![allow(unsafe_op_in_unsafe_fn)]
 
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -71,7 +72,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW,
+    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW, IsWindow,
     LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
@@ -89,6 +90,10 @@ const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
 /// Lay out and repaint once a nested WM_SIZE or WM_DPICHANGED was deferred.
 const WM_RELAYOUT: u32 = WM_APP + 3;
+/// Re-run an action the user just confirmed (see [`App::confirm`]).
+const WM_REDO: u32 = WM_APP + 4;
+/// Apply a popup-menu choice made after its handler returned.
+const WM_MENU_PICKED: u32 = WM_APP + 5;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -323,17 +328,18 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
-// Reentrancy guard for the window procedure. Modal pumps (MessageBoxW,
-// TrackPopupMenu) and synchronous dispatches (SetWindowPos, control
-// notifications) re-enter wnd_proc while the outer handler still holds its
-// &mut App. A second &mut to the same App would be undefined behavior, so
-// nested entries never touch App: they record what must not be lost in
-// DEFERRED and fall through to DefWindowProcW. Messages App never handles are
-// routed to DefWindowProcW before the guard is taken, so the native modal
-// loops they start (moving or sizing by the title bar or frame, the system
-// menu, caption buttons) dispatch to a free handler instead of a parked one.
-// Once an outer handler returns and releases the guard, flush_deferred
-// re-posts everything recorded, so nothing waits for an unrelated event.
+// Reentrancy guard for the window procedure. Synchronous dispatches
+// (SetWindowPos, control notifications) re-enter wnd_proc while the outer
+// handler still holds its &mut App. A second &mut to the same App would be
+// undefined behavior, so nested entries never touch App: they record what
+// must not be lost in DEFERRED and fall through to DefWindowProcW. Native
+// modal loops never run under the guard: messages App never handles go to
+// DefWindowProcW before the guard is taken (title-bar drag, frame sizing,
+// system menu, caption buttons), and message boxes, confirmations, popup
+// menus, shell opens, and the UAC relaunch are queued in NATIVE and shown by
+// run_native after the handler returns. Once an outer handler returns and
+// releases the guard, flush_deferred re-posts everything recorded and runs
+// the queued native UI.
 static IN_HANDLER: AtomicBool = AtomicBool::new(false);
 /// `DEFER_*` bits recorded by nested entries. One bit per kind, so a later
 /// progress tick can never overwrite a parked completion.
@@ -343,6 +349,87 @@ const DEFER_DONE: u32 = 2;
 const DEFER_CLOSE: u32 = 4;
 const DEFER_LAYOUT: u32 = 8;
 const DEFER_PAINT: u32 = 16;
+
+// Native modal UI (message boxes, confirmations, popup menus, the UAC
+// relaunch) never runs inside a handler. A handler queues it here and
+// returns; run_native shows it once the guard is released, so the modal loop
+// dispatches every message to a free handler instead of a parked one. A
+// confirmation does not resume the code that asked: on Yes the action is
+// re-run, recomputes its question from the state at that moment, and proceeds
+// only if that question and the exact targets match what was approved.
+static NATIVE: Mutex<VecDeque<Native>> = Mutex::new(VecDeque::new());
+/// True while run_native has a modal loop open; nested flushes leave the
+/// queue to it, so only one dialog is up at a time.
+static SHOWING: AtomicBool = AtomicBool::new(false);
+/// Confirmed actions waiting for WM_REDO, with their approval keys.
+static REDO: Mutex<VecDeque<(Redo, String)>> = Mutex::new(VecDeque::new());
+/// The approval key for the action WM_REDO is re-running right now.
+static APPROVED: Mutex<Option<String>> = Mutex::new(None);
+/// Menu choices waiting for WM_MENU_PICKED.
+static PICKED: Mutex<VecDeque<Picked>> = Mutex::new(VecDeque::new());
+
+enum Native {
+    Message {
+        text: String,
+        icon: u32,
+    },
+    Confirm {
+        text: String,
+        key: String,
+        redo: Redo,
+    },
+    Menu {
+        /// HMENU, owned here until shown and destroyed.
+        menu: isize,
+        at: POINT,
+        picked: Picked,
+    },
+    /// Relaunch elevated; close this window if the copy started.
+    Elevate,
+    /// Open a file, folder, or program with the shell.
+    Shell {
+        file: String,
+        args: Option<String>,
+    },
+}
+
+/// The action a confirmation guards, re-run once the user says Yes.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum Redo {
+    IgnoreRows(Vec<usize>),
+    ServicesApply,
+    PowerRows(Vec<usize>, bool),
+    SetRows(Vec<usize>, StartType),
+    PrivacyClean,
+    Shred,
+    Repair,
+    Restore(usize),
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MenuKind {
+    Findings,
+    Services,
+}
+
+/// A popup menu shown for some rows. The choice is applied only if those
+/// rows still name the same items (`identity`) when it arrives.
+#[derive(Clone, Debug)]
+struct Picked {
+    kind: MenuKind,
+    rows: Vec<usize>,
+    identity: String,
+    choice: usize,
+}
+
+fn lock<T>(slot: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    slot.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The approval key for a confirmation: the question and the exact targets.
+fn approval_key(question: &str, identity: &str) -> String {
+    format!("{identity}\u{1f}{question}")
+}
 
 struct Fonts {
     title: HFONT,
@@ -498,6 +585,8 @@ unsafe extern "system" fn wnd_proc(
         }
         let app = &mut *window_app(hwnd);
         app.sync_controls();
+        drop(_guard);
+        flush_deferred(hwnd);
         return 0;
     }
     if msg == WM_GETMINMAXINFO {
@@ -631,6 +720,20 @@ unsafe extern "system" fn wnd_proc(
                 }
                 0
             }
+            WM_REDO => {
+                if let Some((redo, key)) = lock(&REDO).pop_front() {
+                    *lock(&APPROVED) = Some(key);
+                    app.redo(redo);
+                    *lock(&APPROVED) = None;
+                }
+                0
+            }
+            WM_MENU_PICKED => {
+                if let Some(picked) = lock(&PICKED).pop_front() {
+                    app.menu_picked(picked);
+                }
+                0
+            }
             WM_CLOSE => {
                 if matches!(
                     app.job,
@@ -692,6 +795,8 @@ fn app_handles(msg: u32) -> bool {
             | WM_DROPFILES
             | WM_JOB_PROGRESS
             | WM_JOB_DONE
+            | WM_REDO
+            | WM_MENU_PICKED
             | WM_CLOSE
             | WM_DESTROY
     )
@@ -750,6 +855,102 @@ fn flush_deferred(hwnd: HWND) {
     if bits & DEFER_PAINT != 0 {
         unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
     }
+    run_native(hwnd);
+}
+
+/// Show queued native UI, one item at a time, with no handler active. Runs
+/// only from flush_deferred, after the guard is released. A flush nested in
+/// one of these modal loops leaves the queue to the loop already running.
+fn run_native(hwnd: HWND) {
+    if SHOWING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let title = wide("Hive Mend");
+    while let Some(next) = lock(&NATIVE).pop_front() {
+        if unsafe { IsWindow(hwnd) } == 0 {
+            if let Native::Menu { menu, .. } = next {
+                unsafe { DestroyMenu(menu as HMENU) };
+            }
+            continue;
+        }
+        match next {
+            Native::Message { text, icon } => unsafe {
+                MessageBoxW(hwnd, wide(&text).as_ptr(), title.as_ptr(), MB_OK | icon);
+            },
+            Native::Confirm { text, key, redo } => {
+                let yes = unsafe {
+                    MessageBoxW(
+                        hwnd,
+                        wide(&text).as_ptr(),
+                        title.as_ptr(),
+                        MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
+                    ) == IDYES
+                };
+                if yes {
+                    lock(&REDO).push_back((redo, key));
+                    unsafe { PostMessageW(hwnd, WM_REDO, 0, 0) };
+                }
+            }
+            Native::Menu {
+                menu,
+                at,
+                mut picked,
+            } => {
+                let choice = unsafe {
+                    let choice = TrackPopupMenu(
+                        menu as HMENU,
+                        TPM_RETURNCMD | TPM_RIGHTBUTTON,
+                        at.x,
+                        at.y,
+                        0,
+                        hwnd,
+                        std::ptr::null(),
+                    );
+                    DestroyMenu(menu as HMENU);
+                    choice as usize
+                };
+                if choice != 0 {
+                    picked.choice = choice;
+                    lock(&PICKED).push_back(picked);
+                    unsafe { PostMessageW(hwnd, WM_MENU_PICKED, 0, 0) };
+                }
+            }
+            Native::Elevate => {
+                let exe = wide(&exe_path().display().to_string());
+                let result = unsafe {
+                    ShellExecuteW(
+                        hwnd,
+                        wide("runas").as_ptr(),
+                        exe.as_ptr(),
+                        std::ptr::null(),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    )
+                };
+                // Above 32 means the elevated copy started. Otherwise the
+                // prompt was declined.
+                if result as isize > 32 {
+                    unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
+                }
+            }
+            Native::Shell { file, args } => {
+                let file = wide(&file);
+                let args = args.as_deref().map(wide);
+                unsafe {
+                    ShellExecuteW(
+                        hwnd,
+                        wide("open").as_ptr(),
+                        file.as_ptr(),
+                        args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
+                        std::ptr::null(),
+                        SW_SHOWNORMAL,
+                    );
+                }
+            }
+        }
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
+    }
+    SHOWING.store(false, Ordering::SeqCst);
 }
 
 fn window_app(hwnd: HWND) -> *mut App {
@@ -772,15 +973,6 @@ impl Drop for HandlerGuard {
     fn drop(&mut self) {
         IN_HANDLER.store(false, Ordering::SeqCst);
     }
-}
-
-/// Re-post messages deferred during a modal pump and force the repaint
-/// that nested WM_PAINTs skipped. Runs after every MessageBoxW and
-/// TrackPopupMenu, while still inside the outer handler; wnd_proc flushes
-/// again once that handler returns.
-fn drain_nested(hwnd: HWND) {
-    flush_deferred(hwnd);
-    unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
 impl App {
@@ -1601,7 +1793,7 @@ impl App {
             rows.len(),
             if rows.len() == 1 { "entry" } else { "entries" }
         );
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::IgnoreRows(rows.to_vec())) {
             return;
         }
         for row in rows {
@@ -1702,7 +1894,7 @@ impl App {
         } else {
             format!("Ignore these {} entries", rows.len())
         };
-        let choice = unsafe {
+        let menu = unsafe {
             let menu = CreatePopupMenu();
             AppendMenuW(menu, MF_STRING, MENU_DETAILS, wide("Details...").as_ptr());
             AppendMenuW(menu, MF_STRING, MENU_COPY, wide("Copy location").as_ptr());
@@ -1717,19 +1909,28 @@ impl App {
             if lparam != -1 {
                 GetCursorPos(&mut at);
             }
-            let choice = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                at.x,
-                at.y,
-                0,
-                self.hwnd,
-                std::ptr::null(),
-            );
-            DestroyMenu(menu);
-            choice as usize
+            menu
         };
-        drain_nested(self.hwnd);
+        // Shown by run_native after this handler returns; the choice comes
+        // back as WM_MENU_PICKED and applies only to the same items.
+        let identity = self.menu_identity(MenuKind::Findings, &rows);
+        lock(&NATIVE).push_back(Native::Menu {
+            menu: menu as isize,
+            at,
+            picked: Picked {
+                kind: MenuKind::Findings,
+                rows,
+                identity,
+                choice: 0,
+            },
+        });
+    }
+
+    fn findings_choice(&mut self, rows: &[usize], choice: usize) {
+        let Some(first) = rows.first().and_then(|row| self.findings.get(*row)) else {
+            return;
+        };
+        let is_file = matches!(first.repair, Repair::DeleteFile { .. });
         match choice {
             MENU_DETAILS => self.show_details(rows[0]),
             MENU_COPY => {
@@ -1750,7 +1951,7 @@ impl App {
                     open_in_regedit(self.hwnd, &finding.key);
                 }
             }
-            MENU_IGNORE => self.ignore_rows(&rows),
+            MENU_IGNORE => self.ignore_rows(rows),
             _ => {}
         }
     }
@@ -1876,7 +2077,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
                 format!(
                     "{} ({})",
@@ -1886,7 +2087,10 @@ impl App {
             } else {
                 format!("these {} services", selected.len())
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         for change in selected.iter().take(8) {
             question.push_str(&format!(
@@ -1898,7 +2102,7 @@ impl App {
         if selected.len() > 8 {
             question.push_str(&format!("\n...and {} more", selected.len() - 8));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::ServicesApply) {
             discard_reserved_backup(&backup_file);
             return;
         }
@@ -1997,7 +2201,7 @@ impl App {
         if names.len() > 8 {
             question.push_str(&format!("\n...and {} more", names.len() - 8));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::PowerRows(rows.to_vec(), start)) {
             return;
         }
         self.job = Job::Services;
@@ -2082,7 +2286,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to {}?\n\nHive Mend saves the current start types to\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            "Set {} to {}?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
                 format!(
                     "{} (now {})",
@@ -2093,12 +2297,15 @@ impl App {
                 format!("these {} services", changes.len())
             },
             to.label(),
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         if to == StartType::Disabled {
             question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::SetRows(rows.to_vec(), to)) {
             discard_reserved_backup(&backup_file);
             return;
         }
@@ -2414,14 +2621,17 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Clean {} {}?\n\nHive Mend saves the registry entries to\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            "Clean {} {}?\n\nHive Mend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
             selected.len(),
             if selected.len() == 1 {
                 "category"
             } else {
                 "categories"
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         let shown = selected.iter().take(10);
         for item in shown {
@@ -2437,7 +2647,7 @@ impl App {
         if selected.len() > 10 {
             question.push_str(&format!("\n...and {} more", selected.len() - 10));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::PrivacyClean) {
             discard_reserved_backup(&backup_file);
             return;
         }
@@ -2916,7 +3126,7 @@ impl App {
         if ticked.len() > 10 {
             question.push_str(&format!("\n...and {} more", ticked.len() - 10));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Shred) {
             return;
         }
         self.job = Job::Shredding;
@@ -3182,7 +3392,7 @@ impl App {
         let stopped = first.state == ServiceState::Stopped;
         let can_write = self.elevated;
         let gray = |on: bool| if on { MF_GRAYED } else { MF_STRING };
-        let choice = unsafe {
+        let menu = unsafe {
             let menu = CreatePopupMenu();
             AppendMenuW(
                 menu,
@@ -3224,26 +3434,31 @@ impl App {
             if lparam != -1 {
                 GetCursorPos(&mut at);
             }
-            let choice = TrackPopupMenu(
-                menu,
-                TPM_RETURNCMD | TPM_RIGHTBUTTON,
-                at.x,
-                at.y,
-                0,
-                self.hwnd,
-                std::ptr::null(),
-            );
-            DestroyMenu(menu);
-            choice as usize
+            menu
         };
-        drain_nested(self.hwnd);
+        // Shown by run_native after this handler returns; the choice comes
+        // back as WM_MENU_PICKED and applies only to the same items.
+        let identity = self.menu_identity(MenuKind::Services, &rows);
+        lock(&NATIVE).push_back(Native::Menu {
+            menu: menu as isize,
+            at,
+            picked: Picked {
+                kind: MenuKind::Services,
+                rows,
+                identity,
+                choice: 0,
+            },
+        });
+    }
+
+    fn services_choice(&mut self, rows: &[usize], choice: usize) {
         match choice {
-            MENU_SVC_START => self.power_rows(&rows, true),
-            MENU_SVC_STOP => self.power_rows(&rows, false),
-            MENU_SVC_AUTO => self.set_rows(&rows, StartType::Automatic),
-            MENU_SVC_AUTO_DELAYED => self.set_rows(&rows, StartType::AutomaticDelayed),
-            MENU_SVC_MANUAL => self.set_rows(&rows, StartType::Manual),
-            MENU_SVC_DISABLED => self.set_rows(&rows, StartType::Disabled),
+            MENU_SVC_START => self.power_rows(rows, true),
+            MENU_SVC_STOP => self.power_rows(rows, false),
+            MENU_SVC_AUTO => self.set_rows(rows, StartType::Automatic),
+            MENU_SVC_AUTO_DELAYED => self.set_rows(rows, StartType::AutomaticDelayed),
+            MENU_SVC_MANUAL => self.set_rows(rows, StartType::Manual),
+            MENU_SVC_DISABLED => self.set_rows(rows, StartType::Disabled),
             _ => {}
         }
     }
@@ -3270,14 +3485,17 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup to\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
+            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
             if selected.len() == 1 {
                 "entry"
             } else {
                 "entries"
             },
-            backup_file.display()
+            backup_file
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
         );
         let permanent = selected.iter().filter(|f| f.permanent()).count();
         if permanent > 0 {
@@ -3292,7 +3510,7 @@ impl App {
                 "\n\n{admin} of these are machine-wide. Without administrator rights Windows will refuse them and they will stay as they are."
             ));
         }
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Repair) {
             discard_reserved_backup(&backup_file);
             return;
         }
@@ -3532,7 +3750,7 @@ impl App {
         }
         if backup.summary.machine_wide && !self.elevated {
             let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
-            if self.confirm(ask) {
+            if self.confirm(ask, Redo::Restore(row)) {
                 self.elevate();
             }
             return;
@@ -3542,7 +3760,7 @@ impl App {
             "Restore the backup saved {saved}?\n\nThis puts back {}. Entries that exist now are overwritten with the saved copy.",
             contents(&backup.summary)
         );
-        if !self.confirm(&question) {
+        if !self.confirm(&question, Redo::Restore(row)) {
             return;
         }
         self.job = Job::Restoring;
@@ -3641,23 +3859,9 @@ impl App {
         if self.busy() || self.elevated {
             return;
         }
-        let exe = wide(&exe_path().display().to_string());
-        let result = unsafe {
-            ShellExecuteW(
-                self.hwnd,
-                wide("runas").as_ptr(),
-                exe.as_ptr(),
-                std::ptr::null(),
-                std::ptr::null(),
-                SW_SHOWNORMAL,
-            )
-        };
-        // Above 32 means the elevated copy started. Otherwise the prompt was declined.
-        if result as isize > 32 {
-            // Ask for the close instead of destroying synchronously: a
-            // nested WM_DESTROY would run while this handler is live.
-            unsafe { PostMessageW(self.hwnd, WM_CLOSE, 0, 0) };
-        }
+        // ShellExecuteW waits on the UAC prompt; it runs from run_native,
+        // outside any handler.
+        lock(&NATIVE).push_back(Native::Elevate);
     }
 
     // ---- jobs ----------------------------------------------------------
@@ -3719,26 +3923,127 @@ impl App {
         self.invalidate();
     }
 
-    fn confirm(&self, text: &str) -> bool {
-        let text = wide(text);
-        let title = wide("Hive Mend");
-        let yes = unsafe {
-            MessageBoxW(
-                self.hwnd,
-                text.as_ptr(),
-                title.as_ptr(),
-                MB_YESNO | MB_ICONQUESTION | MB_DEFBUTTON2,
-            ) == IDYES
-        };
-        drain_nested(self.hwnd);
-        yes
+    /// True only while `redo` is being re-run after the user said Yes to
+    /// this exact question for these exact targets. Otherwise the question
+    /// is queued for after the handler returns and this returns false, so the
+    /// caller backs out as it would on No; on Yes the action runs again.
+    fn confirm(&self, text: &str, redo: Redo) -> bool {
+        let key = approval_key(text, &self.redo_identity(&redo));
+        if lock(&APPROVED).take().as_deref() == Some(key.as_str()) {
+            return true;
+        }
+        lock(&NATIVE).push_back(Native::Confirm {
+            text: text.to_string(),
+            key,
+            redo,
+        });
+        false
     }
 
+    /// Queue a message box for after the handler returns.
     fn message(&self, text: &str, icon: u32) {
-        let text = wide(text);
-        let title = wide("Hive Mend");
-        unsafe { MessageBoxW(self.hwnd, text.as_ptr(), title.as_ptr(), MB_OK | icon) };
-        drain_nested(self.hwnd);
+        lock(&NATIVE).push_back(Native::Message {
+            text: text.to_string(),
+            icon,
+        });
+    }
+
+    /// What an action would act on right now, so an approval given for one
+    /// set of targets is never spent on another.
+    fn redo_identity(&self, redo: &Redo) -> String {
+        let finding = |finding: &Finding| format!("{}|{:?}", finding.key, finding.value);
+        let ticked = |checked: &[bool], index: usize| checked.get(index).copied().unwrap_or(false);
+        let parts: Vec<String> = match redo {
+            Redo::IgnoreRows(rows) => rows
+                .iter()
+                .filter_map(|row| self.findings.get(*row))
+                .map(finding)
+                .collect(),
+            Redo::Repair => self
+                .findings
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.checked, *index))
+                .map(|(_, item)| finding(item))
+                .collect(),
+            Redo::ServicesApply => self
+                .svc_proposals
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.svc_checked, *index))
+                .map(|(_, change)| format!("{}>{:?}", change.name, change.to))
+                .collect(),
+            Redo::PowerRows(rows, _) | Redo::SetRows(rows, _) => rows
+                .iter()
+                .filter_map(|row| self.services.get(*row))
+                .map(|info| info.name.clone())
+                .collect(),
+            Redo::PrivacyClean => self
+                .priv_items
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.priv_checked, *index))
+                .map(|(_, item)| item.id.clone())
+                .collect(),
+            Redo::Shred => self
+                .shred_rows
+                .iter()
+                .enumerate()
+                .filter(|(index, _)| ticked(&self.shred_checked, *index))
+                .map(|(_, row)| row.target.path.clone())
+                .collect(),
+            Redo::Restore(row) => self
+                .backups
+                .get(*row)
+                .map(|backup| backup.path.display().to_string())
+                .into_iter()
+                .collect(),
+        };
+        format!("{redo:?}\u{1e}{}", parts.join("\u{1e}"))
+    }
+
+    fn redo(&mut self, redo: Redo) {
+        match redo {
+            Redo::IgnoreRows(rows) => self.ignore_rows(&rows),
+            Redo::ServicesApply => self.start_services_apply(),
+            Redo::PowerRows(rows, start) => self.power_rows(&rows, start),
+            Redo::SetRows(rows, to) => self.set_rows(&rows, to),
+            Redo::PrivacyClean => self.start_privacy_clean(),
+            Redo::Shred => self.start_shred(),
+            Redo::Repair => self.start_repair(),
+            Redo::Restore(row) => self.start_restore(row),
+        }
+    }
+
+    /// The items a popup menu's rows name right now.
+    fn menu_identity(&self, kind: MenuKind, rows: &[usize]) -> String {
+        match kind {
+            MenuKind::Findings => rows
+                .iter()
+                .filter_map(|row| self.findings.get(*row))
+                .map(|finding| format!("{}|{:?}", finding.key, finding.value))
+                .collect::<Vec<_>>()
+                .join("\u{1e}"),
+            MenuKind::Services => rows
+                .iter()
+                .filter_map(|row| self.services.get(*row))
+                .map(|info| info.name.clone())
+                .collect::<Vec<_>>()
+                .join("\u{1e}"),
+        }
+    }
+
+    fn menu_picked(&mut self, picked: Picked) {
+        if self.busy()
+            || picked.rows.is_empty()
+            || self.menu_identity(picked.kind, &picked.rows) != picked.identity
+        {
+            return;
+        }
+        match picked.kind {
+            MenuKind::Findings => self.findings_choice(&picked.rows, picked.choice),
+            MenuKind::Services => self.services_choice(&picked.rows, picked.choice),
+        }
     }
 
     // ---- layout --------------------------------------------------------
@@ -6291,19 +6596,13 @@ fn copy_text(hwnd: HWND, value: &str) {
     }
 }
 
-fn shell_open(hwnd: HWND, file: &str, args: Option<&str>) {
-    let file = wide(file);
-    let args = args.map(wide);
-    unsafe {
-        ShellExecuteW(
-            hwnd,
-            wide("open").as_ptr(),
-            file.as_ptr(),
-            args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
-            std::ptr::null(),
-            SW_SHOWNORMAL,
-        );
-    }
+/// Queue a shell open for after the handler returns: ShellExecuteW can pump
+/// messages (its own error dialog, a DDE or COM wait).
+fn shell_open(_hwnd: HWND, file: &str, args: Option<&str>) {
+    lock(&NATIVE).push_back(Native::Shell {
+        file: file.to_string(),
+        args: args.map(str::to_string),
+    });
 }
 
 /// Registry Editor opens at its saved `LastKey`, so set that and start it.
@@ -6404,6 +6703,34 @@ mod tests {
             vec![WM_RELAYOUT, WM_JOB_PROGRESS, WM_JOB_DONE, WM_CLOSE]
         );
         assert_ne!(bits & DEFER_PAINT, 0);
+    }
+
+    #[test]
+    fn an_approval_covers_only_the_same_question_and_targets() {
+        let approved = approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\B");
+        assert_eq!(
+            approved,
+            approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\B")
+        );
+        // Same question, different entries ticked by the time it re-runs.
+        assert_ne!(
+            approved,
+            approval_key("Repair 2 entries?", "Repair|HKCU\\A|HKCU\\C")
+        );
+        // Same entries, but the question now says something else.
+        assert_ne!(
+            approved,
+            approval_key(
+                "Repair 2 entries? 1 is machine-wide.",
+                "Repair|HKCU\\A|HKCU\\B"
+            )
+        );
+    }
+
+    #[test]
+    fn redo_and_menu_messages_reach_app() {
+        assert!(app_handles(WM_REDO));
+        assert!(app_handles(WM_MENU_PICKED));
     }
 
     #[test]
