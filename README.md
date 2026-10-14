@@ -104,16 +104,17 @@ Restore, Privacy, Shredder, Services, Monitor, Tools, Settings, and About.
   secure are always refused. Listing is read-only; changing anything
   needs administrator rights.
 - Privacy lists cleanable categories (history lists, temp files,
-  clipboard, Recycle Bin, browser caches, application histories, custom
-  items, free-space wipe). Preview counts what each holds, tick what to
+  clipboard, Recycle Bin, browser caches, application histories, and
+  custom items). Preview counts what each holds, tick what to
   clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
   for good. The built-in history and cookie cleaning waits for a closed
   browser and never touches saved logins, autofill, or bookmarks. Custom
   items you add can name any allowed Temp or browser-profile file, so add
-  only paths you understand. The built-in categories are user-scope; the
-  optional free-space wipe runs across a whole drive. No administrator
-  rights are needed.
+  only paths you understand. The built-in categories are user-scope, and
+  no administrator rights are needed. There is no free-space wipe:
+  overwriting a drive's empty space does not reliably erase anything on
+  SSD or NVMe drives and only adds wear.
 - Shredder overwrites files so they cannot be recovered, then deletes
   them. Drop files onto the page, type a path and Add, or stage the
   Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The

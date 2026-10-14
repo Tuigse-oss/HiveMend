@@ -2456,7 +2456,7 @@ impl App {
     // ---- privacy ----
 
     fn rebuild_privacy(&mut self) {
-        let mut items = build_items(&WindowsSystemTargets);
+        let mut items = build_items();
         // The custom list and the remembered ticks live in the per-user
         // folder, which programs running without elevation can edit. An
         // elevated window acts on neither: it starts with nothing ticked and

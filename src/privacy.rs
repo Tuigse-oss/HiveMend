@@ -35,11 +35,6 @@ pub trait SystemTargets {
     /// Recycle Bin (items, bytes) across all fixed drives.
     fn bin_items(&self) -> (usize, u64);
     fn empty_bin(&mut self) -> Result<(), String>;
-    /// Fixed drives as roots (`C:\`), for free-space rows.
-    fn fixed_drives(&self) -> Vec<String>;
-    fn free_bytes(&self, drive: &str) -> u64;
-    /// Launch a detached free-space wipe. Returns once it is running.
-    fn wipe_free_space(&mut self, drive: &str) -> Result<(), String>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +43,6 @@ pub enum PrivacyGroup {
     Browsers,
     Plugins,
     Custom,
-    Maintenance,
 }
 
 impl PrivacyGroup {
@@ -58,7 +52,6 @@ impl PrivacyGroup {
             Self::Browsers => "Browsers",
             Self::Plugins => "Applications",
             Self::Custom => "Custom",
-            Self::Maintenance => "Maintenance",
         }
     }
 }
@@ -126,9 +119,6 @@ pub enum PrivacyTarget {
     },
     Clipboard,
     RecycleBin,
-    FreeSpace {
-        drive: String,
-    },
 }
 
 #[derive(Clone, Debug)]
@@ -407,27 +397,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
     items
 }
 
-/// Built-ins plus one free-space row per fixed drive.
-pub fn build_items(sys: &dyn SystemTargets) -> Vec<PrivacyItem> {
-    let mut items = builtin_items();
-    for drive in sys.fixed_drives() {
-        let short = drive.trim_end_matches(['\\', '/']);
-        let mut wipe = item(
-            &format!("freespace-{short}"),
-            &format!("Free-space wipe ({short})"),
-            PrivacyGroup::Maintenance,
-            "Overwrites empty space with cipher. Very slow.",
-            vec![PrivacyTarget::FreeSpace {
-                drive: drive.clone(),
-            }],
-        );
-        wipe.confirm_note = Some(
-            "This takes tens of minutes and runs on its own after it starts. On SSDs the benefit is partial."
-                .to_string(),
-        );
-        items.push(wipe);
-    }
-    items
+/// The privacy categories offered on this PC.
+pub fn build_items() -> Vec<PrivacyItem> {
+    builtin_items()
 }
 
 /// Case-insensitive `*`/`?` mask over a file name. `*.*` matches everything.
@@ -870,9 +842,6 @@ fn preview_target(
             row.files += count;
             row.bytes += bytes;
         }
-        PrivacyTarget::FreeSpace { drive } => {
-            row.bytes += sys.free_bytes(drive);
-        }
     }
 }
 
@@ -1156,8 +1125,7 @@ fn collect_repairs(
             PrivacyTarget::DirFiles { .. }
             | PrivacyTarget::ExactFiles { .. }
             | PrivacyTarget::Clipboard
-            | PrivacyTarget::RecycleBin
-            | PrivacyTarget::FreeSpace { .. } => {}
+            | PrivacyTarget::RecycleBin => {}
         }
     }
 }
@@ -1294,12 +1262,6 @@ fn execute_item(
                     }
                 }
             }
-            PrivacyTarget::FreeSpace { drive } => match sys.wipe_free_space(drive) {
-                Ok(()) => {
-                    done.note = "Started. It runs on its own for a long while.".to_string();
-                }
-                Err(err) => errors.push(format!("free-space wipe ({drive}): {err}")),
-            },
         }
     }
     done
@@ -1608,11 +1570,8 @@ mod tests {
     struct FakeSys {
         clipboard: usize,
         bin: (usize, u64),
-        drives: Vec<String>,
-        free: u64,
         cleared: bool,
         emptied: bool,
-        wiped: Vec<String>,
     }
 
     impl SystemTargets for FakeSys {
@@ -1633,19 +1592,6 @@ mod tests {
         fn empty_bin(&mut self) -> Result<(), String> {
             self.emptied = true;
             self.bin = (0, 0);
-            Ok(())
-        }
-
-        fn fixed_drives(&self) -> Vec<String> {
-            self.drives.clone()
-        }
-
-        fn free_bytes(&self, _drive: &str) -> u64 {
-            self.free
-        }
-
-        fn wipe_free_space(&mut self, drive: &str) -> Result<(), String> {
-            self.wiped.push(drive.to_string());
             Ok(())
         }
     }
@@ -2040,39 +1986,38 @@ mod tests {
         let mut sys = FakeSys {
             clipboard: 1,
             bin: (2, 70),
-            drives: vec![r"C:\".into()],
-            free: 1000,
             ..FakeSys::default()
         };
-        let built = build_items(&sys);
-        assert!(built.iter().any(|item| item.id == r"freespace-C:"));
         let items = [builtin("clipboard"), builtin("recycle-bin")].to_vec();
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert_eq!(report.items[0].other, 1);
         assert_eq!(report.items[1].files, 2);
         let backup = std::env::temp_dir().join("hive-mend-privacy-special-test.reg");
-        let freespace = built
-            .into_iter()
-            .find(|item| item.id == r"freespace-C:")
-            .expect("wipe row");
-        let report = preview(&reg, &fs, &sys, &quiet(), std::slice::from_ref(&freespace));
-        assert_eq!(report.items[0].bytes, 1000);
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
-            &[builtin("clipboard"), builtin("recycle-bin"), freespace],
+            &items,
             &backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert!(sys.cleared && sys.emptied);
-        assert_eq!(sys.wiped, vec![r"C:\".to_string()]);
         assert_eq!(outcome.items[0].other, 1);
         assert_eq!(outcome.items[1].files, 2);
-        assert!(!outcome.items[2].note.is_empty());
         let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn no_category_overwrites_free_space() {
+        // Overwriting a drive's free space does not reliably erase anything
+        // on an SSD or NVMe drive and only adds wear, so it is not offered.
+        assert!(
+            build_items()
+                .iter()
+                .all(|item| !item.id.starts_with("freespace"))
+        );
     }
 
     #[test]

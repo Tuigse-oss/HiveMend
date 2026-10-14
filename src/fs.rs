@@ -1213,7 +1213,6 @@ mod live_tests {
             "{system} is not under {windows}"
         );
         assert!(std::path::Path::new(&system).join("reg.exe").is_file());
-        assert!(std::path::Path::new(&system).join("cipher.exe").is_file());
     }
 
     fn wide(text: &str) -> Vec<u16> {
