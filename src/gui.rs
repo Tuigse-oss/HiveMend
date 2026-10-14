@@ -210,10 +210,7 @@ const SCANNERS: &[(ScannerId, &str)] = &[
         "Broken shortcuts and old temp files",
     ),
     (ScannerId::RegistryIntegrity, "Shell folders (report only)"),
-    (
-        ScannerId::DeepScan,
-        "Deep Scan (slower; review results closely)",
-    ),
+    (ScannerId::DeepScan, "Deep Scan (review results closely)"),
 ];
 
 const OPTIMIZE: [ScannerId; 4] = [

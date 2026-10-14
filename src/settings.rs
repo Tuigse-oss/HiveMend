@@ -6,7 +6,8 @@ use crate::model::ScannerId;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Settings {
-    /// Scanners left out of "Scan Your Registry". Deep Scan is off by default.
+    /// Scanners left out of a full scan. Every scanner, Deep Scan included,
+    /// is on by default.
     pub disabled: Vec<ScannerId>,
     pub last_scan: String,
     pub last_problems: Option<usize>,
@@ -18,7 +19,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            disabled: vec![ScannerId::DeepScan],
+            disabled: Vec::new(),
             last_scan: String::new(),
             last_problems: None,
             last_repair: String::new(),
@@ -115,18 +116,19 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deep_scan_is_off_until_enabled_and_settings_round_trip() {
+    fn deep_scan_is_on_by_default_and_settings_round_trip() {
         let mut settings = Settings::default();
-        assert!(!settings.full_scan().contains(&ScannerId::DeepScan));
+        assert!(settings.full_scan().contains(&ScannerId::DeepScan));
         assert!(settings.full_scan().contains(&ScannerId::CustomControls));
-        settings.set_enabled(ScannerId::DeepScan, true);
+        settings.set_enabled(ScannerId::DeepScan, false);
         settings.set_enabled(ScannerId::TempShortcuts, false);
         settings.last_scan = "10/12/2026 15:30".into();
         settings.last_problems = Some(12);
         settings.last_repair = "Removed 3\nBackup x".into();
         settings.privacy_ticked = ["user-temp".to_string(), "clipboard".to_string()].to_vec();
         let again = Settings::parse(&settings.to_text());
-        assert!(again.full_scan().contains(&ScannerId::DeepScan));
+        // A saved choice to leave Deep Scan out is kept.
+        assert!(!again.full_scan().contains(&ScannerId::DeepScan));
         assert!(!again.full_scan().contains(&ScannerId::TempShortcuts));
         assert_eq!(again.last_problems, Some(12));
         assert_eq!(again.last_repair, "Removed 3 Backup x");

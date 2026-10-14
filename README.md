@@ -21,7 +21,7 @@ It covers twelve scanner jobs:
 | CC | COM controls, type libraries, default icons, shell hooks, preview handlers, autoplay handlers, codecs, context menus, and legacy browser extensions whose file is gone |
 | DEEP | Optional wider pass over path-shaped values |
 
-The built-in paths cover the Windows 10 and 11 layout, including per-user uninstall keys and the 32-bit `WOW6432Node` view. There is no self-updater and no license client. Deep scan stays off unless you pass `--include-deep` or `--only DEEP`.
+The built-in paths cover the Windows 10 and 11 layout, including per-user uninstall keys and the 32-bit `WOW6432Node` view. There is no self-updater and no license client. In the window, Deep Scan is part of every full scan by default (Settings can leave it out); from the command line it runs only with `--include-deep` or `--only DEEP`.
 
 Shell folders, `UserChoice` file associations, Winlogon, services, files inside the Windows directory, and built-in protocols such as `http` and `ms-settings` are not deleted.
 
