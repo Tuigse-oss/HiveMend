@@ -1323,6 +1323,38 @@ mod live_tests {
     }
 
     #[test]
+    fn live_a_pinned_rename_stays_in_the_files_own_folder() {
+        // A bare new name must never be resolved against the process's
+        // current directory, which may be another folder or another drive.
+        let scratch = Scratch::new("rename");
+        let path = scratch.0.join("before.bin");
+        std::fs::write(&path, [3u8; 16]).unwrap();
+        let mut fs = HostFs;
+        let mut pin =
+            crate::pathutil::pin_for_shred(&mut fs, &path.display().to_string(), ItemKind::File)
+                .expect("pin");
+        let cwd = std::env::current_dir().unwrap();
+        let stray = cwd.join("after.bin");
+        let renamed = fs.pin_rename(&mut pin, "after.bin");
+        let landed_here = scratch.0.join("after.bin").exists();
+        let landed_in_cwd = stray.exists() && cwd != scratch.0;
+        if landed_in_cwd {
+            let _ = std::fs::remove_file(&stray);
+        }
+        renamed.expect("rename in place");
+        assert!(
+            !landed_in_cwd,
+            "the file was moved into the current directory"
+        );
+        assert!(
+            landed_here,
+            "the file is not in its own folder under the new name"
+        );
+        assert!(!path.exists());
+        assert!(pin.real_path.ends_with("after.bin"), "{}", pin.real_path);
+    }
+
+    #[test]
     fn live_a_path_swapped_after_pinning_does_not_redirect_the_work() {
         let scratch = Scratch::new("swap");
         let path = scratch.0.join("target.bin");

@@ -832,19 +832,23 @@ mod host {
     use super::{Access, ItemKind, PinHandle, Pinned};
     use std::os::windows::fs::{FileExt, OpenOptionsExt};
     use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE};
+    use windows_sys::Wdk::Storage::FileSystem::{FileRenameInformation, NtSetInformationFile};
+    use windows_sys::Win32::Foundation::{
+        GENERIC_READ, GENERIC_WRITE, INVALID_HANDLE_VALUE, RtlNtStatusToDosError,
+    };
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_HIDDEN,
         FILE_ATTRIBUTE_REPARSE_POINT, FILE_ATTRIBUTE_SYSTEM, FILE_DISPOSITION_INFO,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_NAME_NORMALIZED,
         FILE_READ_ATTRIBUTES, FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, FileDispositionInfo, FileRenameInfo, GetDriveTypeW,
-        GetFileInformationByHandle, GetFinalPathNameByHandleW, ReOpenFile,
-        SetFileInformationByHandle, VOLUME_NAME_DOS,
+        FILE_SHARE_WRITE, FileDispositionInfo, GetDriveTypeW, GetFileInformationByHandle,
+        GetFinalPathNameByHandleW, ReOpenFile, SetFileInformationByHandle, VOLUME_NAME_DOS,
     };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const DELETE: u32 = 0x0001_0000;
     const READ_CONTROL: u32 = 0x0002_0000;
+    const FILE_TRAVERSE: u32 = 0x0000_0020;
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const DRIVE_FIXED: u32 = 3;
     const SHARE_ALL: u32 = FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE;
@@ -1012,34 +1016,79 @@ mod host {
         file.seek_write(buf, offset)
     }
 
-    /// Rename through the handle within its own folder: `FILE_RENAME_INFO`
-    /// with no root directory and a bare name, never replacing.
+    /// Rename through the handle within its own folder. A bare name with no
+    /// root directory would be resolved against the process's current
+    /// directory, so the file's parent folder is opened (never following a
+    /// link), checked to still be the file's real parent, and passed as
+    /// `RootDirectory`. Never replaces an existing name.
     pub fn rename(file: &std::fs::File, path: &str, name: &str) -> Result<(), String> {
+        let current = final_path(file)?;
+        let (parent, _) = current
+            .rsplit_once('\\')
+            .ok_or_else(|| format!("{path}: no parent folder"))?;
+        let parent_path = if parent.len() == 2 {
+            format!("{parent}\\")
+        } else {
+            parent.to_string()
+        };
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE)
+            .share_mode(SHARE_ALL)
+            .custom_flags(FLAGS)
+            .open(&parent_path)
+            .map_err(|err| format!("{path}: {err}"))?;
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(dir.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(format!("{path}: {}", last_error()));
+        }
+        let attrs = info.dwFileAttributes;
+        if attrs & FILE_ATTRIBUTE_DIRECTORY == 0 || attrs & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+            return Err(format!("{path}: its folder is not a plain folder"));
+        }
+        let dir_real = final_path(&dir)?;
+        let still_inside = final_path(file)?.rsplit_once('\\').is_some_and(|(now, _)| {
+            now.trim_end_matches('\\')
+                .eq_ignore_ascii_case(dir_real.trim_end_matches('\\'))
+        });
+        if !still_inside {
+            return Err(format!("{path} moved while it was being renamed"));
+        }
         let units: Vec<u16> = name.encode_utf16().collect();
         let name_at = std::mem::offset_of!(FILE_RENAME_INFO, FileName);
         let len_at = std::mem::offset_of!(FILE_RENAME_INFO, FileNameLength);
+        let root_at = std::mem::offset_of!(FILE_RENAME_INFO, RootDirectory);
         let size = name_at + (units.len() + 1) * 2;
         // u64 storage keeps the struct's handle field aligned. Zeroed flags
-        // mean ReplaceIfExists is false and RootDirectory is null, so the bare
-        // name renames within the file's own folder.
+        // mean ReplaceIfExists is false.
         let mut buf = vec![0u64; size.div_ceil(8)];
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(buf.as_mut_ptr() as *mut u8, buf.len() * 8) };
+        let root = dir.as_raw_handle() as usize;
+        bytes[root_at..root_at + std::mem::size_of::<usize>()].copy_from_slice(&root.to_ne_bytes());
         bytes[len_at..len_at + 4].copy_from_slice(&((units.len() * 2) as u32).to_le_bytes());
         for (index, unit) in units.iter().enumerate() {
             let at = name_at + index * 2;
             bytes[at..at + 2].copy_from_slice(&unit.to_le_bytes());
         }
-        let ok = unsafe {
-            SetFileInformationByHandle(
+        // SetFileInformationByHandle refuses a RootDirectory, so call the
+        // native API it wraps; FILE_RENAME_INFORMATION has the same layout.
+        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+        let status = unsafe {
+            NtSetInformationFile(
                 file.as_raw_handle() as _,
-                FileRenameInfo,
+                &mut status_block,
                 buf.as_ptr() as *const _,
                 size as u32,
+                FileRenameInformation,
             )
         };
-        if ok == 0 {
-            return Err(format!("{path}: {}", last_error()));
+        drop(dir);
+        if status < 0 {
+            let code = unsafe { RtlNtStatusToDosError(status) };
+            return Err(format!(
+                "{path}: {}",
+                std::io::Error::from_raw_os_error(code as i32)
+            ));
         }
         Ok(())
     }
