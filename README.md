@@ -86,7 +86,7 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window. The left rail lists Home, Scan,
-Restore, Privacy, Services, Monitor, Tools, Settings, and About.
+Restore, Privacy, Startup, Services, Monitor, Tools, Settings, and About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
@@ -121,6 +121,13 @@ Restore, Privacy, Services, Monitor, Tools, Settings, and About.
   file shredder: on solid-state drives a normal delete is cleared by the
   drive itself (TRIM), and BitLocker or Device Encryption is what keeps
   deleted data unreadable.
+- Startup lists the programs that start at sign-in, as Task Manager's
+  Startup tab does: the `Run` keys (your account, all users, and 32-bit)
+  and both Startup folders. Disable and Enable flip the same
+  `StartupApproved` switch Task Manager uses, so nothing is deleted and
+  the two always agree. The previous switches are saved to a
+  `startup-*.reg` backup first and can be undone on the Restore page.
+  Items that start for all users need administrator rights.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.

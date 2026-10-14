@@ -20,6 +20,10 @@ pub enum Icon {
     Settings,
     About,
     Tools,
+    Startup,
+    Programs,
+    DiskSpace,
+    Duplicates,
     /// Home-page status: the last scan found nothing.
     StatusOk,
     /// Home-page status: the last scan found stale entries.
@@ -32,7 +36,7 @@ pub enum Icon {
 }
 
 impl Icon {
-    pub const ALL: [Icon; 13] = [
+    pub const ALL: [Icon; 17] = [
         Icon::Logo,
         Icon::Scan,
         Icon::Optimize,
@@ -42,6 +46,10 @@ impl Icon {
         Icon::Settings,
         Icon::About,
         Icon::Tools,
+        Icon::Startup,
+        Icon::Programs,
+        Icon::DiskSpace,
+        Icon::Duplicates,
         Icon::StatusOk,
         Icon::StatusWarn,
         Icon::StatusUnknown,
@@ -59,6 +67,10 @@ impl Icon {
             Icon::Settings => "settings",
             Icon::About => "about",
             Icon::Tools => "tools",
+            Icon::Startup => "startup",
+            Icon::Programs => "programs",
+            Icon::DiskSpace => "disk-space",
+            Icon::Duplicates => "duplicates",
             Icon::StatusOk => "status-ok",
             Icon::StatusWarn => "status-warn",
             Icon::StatusUnknown => "status-unknown",
@@ -537,6 +549,10 @@ fn draw(icon: Icon, size: usize) -> Canvas {
         Icon::Settings => settings(&mut cv),
         Icon::About => about(&mut cv),
         Icon::Tools => tools(&mut cv),
+        Icon::Startup => startup(&mut cv),
+        Icon::Programs => programs(&mut cv),
+        Icon::DiskSpace => disk_space(&mut cv),
+        Icon::Duplicates => duplicates(&mut cv),
         Icon::StatusOk => status(&mut cv, Status::Ok),
         Icon::StatusWarn => status(&mut cv, Status::Warn),
         Icon::StatusUnknown => status(&mut cv, Status::Unknown),
@@ -849,6 +865,134 @@ fn tools(cv: &mut Canvas) {
     cv.ribbon(&jaw, 11.0, 1.4, GOLD, GOLD_DARK, false);
     let end = cv.circle((22.0, 76.0), 5.4);
     cv.paint(&end, INK);
+}
+
+/// A gold sun rising over a green hill: what starts with Windows.
+fn startup(cv: &mut Canvas) {
+    cv.shadow((50.0, 90.0), 36.0, 4.5);
+    let c = (50.0, 62.0);
+    for k in 0..7 {
+        let a = (180.0 + 30.0 * k as f32).to_radians();
+        let inner = (c.0 + 30.0 * a.cos(), c.1 + 30.0 * a.sin());
+        let outer = (c.0 + 42.0 * a.cos(), c.1 + 42.0 * a.sin());
+        let ray = cv.stroke(&[inner, outer], 5.0, false);
+        cv.paint(&ray, GOLD);
+    }
+    let mut sun = arc(c, 24.0, 180.0, 360.0, 60);
+    sun.push(c);
+    let sun_mask = cv.polygon(&sun);
+    cv.paint_with(&sun_mask, vgrad(GOLD_LIGHT, GOLD, 38.0, 62.0));
+    let sun_edge = cv.stroke(&arc(c, 24.0, 180.0, 360.0, 60), 2.0, false);
+    cv.paint(&sun_edge, GOLD_DARK);
+    let mut hill = cubic((6.0, 66.0), (30.0, 54.0), (70.0, 54.0), (94.0, 66.0), 40);
+    hill.extend([(94.0, 86.0), (6.0, 86.0)]);
+    let hill_mask = cv.polygon(&hill);
+    cv.paint_with(&hill_mask, vgrad(GREEN, GREEN_DARK, 56.0, 86.0));
+    let ridge = cv.stroke(
+        &cubic((6.0, 66.0), (30.0, 54.0), (70.0, 54.0), (94.0, 66.0), 40),
+        2.4,
+        false,
+    );
+    cv.paint(&ridge, GREEN_DARK);
+}
+
+/// A wooden chest bound with a gold Celtic band: installed programs.
+fn programs(cv: &mut Canvas) {
+    cv.shadow((50.0, 90.0), 36.0, 4.5);
+    let wood_light = rgb(176, 120, 64);
+    let wood = rgb(128, 82, 40);
+    let lid = cv.polygon(&[(14.0, 34.0), (22.0, 16.0), (78.0, 16.0), (86.0, 34.0)]);
+    cv.paint_with(&lid, vgrad(wood_light, wood, 16.0, 34.0));
+    let body = cv.polygon(&[(14.0, 34.0), (86.0, 34.0), (86.0, 84.0), (14.0, 84.0)]);
+    cv.paint_with(&body, vgrad(wood_light, wood, 34.0, 84.0));
+    for y in [48.0, 62.0, 76.0] {
+        let plank = cv.stroke(&[(16.0, y), (84.0, y)], 1.4, false);
+        cv.paint(&plank, rgb(96, 60, 28));
+    }
+    let outline = cv.stroke(
+        &[
+            (14.0, 34.0),
+            (22.0, 16.0),
+            (78.0, 16.0),
+            (86.0, 34.0),
+            (86.0, 84.0),
+            (14.0, 84.0),
+        ],
+        2.4,
+        true,
+    );
+    cv.paint(&outline, rgb(78, 48, 22));
+    let seam = cv.stroke(&[(14.0, 34.0), (86.0, 34.0)], 2.4, false);
+    cv.paint(&seam, rgb(78, 48, 22));
+    // The band: a gold strap with a small woven knot.
+    let band = cv.polygon(&[(44.0, 16.0), (56.0, 16.0), (56.0, 84.0), (44.0, 84.0)]);
+    cv.paint_with(&band, vgrad(GOLD_LIGHT, GOLD, 16.0, 84.0));
+    let band_edge = cv.stroke(&[(44.0, 16.0), (44.0, 84.0)], 1.2, false);
+    cv.paint(&band_edge, GOLD_DARK);
+    let band_edge = cv.stroke(&[(56.0, 16.0), (56.0, 84.0)], 1.2, false);
+    cv.paint(&band_edge, GOLD_DARK);
+    let knot = torus_knot((50.0, 44.0), 11.0, 2.0, 3.0, 240);
+    cv.knot(&knot, 2.4, 0.7, GREEN, GREEN_DARK);
+}
+
+/// A pie-chart roundel: what uses the disk.
+fn disk_space(cv: &mut Canvas) {
+    cv.shadow((50.0, 92.0), 34.0, 5.0);
+    let c = (50.0, 50.0);
+    let disc = cv.circle(c, 40.0);
+    cv.paint_with(&disc, vgrad(GREEN, GREEN_DARK, 10.0, 90.0));
+    let mut slice = arc(c, 40.0, -90.0, 30.0, 60);
+    slice.push(c);
+    let slice_mask = cv.polygon(&slice);
+    cv.paint_with(&slice_mask, vgrad(GOLD_LIGHT, GOLD, 10.0, 90.0));
+    let mut small = arc(c, 40.0, 30.0, 95.0, 30);
+    small.push(c);
+    let small_mask = cv.polygon(&small);
+    cv.paint_with(&small_mask, vgrad(GREEN_LIGHT, GREEN, 40.0, 90.0));
+    for a in [-90.0f32, 30.0, 95.0] {
+        let r = a.to_radians();
+        let spoke = cv.stroke(
+            &[c, (c.0 + 40.0 * r.cos(), c.1 + 40.0 * r.sin())],
+            2.2,
+            false,
+        );
+        cv.paint(&spoke, INK);
+    }
+    let rim = cv.stroke(&arc(c, 40.0, 0.0, 360.0, 160), 4.0, true);
+    cv.paint(&rim, GOLD_DARK);
+}
+
+/// Two overlapping pages joined by a knot: files that are the same.
+fn duplicates(cv: &mut Canvas) {
+    cv.shadow((52.0, 92.0), 34.0, 4.5);
+    let page = |cv: &mut Canvas, x: f32, y: f32, top: Rgba, bottom: Rgba| {
+        let sheet = [
+            (x, y),
+            (x + 40.0, y),
+            (x + 50.0, y + 10.0),
+            (x + 50.0, y + 60.0),
+            (x, y + 60.0),
+        ];
+        let mask = cv.polygon(&sheet);
+        cv.paint_with(&mask, vgrad(top, bottom, y, y + 60.0));
+        let edge = cv.stroke(&sheet, 2.0, true);
+        cv.paint(&edge, INK);
+        let fold = cv.stroke(
+            &[(x + 40.0, y), (x + 40.0, y + 10.0), (x + 50.0, y + 10.0)],
+            1.6,
+            false,
+        );
+        cv.paint(&fold, INK);
+        for k in 0..4 {
+            let line_y = y + 22.0 + k as f32 * 9.0;
+            let line = cv.stroke(&[(x + 8.0, line_y), (x + 42.0, line_y)], 2.0, false);
+            cv.paint(&line, with_alpha(INK, 0.35));
+        }
+    };
+    page(cv, 12.0, 10.0, GREEN_LIGHT, GREEN);
+    page(cv, 36.0, 26.0, rgb(255, 252, 240), rgb(238, 230, 206));
+    let knot = torus_knot((40.0, 50.0), 13.0, 2.0, 3.0, 240);
+    cv.knot(&knot, 3.0, 0.8, GOLD, GOLD_DARK);
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]

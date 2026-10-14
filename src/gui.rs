@@ -102,6 +102,11 @@ const ID_OPEN_BACKUPS: u16 = 1102;
 const ID_UNIGNORE: u16 = 1103;
 const ID_SCANNER_BASE: u16 = 1200;
 const ID_RESTORE_POINT: u16 = 1150;
+const ID_SU_ENABLE: u16 = 1600;
+const ID_SU_DISABLE: u16 = 1601;
+const ID_SU_OPEN: u16 = 1602;
+const ID_SU_REFRESH: u16 = 1603;
+const ID_SU_LIST: u16 = 2010;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -171,6 +176,7 @@ enum Page {
     Settings,
     Services,
     Privacy,
+    Startup,
     Monitor,
     Tools,
     About,
@@ -181,6 +187,7 @@ const NAV: &[(&str, Page, Icon)] = &[
     ("Scan", Page::Scan, Icon::Scan),
     ("Restore", Page::Restore, Icon::Restore),
     ("Privacy", Page::Privacy, Icon::Privacy),
+    ("Startup", Page::Startup, Icon::Startup),
     ("Services", Page::Services, Icon::Optimize),
     ("Monitor", Page::Monitor, Icon::Monitor),
     ("Tools", Page::Tools, Icon::Tools),
@@ -386,6 +393,7 @@ enum Redo {
     PrivacyClean,
     Repair,
     Restore(usize),
+    Startup(Vec<usize>, bool),
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -461,6 +469,14 @@ struct App {
     btn_open_backups: HWND,
     scanner_boxes: Vec<(ScannerId, HWND)>,
     chk_restore_point: HWND,
+    startup_items: Vec<hive_mend::StartupItem>,
+    startup_loaded: bool,
+    startup_note: String,
+    startup_list: HWND,
+    btn_su_enable: HWND,
+    btn_su_disable: HWND,
+    btn_su_open: HWND,
+    btn_su_refresh: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -979,6 +995,14 @@ impl App {
             btn_open_backups: std::ptr::null_mut(),
             scanner_boxes: Vec::new(),
             chk_restore_point: std::ptr::null_mut(),
+            startup_items: Vec::new(),
+            startup_loaded: false,
+            startup_note: String::new(),
+            startup_list: std::ptr::null_mut(),
+            btn_su_enable: std::ptr::null_mut(),
+            btn_su_disable: std::ptr::null_mut(),
+            btn_su_open: std::ptr::null_mut(),
+            btn_su_refresh: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1066,6 +1090,22 @@ impl App {
             unsafe { SendMessageW(check, BM_SETCHECK, state, 0) };
             self.scanner_boxes.push((*id, check));
         }
+        self.startup_list = list_view(
+            hwnd,
+            ID_SU_LIST,
+            0,
+            0,
+            &[
+                ("Name", 220),
+                ("Status", 90),
+                ("For", 110),
+                ("Command", 420),
+            ],
+        );
+        self.btn_su_enable = button(hwnd, ID_SU_ENABLE, "Enable", BS_PUSHBUTTON);
+        self.btn_su_disable = button(hwnd, ID_SU_DISABLE, "Disable", BS_PUSHBUTTON);
+        self.btn_su_open = button(hwnd, ID_SU_OPEN, "Open File Location", BS_PUSHBUTTON);
+        self.btn_su_refresh = button(hwnd, ID_SU_REFRESH, "Refresh", BS_PUSHBUTTON);
         self.chk_restore_point = button(
             hwnd,
             ID_RESTORE_POINT,
@@ -1165,6 +1205,13 @@ impl App {
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
         all.push(self.chk_restore_point);
+        all.extend([
+            self.startup_list,
+            self.btn_su_enable,
+            self.btn_su_disable,
+            self.btn_su_open,
+            self.btn_su_refresh,
+        ]);
         all
     }
 
@@ -1291,6 +1338,9 @@ impl App {
         if matches!(page, Page::Restore | Page::Status | Page::Monitor) && !self.busy() {
             self.refresh_backups();
         }
+        if page == Page::Startup && !self.startup_loaded {
+            self.refresh_startup();
+        }
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
@@ -1320,6 +1370,28 @@ impl App {
                 self.save_settings();
             }
             return;
+        }
+        match id {
+            ID_SU_ENABLE => {
+                let rows = selected_rows(self.startup_list);
+                self.toggle_startup(&rows, true);
+                return;
+            }
+            ID_SU_DISABLE => {
+                let rows = selected_rows(self.startup_list);
+                self.toggle_startup(&rows, false);
+                return;
+            }
+            ID_SU_OPEN => {
+                self.open_startup_location();
+                return;
+            }
+            ID_SU_REFRESH => {
+                self.refresh_startup();
+                self.invalidate();
+                return;
+            }
+            _ => {}
         }
         match id {
             ID_SCAN => {
@@ -2762,6 +2834,173 @@ impl App {
         }
     }
 
+    // ---- startup -------------------------------------------------------
+
+    fn refresh_startup(&mut self) {
+        self.startup_items = hive_mend::list_startup(&WindowsRegistry, &HostFs);
+        self.startup_loaded = true;
+        let off = self
+            .startup_items
+            .iter()
+            .filter(|item| !item.enabled)
+            .count();
+        self.startup_note = format!(
+            "{} programs start with Windows; {off} turned off.",
+            self.startup_items.len() - off
+        );
+        unsafe {
+            SendMessageW(self.startup_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.startup_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, item) in self.startup_items.iter().enumerate() {
+            insert_row(
+                self.startup_list,
+                row,
+                &[
+                    &item.name,
+                    if item.enabled { "Enabled" } else { "Disabled" },
+                    item.scope.label(),
+                    &item.command,
+                ],
+            );
+        }
+        unsafe {
+            SendMessageW(self.startup_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.startup_list, std::ptr::null(), 1);
+        }
+    }
+
+    /// Turn the highlighted startup items on or off, after a confirmation and
+    /// a backup of their current flags.
+    fn toggle_startup(&mut self, rows: &[usize], enable: bool) {
+        if self.busy() {
+            return;
+        }
+        let picked: Vec<hive_mend::StartupItem> = rows
+            .iter()
+            .filter_map(|row| self.startup_items.get(*row).cloned())
+            .collect();
+        if picked.is_empty() {
+            self.message(
+                "Highlight one or more startup items first.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        if !self.elevated
+            && picked
+                .iter()
+                .any(|item| item.scope == hive_mend::StartupScope::Machine)
+        {
+            self.message(
+                "Items that start for all users can only be changed with administrator rights. Use Run as administrator, or highlight only your own items.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let changing = picked.iter().filter(|item| item.enabled != enable).count();
+        if changing == 0 {
+            self.message(
+                if enable {
+                    "Those items are already enabled."
+                } else {
+                    "Those items are already disabled."
+                },
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let verb = if enable { "Enable" } else { "Disable" };
+        let question = format!(
+            "{verb} {changing} startup {}?\n\n{}Hivemend saves the current settings in\n{}\nfirst, so this can be undone on the Restore page.",
+            if changing == 1 { "item" } else { "items" },
+            if enable {
+                ""
+            } else {
+                "Disabled items stay installed; they just stop starting with Windows, the same switch Task Manager uses. "
+            },
+            backups_location()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
+        );
+        if !self.confirm(&question, Redo::Startup(rows.to_vec(), enable)) {
+            return;
+        }
+        let Some(backup_file) = next_backup_file_with("startup") else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
+            return;
+        };
+        let refs: Vec<&hive_mend::StartupItem> = picked.iter().collect();
+        let (body, refused) = hive_mend::startup_backup(&WindowsRegistry, &refs);
+        if let Err(err) = hive_mend::write_backup(&backup_file, &body) {
+            discard_reserved_backup(&backup_file);
+            self.message(
+                &format!("The backup could not be written, so nothing was changed.\n\n{err}"),
+                MB_ICONWARNING,
+            );
+            return;
+        }
+        let outcome = hive_mend::set_startup(
+            &mut WindowsRegistry,
+            &refs,
+            enable,
+            hive_mend::filetime_now(),
+            &refused,
+        );
+        let mut lines = vec![format!(
+            "{} {}.",
+            if enable { "Enabled:" } else { "Disabled:" },
+            outcome.changed
+        )];
+        if !refused.is_empty() {
+            lines.push(format!(
+                "Left alone (name cannot be backed up): {}",
+                refused.join(", ")
+            ));
+        }
+        for error in outcome.errors.iter().take(5) {
+            lines.push(format!("Failed: {error}"));
+        }
+        lines.push(format!("Backup: {}", backup_file.display()));
+        self.refresh_startup();
+        self.refresh_backups();
+        self.message(
+            &lines.join("\n"),
+            if outcome.errors.is_empty() {
+                MB_ICONINFORMATION
+            } else {
+                MB_ICONWARNING
+            },
+        );
+    }
+
+    fn open_startup_location(&mut self) {
+        let Some(item) = selected_rows(self.startup_list)
+            .first()
+            .and_then(|row| self.startup_items.get(*row))
+            .cloned()
+        else {
+            self.message("Highlight a startup item first.", MB_ICONINFORMATION);
+            return;
+        };
+        // The program it starts, or the shortcut itself when the target is
+        // not a plain path.
+        let target = hive_mend::paths_in_command(&item.command)
+            .into_iter()
+            .next()
+            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or_else(|| format!(r"{}\{}", item.location, item.name));
+        if target.starts_with("HKEY_") {
+            open_in_regedit(self.hwnd, &item.location);
+        } else {
+            let arg = format!("/select,\"{target}\"");
+            shell_open(self.hwnd, "explorer.exe", Some(&arg));
+        }
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -3477,6 +3716,11 @@ impl App {
                 .filter(|(index, _)| ticked(&self.svc_checked, *index))
                 .map(|(_, change)| format!("{}>{:?}", change.name, change.to))
                 .collect(),
+            Redo::Startup(rows, _) => rows
+                .iter()
+                .filter_map(|row| self.startup_items.get(*row))
+                .map(|item| format!("{}|{}", item.approved_key, item.name))
+                .collect(),
             Redo::PowerRows(rows, _) | Redo::SetRows(rows, _) => rows
                 .iter()
                 .filter_map(|row| self.services.get(*row))
@@ -3508,6 +3752,7 @@ impl App {
             Redo::PrivacyClean => self.start_privacy_clean(),
             Redo::Repair => self.start_repair(),
             Redo::Restore(row) => self.start_restore(row),
+            Redo::Startup(rows, enable) => self.toggle_startup(&rows, enable),
         }
     }
 
@@ -3799,6 +4044,44 @@ impl App {
                     self.size_priv_columns(width);
                 }
             }
+            Page::Startup => {
+                visible.extend([
+                    self.startup_list,
+                    self.btn_su_enable,
+                    self.btn_su_disable,
+                    self.btn_su_open,
+                    self.btn_su_refresh,
+                ]);
+                let top = self.s(LIST_Y);
+                place(
+                    self.startup_list,
+                    left,
+                    top,
+                    width,
+                    (button_y - self.s(14) - top).max(self.s(80)),
+                );
+                let mut x = left;
+                for (control, w) in [
+                    (self.btn_su_enable, 110),
+                    (self.btn_su_disable, 110),
+                    (self.btn_su_open, 170),
+                ] {
+                    place(control, x, button_y, self.s(w), button_h);
+                    x += self.s(w + 8);
+                }
+                let refresh_w = self.s(110);
+                place(
+                    self.btn_su_refresh,
+                    right - refresh_w,
+                    button_y,
+                    refresh_w,
+                    button_h,
+                );
+                let command_w = (width - self.s(220 + 90 + 110 + 26)).max(self.s(160));
+                unsafe {
+                    SendMessageW(self.startup_list, LVM_SETCOLUMNWIDTH, 3, command_w as isize)
+                };
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -3916,6 +4199,7 @@ impl App {
                 Page::Restore => self.draw_restore(mem, rect),
                 Page::Settings => self.draw_settings(mem, rect),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
+                Page::Startup => self.draw_startup(mem, rect),
                 Page::Privacy => self.draw_privacy(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
@@ -4116,7 +4400,7 @@ impl App {
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
             self.spot(item, Action::Page(*page));
-            y += self.s(42);
+            y += self.s(40);
         }
         if self.busy() {
             let note = match self.job {
@@ -4624,6 +4908,29 @@ impl App {
                 bottom: self.s(BODY_Y + 22),
             },
             "Double-click a row for details. Registry entries are backed up first; files are not.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_startup(&mut self, hdc: HDC, rect: RECT) {
+        self.heading(hdc, rect, "Startup", None);
+        let line = if self.startup_note.is_empty() {
+            "Programs that start when you sign in to Windows.".to_string()
+        } else {
+            self.startup_note.clone()
+        };
+        self.subtitle(hdc, rect, &line);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: self.s(CONTENT_X),
+                top: self.s(BODY_Y),
+                right: rect.right - self.s(24),
+                bottom: self.s(BODY_Y + 22),
+            },
+            "Highlight items, then Enable or Disable. Disabling keeps the program installed, like Task Manager's Startup tab.",
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
     }

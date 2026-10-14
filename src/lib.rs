@@ -17,6 +17,7 @@ mod rules;
 mod scanners;
 mod services;
 mod settings;
+mod startup;
 mod store;
 mod sysinfo;
 mod tools;
@@ -32,7 +33,7 @@ mod windows_services;
 pub use backup::import_reg_file;
 pub use backup::{
     BackupInfo, BackupSummary, backup_name, is_hive_mend_backup, list_backups, read_backup,
-    reserve_backup_path,
+    reserve_backup_path, write_backup,
 };
 pub use demo::sample_world;
 pub use engine::{
@@ -47,6 +48,7 @@ pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
+pub use pathutil::paths_in_command;
 pub use privacy::{
     CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,
     PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,
@@ -62,6 +64,10 @@ pub use services::{
     tuneup_allowed,
 };
 pub use settings::Settings;
+pub use startup::{
+    StartupItem, StartupOutcome, StartupScope, approved_bytes, filetime_now, list_startup,
+    set_startup, startup_backup,
+};
 #[cfg(windows)]
 pub use sysinfo::gather as gather_snapshot;
 pub use sysinfo::{SystemSnapshot, format_bytes, format_uptime, percent};

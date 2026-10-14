@@ -302,7 +302,7 @@ fn export_tree(
     Ok(())
 }
 
-fn format_value(value: &RegValue) -> String {
+pub(crate) fn format_value(value: &RegValue) -> String {
     let name = if value.name.is_empty() {
         "@".to_string()
     } else {

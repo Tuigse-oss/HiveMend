@@ -25,6 +25,12 @@ pub trait Registry {
     fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError>;
     fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError>;
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError>;
+    /// Write one value, creating the key itself (not its parents) if it is
+    /// missing. Implementations refuse to write through a registry link.
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        let _ = (path, name, data);
+        Err(RegError::Message("this registry cannot be written".into()))
+    }
 }
 
 #[derive(Clone, Debug, Default)]
@@ -125,6 +131,11 @@ impl Registry for MemoryRegistry {
             .iter()
             .map(|child| child.name.clone())
             .collect())
+    }
+
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        self.set(path, name, data.clone());
+        Ok(())
     }
 
     fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {

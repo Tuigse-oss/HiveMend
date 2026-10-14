@@ -9,9 +9,10 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-    HKEY_USERS, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
-    REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_LINK, REG_MULTI_SZ, REG_OPTION_OPEN_LINK, REG_SZ,
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
+    HKEY_USERS, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ,
+    KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_LINK, REG_MULTI_SZ,
+    REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey, RegCreateKeyExW,
+    RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
 };
 
 use crate::model::{RegValue, ValueKind};
@@ -110,6 +111,39 @@ impl Registry for WindowsRegistry {
             return Err(failure(
                 rc,
                 format!("RegDeleteValueW {path}\\{name} failed ({rc})"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        // An embedded NUL would truncate the name at the Win32 boundary.
+        if name.contains('\0') {
+            return Err(RegError::Message(format!(
+                "{path}: value name contains a NUL and cannot be addressed safely"
+            )));
+        }
+        let opened = match open(path, true) {
+            Ok(opened) => opened,
+            Err(RegError::NotFound) => create_key(path, 0)?,
+            Err(err) => return Err(err),
+        };
+        let (kind, bytes) = encode_value(data);
+        let wide = wide(name);
+        let rc = unsafe {
+            RegSetValueExW(
+                opened.key,
+                wide.as_ptr(),
+                0,
+                kind,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(failure(
+                rc,
+                format!("RegSetValueExW {path}\\{name} failed ({rc})"),
             ));
         }
         Ok(())
@@ -218,6 +252,76 @@ fn enum_subkeys(key: HKEY, path: &str) -> Result<Vec<String>, RegError> {
         index = index.saturating_add(1);
     }
     Ok(names)
+}
+
+/// Create the last component of `path` under its existing parent, reached by
+/// the same link-checked walk as every other open. A name that already exists
+/// as a link is refused rather than created through.
+/// Open `path` for writing values, creating it and any missing parent keys
+/// one level at a time. Each level is opened without following links and
+/// refused if it is one, so a value is never written through a link.
+fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
+    if depth > MAX_LINK_HOPS + 64 {
+        return Err(RegError::Message(format!("{path}: too deep to create")));
+    }
+    let (parent, leaf) = split_parent(path)?;
+    let parent = match open_with(&parent, KEY_CREATE_SUB_KEY) {
+        Ok(parent) => parent,
+        Err(RegError::NotFound) => {
+            drop(create_key(&parent, depth + 1)?);
+            open_with(&parent, KEY_CREATE_SUB_KEY)?
+        }
+        Err(err) => return Err(err),
+    };
+    if let Ok(existing) = open_child(
+        parent.key,
+        &leaf,
+        KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+    ) {
+        if is_link(existing.key)? {
+            return Err(RegError::Message(format!(
+                "{path} is a registry link; links are never written through"
+            )));
+        }
+        return Ok(existing);
+    }
+    let wide = wide(&leaf);
+    let mut key: HKEY = ptr::null_mut();
+    let rc = unsafe {
+        RegCreateKeyExW(
+            parent.key,
+            wide.as_ptr(),
+            0,
+            ptr::null(),
+            REG_OPTION_NON_VOLATILE,
+            KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+            ptr::null(),
+            &mut key,
+            ptr::null_mut(),
+        )
+    };
+    if rc != ERROR_SUCCESS || key.is_null() {
+        return Err(failure(rc, format!("RegCreateKeyExW {path} failed ({rc})")));
+    }
+    let opened = Opened { key, close: true };
+    if is_link(opened.key)? {
+        return Err(RegError::Message(format!(
+            "{path} became a registry link while it was created"
+        )));
+    }
+    Ok(opened)
+}
+
+/// A value's registry type and raw bytes, as RegSetValueExW takes them.
+fn encode_value(data: &ValueKind) -> (u32, Vec<u8>) {
+    match data {
+        ValueKind::Sz(text) => (REG_SZ, sz_bytes(text)),
+        ValueKind::ExpandSz(text) => (REG_EXPAND_SZ, sz_bytes(text)),
+        ValueKind::Dword(value) => (REG_DWORD, value.to_le_bytes().to_vec()),
+        ValueKind::MultiSz(parts) => (REG_MULTI_SZ, multi_sz_bytes(parts)),
+        ValueKind::Binary(bytes) => (REG_BINARY, bytes.clone()),
+        ValueKind::Other { kind, bytes } => (*kind, bytes.clone()),
+    }
 }
 
 fn failure(rc: u32, message: String) -> RegError {
@@ -375,10 +479,20 @@ fn decode_multi(bytes: &[u8]) -> Vec<String> {
 /// the walk then restarts from that target. Any other link is refused, so a
 /// read, backup, or delete always reaches the key its path names.
 fn open(path: &str, write: bool) -> Result<Opened, RegError> {
-    let mut access = KEY_READ | KEY_WOW64_64KEY;
     if write {
-        access |= KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS;
+        open_with(
+            path,
+            KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS,
+        )
+    } else {
+        open_with(path, 0)
     }
+}
+
+/// Open `path` with read access plus `extra`, crossing only the links
+/// Windows itself defines.
+fn open_with(path: &str, extra: u32) -> Result<Opened, RegError> {
+    let access = KEY_READ | KEY_WOW64_64KEY | extra;
     let original = canonical_path(path);
     let mut current = original.clone();
     for _ in 0..=MAX_LINK_HOPS {
@@ -843,6 +957,45 @@ mod live_tests {
         assert!(kids.is_empty());
         reg.delete_tree(&key.root).expect("delete test tree");
         assert!(matches!(reg.subkeys(&key.root), Err(RegError::NotFound)));
+    }
+
+    #[test]
+    fn live_set_value_creates_missing_parent_keys() {
+        // A fresh profile has no StartupApproved key yet; writing a flag
+        // there must create every missing level, not fail with not found.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        // Its own root: the other live tests share TestKey's.
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendCreateTest{}",
+            std::process::id()
+        ));
+        let mut reg = WindowsRegistry;
+        assert!(matches!(reg.values(&root.0), Err(RegError::NotFound)));
+        let deep = format!(r"{}\New\Deeper\Leaf", root.0);
+        assert!(matches!(reg.values(&deep), Err(RegError::NotFound)));
+        let data = ValueKind::Binary(vec![3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        reg.set_value(&deep, "Flag", &data)
+            .expect("write through new keys");
+        let values = reg.values(&deep).expect("read new key");
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Flag" && value.data == data)
+        );
+        // Writing again replaces the value in the key that now exists.
+        reg.set_value(&deep, "Flag", &ValueKind::Dword(2))
+            .expect("rewrite");
+        let values = reg.values(&deep).expect("re-read new key");
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Flag" && value.data == ValueKind::Dword(2))
+        );
     }
 
     #[test]
