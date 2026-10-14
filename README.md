@@ -95,8 +95,10 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   Recycle Bin; tick the rows, pick 1, 3, or 7 passes, then Shred. The
   confirmation lists the paths (the first ten, then a count of any rest)
   and cannot be undone. The Windows
-  folder, program folders, drive roots, links, and hidden system files
-  are always refused. Shredding on a solid-state drive warns that
+  folder, program folders, drive roots, links, hidden system files, and
+  files with more than one hard link are always refused, judged by where
+  each file really is after junctions, 8.3 names, and SUBST drives are
+  resolved. Shredding on a solid-state drive warns that
   traces may survive in spare blocks the overwrite cannot reach. No
   administrator rights are needed for your own files.
 - Monitor shows live memory, system-drive, and uptime readings with
