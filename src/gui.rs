@@ -5853,7 +5853,16 @@ impl App {
             right,
             y,
             "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
-        ) + gap * 2;
+        ) + gap / 2;
+        y = paragraph(
+            hdc,
+            self.fonts.body_bold,
+            INK,
+            left,
+            right,
+            y,
+            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0).",
+        ) + gap;
         y = paragraph(
             hdc,
             self.fonts.heading,
@@ -5926,7 +5935,7 @@ impl App {
                 &value,
             ) + gap / 2;
         }
-        y += gap * 2;
+        y += gap / 2;
         paragraph(
             hdc,
             self.fonts.body,

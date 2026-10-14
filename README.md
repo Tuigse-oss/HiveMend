@@ -1,6 +1,10 @@
 # Hive Mend
 
-Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup. It covers twelve scanner jobs:
+Hive Mend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
+
+> **Use at your own risk.** Hive Mend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but shredded files and cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
+
+It covers twelve scanner jobs:
 
 | Id | Job |
 | --- | --- |
