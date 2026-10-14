@@ -166,9 +166,19 @@ cargo audit bin hive-mend-v0.1.0-x86_64-windows.exe
 
 Please report vulnerabilities privately, as described in [SECURITY.md](SECURITY.md).
 
+## Made by TUIGSE LLC
+
+<img src="docs/tuigse-emblem.png" width="96" alt="TUIGSE LLC emblem">
+
+Hive Mend is a TUIGSE LLC project.
+
 ## License
 
 Licensed under either of the MIT license ([LICENSE-MIT](LICENSE-MIT)) or
 the Apache License, Version 2.0 ([LICENSE-APACHE](LICENSE-APACHE)) at your
 option. Unless you explicitly state otherwise, any contribution intentionally
 submitted for inclusion in this project is licensed the same way.
+
+The TUIGSE LLC name and emblem (`assets/tuigse-emblem-256.bgra`,
+`docs/tuigse-emblem.png`) are TUIGSE LLC's marks. They are not licensed under
+MIT or Apache-2.0; forks should remove or replace them.

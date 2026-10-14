@@ -27,10 +27,13 @@ pub enum Icon {
     StatusWarn,
     /// Home-page status: no scan yet.
     StatusUnknown,
+    /// The TUIGSE LLC emblem, the publisher's mark (an embedded image, not
+    /// drawn in code).
+    Tuigse,
 }
 
 impl Icon {
-    pub const ALL: [Icon; 13] = [
+    pub const ALL: [Icon; 14] = [
         Icon::Logo,
         Icon::Scan,
         Icon::Optimize,
@@ -44,6 +47,7 @@ impl Icon {
         Icon::StatusOk,
         Icon::StatusWarn,
         Icon::StatusUnknown,
+        Icon::Tuigse,
     ];
 
     pub fn name(self) -> &'static str {
@@ -61,6 +65,7 @@ impl Icon {
             Icon::StatusOk => "status-ok",
             Icon::StatusWarn => "status-warn",
             Icon::StatusUnknown => "status-unknown",
+            Icon::Tuigse => "tuigse",
         }
     }
 }
@@ -523,6 +528,10 @@ fn spiral(c: P, r0: f32, r1: f32, a0: f32, turns: f32, steps: usize) -> Vec<P> {
 
 fn draw(icon: Icon, size: usize) -> Canvas {
     let mut cv = Canvas::new(size);
+    if icon == Icon::Tuigse {
+        cv.px = emblem(size);
+        return cv;
+    }
     match icon {
         Icon::Logo => logo(&mut cv),
         Icon::Scan => scan(&mut cv),
@@ -537,6 +546,7 @@ fn draw(icon: Icon, size: usize) -> Canvas {
         Icon::StatusOk => status(&mut cv, Status::Ok),
         Icon::StatusWarn => status(&mut cv, Status::Warn),
         Icon::StatusUnknown => status(&mut cv, Status::Unknown),
+        Icon::Tuigse => unreachable!("drawn from the embedded image above"),
     }
     cv
 }
@@ -990,6 +1000,44 @@ pub fn corner_sprite(
                 (c(fill) * f + c(border) * b + c(behind) * o).round() as u8
             };
             out.extend([blend(2), blend(1), blend(0), 255]);
+        }
+    }
+    out
+}
+
+/// The TUIGSE LLC emblem: 256 x 256 straight-alpha BGRA, cropped to a
+/// circle. Made from TUIGSE's own logo artwork (`tuigse2.jpg`).
+const EMBLEM: &[u8] = include_bytes!("../assets/tuigse-emblem-256.bgra");
+const EMBLEM_SIZE: usize = 256;
+
+/// The emblem scaled to `size` by area averaging (premultiplied RGBA), so it
+/// stays smooth at every display scale.
+fn emblem(size: usize) -> Vec<[f32; 4]> {
+    let scale = EMBLEM_SIZE as f32 / size as f32;
+    let mut out = vec![[0.0f32; 4]; size * size];
+    for y in 0..size {
+        for x in 0..size {
+            let (x0, x1) = (x as f32 * scale, (x + 1) as f32 * scale);
+            let (y0, y1) = (y as f32 * scale, (y + 1) as f32 * scale);
+            let mut acc = [0.0f32; 4];
+            let mut weight = 0.0f32;
+            for sy in y0.floor() as usize..(y1.ceil() as usize).min(EMBLEM_SIZE) {
+                let wy = (y1.min(sy as f32 + 1.0) - y0.max(sy as f32)).max(0.0);
+                for sx in x0.floor() as usize..(x1.ceil() as usize).min(EMBLEM_SIZE) {
+                    let wx = (x1.min(sx as f32 + 1.0) - x0.max(sx as f32)).max(0.0);
+                    let w = wx * wy;
+                    let i = (sy * EMBLEM_SIZE + sx) * 4;
+                    let a = EMBLEM[i + 3] as f32 / 255.0;
+                    acc[0] += EMBLEM[i + 2] as f32 / 255.0 * a * w;
+                    acc[1] += EMBLEM[i + 1] as f32 / 255.0 * a * w;
+                    acc[2] += EMBLEM[i] as f32 / 255.0 * a * w;
+                    acc[3] += a * w;
+                    weight += w;
+                }
+            }
+            if weight > 0.0 {
+                out[y * size + x] = acc.map(|v| v / weight);
+            }
         }
     }
     out

@@ -5991,7 +5991,10 @@ impl App {
         self.subtitle(
             hdc,
             rect,
-            &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "Hive Mend {} \u{00b7} a TUIGSE LLC project",
+                env!("CARGO_PKG_VERSION")
+            ),
         );
         let left = self.s(CONTENT_X);
         let icon_w = self.s(64);
@@ -6002,6 +6005,28 @@ impl App {
             rect.right - self.s(24) - icon_w,
             self.s(TITLE_Y),
             icon_w,
+        );
+        // The publisher's emblem beneath the product's logo.
+        let emblem_top = self.s(TITLE_Y) + icon_w + self.s(20);
+        self.draw_icon(
+            hdc,
+            Icon::Tuigse,
+            rect.right - self.s(24) - icon_w,
+            emblem_top,
+            icon_w,
+        );
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: rect.right - self.s(24) - icon_w - self.s(20),
+                top: emblem_top + icon_w + self.s(4),
+                right: rect.right - self.s(4),
+                bottom: emblem_top + icon_w + self.s(24),
+            },
+            "TUIGSE LLC",
+            DT_SINGLELINE | DT_CENTER,
         );
         let gap = self.s(10);
         let mut y = self.s(BODY_Y);
