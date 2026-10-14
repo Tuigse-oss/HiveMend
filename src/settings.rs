@@ -4,7 +4,7 @@ use std::path::Path;
 
 use crate::model::ScannerId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     /// Scanners left out of a full scan. Every scanner, Deep Scan included,
     /// is on by default.
@@ -14,18 +14,6 @@ pub struct Settings {
     pub last_repair: String,
     /// Privacy category ids left ticked. Empty means nothing ticked.
     pub privacy_ticked: Vec<String>,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            disabled: Vec::new(),
-            last_scan: String::new(),
-            last_problems: None,
-            last_repair: String::new(),
-            privacy_ticked: Vec::new(),
-        }
-    }
 }
 
 impl Settings {
