@@ -87,6 +87,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
+/// Lay out and repaint once a nested WM_SIZE or WM_DPICHANGED was deferred.
+const WM_RELAYOUT: u32 = WM_APP + 3;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -325,12 +327,22 @@ static CANCEL: AtomicBool = AtomicBool::new(false);
 // TrackPopupMenu) and synchronous dispatches (SetWindowPos, control
 // notifications) re-enter wnd_proc while the outer handler still holds its
 // &mut App. A second &mut to the same App would be undefined behavior, so
-// nested entries never touch App: job and close messages are parked for
-// redelivery, everything else falls through to DefWindowProcW. drain_nested
-// runs after every pump to redeliver and repaint.
+// nested entries never touch App: they record what must not be lost in
+// DEFERRED and fall through to DefWindowProcW. Messages App never handles are
+// routed to DefWindowProcW before the guard is taken, so the native modal
+// loops they start (moving or sizing by the title bar or frame, the system
+// menu, caption buttons) dispatch to a free handler instead of a parked one.
+// Once an outer handler returns and releases the guard, flush_deferred
+// re-posts everything recorded, so nothing waits for an unrelated event.
 static IN_HANDLER: AtomicBool = AtomicBool::new(false);
-static PENDING_MSG: AtomicU32 = AtomicU32::new(0);
-static PENDING_CLOSE: AtomicBool = AtomicBool::new(false);
+/// `DEFER_*` bits recorded by nested entries. One bit per kind, so a later
+/// progress tick can never overwrite a parked completion.
+static DEFERRED: AtomicU32 = AtomicU32::new(0);
+const DEFER_PROGRESS: u32 = 1;
+const DEFER_DONE: u32 = 2;
+const DEFER_CLOSE: u32 = 4;
+const DEFER_LAYOUT: u32 = 8;
+const DEFER_PAINT: u32 = 16;
 
 struct Fonts {
     title: HFONT,
@@ -498,155 +510,245 @@ unsafe extern "system" fn wnd_proc(
         return 0;
     }
     let app = window_app(hwnd);
-    if app.is_null() {
+    if app.is_null() || !app_handles(msg) {
         return DefWindowProcW(hwnd, msg, wparam, lparam);
     }
-    // Nested dispatch while a handler runs: park what must not be lost,
-    // default the rest, and never form a second &mut App. WM_CLOSE must
-    // not reach DefWindowProcW here — its default action destroys the
-    // window without running our WM_DESTROY cleanup.
-    let _guard = match HandlerGuard::enter() {
-        Some(guard) => guard,
-        None => {
-            if msg == WM_JOB_PROGRESS || msg == WM_JOB_DONE {
-                PENDING_MSG.store(msg, Ordering::SeqCst);
-            } else if msg == WM_CLOSE {
-                PENDING_CLOSE.store(true, Ordering::SeqCst);
-                return 0;
+    // Nested dispatch while a handler runs: record what must not be lost,
+    // default the rest, and never form a second &mut App. WM_CLOSE must not
+    // reach DefWindowProcW here — its default action destroys the window
+    // without running our WM_DESTROY cleanup.
+    let Some(guard) = HandlerGuard::enter() else {
+        let (bits, reply) = nested_reply(msg);
+        DEFERRED.fetch_or(bits, Ordering::SeqCst);
+        return match reply {
+            NestedReply::Handled => 0,
+            NestedReply::Default => DefWindowProcW(hwnd, msg, wparam, lparam),
+        };
+    };
+    let result = 'handled: {
+        let _guard = guard;
+        let app = &mut *app;
+        match msg {
+            WM_ERASEBKGND => 1,
+            WM_PAINT => {
+                app.paint();
+                0
             }
-            return DefWindowProcW(hwnd, msg, wparam, lparam);
+            WM_SIZE | WM_RELAYOUT => {
+                app.sync_controls();
+                InvalidateRect(hwnd, std::ptr::null(), 0);
+                0
+            }
+            WM_DPICHANGED => {
+                app.set_dpi((wparam & 0xffff) as u32);
+                let rect = &*(lparam as *const RECT);
+                SetWindowPos(
+                    hwnd,
+                    std::ptr::null_mut(),
+                    rect.left,
+                    rect.top,
+                    rect.right - rect.left,
+                    rect.bottom - rect.top,
+                    SWP_NOZORDER | SWP_NOACTIVATE,
+                );
+                // The nested WM_SIZE is deferred by the guard, so lay out and
+                // repaint directly instead of waiting for the flush.
+                app.sync_controls();
+                app.invalidate();
+                0
+            }
+            WM_MOUSEMOVE => {
+                let (x, y) = point(lparam);
+                app.set_hover(app.spot_at(x, y));
+                if !app.tracking {
+                    let mut track = TRACKMOUSEEVENT {
+                        cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
+                        dwFlags: TME_LEAVE,
+                        hwndTrack: hwnd,
+                        dwHoverTime: 0,
+                    };
+                    TrackMouseEvent(&mut track);
+                    app.tracking = true;
+                }
+                0
+            }
+            WM_MOUSELEAVE => {
+                app.tracking = false;
+                app.set_hover(None);
+                0
+            }
+            WM_SETCURSOR => {
+                if (lparam & 0xffff) as u32 == HTCLIENT
+                    && wparam as HWND == hwnd
+                    && let Some(index) = app.hover
+                    && app.spot_enabled(index)
+                {
+                    SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
+                    break 'handled 1;
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
+            WM_LBUTTONUP => {
+                let (x, y) = point(lparam);
+                if let Some(index) = app.spot_at(x, y)
+                    && app.spot_enabled(index)
+                {
+                    let action = app.hotspots[index].action;
+                    app.perform(action);
+                }
+                0
+            }
+            WM_COMMAND => {
+                app.command((wparam & 0xffff) as u16, ((wparam >> 16) & 0xffff) as u16);
+                0
+            }
+            WM_NOTIFY => app.notify(&*(lparam as *const NMHDR), lparam),
+            WM_CONTEXTMENU => {
+                if wparam as HWND == app.list {
+                    app.findings_menu(lparam);
+                } else if wparam as HWND == app.svc_list {
+                    app.services_menu(lparam);
+                }
+                0
+            }
+            WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
+                SetBkColor(wparam as HDC, BG);
+                app.bg_brush as LRESULT
+            }
+            WM_DROPFILES => {
+                let drop = wparam as HDROP;
+                app.drop_files(drop);
+                DragFinish(drop);
+                0
+            }
+            WM_JOB_PROGRESS => {
+                app.show_progress();
+                0
+            }
+            WM_JOB_DONE => {
+                if let Some(result) = RESULT.lock().ok().and_then(|mut slot| slot.take()) {
+                    app.finish(result);
+                }
+                0
+            }
+            WM_CLOSE => {
+                if matches!(
+                    app.job,
+                    Job::Repairing
+                        | Job::Restoring
+                        | Job::Services
+                        | Job::Cleaning
+                        | Job::Shredding
+                ) {
+                    app.message(
+                        "Hive Mend is still working. Please wait for it to finish before closing.",
+                        MB_ICONWARNING,
+                    );
+                    break 'handled 0;
+                }
+                // app is dead after this point: DestroyWindow dispatches
+                // WM_DESTROY synchronously, which must run as a normal guarded
+                // entry instead of being deferred.
+                drop(_guard);
+                DestroyWindow(hwnd);
+                0
+            }
+            WM_DESTROY => {
+                SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
+                let app = Box::from_raw(app as *mut App);
+                app.release();
+                PostQuitMessage(0);
+                0
+            }
+            _ => DefWindowProcW(hwnd, msg, wparam, lparam),
         }
     };
-    let app = &mut *app;
+    // The guard is released here, so re-posted messages reach a free handler.
+    flush_deferred(hwnd);
+    result
+}
+
+/// Messages the window procedure acts on. Everything else goes straight to
+/// DefWindowProcW without taking the guard or borrowing App, so a native
+/// modal loop it starts (title-bar drag, frame sizing, system menu, caption
+/// buttons) is not run inside a handler.
+fn app_handles(msg: u32) -> bool {
+    matches!(
+        msg,
+        WM_ERASEBKGND
+            | WM_PAINT
+            | WM_SIZE
+            | WM_RELAYOUT
+            | WM_DPICHANGED
+            | WM_MOUSEMOVE
+            | WM_MOUSELEAVE
+            | WM_SETCURSOR
+            | WM_LBUTTONUP
+            | WM_COMMAND
+            | WM_NOTIFY
+            | WM_CONTEXTMENU
+            | WM_CTLCOLORSTATIC
+            | WM_CTLCOLORBTN
+            | WM_DROPFILES
+            | WM_JOB_PROGRESS
+            | WM_JOB_DONE
+            | WM_CLOSE
+            | WM_DESTROY
+    )
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum NestedReply {
+    /// Answered here with 0; the deferred bit carries the real work.
+    Handled,
+    /// Also passed to DefWindowProcW.
+    Default,
+}
+
+/// What a nested entry records for later, and how it answers now. Job and
+/// close messages are answered without DefWindowProcW (whose WM_CLOSE default
+/// would destroy the window behind our cleanup); a nested size or paint still
+/// gets the default and is redone once the guard is free.
+fn nested_reply(msg: u32) -> (u32, NestedReply) {
     match msg {
-        WM_ERASEBKGND => 1,
-        WM_PAINT => {
-            app.paint();
-            0
-        }
-        WM_SIZE => {
-            app.sync_controls();
-            InvalidateRect(hwnd, std::ptr::null(), 0);
-            0
-        }
-        WM_DPICHANGED => {
-            app.set_dpi((wparam & 0xffff) as u32);
-            let rect = &*(lparam as *const RECT);
-            SetWindowPos(
-                hwnd,
-                std::ptr::null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
-                SWP_NOZORDER | SWP_NOACTIVATE,
-            );
-            // The nested WM_SIZE is deferred by the guard, so lay out and
-            // repaint directly instead of relying on it.
-            app.sync_controls();
-            app.invalidate();
-            0
-        }
-        WM_MOUSEMOVE => {
-            let (x, y) = point(lparam);
-            app.set_hover(app.spot_at(x, y));
-            if !app.tracking {
-                let mut track = TRACKMOUSEEVENT {
-                    cbSize: std::mem::size_of::<TRACKMOUSEEVENT>() as u32,
-                    dwFlags: TME_LEAVE,
-                    hwndTrack: hwnd,
-                    dwHoverTime: 0,
-                };
-                TrackMouseEvent(&mut track);
-                app.tracking = true;
-            }
-            0
-        }
-        WM_MOUSELEAVE => {
-            app.tracking = false;
-            app.set_hover(None);
-            0
-        }
-        WM_SETCURSOR => {
-            if (lparam & 0xffff) as u32 == HTCLIENT
-                && wparam as HWND == hwnd
-                && let Some(index) = app.hover
-                && app.spot_enabled(index)
-            {
-                SetCursor(LoadCursorW(std::ptr::null_mut(), IDC_HAND));
-                return 1;
-            }
-            DefWindowProcW(hwnd, msg, wparam, lparam)
-        }
-        WM_LBUTTONUP => {
-            let (x, y) = point(lparam);
-            if let Some(index) = app.spot_at(x, y)
-                && app.spot_enabled(index)
-            {
-                let action = app.hotspots[index].action;
-                app.perform(action);
-            }
-            0
-        }
-        WM_COMMAND => {
-            app.command((wparam & 0xffff) as u16, ((wparam >> 16) & 0xffff) as u16);
-            0
-        }
-        WM_NOTIFY => app.notify(&*(lparam as *const NMHDR), lparam),
-        WM_CONTEXTMENU => {
-            if wparam as HWND == app.list {
-                app.findings_menu(lparam);
-            } else if wparam as HWND == app.svc_list {
-                app.services_menu(lparam);
-            }
-            0
-        }
-        WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-            SetBkColor(wparam as HDC, BG);
-            app.bg_brush as LRESULT
-        }
-        WM_DROPFILES => {
-            let drop = wparam as HDROP;
-            app.drop_files(drop);
-            DragFinish(drop);
-            0
-        }
-        WM_JOB_PROGRESS => {
-            app.show_progress();
-            0
-        }
-        WM_JOB_DONE => {
-            if let Some(result) = RESULT.lock().ok().and_then(|mut slot| slot.take()) {
-                app.finish(result);
-            }
-            0
-        }
-        WM_CLOSE => {
-            if matches!(
-                app.job,
-                Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning | Job::Shredding
-            ) {
-                app.message(
-                    "Hive Mend is still working. Please wait for it to finish before closing.",
-                    MB_ICONWARNING,
-                );
-                return 0;
-            }
-            // app is dead after this point: DestroyWindow dispatches
-            // WM_DESTROY synchronously, which must run as a normal guarded
-            // entry instead of being deferred.
-            drop(_guard);
-            DestroyWindow(hwnd);
-            0
-        }
-        WM_DESTROY => {
-            SetWindowLongPtrW(hwnd, GWLP_USERDATA, 0);
-            let app = Box::from_raw(app as *mut App);
-            app.release();
-            PostQuitMessage(0);
-            0
-        }
-        _ => DefWindowProcW(hwnd, msg, wparam, lparam),
+        WM_JOB_PROGRESS => (DEFER_PROGRESS, NestedReply::Handled),
+        WM_JOB_DONE => (DEFER_DONE, NestedReply::Handled),
+        WM_CLOSE => (DEFER_CLOSE, NestedReply::Handled),
+        WM_SIZE | WM_DPICHANGED | WM_RELAYOUT => (DEFER_LAYOUT, NestedReply::Default),
+        WM_PAINT => (DEFER_PAINT, NestedReply::Default),
+        _ => (0, NestedReply::Default),
+    }
+}
+
+/// The messages to re-post for a set of deferred bits, in delivery order.
+/// Paint is not a message here: it is an invalidation.
+fn deferred_messages(bits: u32) -> Vec<u32> {
+    let mut out = Vec::new();
+    if bits & DEFER_LAYOUT != 0 {
+        out.push(WM_RELAYOUT);
+    }
+    if bits & DEFER_PROGRESS != 0 {
+        out.push(WM_JOB_PROGRESS);
+    }
+    if bits & DEFER_DONE != 0 {
+        out.push(WM_JOB_DONE);
+    }
+    if bits & DEFER_CLOSE != 0 {
+        out.push(WM_CLOSE);
+    }
+    out
+}
+
+/// Re-post what nested entries deferred. Posting (rather than handling
+/// here) means each message is dispatched later by a pump with no handler
+/// active, so it takes the guard normally.
+fn flush_deferred(hwnd: HWND) {
+    let bits = DEFERRED.swap(0, Ordering::SeqCst);
+    for message in deferred_messages(bits) {
+        unsafe { PostMessageW(hwnd, message, 0, 0) };
+    }
+    if bits & DEFER_PAINT != 0 {
+        unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
     }
 }
 
@@ -672,17 +774,12 @@ impl Drop for HandlerGuard {
     }
 }
 
-/// Redeliver messages parked during a modal pump and force the repaint
+/// Re-post messages deferred during a modal pump and force the repaint
 /// that nested WM_PAINTs skipped. Runs after every MessageBoxW and
-/// TrackPopupMenu, while still inside the outer handler.
+/// TrackPopupMenu, while still inside the outer handler; wnd_proc flushes
+/// again once that handler returns.
 fn drain_nested(hwnd: HWND) {
-    let pending = PENDING_MSG.swap(0, Ordering::SeqCst);
-    if pending != 0 {
-        unsafe { PostMessageW(hwnd, pending, 0, 0) };
-    }
-    if PENDING_CLOSE.swap(false, Ordering::SeqCst) {
-        unsafe { PostMessageW(hwnd, WM_CLOSE, 0, 0) };
-    }
+    flush_deferred(hwnd);
     unsafe { InvalidateRect(hwnd, std::ptr::null(), 0) };
 }
 
@@ -2072,6 +2169,9 @@ impl App {
                         for skipped in &outcome.not_backed_up {
                             lines.push(format!("Not backed up, left alone: {skipped}"));
                         }
+                        for pending in outcome.unconfirmed.iter().take(5) {
+                            lines.push(format!("Not confirmed: {pending}"));
+                        }
                         for error in outcome.errors.iter().take(5) {
                             lines.push(format!("Failed: {error}"));
                         }
@@ -2084,18 +2184,24 @@ impl App {
                         if !outcome.backup_file.as_os_str().is_empty() {
                             lines.push(format!("Backup: {}", outcome.backup_file.display()));
                         }
-                        self.svc_note = if outcome.applied.is_empty() && outcome.errors.is_empty() {
+                        self.svc_note = if outcome.applied.is_empty()
+                            && outcome.errors.is_empty()
+                            && outcome.unconfirmed.is_empty()
+                        {
                             "Nothing needed changing.".to_string()
                         } else {
                             format!(
-                                "Applied {}, refused {}, failed {}.",
+                                "Applied {}, refused {}, failed {}, not confirmed {}.",
                                 outcome.applied.len(),
                                 outcome.refused.len() + outcome.not_backed_up.len(),
-                                outcome.errors.len() + outcome.denied
+                                outcome.errors.len() + outcome.denied,
+                                outcome.unconfirmed.len()
                             )
                         };
                         let icon = if outcome.applied.is_empty()
-                            && (outcome.denied > 0 || !outcome.errors.is_empty())
+                            && (outcome.denied > 0
+                                || !outcome.errors.is_empty()
+                                || !outcome.unconfirmed.is_empty())
                         {
                             MB_ICONWARNING
                         } else {
@@ -6206,5 +6312,57 @@ fn load_bitmap(name: &str) -> HBITMAP {
             0,
             LR_LOADFROMFILE | LR_CREATEDIBSECTION,
         ) as HBITMAP
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVING, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
+    };
+
+    #[test]
+    fn modal_loop_starters_never_take_the_guard() {
+        // Dragging the title bar or a frame edge runs DefWindowProcW's modal
+        // loop from these. If they took the guard, every message that loop
+        // dispatches (a job finishing, WM_CLOSE, WM_SIZE) would be nested.
+        for msg in [
+            WM_NCLBUTTONDOWN,
+            WM_SYSCOMMAND,
+            WM_ENTERSIZEMOVE,
+            WM_EXITSIZEMOVE,
+            WM_MOVING,
+            WM_SIZING,
+        ] {
+            assert!(!app_handles(msg), "message {msg:#x} must stay default-only");
+        }
+        for msg in [WM_JOB_DONE, WM_JOB_PROGRESS, WM_CLOSE, WM_SIZE, WM_RELAYOUT] {
+            assert!(app_handles(msg), "message {msg:#x} must reach App");
+        }
+    }
+
+    #[test]
+    fn a_progress_tick_cannot_overwrite_a_parked_completion() {
+        // Completion, then a late progress tick, then close and a resize, all
+        // while a modal pump holds the guard: every one must be redelivered.
+        let mut bits = 0;
+        for msg in [WM_JOB_DONE, WM_JOB_PROGRESS, WM_CLOSE, WM_SIZE, WM_PAINT] {
+            bits |= nested_reply(msg).0;
+        }
+        assert_eq!(
+            deferred_messages(bits),
+            vec![WM_RELAYOUT, WM_JOB_PROGRESS, WM_JOB_DONE, WM_CLOSE]
+        );
+        assert_ne!(bits & DEFER_PAINT, 0);
+    }
+
+    #[test]
+    fn nested_close_and_job_messages_skip_the_default_handler() {
+        // DefWindowProcW's WM_CLOSE destroys the window behind our cleanup.
+        assert_eq!(nested_reply(WM_CLOSE).1, NestedReply::Handled);
+        assert_eq!(nested_reply(WM_JOB_DONE).1, NestedReply::Handled);
+        assert_eq!(nested_reply(WM_SIZE).1, NestedReply::Default);
+        assert_eq!(nested_reply(WM_SYSCOMMAND), (0, NestedReply::Default));
     }
 }
