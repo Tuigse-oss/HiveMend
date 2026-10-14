@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use crate::backup::{export_repairs, write_backup};
-use crate::fs::{FileView, ItemKind};
+use crate::fs::{Access, FileView, ItemKind};
 use crate::model::{Error, Repair};
 use crate::pathutil::{
     canonical_path, expand_env, has_unsafe_fs_component, is_protected_key, normalize_fs,
@@ -1346,11 +1346,39 @@ fn delete_file(
         done.note(format!("refused: {}", hit.path));
         return;
     }
-    if fs.is_dir(&hit.path) {
+    // Pin the object and check where it really is: the root and the file are
+    // both resolved, so a junction or link inside a cache folder cannot carry
+    // the delete outside it. The delete goes through the checked handle.
+    let mut pin = match fs.pin(&hit.path) {
+        Ok(pin) => pin,
+        Err(err) if err.contains("not found") || err.contains("os error 2") => {
+            done.already_gone += 1;
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {}: {err}", hit.path));
+            return;
+        }
+    };
+    if pin.kind != ItemKind::File {
         done.note(format!("not a file: {}", hit.path));
         return;
     }
-    match fs.remove_file(&hit.path) {
+    let real_root = fs
+        .pin(root)
+        .map(|pin| pin.real_path)
+        .unwrap_or_else(|_| root.to_string());
+    if !privacy_file_allowed(fs, &real_root, &pin.real_path) {
+        done.note(format!(
+            "refused: {} (it resolves to {})",
+            hit.path, pin.real_path
+        ));
+        return;
+    }
+    let result = fs
+        .pin_acquire(&mut pin, Access::Delete)
+        .and_then(|()| fs.pin_delete(pin));
+    match result {
         Ok(()) => {
             done.files += 1;
             done.bytes += hit.bytes;
@@ -1922,6 +1950,29 @@ mod tests {
             r"C:\HiveMend\backups\a.reg"
         ));
         assert!(!privacy_file_allowed(&fs, temp, r"C:\Users\test\a.tmp"));
+    }
+
+    #[test]
+    fn a_cache_file_that_resolves_outside_its_root_is_not_deleted() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let root = r"C:\Users\me\AppData\Local\Temp";
+        fs.add_file_bytes(&format!(r"{root}\ok.tmp"), vec![1; 8], None);
+        fs.add_file_bytes(r"C:\Users\me\Documents\keep.txt", vec![2; 8], None);
+        fs.add_alias(&format!(r"{root}\out"), r"C:\Users\me\Documents");
+        let mut done = ItemOutcome::blank("test");
+        let mut errors = Vec::new();
+        for path in [format!(r"{root}\ok.tmp"), format!(r"{root}\out\keep.txt")] {
+            let hit = FileHit { path, bytes: 8 };
+            delete_file(&mut fs, root, &hit, &mut done, &mut errors);
+        }
+        assert_eq!(done.files, 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            done.restricted
+                .iter()
+                .any(|note| note.contains("resolves to"))
+        );
+        assert_eq!(fs.read(r"C:\Users\me\Documents\keep.txt"), Some(vec![2; 8]));
     }
 
     #[test]

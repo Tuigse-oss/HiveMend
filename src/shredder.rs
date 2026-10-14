@@ -4,8 +4,8 @@
 //! absolute refusals, per-item errors, and cancel. Pass counts are named
 //! by count only; no certification is claimed.
 
-use crate::fs::{FileView, ItemKind};
-use crate::pathutil::shred_allowed;
+use crate::fs::{FileView, ItemKind, Pinned};
+use crate::pathutil::{pin_for_shred, shred_allowed};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ShredMethod {
@@ -209,8 +209,14 @@ pub fn shred_paths(
         progress(total, total, "");
     }
     for dir in dirs {
-        if let Err(err) = fs.remove_dir(&dir) {
-            outcome.errors.push(format!("{dir}: {err}"));
+        // A folder is pinned and checked like a file before it goes.
+        match pin_for_shred(fs, &dir, ItemKind::Dir) {
+            Ok(pin) => {
+                if let Err(err) = fs.pin_delete(pin) {
+                    outcome.errors.push(format!("{dir}: {err}"));
+                }
+            }
+            Err(reason) => outcome.refused.push(reason),
         }
     }
     outcome
@@ -263,13 +269,14 @@ fn shred_file(
     total: usize,
     progress: &mut dyn FnMut(usize, usize, &str) -> bool,
 ) -> FileDone {
-    // Re-gate every file: a staged path could have been swapped for a link.
-    if let Err(reason) = shred_allowed(fs, path) {
-        return FileDone::Refused(reason);
-    }
-    let Some(len) = fs.len(path) else {
-        return FileDone::Refused(format!("{path} cannot be sized"));
+    // Re-gate every file and pin it: every pass, the verify, truncate,
+    // rename, and delete go through this one checked handle, so a path
+    // swapped for a link or another file after staging changes nothing.
+    let mut pin = match pin_for_shred(fs, path, ItemKind::File) {
+        Ok(pin) => pin,
+        Err(reason) => return FileDone::Refused(reason),
     };
+    let len = pin.len;
     let name = file_name(path).to_string();
     let passes = opts.method.passes();
     for pass in 0..passes {
@@ -284,31 +291,32 @@ fn shred_file(
             return FileDone::Canceled;
         }
         if len > 0
-            && let Err(err) = overwrite_pass(fs, path, len, pass, seed, file_no)
+            && let Err(err) = overwrite_pass(fs, &pin, len, pass, seed, file_no)
         {
             return FileDone::Failed(format!("{path}: {err}"));
         }
         *done += 1;
     }
-    if len > 0 && !verify_file(fs, path, len, passes - 1, seed, file_no) {
+    if len > 0 && !verify_file(fs, &pin, len, passes - 1, seed, file_no) {
         return FileDone::Failed(format!("{path}: verify failed, file kept"));
     }
-    let mut current = path.to_string();
     if len > 0
-        && let Err(err) = fs.set_len(&current, 0)
+        && let Err(err) = fs.pin_set_len(&pin, 0)
     {
         return FileDone::Failed(format!("{path}: {err}"));
     }
     if opts.rename {
-        match random_sibling(&current, seed, file_no) {
-            Some(next) => match fs.rename_file(&current, &next) {
-                Ok(()) => current = next,
-                Err(err) => return FileDone::Failed(format!("{path}: {err}")),
-            },
+        match random_sibling(path, seed, file_no) {
+            Some(next) => {
+                let next_name = file_name(&next).to_string();
+                if let Err(err) = fs.pin_rename(&mut pin, &next_name) {
+                    return FileDone::Failed(format!("{path}: {err}"));
+                }
+            }
             None => return FileDone::Failed(format!("{path}: no usable name found")),
         }
     }
-    match fs.remove_file(&current) {
+    match fs.pin_delete(pin) {
         Ok(()) => FileDone::Shredded(len),
         Err(err) => FileDone::Failed(format!("{path}: {err}")),
     }
@@ -316,7 +324,7 @@ fn shred_file(
 
 fn overwrite_pass(
     fs: &mut dyn FileView,
-    path: &str,
+    pin: &Pinned,
     len: u64,
     pass: usize,
     seed: u64,
@@ -328,17 +336,17 @@ fn overwrite_pass(
         let chunk_no = offset / CHUNK as u64;
         let take = ((len - offset) as usize).min(buf.len());
         pass_fill(pass, seed, file_no, chunk_no, &mut buf[..take]);
-        fs.write_at(path, offset, &buf[..take])?;
+        fs.pin_write_at(pin, offset, &buf[..take])?;
         offset += take as u64;
     }
-    fs.sync_file(path)
+    fs.pin_sync(pin)
 }
 
 /// Read back the first and last windows and compare against regenerated
 /// pattern bytes. Anything unreadable or mismatched fails closed.
 fn verify_file(
     fs: &dyn FileView,
-    path: &str,
+    pin: &Pinned,
     len: u64,
     pass: usize,
     seed: u64,
@@ -348,13 +356,13 @@ fn verify_file(
         return true;
     }
     let head = (len as usize).min(CHUNK);
-    if !window_matches(fs, path, pass, seed, file_no, 0, head) {
+    if !window_matches(fs, pin, pass, seed, file_no, 0, head) {
         return false;
     }
     if len as usize > head {
         let tail = (len as usize).min(CHUNK);
         let offset = len - tail as u64;
-        if !window_matches(fs, path, pass, seed, file_no, offset, tail) {
+        if !window_matches(fs, pin, pass, seed, file_no, offset, tail) {
             return false;
         }
     }
@@ -363,14 +371,14 @@ fn verify_file(
 
 fn window_matches(
     fs: &dyn FileView,
-    path: &str,
+    pin: &Pinned,
     pass: usize,
     seed: u64,
     file_no: u64,
     offset: u64,
     len: usize,
 ) -> bool {
-    match fs.read_at(path, offset, len) {
+    match fs.pin_read_at(pin, offset, len) {
         Some(got) => got.len() == len && got == expected_bytes(pass, seed, file_no, offset, len),
         None => false,
     }
@@ -552,12 +560,28 @@ pub fn shred_recycle_items(
     let mut outcome = shred_paths(fs, &targets, opts, seed, progress);
     for item in items {
         if outcome.shredded_paths.iter().any(|path| path == &item.data)
-            && let Err(err) = fs.remove_file(&item.meta)
+            && let Err(err) = delete_recycle_meta(fs, &item.meta)
         {
             outcome.errors.push(format!("{}: {err}", item.meta));
         }
     }
     outcome
+}
+
+/// Delete a `$I` metadata file through a pinned, checked handle: a plain
+/// single-name file whose real path is still a `$I` name in a Recycle Bin.
+fn delete_recycle_meta(fs: &mut dyn FileView, meta: &str) -> Result<(), String> {
+    let mut pin = fs.pin(meta)?;
+    let real = pin.real_path.to_ascii_lowercase();
+    let in_bin = real.contains("\\$recycle.bin\\")
+        && file_name(&real).starts_with("$i")
+        && pin.kind == ItemKind::File
+        && pin.links == 1;
+    if !in_bin {
+        return Err(format!("refused: resolves to {}", pin.real_path));
+    }
+    fs.pin_acquire(&mut pin, crate::fs::Access::Delete)?;
+    fs.pin_delete(pin)
 }
 
 // ---- media ----
@@ -628,29 +652,38 @@ mod tests {
         fn is_hidden_system(&self, path: &str) -> bool {
             path.eq_ignore_ascii_case(&self.flagged)
         }
-        fn remove_file(&mut self, path: &str) -> Result<(), String> {
-            self.inner.remove_file(path)
+        fn pin(&self, path: &str) -> Result<Pinned, String> {
+            let mut pin = self.inner.pin(path)?;
+            pin.hidden_system = path.eq_ignore_ascii_case(&self.flagged);
+            Ok(pin)
         }
-        fn copy_file(&mut self, from: &str, to: &str) -> Result<(), String> {
-            self.inner.copy_file(from, to)
+        fn pin_acquire(
+            &mut self,
+            pin: &mut Pinned,
+            access: crate::fs::Access,
+        ) -> Result<(), String> {
+            self.inner.pin_acquire(pin, access)
         }
-        fn write_at(&mut self, path: &str, offset: u64, bytes: &[u8]) -> Result<(), String> {
-            self.inner.write_at(path, offset, bytes)
+        fn pin_read_at(&self, pin: &Pinned, offset: u64, len: usize) -> Option<Vec<u8>> {
+            self.inner.pin_read_at(pin, offset, len)
         }
-        fn sync_file(&mut self, path: &str) -> Result<(), String> {
-            self.inner.sync_file(path)
+        fn pin_write_at(&mut self, pin: &Pinned, offset: u64, bytes: &[u8]) -> Result<(), String> {
+            self.inner.pin_write_at(pin, offset, bytes)
         }
-        fn set_len(&mut self, path: &str, len: u64) -> Result<(), String> {
-            self.inner.set_len(path, len)
+        fn pin_sync(&mut self, pin: &Pinned) -> Result<(), String> {
+            self.inner.pin_sync(pin)
         }
-        fn rename_file(&mut self, from: &str, to: &str) -> Result<(), String> {
-            self.inner.rename_file(from, to)
+        fn pin_set_len(&mut self, pin: &Pinned, len: u64) -> Result<(), String> {
+            self.inner.pin_set_len(pin, len)
         }
-        fn remove_dir(&mut self, path: &str) -> Result<(), String> {
-            self.inner.remove_dir(path)
+        fn pin_rename(&mut self, pin: &mut Pinned, name: &str) -> Result<(), String> {
+            self.inner.pin_rename(pin, name)
         }
-        fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>> {
-            self.inner.read_at(path, offset, len)
+        fn pin_delete(&mut self, pin: Pinned) -> Result<(), String> {
+            self.inner.pin_delete(pin)
+        }
+        fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
+            self.inner.pin_copy_to(pin, to)
         }
         fn var(&self, name: &str) -> Option<String> {
             self.inner.var(name)
@@ -870,6 +903,71 @@ mod tests {
     }
 
     #[test]
+    fn a_path_that_resolves_into_a_protected_folder_is_refused_and_untouched() {
+        // `C:\Docs\j` stands in for a junction, 8.3 name, or SUBST drive that
+        // really leads into System32: the spelling passes, the object fails.
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.add_file_bytes(r"C:\Windows\System32\drivers\etc\hosts", vec![7; 64], None);
+        fs.add_dir(r"C:\Docs");
+        fs.add_alias(r"C:\Docs\j", r"C:\Windows\System32\drivers\etc");
+        let outcome = shred_paths(
+            &mut fs,
+            &[target(r"C:\Docs\j\hosts", false)],
+            &ShredOptions::default(),
+            SEED,
+            &mut allow,
+        );
+        assert_eq!(outcome.shredded, 0);
+        assert_eq!(outcome.refused.len(), 1, "{:?}", outcome.refused);
+        assert!(outcome.refused[0].contains("Windows folder"));
+        assert_eq!(
+            fs.read(r"C:\Windows\System32\drivers\etc\hosts"),
+            Some(vec![7; 64])
+        );
+    }
+
+    #[test]
+    fn a_file_with_other_hard_links_is_not_overwritten() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.add_file_bytes(r"C:\Docs\shared.dat", vec![9; 32], None);
+        fs.set_links(r"C:\Docs\shared.dat", 2);
+        let outcome = shred_paths(
+            &mut fs,
+            &[target(r"C:\Docs\shared.dat", false)],
+            &ShredOptions::default(),
+            SEED,
+            &mut allow,
+        );
+        assert_eq!(outcome.shredded, 0);
+        assert!(outcome.refused[0].contains("hard links"));
+        assert_eq!(fs.read(r"C:\Docs\shared.dat"), Some(vec![9; 32]));
+    }
+
+    #[test]
+    fn a_staged_folder_that_now_resolves_elsewhere_is_not_removed() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.add_dir(r"C:\Docs\Stage");
+        fs.add_dir(r"C:\Program Files\App\Empty");
+        fs.add_alias(r"C:\Docs\Stage", r"C:\Program Files\App\Empty");
+        let outcome = shred_paths(
+            &mut fs,
+            &[target(r"C:\Docs\Stage", true)],
+            &ShredOptions::default(),
+            SEED,
+            &mut allow,
+        );
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|why| why.contains("program folder")),
+            "{:?}",
+            outcome.refused
+        );
+        assert!(fs.is_dir(r"C:\Program Files\App\Empty"));
+    }
+
+    #[test]
     fn protected_folders_are_refused() {
         let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("ProgramFiles", r"C:\Program Files");
@@ -1061,9 +1159,10 @@ mod tests {
     fn verify_rejects_tampered_bytes() {
         let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\v.dat", vec![0; 100], None);
-        assert!(verify_file(&fs, r"C:\Docs\v.dat", 100, 0, SEED, 0));
-        fs.write_at(r"C:\Docs\v.dat", 50, &[0x41]).unwrap();
-        assert!(!verify_file(&fs, r"C:\Docs\v.dat", 100, 0, SEED, 0));
+        let pin = fs.pin(r"C:\Docs\v.dat").unwrap();
+        assert!(verify_file(&fs, &pin, 100, 0, SEED, 0));
+        fs.pin_write_at(&pin, 50, &[0x41]).unwrap();
+        assert!(!verify_file(&fs, &pin, 100, 0, SEED, 0));
     }
 
     #[test]
@@ -1138,5 +1237,105 @@ mod live_tests {
         );
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A scratch folder under the temp directory, removed on drop.
+    struct Scratch(std::path::PathBuf);
+
+    impl Scratch {
+        fn new(tag: &str) -> Self {
+            let dir = std::env::temp_dir().join(format!("hivemend-{tag}-{}", std::process::id()));
+            let _ = std::fs::remove_dir_all(&dir);
+            std::fs::create_dir_all(&dir).expect("make scratch dir");
+            Self(dir)
+        }
+    }
+
+    impl Drop for Scratch {
+        fn drop(&mut self) {
+            // remove_dir_all removes a junction itself, never its target.
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    fn shred_one(path: &str) -> ShredOutcome {
+        shred_paths(
+            &mut HostFs,
+            &[ShredTarget {
+                path: path.to_string(),
+                is_dir: false,
+            }],
+            &ShredOptions::default(),
+            0x1234_5678_9abc_def0,
+            &mut |_, _, _| true,
+        )
+    }
+
+    #[test]
+    fn live_a_junction_into_system32_is_resolved_and_refused() {
+        // ntoskrnl.exe is owned by TrustedInstaller: not even an elevated run
+        // could write it, so this test cannot do harm if the check regressed.
+        let system = crate::fs::host_known_dir(crate::fs::KnownDir::System).unwrap();
+        let victim = std::path::Path::new(&system).join("ntoskrnl.exe");
+        let before = std::fs::metadata(&victim).expect("ntoskrnl.exe metadata");
+        let scratch = Scratch::new("junction");
+        let link = scratch.0.join("j");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&system)
+            .output()
+            .expect("run mklink");
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        let staged = link.join("ntoskrnl.exe").display().to_string();
+        // The spelling is a plain temp path; only the object is protected.
+        let outcome = shred_one(&staged);
+        assert_eq!(outcome.shredded, 0);
+        assert!(
+            outcome
+                .refused
+                .iter()
+                .any(|why| why.contains("Windows folder")),
+            "refused: {:?} errors: {:?}",
+            outcome.refused,
+            outcome.errors
+        );
+        let after = std::fs::metadata(&victim).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    fn live_a_hard_linked_file_is_refused_and_both_names_keep_their_bytes() {
+        let scratch = Scratch::new("hardlink");
+        let first = scratch.0.join("a.bin");
+        let second = scratch.0.join("b.bin");
+        std::fs::write(&first, [0x5Au8; 512]).unwrap();
+        std::fs::hard_link(&first, &second).expect("make hard link");
+        let outcome = shred_one(&first.display().to_string());
+        assert_eq!(outcome.shredded, 0);
+        assert!(outcome.refused.iter().any(|why| why.contains("hard links")));
+        assert_eq!(std::fs::read(&first).unwrap(), vec![0x5Au8; 512]);
+        assert_eq!(std::fs::read(&second).unwrap(), vec![0x5Au8; 512]);
+    }
+
+    #[test]
+    fn live_a_path_swapped_after_pinning_does_not_redirect_the_work() {
+        let scratch = Scratch::new("swap");
+        let path = scratch.0.join("target.bin");
+        let moved = scratch.0.join("moved.bin");
+        std::fs::write(&path, [1u8; 64]).unwrap();
+        let text = path.display().to_string();
+        let mut fs = HostFs;
+        let pin = crate::pathutil::pin_for_shred(&mut fs, &text, ItemKind::File).expect("pin");
+        // Swap: the pinned file moves away and a decoy takes its name.
+        std::fs::rename(&path, &moved).expect("move pinned file");
+        std::fs::write(&path, b"decoy").unwrap();
+        fs.pin_write_at(&pin, 0, &[0xEE; 64]).unwrap();
+        fs.pin_sync(&pin).unwrap();
+        assert_eq!(std::fs::read(&moved).unwrap(), vec![0xEE; 64]);
+        fs.pin_delete(pin).unwrap();
+        assert!(!moved.exists(), "the pinned object itself is deleted");
+        assert_eq!(std::fs::read(&path).unwrap(), b"decoy");
     }
 }

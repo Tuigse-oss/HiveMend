@@ -1,4 +1,4 @@
-use crate::fs::{FileView, KnownDir, is_drive_absolute};
+use crate::fs::{FileView, ItemKind, KnownDir, is_drive_absolute};
 
 pub fn canonical_hive(name: &str) -> Option<&'static str> {
     match name.to_ascii_uppercase().as_str() {
@@ -585,7 +585,6 @@ pub fn file_delete_allowed(path: &str) -> bool {
 /// the Windows, program, and app-data folders may shred. Errors name the
 /// rule that fired and are absolute: no caller may override a refusal.
 pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), String> {
-    use crate::fs::ItemKind;
     let clean = normalize_fs(path);
     let bytes = clean.as_bytes();
     let absolute = bytes.len() > 2 && bytes[1] == b':' && bytes[2] == b'\\';
@@ -637,6 +636,46 @@ pub fn shred_location_allowed(
         return Err(format!("{path} is inside the app data folder"));
     }
     Ok(())
+}
+
+/// Pin a staged shred target and check the object itself, not just its
+/// spelling: [`shred_allowed`] on the path, then the same location rules on
+/// the real path Windows reports for the open handle (junctions, links, 8.3
+/// names, and SUBST resolved). A file with more than one hard link is refused,
+/// since overwriting it would change every other name too. Only then is write
+/// or delete access gained, on that same handle.
+pub fn pin_for_shred(
+    fs: &mut dyn FileView,
+    path: &str,
+    want: ItemKind,
+) -> Result<crate::fs::Pinned, String> {
+    shred_allowed(&*fs, path)?;
+    let mut pin = fs.pin(path).map_err(|err| format!("{path}: {err}"))?;
+    if pin.kind != want {
+        return Err(format!("{path} changed since staging"));
+    }
+    if pin.hidden_system {
+        return Err(format!("{path} is a hidden system file"));
+    }
+    let real = normalize_fs(&pin.real_path);
+    if !is_drive_absolute(&real) {
+        return Err(format!("{path} resolves to {real}, not a local path"));
+    }
+    shred_location_allowed(&*fs, path, &real)
+        .map_err(|why| format!("{why} (it resolves to {real})"))?;
+    if pin.kind == ItemKind::File && pin.links > 1 {
+        return Err(format!(
+            "{path} has other hard links; shredding it would overwrite them too"
+        ));
+    }
+    let access = if want == ItemKind::File {
+        crate::fs::Access::Write
+    } else {
+        crate::fs::Access::Delete
+    };
+    fs.pin_acquire(&mut pin, access)
+        .map_err(|err| format!("{path}: {err}"))?;
+    Ok(pin)
 }
 
 pub fn looks_like_stored_path(text: &str) -> bool {
