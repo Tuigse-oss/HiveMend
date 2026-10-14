@@ -39,7 +39,9 @@ pub use engine::{
     still_reported,
 };
 pub use exclude::{Exclusion, Exclusions};
-pub use fs::{FileView, HostFs, ItemKind, MemoryFs};
+#[cfg(windows)]
+pub use fs::host_known_dir;
+pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 #[cfg(windows)]
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};

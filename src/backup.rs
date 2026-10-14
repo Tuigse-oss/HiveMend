@@ -556,8 +556,11 @@ pub fn import_reg_file(path: &Path) -> Result<(), String> {
     }
     use std::os::windows::process::CommandExt;
     const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-    let reg_exe = Path::new(&system_root).join("System32").join("reg.exe");
+    // System32 from the API, not %SystemRoot%: an elevated restore must run
+    // the real reg.exe, whatever environment launched this process.
+    let system = crate::fs::host_known_dir(crate::fs::KnownDir::System)
+        .ok_or("could not locate the System32 folder")?;
+    let reg_exe = Path::new(&system).join("reg.exe");
     let output = std::process::Command::new(reg_exe)
         .arg("import")
         .arg(path)

@@ -659,7 +659,7 @@ mod tests {
 
     #[test]
     fn one_pass_shreds_file_and_counts_bytes() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\secret.txt", vec![0x41; 100], None);
         let opts = ShredOptions {
             method: ShredMethod::OnePass,
@@ -687,7 +687,7 @@ mod tests {
 
     #[test]
     fn progress_counts_files_times_passes() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![1; 10], None);
         fs.add_file_bytes(r"C:\Docs\b.txt", vec![2; 10], None);
         let mut calls: Vec<(usize, usize, String)> = Vec::new();
@@ -716,7 +716,7 @@ mod tests {
 
     #[test]
     fn cancel_finishes_the_current_file_then_stops() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![0x41; 32], None);
         fs.add_file_bytes(r"C:\Docs\b.txt", vec![0x42; 32], None);
         // Allow only the first file's first pass, then ask to stop.
@@ -747,7 +747,7 @@ mod tests {
 
     #[test]
     fn empty_file_shreds() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file(r"C:\Docs\empty.dat");
         let outcome = shred_paths(
             &mut fs,
@@ -763,7 +763,7 @@ mod tests {
 
     #[test]
     fn directory_recurses_and_removes_deepest_first() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\Tree\a.txt", vec![1; 8], None);
         fs.add_file_bytes(r"C:\Docs\Tree\Sub\b.txt", vec![2; 8], None);
         let outcome = shred_paths(
@@ -782,7 +782,7 @@ mod tests {
 
     #[test]
     fn directory_with_link_skips_link_and_reports_parent() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\Mixed\ok.txt", vec![1; 8], None);
         fs.add_other(r"C:\Docs\Mixed\link.lnk");
         let outcome = shred_paths(
@@ -802,7 +802,7 @@ mod tests {
 
     #[test]
     fn link_target_is_refused() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_other(r"C:\Docs\alias.lnk");
         let outcome = shred_paths(
             &mut fs,
@@ -819,7 +819,7 @@ mod tests {
 
     #[test]
     fn hidden_system_file_is_refused() {
-        let mut inner = MemoryFs::new();
+        let mut inner = MemoryFs::with_windows_dirs();
         inner.add_file_bytes(r"C:\Docs\page.dat", vec![1; 8], None);
         let mut fs = HiddenFs {
             inner,
@@ -840,7 +840,7 @@ mod tests {
 
     #[test]
     fn missing_path_is_refused() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         let outcome = shred_paths(
             &mut fs,
             &[target(r"C:\Docs\gone.txt", false)],
@@ -855,7 +855,7 @@ mod tests {
 
     #[test]
     fn relative_path_and_root_are_refused() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![1; 4], None);
         let outcome = shred_paths(
             &mut fs,
@@ -871,7 +871,7 @@ mod tests {
 
     #[test]
     fn protected_folders_are_refused() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("ProgramFiles", r"C:\Program Files");
         fs.add_file_bytes(r"C:\Windows\Temp\x.dat", vec![1; 4], None);
         fs.add_file_bytes(r"C:\Program Files\App\x.exe", vec![1; 4], None);
@@ -911,7 +911,7 @@ mod tests {
 
     #[test]
     fn type_mismatch_is_refused() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![1; 4], None);
         fs.add_dir(r"C:\Docs\Sub");
         let outcome = shred_paths(
@@ -936,7 +936,7 @@ mod tests {
 
     #[test]
     fn cancel_stops_after_finished_files() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\a.txt", vec![1; 8], None);
         fs.add_file_bytes(r"C:\Docs\b.txt", vec![2; 8], None);
         let mut progress = |done: usize, _total: usize, _name: &str| done < 1;
@@ -1019,7 +1019,7 @@ mod tests {
     }
 
     fn recycle_fs() -> MemoryFs {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\$Recycle.Bin\S-1-5-21-1\$Rabc.txt", vec![7; 32], None);
         fs.add_file_bytes(
             r"C:\$Recycle.Bin\S-1-5-21-1\$Iabc.txt",
@@ -1059,7 +1059,7 @@ mod tests {
 
     #[test]
     fn verify_rejects_tampered_bytes() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.add_file_bytes(r"C:\Docs\v.dat", vec![0; 100], None);
         assert!(verify_file(&fs, r"C:\Docs\v.dat", 100, 0, SEED, 0));
         fs.write_at(r"C:\Docs\v.dat", 50, &[0x41]).unwrap();

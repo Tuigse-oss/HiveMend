@@ -9,6 +9,48 @@ pub enum ItemKind {
     Other,
 }
 
+/// A system folder that refusal checks and launched tools are anchored to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum KnownDir {
+    Windows,
+    System,
+    ProgramFiles,
+    ProgramFilesX86,
+    ProgramData,
+}
+
+impl KnownDir {
+    pub const PROTECTED: [KnownDir; 4] = [
+        KnownDir::Windows,
+        KnownDir::ProgramFiles,
+        KnownDir::ProgramFilesX86,
+        KnownDir::ProgramData,
+    ];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Windows => "Windows",
+            Self::System => "System32",
+            Self::ProgramFiles => "Program Files",
+            Self::ProgramFilesX86 => "Program Files (x86)",
+            Self::ProgramData => "ProgramData",
+        }
+    }
+}
+
+/// True for a fully qualified drive path such as `C:\Windows`: a letter, a
+/// colon, a backslash, and at least one more character, and no component that
+/// resolves differently from its spelling.
+pub fn is_drive_absolute(path: &str) -> bool {
+    let bytes = path.as_bytes();
+    bytes.len() > 3
+        && bytes[0].is_ascii_alphabetic()
+        && bytes[1] == b':'
+        && bytes[2] == b'\\'
+        && !path.contains('/')
+        && !crate::pathutil::has_unsafe_fs_component(path)
+}
+
 #[derive(Clone, Debug)]
 pub struct DirItem {
     pub name: String,
@@ -60,6 +102,20 @@ pub trait FileView {
     /// Read up to `len` bytes at `offset` for the verify pass.
     fn read_at(&self, path: &str, offset: u64, len: usize) -> Option<Vec<u8>>;
     fn var(&self, name: &str) -> Option<String>;
+    /// Where a system folder really is. On the host this comes from the
+    /// Windows APIs, never the environment, which a launcher controls. The
+    /// default (used by `MemoryFs`) reads the matching variable.
+    fn known_dir(&self, dir: KnownDir) -> Option<String> {
+        match dir {
+            KnownDir::Windows => self.var("SystemRoot").or_else(|| self.var("windir")),
+            KnownDir::System => self
+                .known_dir(KnownDir::Windows)
+                .map(|root| format!("{}\\System32", root.trim_end_matches('\\'))),
+            KnownDir::ProgramFiles => self.var("ProgramFiles"),
+            KnownDir::ProgramFilesX86 => self.var("ProgramFiles(x86)"),
+            KnownDir::ProgramData => self.var("ProgramData"),
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -82,6 +138,17 @@ pub struct MemoryFs {
 impl MemoryFs {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// A test filesystem with the standard Windows folders defined, as every
+    /// delete and shred check requires them.
+    pub fn with_windows_dirs() -> Self {
+        let mut fs = Self::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.set_var("ProgramFiles", r"C:\Program Files");
+        fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
+        fs.set_var("ProgramData", r"C:\ProgramData");
+        fs
     }
 
     pub fn set_var(&mut self, name: &str, value: &str) {
@@ -361,7 +428,69 @@ fn open_regular(path: &str, write: bool) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
+/// A system folder from the Windows APIs: the Windows and System32 folders
+/// from `GetSystemWindowsDirectoryW`/`GetSystemDirectoryW`, the rest from
+/// `SHGetKnownFolderPath`. None of them read the environment. `None` unless
+/// the answer is a fully qualified drive path.
+#[cfg(windows)]
+pub fn host_known_dir(dir: KnownDir) -> Option<String> {
+    use windows_sys::Win32::System::Com::CoTaskMemFree;
+    use windows_sys::Win32::System::SystemInformation::{
+        GetSystemDirectoryW, GetSystemWindowsDirectoryW,
+    };
+    use windows_sys::Win32::UI::Shell::{
+        FOLDERID_ProgramData, FOLDERID_ProgramFiles, FOLDERID_ProgramFilesX86, SHGetKnownFolderPath,
+    };
+    let text = match dir {
+        KnownDir::Windows | KnownDir::System => {
+            let mut buf = [0u16; 520];
+            let len = unsafe {
+                if dir == KnownDir::Windows {
+                    GetSystemWindowsDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+                } else {
+                    GetSystemDirectoryW(buf.as_mut_ptr(), buf.len() as u32)
+                }
+            } as usize;
+            if len == 0 || len >= buf.len() {
+                return None;
+            }
+            String::from_utf16(&buf[..len]).ok()?
+        }
+        KnownDir::ProgramFiles | KnownDir::ProgramFilesX86 | KnownDir::ProgramData => {
+            let id = match dir {
+                KnownDir::ProgramFiles => &FOLDERID_ProgramFiles,
+                KnownDir::ProgramFilesX86 => &FOLDERID_ProgramFilesX86,
+                _ => &FOLDERID_ProgramData,
+            };
+            let mut raw: windows_sys::core::PWSTR = std::ptr::null_mut();
+            let hr = unsafe { SHGetKnownFolderPath(id, 0, std::ptr::null_mut(), &mut raw) };
+            let text = if hr == 0 && !raw.is_null() {
+                let len = (0..).take_while(|&i| unsafe { *raw.add(i) } != 0).count();
+                String::from_utf16(unsafe { std::slice::from_raw_parts(raw, len) }).ok()
+            } else {
+                None
+            };
+            unsafe { CoTaskMemFree(raw as *const _) };
+            text?
+        }
+    };
+    let text = text.trim_end_matches('\\').to_string();
+    is_drive_absolute(&text).then_some(text)
+}
+
 impl FileView for HostFs {
+    fn known_dir(&self, dir: KnownDir) -> Option<String> {
+        #[cfg(windows)]
+        {
+            host_known_dir(dir)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = dir;
+            None
+        }
+    }
+
     fn exists(&self, path: &str) -> bool {
         if !on_local_fixed_drive(path) {
             return true;
@@ -526,5 +655,30 @@ impl FileView for HostFs {
                 None
             }
         })
+    }
+}
+
+/// Live Windows test. Read-only folder lookups.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_known_dirs_are_absolute_and_nested_as_expected() {
+        let windows = host_known_dir(KnownDir::Windows).expect("Windows folder");
+        let system = host_known_dir(KnownDir::System).expect("System32 folder");
+        for dir in KnownDir::PROTECTED {
+            let path = host_known_dir(dir).unwrap_or_else(|| panic!("{dir:?} missing"));
+            assert!(is_drive_absolute(&path), "{dir:?}: {path}");
+            assert!(!path.ends_with('\\'), "{dir:?}: {path}");
+        }
+        assert!(
+            system
+                .to_ascii_lowercase()
+                .starts_with(&(windows.to_ascii_lowercase() + "\\")),
+            "{system} is not under {windows}"
+        );
+        assert!(std::path::Path::new(&system).join("reg.exe").is_file());
+        assert!(std::path::Path::new(&system).join("cipher.exe").is_file());
     }
 }

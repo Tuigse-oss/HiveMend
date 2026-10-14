@@ -1,4 +1,4 @@
-use crate::fs::FileView;
+use crate::fs::{FileView, KnownDir, is_drive_absolute};
 
 pub fn canonical_hive(name: &str) -> Option<&'static str> {
     match name.to_ascii_uppercase().as_str() {
@@ -104,8 +104,31 @@ fn var_aliases(name: &str) -> &'static [&'static str] {
     }
 }
 
+/// A system folder as the refusal checks must see it: from the Windows APIs
+/// on the host, and only when it is a fully qualified drive path.
+pub fn known_root(fs: &dyn FileView, dir: KnownDir) -> Option<String> {
+    let root = normalize_fs(&fs.known_dir(dir)?);
+    let root = root.trim_end_matches('\\').to_string();
+    is_drive_absolute(&root).then_some(root)
+}
+
+/// Every folder a delete or shred must stay out of, or an error naming the
+/// one that could not be located. A missing root refuses the operation
+/// instead of silently dropping that protection.
+pub fn protected_roots(fs: &dyn FileView) -> Result<Vec<String>, String> {
+    KnownDir::PROTECTED
+        .iter()
+        .map(|dir| {
+            known_root(fs, *dir)
+                .ok_or_else(|| format!("the {} folder could not be located", dir.label()))
+        })
+        .collect()
+}
+
+/// The Windows folder for locating files during a scan. Refusal checks use
+/// [`protected_roots`] or [`under_windows_dir`], which fail closed instead.
 pub fn system_root(fs: &dyn FileView) -> String {
-    lookup_var(fs, "SystemRoot").unwrap_or_else(|| "C:\\Windows".to_string())
+    known_root(fs, KnownDir::Windows).unwrap_or_else(|| "C:\\Windows".to_string())
 }
 
 pub fn normalize_fs(path: &str) -> String {
@@ -133,10 +156,24 @@ pub fn has_unsafe_fs_component(path: &str) -> bool {
         .any(|part| part == "." || part == ".." || part.ends_with('.') || part.ends_with(' '))
 }
 
+/// True when `path` is inside the Windows folder, or when that folder cannot
+/// be located: scanners skip such paths, so an unknown root errs toward
+/// leaving things alone.
 pub fn under_windows_dir(fs: &dyn FileView, path: &str) -> bool {
-    let root = normalize_fs(&system_root(fs)).to_ascii_lowercase();
+    let Some(root) = known_root(fs, KnownDir::Windows) else {
+        return true;
+    };
+    path_under(path, &root)
+}
+
+/// Case-insensitive `path == root` or `path` inside `root`, after
+/// normalizing separators.
+pub fn path_under(path: &str, root: &str) -> bool {
+    let root = normalize_fs(root)
+        .trim_end_matches('\\')
+        .to_ascii_lowercase();
     let path = normalize_fs(path).to_ascii_lowercase();
-    path == root || path.starts_with(&(root + "\\"))
+    !root.is_empty() && (path == root || path.starts_with(&(root + "\\")))
 }
 
 /// True unless the file is verifiably gone. A path with an unresolved
@@ -575,23 +612,28 @@ pub fn shred_allowed(fs: &dyn crate::fs::FileView, path: &str) -> Result<(), Str
     if fs.is_hidden_system(&clean) {
         return Err(format!("{path} is a hidden system file"));
     }
-    let lower = clean.to_ascii_lowercase();
-    let under = |root: &str| {
-        let root = normalize_fs(root).to_ascii_lowercase();
-        lower == root || lower.starts_with(&(root + "\\"))
-    };
-    if under(&system_root(fs)) {
+    shred_location_allowed(fs, path, &clean)
+}
+
+/// The location rules of [`shred_allowed`], applied to `clean`: outside the
+/// Windows, Program Files, and ProgramData folders (located by API, refusing
+/// when one cannot be found) and outside the app data folder. `shred_file`
+/// runs this again on the path Windows reports for the opened file.
+pub fn shred_location_allowed(
+    fs: &dyn crate::fs::FileView,
+    path: &str,
+    clean: &str,
+) -> Result<(), String> {
+    let roots = protected_roots(fs).map_err(|why| format!("{path} refused: {why}"))?;
+    if let Some(windows) = roots.first()
+        && path_under(clean, windows)
+    {
         return Err(format!("{path} is inside the Windows folder"));
     }
-    for var in ["ProgramFiles", "ProgramFiles(x86)", "ProgramData"] {
-        if let Some(dir) = fs.var(var)
-            && !dir.is_empty()
-            && under(&dir)
-        {
-            return Err(format!("{path} is inside a program folder"));
-        }
+    if roots.iter().skip(1).any(|root| path_under(clean, root)) {
+        return Err(format!("{path} is inside a program folder"));
     }
-    if under(crate::DATA_DIR) {
+    if path_under(clean, crate::DATA_DIR) {
         return Err(format!("{path} is inside the app data folder"));
     }
     Ok(())
@@ -765,6 +807,38 @@ mod tests {
         assert!(!has_unsafe_fs_component(
             r"C:\Users\Me\AppData\Local\Temp\a.tmp"
         ));
+    }
+
+    #[test]
+    fn a_missing_protected_root_refuses_instead_of_dropping_the_check() {
+        // ProgramData is not defined: the gate must refuse, not skip it.
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.set_var("ProgramFiles", r"C:\Program Files");
+        fs.set_var("ProgramFiles(x86)", r"C:\Program Files (x86)");
+        fs.add_file(r"C:\ProgramData\Vendor\x.dat");
+        fs.add_file(r"C:\Docs\a.txt");
+        let err = shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").unwrap_err();
+        assert!(err.contains("could not be located"), "{err}");
+        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_err());
+        fs.set_var("ProgramData", r"C:\ProgramData");
+        assert!(shred_allowed(&fs, r"C:\Docs\a.txt").is_ok());
+        assert!(shred_allowed(&fs, r"C:\ProgramData\Vendor\x.dat").is_err());
+    }
+
+    #[test]
+    fn a_relative_or_ambiguous_windows_root_is_not_trusted() {
+        // A root that is not a plain drive path cannot anchor a refusal, so
+        // scanners treat everything as inside it and leave it alone.
+        for root in ["Windows", r"\Windows", r"C:\.\Windows", r"C:\Windows.", ""] {
+            let mut fs = MemoryFs::new();
+            fs.set_var("SystemRoot", root);
+            assert!(known_root(&fs, KnownDir::Windows).is_none(), "{root:?}");
+            assert!(under_windows_dir(&fs, r"C:\Docs\a.txt"), "{root:?}");
+        }
+        let fs = MemoryFs::with_windows_dirs();
+        assert!(under_windows_dir(&fs, r"C:\WINDOWS\System32\x.dll"));
+        assert!(!under_windows_dir(&fs, r"C:\WindowsApps\x.dll"));
     }
 
     #[test]

@@ -1130,8 +1130,20 @@ impl App {
         let Some(tool) = WINDOWS_TOOLS.get(index) else {
             return;
         };
-        let root = std::env::var("SystemRoot").unwrap_or_else(|_| r"C:\Windows".into());
-        shell_open(self.hwnd, &expand_target(tool.target, &root), None);
+        // The Windows folder from the API, not %SystemRoot%, so the intended
+        // native tool opens. Without it, a path-based tool is not launched.
+        let root = hive_mend::host_known_dir(hive_mend::KnownDir::Windows);
+        let target = match root {
+            Some(root) => expand_target(tool.target, &root),
+            None if !tool.target.to_ascii_lowercase().contains("%systemroot%") => {
+                tool.target.to_string()
+            }
+            None => {
+                self.message("Could not locate the Windows folder.", MB_ICONWARNING);
+                return;
+            }
+        };
+        shell_open(self.hwnd, &target, None);
     }
 
     fn go(&mut self, page: Page) {

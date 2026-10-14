@@ -17,7 +17,7 @@ use crate::fs::{FileView, ItemKind};
 use crate::model::{Error, Repair};
 use crate::pathutil::{
     canonical_path, expand_env, has_unsafe_fs_component, is_protected_key, normalize_fs,
-    system_root,
+    path_under, protected_roots,
 };
 use crate::registry::{RegError, Registry};
 
@@ -653,28 +653,20 @@ fn privacy_file_allowed(fs: &dyn FileView, root: &str, path: &str) -> bool {
     if !looks_absolute(&path) || path.contains("..") || has_unsafe_fs_component(&path) {
         return false;
     }
-    let lower = path.to_ascii_lowercase();
-    let root = normalize_fs(root).to_ascii_lowercase();
-    if lower != root && !lower.starts_with(&(root + "\\")) {
+    if !path_under(&path, root) {
         return false;
     }
-    let sys = normalize_fs(&system_root(fs)).to_ascii_lowercase();
-    if lower == sys || lower.starts_with(&(sys + "\\")) {
+    privacy_location_allowed(fs, &path)
+}
+
+/// Outside the Windows, Program Files, and ProgramData folders (located by
+/// API; a folder that cannot be located refuses everything) and outside the
+/// app data folder.
+fn privacy_location_allowed(fs: &dyn FileView, path: &str) -> bool {
+    let Ok(roots) = protected_roots(fs) else {
         return false;
-    }
-    for var in ["ProgramFiles", "ProgramFiles(x86)"] {
-        if let Some(dir) = fs.var(var) {
-            let dir = normalize_fs(&dir).to_ascii_lowercase();
-            if !dir.is_empty() && (lower == dir || lower.starts_with(&(dir + "\\"))) {
-                return false;
-            }
-        }
-    }
-    let data = normalize_fs(crate::DATA_DIR).to_ascii_lowercase();
-    if lower == data || lower.starts_with(&(data + "\\")) {
-        return false;
-    }
-    true
+    };
+    !roots.iter().any(|dir| path_under(path, dir)) && !path_under(path, crate::DATA_DIR)
 }
 
 // ---- preview ----
@@ -1654,7 +1646,7 @@ mod tests {
     }
 
     fn seed_fs() -> MemoryFs {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("TEMP", r"C:\Users\test\AppData\Local\Temp");
         fs.set_var("TMP", r"C:\Users\test\AppData\Local\Temp");
         fs.set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
@@ -1933,6 +1925,27 @@ mod tests {
     }
 
     #[test]
+    fn file_gate_refuses_everything_when_a_system_folder_is_unknown() {
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let file = format!(r"{temp}\a.tmp");
+        assert!(privacy_file_allowed(
+            &MemoryFs::with_windows_dirs(),
+            temp,
+            &file
+        ));
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.set_var("ProgramFiles(x86)", "");
+        assert!(!privacy_file_allowed(&fs, temp, &file));
+        // ProgramData is protected for privacy deletes too.
+        let data = r"C:\ProgramData\Vendor";
+        assert!(!privacy_file_allowed(
+            &MemoryFs::with_windows_dirs(),
+            data,
+            &format!(r"{data}\x.log")
+        ));
+    }
+
+    #[test]
     fn masks_match_dos_style_case_insensitively() {
         assert!(mask_matches("anything", "*.*"));
         assert!(mask_matches("F_000001", "*.*"));
@@ -1947,7 +1960,7 @@ mod tests {
     #[test]
     fn unresolved_vars_report_restricted_not_silent() {
         let reg = seed_reg();
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("SystemRoot", r"C:\Windows");
         let sys = FakeSys::default();
         let report = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
@@ -2059,7 +2072,7 @@ mod tests {
         let backup = std::env::temp_dir().join("hive-mend-privacy-plugin-test.reg");
         let outcome = clean_with_progress(
             &mut reg,
-            &mut MemoryFs::new(),
+            &mut MemoryFs::with_windows_dirs(),
             &mut FakeSys::default(),
             &quiet(),
             &items,
@@ -2074,7 +2087,7 @@ mod tests {
 
     #[test]
     fn firefox_profiles_come_from_ini_and_folder() {
-        let mut fs = MemoryFs::new();
+        let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("APPDATA", r"C:\Users\test\AppData\Roaming");
         let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
         fs.add_file_bytes(
