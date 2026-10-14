@@ -11,12 +11,13 @@
 //! - The window cannot be closed while a repair or restore is running.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::collections::{HashMap, VecDeque};
+use std::path::PathBuf;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use hive_mend::art::Icon;
 use hive_mend::{
     BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
     HostFs, ItemKind, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, RecycleItem, Repair,
@@ -38,9 +39,9 @@ use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
     CreatePen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HALFTONE, HBITMAP, HBRUSH, HDC,
-    HFONT, InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, TRIVERTEX,
+    GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HBITMAP, HBRUSH, HDC, HFONT,
+    InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
+    SetTextColor, TRANSPARENT, TRIVERTEX,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -72,13 +73,12 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
     ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW, IsWindow,
-    LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW,
+    MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
+    SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
     WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONUP,
     WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW,
@@ -159,12 +159,14 @@ const LIST_Y: i32 = BODY_Y + 22;
 const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 18;
 
 const BG: u32 = rgb(255, 255, 255);
-const SIDEBAR_BG: u32 = rgb(232, 236, 242);
+const SIDEBAR_BG: u32 = rgb(234, 241, 236);
 const INK: u32 = rgb(28, 28, 28);
-const MUTED: u32 = rgb(92, 98, 108);
-const LINK: u32 = rgb(16, 120, 52);
-const BLUE_INK: u32 = rgb(24, 64, 140);
-const ACCENT: u32 = rgb(196, 32, 32);
+const MUTED: u32 = rgb(88, 98, 92);
+const LINK: u32 = rgb(22, 110, 56);
+/// Deep Celtic green, the theme colour shared with the icons in `art`.
+const THEME_INK: u32 = rgb(22, 86, 48);
+/// Gold, the icons' accent colour.
+const ACCENT: u32 = rgb(166, 118, 22);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -445,8 +447,8 @@ struct App {
     dpi: u32,
     fonts: Fonts,
     bg_brush: HBRUSH,
-    icons: Vec<HBITMAP>,
-    tool_icons: Vec<HBITMAP>,
+    /// Icons rendered by `art` at the pixel sizes drawn so far.
+    art: HashMap<(Icon, i32), HBITMAP>,
     hotspots: Vec<HotSpot>,
     hover: Option<usize>,
     tracking: bool,
@@ -529,10 +531,15 @@ pub fn run() -> std::process::ExitCode {
         };
         InitCommonControlsEx(&icc);
         let class_name = wide("HiveMendWindow");
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, ICON_SMALL, SM_CXICON, SM_CXSMICON, WM_SETICON,
+        };
+        let big = logo_icon(GetSystemMetrics(SM_CXICON));
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: GetModuleHandleW(std::ptr::null()),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hIcon: big,
             lpszClassName: class_name.as_ptr(),
             ..std::mem::zeroed()
         };
@@ -558,6 +565,8 @@ pub fn run() -> std::process::ExitCode {
         if hwnd.is_null() {
             return std::process::ExitCode::from(1);
         }
+        let small = logo_icon(GetSystemMetrics(SM_CXSMICON));
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             if IsDialogMessageW(hwnd, &msg) == 0 {
@@ -984,20 +993,7 @@ impl App {
             dpi,
             fonts: make_fonts(dpi),
             bg_brush: unsafe { CreateSolidBrush(BG) },
-            icons: [
-                "PM-RegScan.bmp",
-                "PM-ServiceOptimizer.bmp",
-                "PM-SysMonitor.bmp",
-                "PM-Settings.bmp",
-                "PM-About.bmp",
-            ]
-            .into_iter()
-            .map(load_bitmap)
-            .collect(),
-            tool_icons: WINDOWS_TOOLS
-                .iter()
-                .map(|tool| load_bitmap(tool.icon))
-                .collect(),
+            art: HashMap::new(),
             hotspots: Vec::new(),
             hover: None,
             tracking: false,
@@ -1251,8 +1247,24 @@ impl App {
         unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
     }
 
+    /// Draw `icon` `size` pixels square at (x, y), rendering it once per size.
+    fn draw_icon(&mut self, hdc: HDC, icon: Icon, x: i32, y: i32, size: i32) {
+        if size <= 0 {
+            return;
+        }
+        let bitmap = *self.art.entry((icon, size)).or_insert_with(|| unsafe {
+            dib(
+                &hive_mend::art::render_bgra_premultiplied(icon, size as usize),
+                size,
+            )
+        });
+        if !bitmap.is_null() {
+            unsafe { alpha_blit(hdc, bitmap, x, y, size) };
+        }
+    }
+
     fn release(self) {
-        for bitmap in self.icons.iter().chain(self.tool_icons.iter()) {
+        for bitmap in self.art.values() {
             if !bitmap.is_null() {
                 unsafe { DeleteObject(*bitmap) };
             }
@@ -4533,8 +4545,8 @@ impl App {
                 right: rect.right,
                 bottom: header / 2,
             },
-            (44, 110, 196),
-            (96, 166, 230),
+            (34, 112, 62),
+            (80, 154, 96),
             false,
         );
         gradient(
@@ -4545,8 +4557,8 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            (16, 72, 160),
-            (52, 128, 206),
+            (16, 78, 42),
+            (44, 124, 70),
             false,
         );
         fill(
@@ -4557,7 +4569,7 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            rgb(12, 52, 120),
+            rgb(12, 56, 30),
         );
         text(
             hdc,
@@ -4586,7 +4598,7 @@ impl App {
             if help_lit {
                 rgb(255, 255, 255)
             } else {
-                rgb(214, 232, 250)
+                rgb(222, 240, 226)
             },
             help,
             "Help",
@@ -4615,7 +4627,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                rgb(220, 236, 255),
+                rgb(226, 242, 230),
                 badge,
                 "Running as administrator",
                 DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
@@ -4630,22 +4642,23 @@ impl App {
                 bottom: header / 2 + self.s(17),
             };
             let lit = lit(hover, link);
-            round_box(
+            bubble(
                 hdc,
                 link,
                 self.s(16),
+                (255, 255, 255),
                 if lit {
-                    rgb(255, 255, 255)
+                    (226, 240, 230)
                 } else {
-                    rgb(232, 242, 255)
+                    (244, 234, 200)
                 },
-                rgb(160, 196, 236),
+                rgb(196, 156, 56),
                 1,
             );
             text(
                 hdc,
                 self.fonts.body_bold,
-                BLUE_INK,
+                THEME_INK,
                 link,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -4668,7 +4681,7 @@ impl App {
                 right: side.right + 1,
                 bottom: side.bottom,
             },
-            rgb(206, 212, 222),
+            rgb(198, 214, 202),
         );
         gradient(
             hdc,
@@ -4692,14 +4705,23 @@ impl App {
             };
             let selected = self.page == *page;
             let lit = lit(hover, pill);
-            let (fill_color, border, width) = if selected {
-                (rgb(222, 236, 253), rgb(40, 110, 190), 2)
+            // Glossy bubble buttons: gold for the open page, green on hover.
+            let (bottom, border, width) = if selected {
+                ((240, 220, 150), rgb(166, 124, 34), 2)
             } else if lit {
-                (rgb(246, 250, 255), rgb(120, 160, 210), 1)
+                ((206, 234, 214), rgb(46, 130, 76), 1)
             } else {
-                (rgb(255, 255, 255), rgb(184, 190, 200), 1)
+                ((228, 238, 230), rgb(176, 192, 182), 1)
             };
-            round_box(hdc, pill, self.s(18), fill_color, border, width);
+            bubble(
+                hdc,
+                pill,
+                self.s(38),
+                (255, 255, 255),
+                bottom,
+                border,
+                width,
+            );
             let font = if selected {
                 self.fonts.body_bold
             } else {
@@ -4709,7 +4731,7 @@ impl App {
             text(
                 hdc,
                 font,
-                if selected { BLUE_INK } else { INK },
+                if selected { THEME_INK } else { INK },
                 pill,
                 &label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -4831,98 +4853,146 @@ impl App {
         ]
     }
 
+    /// One glossy action button on the Status page. `main` marks the
+    /// headline tool with a gold rim and a single-line description.
+    unsafe fn action_card(
+        &mut self,
+        hdc: HDC,
+        card: RECT,
+        hover: Option<RECT>,
+        (icon, title, subtitle, action): (Icon, &str, &str, Action),
+        main: bool,
+    ) {
+        let disabled = action.starts_job() && self.busy();
+        let lit = !disabled && lit(hover, card);
+        let (top, bottom, border, width) = if lit {
+            ((255, 255, 255), (204, 232, 212), rgb(46, 130, 76), 2)
+        } else if main {
+            ((255, 255, 255), (238, 232, 206), rgb(196, 156, 56), 2)
+        } else {
+            ((255, 255, 255), (228, 238, 230), rgb(176, 196, 182), 1)
+        };
+        bubble(hdc, card, self.s(22), top, bottom, border, width);
+        let card_h = card.bottom - card.top;
+        let icon_px = self.s(56).min(card_h - self.s(16));
+        self.draw_icon(
+            hdc,
+            icon,
+            card.left + self.s(14),
+            card.top + (card_h - icon_px) / 2,
+            icon_px,
+        );
+        let text_left = card.left + self.s(14) + icon_px + self.s(14);
+        let color = if disabled { MUTED } else { THEME_INK };
+        text(
+            hdc,
+            self.fonts.heading,
+            color,
+            RECT {
+                left: text_left,
+                top: card.top + self.s(12),
+                right: card.right - self.s(14),
+                bottom: card.top + self.s(42),
+            },
+            title,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        let (font, flags) = if main {
+            (self.fonts.body, DT_SINGLELINE | DT_END_ELLIPSIS)
+        } else {
+            (self.fonts.small, DT_WORDBREAK | DT_END_ELLIPSIS)
+        };
+        text(
+            hdc,
+            font,
+            MUTED,
+            RECT {
+                left: text_left,
+                top: card.top + self.s(42),
+                right: card.right - self.s(14),
+                bottom: card.bottom - self.s(6),
+            },
+            subtitle,
+            flags,
+        );
+        self.spot(card, action);
+    }
+
     unsafe fn draw_status(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Select an", Some("Action"));
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
-        let cards = [
-            (
-                0,
-                "Scan Your Registry",
-                "Find entries left behind by programs that are no longer installed",
-                Action::ScanAll,
-            ),
-            (
-                1,
-                "Optimize Your System",
-                "Quick check of startup programs, uninstall entries, shared DLLs, and COM controls",
-                Action::Optimize,
-            ),
-            (
-                2,
-                "Monitor Your System",
-                "Memory, disk space, and uptime at a glance",
-                Action::Page(Page::Monitor),
-            ),
-        ];
-        let mut y = self.s(HEADER_H + 64);
+        // Hive Mend's main tool spans the row; the other four sit in pairs
+        // beneath it, so privacy cleaning and shredding are in plain view.
+        let gap = self.s(12);
         let card_h = self.s(84);
-        for (icon, title, subtitle, action) in cards {
-            let card = RECT {
+        let mut y = self.s(HEADER_H + 64);
+        self.action_card(
+            hdc,
+            RECT {
                 left,
                 top: y,
                 right,
                 bottom: y + card_h,
-            };
-            let disabled = action.starts_job() && self.busy();
-            let lit = !disabled && lit(hover, card);
-            round_box(
-                hdc,
-                card,
-                self.s(18),
-                if lit {
-                    rgb(236, 244, 253)
-                } else {
-                    rgb(248, 250, 252)
-                },
-                if lit {
-                    rgb(60, 130, 210)
-                } else {
-                    rgb(186, 196, 210)
-                },
-                if lit { 2 } else { 1 },
-            );
-            let icon_w = self.s(70);
-            if let Some(bitmap) = self.icons.get(icon).copied().filter(|b| !b.is_null()) {
-                blit(
+            },
+            hover,
+            (
+                Icon::Scan,
+                "Scan Your Registry",
+                "Find entries left behind by programs that are no longer installed",
+                Action::ScanAll,
+            ),
+            true,
+        );
+        y += card_h + gap;
+        let half = (right - left - gap) / 2;
+        let rows = [
+            [
+                (
+                    Icon::Privacy,
+                    "Clean Privacy Traces",
+                    "Browser history, temp files, and recent-file lists",
+                    Action::Page(Page::Privacy),
+                ),
+                (
+                    Icon::Shredder,
+                    "Shred Files",
+                    "Overwrite files so they can never be recovered",
+                    Action::Page(Page::Shredder),
+                ),
+            ],
+            [
+                (
+                    Icon::Optimize,
+                    "Optimize Your System",
+                    "Quick check of startup, uninstall, DLL, and COM entries",
+                    Action::Optimize,
+                ),
+                (
+                    Icon::Monitor,
+                    "Monitor Your System",
+                    "Memory, disk space, and uptime at a glance",
+                    Action::Page(Page::Monitor),
+                ),
+            ],
+        ];
+        for row in rows {
+            for (column, card) in row.into_iter().enumerate() {
+                let card_left = left + column as i32 * (half + gap);
+                self.action_card(
                     hdc,
-                    bitmap,
-                    card.left + self.s(14),
-                    card.top + (card_h - self.s(64)) / 2,
-                    icon_w,
-                    self.s(64),
+                    RECT {
+                        left: card_left,
+                        top: y,
+                        right: card_left + half,
+                        bottom: y + card_h,
+                    },
+                    hover,
+                    card,
+                    false,
                 );
             }
-            let text_left = card.left + self.s(104);
-            let color = if disabled { MUTED } else { BLUE_INK };
-            text(
-                hdc,
-                self.fonts.heading,
-                color,
-                RECT {
-                    left: text_left,
-                    top: card.top + self.s(14),
-                    right: card.right - self.s(16),
-                    bottom: card.top + self.s(44),
-                },
-                title,
-                DT_SINGLELINE,
-            );
-            text(
-                hdc,
-                self.fonts.body,
-                MUTED,
-                RECT {
-                    left: text_left,
-                    top: card.top + self.s(46),
-                    right: card.right - self.s(16),
-                    bottom: card.bottom - self.s(8),
-                },
-                subtitle,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            self.spot(card, action);
-            y += card_h + self.s(12);
+            y += card_h + gap;
         }
 
         y += self.s(10);
@@ -5165,23 +5235,23 @@ impl App {
                 tab,
                 self.s(14),
                 if selected {
-                    rgb(225, 236, 250)
+                    rgb(222, 240, 226)
                 } else if lit {
-                    rgb(240, 244, 250)
+                    rgb(240, 247, 241)
                 } else {
-                    rgb(248, 250, 252)
+                    rgb(249, 251, 249)
                 },
                 if selected {
-                    rgb(60, 130, 210)
+                    rgb(46, 130, 76)
                 } else {
-                    rgb(186, 196, 210)
+                    rgb(184, 198, 188)
                 },
                 if selected { 2 } else { 1 },
             );
             text(
                 hdc,
                 self.fonts.body_bold,
-                if selected { BLUE_INK } else { INK },
+                if selected { THEME_INK } else { INK },
                 tab,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5323,7 +5393,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                BLUE_INK,
+                THEME_INK,
                 RECT {
                     left: rect.right - self.s(160),
                     top: self.s(SUBTITLE_Y),
@@ -5712,8 +5782,8 @@ impl App {
             hdc,
             track,
             self.s(6),
-            rgb(238, 242, 247),
-            rgb(186, 196, 210),
+            rgb(236, 242, 238),
+            rgb(184, 198, 188),
             1,
         );
         let color = if used >= 90 {
@@ -5770,33 +5840,30 @@ impl App {
                 tile,
                 self.s(12),
                 if lit {
-                    rgb(236, 244, 253)
+                    rgb(236, 246, 238)
                 } else {
-                    rgb(248, 250, 252)
+                    rgb(249, 251, 249)
                 },
                 if lit {
-                    rgb(60, 130, 210)
+                    rgb(46, 130, 76)
                 } else {
-                    rgb(186, 196, 210)
+                    rgb(184, 198, 188)
                 },
                 if lit { 2 } else { 1 },
             );
             let icon_size = self.s(40);
-            if let Some(bitmap) = self.tool_icons.get(index).copied().filter(|b| !b.is_null()) {
-                blit(
-                    hdc,
-                    bitmap,
-                    tile.left + self.s(8),
-                    tile.top + (row_h - icon_size) / 2,
-                    icon_size,
-                    icon_size,
-                );
-            }
+            self.draw_icon(
+                hdc,
+                tool.icon,
+                tile.left + self.s(8),
+                tile.top + (row_h - icon_size) / 2,
+                icon_size,
+            );
             let text_left = tile.left + self.s(8) + icon_size + self.s(8);
             text(
                 hdc,
                 self.fonts.body_bold,
-                BLUE_INK,
+                THEME_INK,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(4),
@@ -5831,18 +5898,15 @@ impl App {
             &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")),
         );
         let left = self.s(CONTENT_X);
-        let icon_w = self.s(70);
+        let icon_w = self.s(64);
         let right = (rect.right - self.s(24) - icon_w - self.s(24)).max(left + self.s(200));
-        if let Some(bitmap) = self.icons.get(4).copied().filter(|b| !b.is_null()) {
-            blit(
-                hdc,
-                bitmap,
-                rect.right - self.s(24) - icon_w,
-                self.s(TITLE_Y),
-                icon_w,
-                self.s(64),
-            );
-        }
+        self.draw_icon(
+            hdc,
+            Icon::Logo,
+            rect.right - self.s(24) - icon_w,
+            self.s(TITLE_Y),
+            icon_w,
+        );
         let gap = self.s(10);
         let mut y = self.s(BODY_Y);
         y = paragraph(
@@ -5883,7 +5947,7 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body,
-                BLUE_INK,
+                THEME_INK,
                 left,
                 left + self.s(16),
                 y,
@@ -5914,7 +5978,6 @@ impl App {
                     .map(|dir| dir.display().to_string())
                     .unwrap_or_default(),
             ),
-            ("Images", image_root().display().to_string()),
         ] {
             paragraph(
                 hdc,
@@ -6588,14 +6651,136 @@ unsafe fn measure(hdc: HDC, font: HFONT, value: &str) -> (i32, i32) {
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 
-unsafe fn blit(hdc: HDC, bitmap: HBITMAP, x: i32, y: i32, w: i32, h: i32) {
+/// A 32-bit top-down DIB section holding `bgra` (`size` x `size` pixels).
+unsafe fn dib(bgra: &[u8], size: i32) -> HBITMAP {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS,
+    };
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: size,
+        biHeight: -size,
+        biPlanes: 1,
+        biBitCount: 32,
+        ..std::mem::zeroed()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(
+        std::ptr::null_mut(),
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    if bitmap.is_null() || bits.is_null() {
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+    bitmap
+}
+
+/// Draw a premultiplied 32-bit bitmap with its alpha channel.
+unsafe fn alpha_blit(hdc: HDC, bitmap: HBITMAP, x: i32, y: i32, size: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BLENDFUNCTION};
     let mem = CreateCompatibleDC(hdc);
     let old = SelectObject(mem, bitmap);
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, std::ptr::null_mut());
-    StretchBlt(hdc, x, y, w, h, mem, 0, 0, 70, 64, SRCCOPY);
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    AlphaBlend(hdc, x, y, size, size, mem, 0, 0, size, size, blend);
     SelectObject(mem, old);
     DeleteDC(mem);
+}
+
+/// The beehive logo as a window icon `size` pixels square.
+unsafe fn logo_icon(size: i32) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+    use windows_sys::Win32::Graphics::Gdi::CreateBitmap;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+    let size = size.max(16);
+    // Icons take straight (not premultiplied) alpha.
+    let rgba = hive_mend::art::render_rgba(Icon::Logo, size as usize);
+    let bgra: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|px| [px[2], px[1], px[0], px[3]])
+        .collect();
+    let color = dib(&bgra, size);
+    let mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
+    let info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask,
+        hbmColor: color,
+    };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(color);
+    DeleteObject(mask);
+    icon
+}
+
+/// A glossy "bubble" button: a vertical gradient from `top` to `bottom`, a
+/// lighter sheen over the upper half, and a rounded outline.
+unsafe fn bubble(
+    hdc: HDC,
+    rect: RECT,
+    radius: i32,
+    top: (u8, u8, u8),
+    bottom: (u8, u8, u8),
+    border: u32,
+    width: i32,
+) {
+    use windows_sys::Win32::Graphics::Gdi::{
+        CreateRoundRectRgn, GetStockObject, NULL_BRUSH, SelectClipRgn,
+    };
+    let lighten = |c: (u8, u8, u8), t: f32| {
+        let up = |v: u8| (v as f32 + (255.0 - v as f32) * t) as u8;
+        (up(c.0), up(c.1), up(c.2))
+    };
+    let region = CreateRoundRectRgn(
+        rect.left,
+        rect.top,
+        rect.right + 1,
+        rect.bottom + 1,
+        radius,
+        radius,
+    );
+    SelectClipRgn(hdc, region);
+    gradient(hdc, rect, top, bottom, true);
+    let middle = rect.top + (rect.bottom - rect.top) * 9 / 20;
+    gradient(
+        hdc,
+        RECT {
+            left: rect.left,
+            top: rect.top,
+            right: rect.right,
+            bottom: middle,
+        },
+        lighten(top, 0.85),
+        lighten(top, 0.35),
+        true,
+    );
+    SelectClipRgn(hdc, std::ptr::null_mut());
+    DeleteObject(region);
+    let pen = CreatePen(0, width, border);
+    let old_pen = SelectObject(hdc, pen);
+    let old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    RoundRect(
+        hdc,
+        rect.left,
+        rect.top,
+        rect.right,
+        rect.bottom,
+        radius,
+        radius,
+    );
+    SelectObject(hdc, old_pen);
+    SelectObject(hdc, old_brush);
+    DeleteObject(pen);
 }
 
 fn copy_text(hwnd: HWND, value: &str) {
@@ -6663,35 +6848,6 @@ fn exe_path() -> PathBuf {
     };
     buffer.truncate(len as usize);
     PathBuf::from(String::from_utf16_lossy(&buffer))
-}
-
-fn image_root() -> PathBuf {
-    let shared = PathBuf::from(r"C:\hivemendimages");
-    if shared.is_dir() {
-        return shared;
-    }
-    exe_path()
-        .parent()
-        .map(|dir| dir.join("images"))
-        .unwrap_or_else(|| PathBuf::from("images"))
-}
-
-fn load_bitmap(name: &str) -> HBITMAP {
-    let path = image_root().join(name);
-    if !Path::new(&path).exists() {
-        return std::ptr::null_mut();
-    }
-    let wide_path = wide(&path.display().to_string());
-    unsafe {
-        LoadImageW(
-            std::ptr::null_mut(),
-            wide_path.as_ptr(),
-            IMAGE_BITMAP,
-            0,
-            0,
-            LR_LOADFROMFILE | LR_CREATEDIBSECTION,
-        ) as HBITMAP
-    }
 }
 
 #[cfg(test)]

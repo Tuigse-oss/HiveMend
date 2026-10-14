@@ -1,3 +1,4 @@
+pub mod art;
 mod backup;
 mod demo;
 mod engine;

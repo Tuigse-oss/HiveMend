@@ -6,14 +6,16 @@
 //! original, updated for Windows 10 and 11 (dead CPLs replaced by their
 //! Settings URIs).
 
+use crate::art::Icon;
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct WindowsTool {
     /// Short name shown on the tile.
     pub name: &'static str,
     /// One-line description shown under the name.
     pub description: &'static str,
-    /// Bitmap in the images folder, for example `PM-DeviceManager.bmp`.
-    pub icon: &'static str,
+    /// The Hive Mend icon shown on the tile.
+    pub icon: Icon,
     /// `%SystemRoot%` template, plain exe name, or Settings URI.
     pub target: &'static str,
 }
@@ -22,91 +24,91 @@ pub const WINDOWS_TOOLS: &[WindowsTool] = &[
     WindowsTool {
         name: "Computer Management",
         description: "Manage local users, disks, and services",
-        icon: "PM-ComputerManagement.bmp",
+        icon: Icon::Settings,
         target: r"%SystemRoot%\System32\compmgmt.msc",
     },
     WindowsTool {
         name: "Device Manager",
         description: "Manage and configure hardware devices",
-        icon: "PM-DeviceManager.bmp",
+        icon: Icon::Settings,
         target: r"%SystemRoot%\System32\devmgmt.msc",
     },
     WindowsTool {
         name: "Disk Management",
         description: "Manage disks, volumes, and drive letters",
-        icon: "PM-DiskManagement.bmp",
+        icon: Icon::Optimize,
         target: r"%SystemRoot%\System32\diskmgmt.msc",
     },
     WindowsTool {
         name: "Event Viewer",
         description: "Read Windows and application logs",
-        icon: "PM-EventViewer.bmp",
+        icon: Icon::Scan,
         target: r"%SystemRoot%\System32\eventvwr.msc",
     },
     WindowsTool {
         name: "Services",
         description: "View and manage Windows services",
-        icon: "PM-ServiceMan.bmp",
+        icon: Icon::Optimize,
         target: r"%SystemRoot%\System32\services.msc",
     },
     WindowsTool {
         name: "Local Users and Groups",
         description: "Manage user accounts and groups",
-        icon: "PM-UserGroups.bmp",
+        icon: Icon::Privacy,
         target: r"%SystemRoot%\System32\lusrmgr.msc",
     },
     WindowsTool {
         name: "Group Policy Editor",
         description: "Computer and user configuration",
-        icon: "PM-PolicyEditor.bmp",
+        icon: Icon::Privacy,
         target: r"%SystemRoot%\System32\gpedit.msc",
     },
     WindowsTool {
         name: "Local Security Settings",
         description: "Manage the local security policy",
-        icon: "PM-SecuritySettings.bmp",
+        icon: Icon::Privacy,
         target: r"%SystemRoot%\System32\secpol.msc",
     },
     WindowsTool {
         name: "Performance Monitor",
         description: "Watch CPU, memory, and disk counters",
-        icon: "PM-SysMonitor1.bmp",
+        icon: Icon::Monitor,
         target: r"%SystemRoot%\System32\perfmon.msc",
     },
     WindowsTool {
         name: "System Information",
         description: "Hardware and software summary",
-        icon: "PM-SystemInformation.bmp",
+        icon: Icon::About,
         target: r"%SystemRoot%\System32\msinfo32.exe",
     },
     WindowsTool {
         name: "System Properties",
         description: "Computer name and protection settings",
-        icon: "PM-SystemProperties.bmp",
+        icon: Icon::Settings,
         target: r"%SystemRoot%\System32\sysdm.cpl",
     },
     WindowsTool {
         name: "System Restore",
         description: "Restore points and system recovery",
-        icon: "PM-SystemRestore.bmp",
+        icon: Icon::Restore,
         target: r"%SystemRoot%\System32\rstrui.exe",
     },
     WindowsTool {
         name: "Control Panel",
         description: "Classic Windows settings",
-        icon: "PM-ControlPanel.bmp",
+        icon: Icon::Settings,
         target: r"%SystemRoot%\System32\control.exe",
     },
     WindowsTool {
         name: "Windows Security",
         description: "Virus, firewall, and device protection",
-        icon: "PM-SecurityCentre.bmp",
+        icon: Icon::Privacy,
         target: "windowsdefender:",
     },
     WindowsTool {
         name: "Windows Update",
         description: "Check for and install updates",
-        icon: "PM-WindowsUpdate.bmp",
+        icon: Icon::Restore,
         target: "ms-settings:windowsupdate",
     },
 ];
@@ -153,11 +155,6 @@ mod tests {
             assert!(!tool.name.is_empty(), "tool name");
             assert!(!tool.description.is_empty(), "{}", tool.name);
             assert!(
-                tool.icon.ends_with(".bmp"),
-                "{} icon should be a bitmap",
-                tool.name
-            );
-            assert!(
                 is_openable(&expand_target(tool.target, r"C:\Windows")),
                 "{} target should be openable: {}",
                 tool.name,
@@ -166,8 +163,6 @@ mod tests {
         }
         let names: HashSet<_> = WINDOWS_TOOLS.iter().map(|tool| tool.name).collect();
         assert_eq!(names.len(), WINDOWS_TOOLS.len(), "duplicate tool names");
-        let icons: HashSet<_> = WINDOWS_TOOLS.iter().map(|tool| tool.icon).collect();
-        assert_eq!(icons.len(), WINDOWS_TOOLS.len(), "duplicate tool icons");
     }
 
     #[test]

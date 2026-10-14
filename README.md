@@ -131,9 +131,10 @@ Settings, Services, Privacy, Shredder, Monitor, Tools, and About.
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
-Card and tile icons load from `C:\hivemendimages` when that folder
-exists, next to a copy of the exe otherwise. The artwork is not part of
-this repository.
+The artwork is original and drawn in code (`src/art.rs`): Celtic and
+Scottish symbols for each tool, in the same green and gold as the window,
+rendered at the screen's own scale. Nothing is loaded from image files.
+`cargo run --example icon_sheet -- icons.png` writes a preview sheet.
 
 Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
