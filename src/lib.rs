@@ -54,7 +54,7 @@ pub use registry::MemoryRegistry;
 pub use rules::decode_text_owned;
 pub use services::{
     MemoryServiceStore, NEVER_TOUCH, SUGGESTED, ServiceChange, ServiceInfo, ServiceOutcome,
-    ServiceState, ServiceStore, StartType, StoreError, TuneupProfile, TuneupTarget,
+    ServiceState, ServiceStore, StartType, StoreError, Transition, TuneupProfile, TuneupTarget,
     apply_start_changes, export_start_backup, is_never_touch, plan_profile, refuse_change,
     refuse_start, refuse_stop, service_key, sort_services, start_services, stop_services,
     tuneup_allowed,

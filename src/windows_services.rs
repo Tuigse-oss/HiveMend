@@ -18,7 +18,7 @@ use windows_sys::Win32::System::Services::{
     SERVICE_STOP, SERVICE_WIN32, StartServiceW,
 };
 
-use crate::services::{ServiceInfo, ServiceState, ServiceStore, StartType, StoreError};
+use crate::services::{ServiceInfo, ServiceState, ServiceStore, StartType, StoreError, Transition};
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct ScmServiceStore;
@@ -236,19 +236,32 @@ fn query_state(service: &ScHandle) -> Option<u32> {
     Some(unsafe { (*(buffer.as_ptr() as *const SERVICE_STATUS_PROCESS)).dwCurrentState })
 }
 
-/// Wait for a service to reach a state, up to about ten seconds. Starting
-/// and stopping are asynchronous; the caller re-lists afterwards anyway.
-fn wait_for_state(manager: &ScHandle, name: &str, running: bool) {
-    for _ in 0..20 {
-        let reached = open_service(manager, name, SERVICE_QUERY_STATUS)
+/// Wait up to about ten seconds for a service to settle, and return where it
+/// ended. Starting and stopping are asynchronous, so a request the service
+/// control manager accepted is not yet a done change: the caller counts only
+/// `Reached`. A wait that ends pending, back where it began, or with an
+/// unreadable status reports that last state instead.
+fn wait_for_state(manager: &ScHandle, name: &str, running: bool) -> Transition {
+    let want = if running {
+        ServiceState::Running
+    } else {
+        ServiceState::Stopped
+    };
+    let mut last = ServiceState::Other;
+    for attempt in 0..20 {
+        last = open_service(manager, name, SERVICE_QUERY_STATUS)
             .ok()
             .and_then(|service| query_state(&service))
-            .is_some_and(|state| (running && state == 4) || (!running && state == 1));
-        if reached {
-            return;
+            .map(ServiceState::from_dword)
+            .unwrap_or(ServiceState::Other);
+        if last == want {
+            return Transition::Reached;
         }
-        std::thread::sleep(std::time::Duration::from_millis(500));
+        if attempt + 1 < 20 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+        }
     }
+    Transition::NotReached(last)
 }
 
 impl ServiceStore for ScmServiceStore {
@@ -311,22 +324,21 @@ impl ServiceStore for ScmServiceStore {
         Ok(())
     }
 
-    fn start(&mut self, name: &str) -> Result<bool, StoreError> {
+    fn start(&mut self, name: &str) -> Result<Transition, StoreError> {
         let manager = open_manager(SC_MANAGER_CONNECT)?;
         let service = open_service(&manager, name, SERVICE_START | SERVICE_QUERY_STATUS)?;
         let ok = unsafe { StartServiceW(service.handle, 0, ptr::null()) };
         if ok == 0 {
             let code = last_error();
             if code == 1056 {
-                return Ok(false);
+                return Ok(Transition::AlreadyThere);
             }
             return Err(scm_error(code, name));
         }
-        wait_for_state(&manager, name, true);
-        Ok(true)
+        Ok(wait_for_state(&manager, name, true))
     }
 
-    fn stop(&mut self, name: &str) -> Result<bool, StoreError> {
+    fn stop(&mut self, name: &str) -> Result<Transition, StoreError> {
         let manager = open_manager(SC_MANAGER_CONNECT)?;
         let service = open_service(&manager, name, SERVICE_STOP | SERVICE_QUERY_STATUS)?;
         let mut status: SERVICE_STATUS = unsafe { std::mem::zeroed() };
@@ -334,12 +346,11 @@ impl ServiceStore for ScmServiceStore {
         if ok == 0 {
             let code = last_error();
             if code == 1062 {
-                return Ok(false);
+                return Ok(Transition::AlreadyThere);
             }
             return Err(scm_error(code, name));
         }
-        wait_for_state(&manager, name, false);
-        Ok(true)
+        Ok(wait_for_state(&manager, name, false))
     }
 }
 
