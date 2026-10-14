@@ -1,0 +1,9 @@
+# Link the C runtime statically into Windows builds. A dynamically linked
+# build needs VCRUNTIME140.dll, which a clean Windows install does not have:
+# hive-mend.exe would fail to start there with "VCRUNTIME140.dll was not
+# found". Static linking makes the .exe self-contained.
+[target.x86_64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]
+
+[target.aarch64-pc-windows-msvc]
+rustflags = ["-C", "target-feature=+crt-static"]

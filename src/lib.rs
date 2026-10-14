@@ -89,3 +89,68 @@ pub use store::{
     custom_privacy_file, elevated, exclusions_file, protected_dir, restore_files, settings_file,
     user_dir,
 };
+
+/// The shipped exe must start on a clean Windows install, which has no
+/// Visual C++ runtime. This test binary is built with the same flags as the
+/// exe (`.cargo/config.toml`), so its own import table shows whether the C
+/// runtime was linked statically.
+#[cfg(all(test, windows, target_env = "msvc"))]
+mod runtime_tests {
+    /// DLL names in a PE file's import table.
+    fn imported_dlls(image: &[u8]) -> Vec<String> {
+        let u16_at = |at: usize| u16::from_le_bytes([image[at], image[at + 1]]) as usize;
+        let u32_at = |at: usize| {
+            u32::from_le_bytes([image[at], image[at + 1], image[at + 2], image[at + 3]]) as usize
+        };
+        let pe = u32_at(0x3c);
+        assert_eq!(&image[pe..pe + 4], b"PE\0\0", "not a PE image");
+        let coff = pe + 4;
+        let sections = u16_at(coff + 2);
+        let optional = coff + 20;
+        let optional_size = u16_at(coff + 16);
+        assert_eq!(u16_at(optional), 0x20b, "expected a PE32+ image");
+        // Data directory 1 (imports) of a PE32+ optional header.
+        let imports_rva = u32_at(optional + 120);
+        let table = optional + optional_size;
+        let to_offset = |rva: usize| {
+            (0..sections)
+                .map(|index| table + index * 40)
+                .find_map(|section| {
+                    let virtual_address = u32_at(section + 12);
+                    let size = u32_at(section + 8).max(u32_at(section + 16));
+                    (rva >= virtual_address && rva < virtual_address + size)
+                        .then(|| rva - virtual_address + u32_at(section + 20))
+                })
+                .expect("RVA outside every section")
+        };
+        let mut names = Vec::new();
+        let mut descriptor = to_offset(imports_rva);
+        while u32_at(descriptor + 12) != 0 {
+            let name = to_offset(u32_at(descriptor + 12));
+            let end = image[name..].iter().position(|byte| *byte == 0).unwrap();
+            names.push(String::from_utf8_lossy(&image[name..name + end]).to_ascii_lowercase());
+            descriptor += 20;
+        }
+        names
+    }
+
+    #[test]
+    fn the_c_runtime_is_linked_statically() {
+        let exe = std::env::current_exe().unwrap();
+        let names = imported_dlls(&std::fs::read(&exe).unwrap());
+        assert!(names.iter().any(|name| name == "kernel32.dll"), "{names:?}");
+        let runtime: Vec<&String> = names
+            .iter()
+            .filter(|name| {
+                name.starts_with("vcruntime")
+                    || name.starts_with("msvcp")
+                    || name.starts_with("ucrtbase")
+                    || name.starts_with("api-ms-win-crt-")
+            })
+            .collect();
+        assert!(
+            runtime.is_empty(),
+            "linked against the C runtime DLLs {runtime:?}; a clean Windows install lacks them"
+        );
+    }
+}
