@@ -1338,4 +1338,26 @@ mod live_tests {
         assert!(!moved.exists(), "the pinned object itself is deleted");
         assert_eq!(std::fs::read(&path).unwrap(), b"decoy");
     }
+    #[test]
+    fn live_a_staged_folder_is_shredded_and_removed_through_handles() {
+        let scratch = Scratch::new("dirshred");
+        let stage = scratch.0.join("stage");
+        std::fs::create_dir_all(stage.join("inner")).unwrap();
+        std::fs::write(stage.join("a.txt"), [1u8; 100]).unwrap();
+        std::fs::write(stage.join("inner").join("b.txt"), [2u8; 100]).unwrap();
+        let outcome = shred_paths(
+            &mut HostFs,
+            &[ShredTarget {
+                path: stage.display().to_string(),
+                is_dir: true,
+            }],
+            &ShredOptions::default(),
+            0x1234_5678_9abc_def0,
+            &mut |_, _, _| true,
+        );
+        assert_eq!(outcome.shredded, 2, "{outcome:?}");
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(outcome.refused.is_empty(), "{:?}", outcome.refused);
+        assert!(!stage.exists());
+    }
 }

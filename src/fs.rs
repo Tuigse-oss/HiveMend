@@ -553,7 +553,7 @@ impl FileView for HostFs {
         let PinHandle::Host(file) = &pin.handle else {
             return Err("not a host handle".into());
         };
-        let file = host::reopen(file, pin.kind, access)?;
+        let file = host::reopen(file, pin.kind, access, &pin.real_path)?;
         pin.handle = PinHandle::Host(file);
         Ok(())
     }
@@ -869,22 +869,53 @@ mod host {
         file: &std::fs::File,
         kind: ItemKind,
         access: Access,
+        real_path: &str,
     ) -> Result<std::fs::File, String> {
         let wanted = match access {
             Access::Write => GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
             Access::ReadDelete => GENERIC_READ | DELETE | SYNCHRONIZE,
             Access::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         };
-        let flags = if kind == ItemKind::Dir {
-            FLAGS
-        } else {
-            FILE_FLAG_OPEN_REPARSE_POINT
+        if kind == ItemKind::Dir {
+            // ReOpenFile refuses directory handles, so open the real path
+            // again without following links and accept the new handle only
+            // if it is the very object still held open by the pin.
+            let again = std::fs::OpenOptions::new()
+                .access_mode(wanted)
+                .share_mode(SHARE_ALL)
+                .custom_flags(FLAGS)
+                .open(real_path)
+                .map_err(|err| err.to_string())?;
+            if file_id(&again)? != file_id(file)? {
+                return Err(format!("{real_path} changed since it was checked"));
+            }
+            return Ok(again);
+        }
+        let handle = unsafe {
+            ReOpenFile(
+                file.as_raw_handle() as _,
+                wanted,
+                SHARE_ALL,
+                FILE_FLAG_OPEN_REPARSE_POINT,
+            )
         };
-        let handle = unsafe { ReOpenFile(file.as_raw_handle() as _, wanted, SHARE_ALL, flags) };
         if handle == INVALID_HANDLE_VALUE || handle.is_null() {
             return Err(last_error());
         }
         Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+    }
+
+    /// Volume serial and file index: the identity of an open object.
+    fn file_id(file: &std::fs::File) -> Result<(u32, u32, u32), String> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(last_error());
+        }
+        Ok((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
     }
 
     pub fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
@@ -977,6 +1008,7 @@ mod host {
         file: &std::fs::File,
         _kind: ItemKind,
         _access: Access,
+        _real_path: &str,
     ) -> Result<std::fs::File, String> {
         file.try_clone().map_err(|err| err.to_string())
     }
