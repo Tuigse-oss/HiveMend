@@ -1377,6 +1377,7 @@ pub fn clean_with_progress(
                     reg,
                     fs,
                     sys,
+                    procs,
                     item,
                     &repairs,
                     pre,
@@ -1449,6 +1450,7 @@ fn execute_item(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     sys: &mut dyn SystemTargets,
+    procs: &dyn ProcessList,
     item: &PrivacyItem,
     repairs: &[PlannedRepair],
     pre: Vec<String>,
@@ -1457,6 +1459,16 @@ fn execute_item(
     errors: &mut Vec<String>,
 ) -> ItemOutcome {
     let mut done = ItemOutcome::blank(&item.id);
+    // Checked again right before each database set is taken: a program
+    // that starts part way through stops the rest of its category.
+    let started = |done: &mut ItemOutcome| {
+        let exe = item.veto_exes.iter().find(|exe| procs.running(exe))?;
+        done.skipped_running = true;
+        done.note(format!(
+            "{exe} started, so the rest of this category was left alone"
+        ));
+        Some(())
+    };
     for warning in &item.warnings {
         done.note(warning.clone());
     }
@@ -1542,6 +1554,9 @@ fn execute_item(
                         continue;
                     }
                     for name in names {
+                        if started(&mut done).is_some() {
+                            return done;
+                        }
                         let set = with_sidecars(&dir, name, *sidecars);
                         delete_file_set(fs, &dir, &set, &mut done, errors);
                     }
@@ -1563,6 +1578,9 @@ fn execute_item(
                     let Some(db) = cookie_db(fs, &dir, names) else {
                         continue;
                     };
+                    if started(&mut done).is_some() {
+                        return done;
+                    }
                     match keep {
                         CookieKeep::Sites(sites) => {
                             trim_cookie_db(fs, &dir, &db, sites, &mut done, errors);
@@ -2700,6 +2718,46 @@ mod tests {
         .unwrap();
         assert!(outcome.items[0].skipped_running);
         assert!(fs.exists(history), "a running browser's files were cleaned");
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn a_browser_that_starts_between_database_sets_stops_the_rest() {
+        // Closed for the plan, the check before the category, and the first
+        // set (History); running by the time the cookie set's turn comes.
+        struct StartsMidway(std::cell::Cell<u32>);
+        impl ProcessList for StartsMidway {
+            fn running(&self, _exe: &str) -> bool {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                calls > 3
+            }
+        }
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-midway");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &StartsMidway(std::cell::Cell::new(0)),
+            &[builtin("chrome-data")],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(
+            !fs.exists(&format!(r"{profile}\History")),
+            "History went first"
+        );
+        assert!(
+            fs.exists(&format!(r"{profile}\Network\Cookies")),
+            "the cookie set was touched after the browser started"
+        );
+        assert!(outcome.items[0].skipped_running);
         let _ = std::fs::remove_file(backup.path());
     }
 
