@@ -497,6 +497,25 @@ pub fn leave_per_user_registry(items: &mut [PrivacyItem]) {
     }
 }
 
+/// For an administrator window: browser history and cookie items do
+/// nothing, and say so. Their files sit in folders programs running without
+/// elevation can change, and the keep list that governs them is per-user.
+pub fn leave_browsers_alone(items: &mut [PrivacyItem]) {
+    for item in items {
+        let browser = item
+            .targets
+            .iter()
+            .any(|target| matches!(target, PrivacyTarget::Cookies { .. }));
+        if browser {
+            item.targets.clear();
+            item.warnings.push(
+                "Browser data is cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            );
+        }
+    }
+}
+
 /// Apply the cookies-to-keep choice to every item that holds cookies.
 pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
     for item in items {

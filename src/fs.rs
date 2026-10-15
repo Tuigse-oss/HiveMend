@@ -185,6 +185,12 @@ pub trait FileView {
         let _ = path;
         Ok(false)
     }
+    /// True when the file has any named data stream, the download marker
+    /// included. A backup copy holds only the main stream, so a file with
+    /// any is not removed by repair.
+    fn named_streams(&self, path: &str) -> Result<bool, String> {
+        self.extra_streams(path)
+    }
     fn var(&self, name: &str) -> Option<String>;
     /// Where a system folder really is. On the host this comes from the
     /// Windows APIs, never the environment, which a launcher controls. The
@@ -224,6 +230,8 @@ pub struct MemoryFs {
     links: HashMap<String, u32>,
     /// Files with named data streams besides the download marker.
     streams: Vec<String>,
+    /// Files with only the download marker (Zone.Identifier).
+    markers: Vec<String>,
 }
 
 impl MemoryFs {
@@ -245,6 +253,11 @@ impl MemoryFs {
     /// Make `alias` (and everything under it) resolve to `real` when pinned.
     pub fn add_alias(&mut self, alias: &str, real: &str) {
         self.aliases.push((norm(alias), norm(real)));
+    }
+
+    /// Give a file the download marker (Zone.Identifier) and no other stream.
+    pub fn add_download_marker(&mut self, path: &str) {
+        self.markers.push(norm(path));
     }
 
     /// Give a file a named data stream besides the download marker.
@@ -329,6 +342,11 @@ fn norm(path: &str) -> String {
 impl FileView for MemoryFs {
     fn extra_streams(&self, path: &str) -> Result<bool, String> {
         Ok(self.streams.contains(&self.resolve(path)))
+    }
+
+    fn named_streams(&self, path: &str) -> Result<bool, String> {
+        let path = self.resolve(path);
+        Ok(self.streams.contains(&path) || self.markers.contains(&path))
     }
 
     fn pin(&self, path: &str) -> Result<Pinned, String> {
@@ -544,6 +562,13 @@ fn on_local_fixed_drive(path: &str) -> bool {
 /// Named data streams besides the main one and the download marker.
 #[cfg(windows)]
 pub(crate) fn host_extra_streams(path: &str) -> Result<bool, String> {
+    host_streams(path, true)
+}
+
+/// Named data streams besides the main one; `allow_marker` also passes the
+/// download marker (Zone.Identifier).
+#[cfg(windows)]
+fn host_streams(path: &str, allow_marker: bool) -> Result<bool, String> {
     use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, GetLastError, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::Storage::FileSystem::{
         FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
@@ -574,7 +599,7 @@ pub(crate) fn host_extra_streams(path: &str) -> Result<bool, String> {
             .position(|unit| *unit == 0)
             .unwrap_or(data.cStreamName.len());
         let name = String::from_utf16_lossy(&data.cStreamName[..len]).to_ascii_lowercase();
-        if name != "::$data" && name != ":zone.identifier:$data" {
+        if name != "::$data" && !(allow_marker && name == ":zone.identifier:$data") {
             extra = true;
             break;
         }
@@ -709,6 +734,18 @@ impl FileView for HostFs {
             return Err("not a host handle".into());
         };
         host::delete(file, &pin.real_path)
+    }
+
+    fn named_streams(&self, path: &str) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            host_streams(path, false)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Ok(false)
+        }
     }
 
     fn extra_streams(&self, path: &str) -> Result<bool, String> {
@@ -1180,11 +1217,14 @@ mod live_tests {
         )
         .unwrap();
         let marked = host_extra_streams(&text);
+        let marked_named = HostFs.named_streams(&text);
         std::fs::write(format!("{text}:notes"), b"hidden").unwrap();
         let extra = host_extra_streams(&text);
         let _ = std::fs::remove_file(&path);
         assert_eq!(plain, Ok(false));
         assert_eq!(marked, Ok(false));
+        // Repair's stricter rule counts the marker: a copy would lose it.
+        assert_eq!(marked_named, Ok(true));
         assert_eq!(extra, Ok(true));
     }
 

@@ -295,8 +295,14 @@ impl ServiceStore for ScmServiceStore {
         };
         let manager = open_manager(SC_MANAGER_CONNECT)?;
         // Read first, so a failed second step can be undone.
-        let prior = query_start(&manager, name);
         let service = open_service(&manager, name, SERVICE_CHANGE_CONFIG)?;
+        // The state to go back to must be known before anything changes;
+        // without it a failed second step could not be undone.
+        let Some(prior) = query_start(&manager, name) else {
+            return Err(StoreError::new(format!(
+                "{name}: its current start type could not be read, so it was left as it is"
+            )));
+        };
         let ok = unsafe {
             ChangeServiceConfigW(
                 service.handle,
@@ -333,7 +339,7 @@ impl ServiceStore for ScmServiceStore {
                 let failed = scm_error(last_error(), name);
                 // Start already changed: put it back, so a failed request
                 // never leaves a different mode behind.
-                let restored = prior.and_then(start_dword).is_some_and(|dword| unsafe {
+                let restored = start_dword(prior).is_some_and(|dword| unsafe {
                     ChangeServiceConfigW(
                         service.handle,
                         SERVICE_NO_CHANGE,

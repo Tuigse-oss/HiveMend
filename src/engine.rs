@@ -222,6 +222,8 @@ mod tests {
         fs.add_file_bytes(&format!(r"{desktop}\plain.lnk"), b"lnk".to_vec(), None);
         fs.add_file_bytes(&format!(r"{desktop}\streams.lnk"), b"lnk".to_vec(), None);
         fs.add_stream(&format!(r"{desktop}\streams.lnk"));
+        fs.add_file_bytes(&format!(r"{desktop}\marked.lnk"), b"lnk".to_vec(), None);
+        fs.add_download_marker(&format!(r"{desktop}\marked.lnk"));
         let copies = r"C:\Users\me\AppData\Local\HiveMend\backups\b-files";
         let streams = delete_file_pinned(
             &mut fs,
@@ -230,6 +232,14 @@ mod tests {
         );
         assert!(matches!(streams, Applied::NotBackedUp));
         assert!(fs.exists(&format!(r"{desktop}\streams.lnk")));
+        // The download marker is a stream too: it would be lost.
+        let marked = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\marked.lnk"),
+            Some(&format!(r"{copies}\0003-marked.lnk")),
+        );
+        assert!(matches!(marked, Applied::NotBackedUp));
+        assert!(fs.exists(&format!(r"{desktop}\marked.lnk")));
         let plain = delete_file_pinned(
             &mut fs,
             &format!(r"{desktop}\plain.lnk"),
@@ -696,9 +706,10 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
             message: err,
         };
     }
-    // The copy holds the main data stream only; a file with other named
-    // streams could not be put back whole, so it is left alone.
-    if copy.is_some() && fs.extra_streams(&real) != Ok(false) {
+    // The copy holds the main data stream only; a file with any named
+    // stream (the download marker included) could not be put back whole,
+    // so it is left alone.
+    if copy.is_some() && fs.named_streams(&real) != Ok(false) {
         return Applied::NotBackedUp;
     }
     if let Some(copy) = copy

@@ -1100,7 +1100,14 @@ impl App {
             tracking: false,
             elevated,
             settings,
-            exclusions: Exclusions::load(&exclusions_file()),
+            // An administrator window reads no per-user policy, the ignore
+            // list included: programs running without elevation can change
+            // that folder.
+            exclusions: if elevated {
+                Exclusions::default()
+            } else {
+                Exclusions::load(&exclusions_file())
+            },
             backups: all_backups(),
             job: Job::Idle,
             findings: Vec::new(),
@@ -2784,10 +2791,23 @@ impl App {
         if self.elevated {
             hive_mend::leave_per_user_registry(&mut items);
         }
-        let (keep, warnings) = hive_mend::cookie_keep_choice(
-            std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned),
-            self.elevated,
-        );
+        // An administrator window reads no per-user policy: it leaves browser
+        // data alone entirely, without looking at the keep list.
+        let (keep, warnings) = if self.elevated {
+            hive_mend::leave_browsers_alone(&mut items);
+            (
+                hive_mend::CookieKeep::LeaveAlone(
+                    "Browser data is cleaned from Hivemend started without administrator rights."
+                        .to_string(),
+                ),
+                Vec::new(),
+            )
+        } else {
+            hive_mend::cookie_keep_choice(
+                std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned),
+                false,
+            )
+        };
         hive_mend::set_cookie_keep(&mut items, &keep);
         for item in items.iter_mut().filter(|item| {
             item.targets

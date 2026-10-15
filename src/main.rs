@@ -242,7 +242,11 @@ fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
 /// the reader, which are not scan problems.
 fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) -> Vec<String> {
     let mut notes = Vec::new();
-    if !args.no_ignore_list {
+    // As administrator, no per-user policy is read, the ignore list
+    // included: programs running without elevation can change it.
+    if !args.no_ignore_list && hive_mend::elevated() {
+        notes.push("the ignore list is not used as administrator".to_string());
+    } else if !args.no_ignore_list {
         let ignored = Exclusions::load(&hive_mend::exclusions_file()).filter(&mut report.findings);
         if ignored > 0 {
             notes.push(format!(
@@ -297,10 +301,12 @@ fn repair_live(
         let mut notes = narrow(&mut report, args);
         // As administrator, per-user registry entries are left for a normal
         // window: a program running without elevation can redirect them.
+        let mut per_user_left = 0;
         if hive_mend::elevated() {
             let before = report.findings.len();
             report.findings.retain(|finding| !finding.per_user());
             let left = before - report.findings.len();
+            per_user_left = left;
             if left > 0 {
                 notes.push(format!(
                     "{left} per-user entries left alone; repair them without administrator rights"
@@ -316,29 +322,36 @@ fn repair_live(
         let mut backup = hive_mend::reserve_backup(backup_dir, SystemTime::now())?;
         let mut fs = HostFs;
         let outcome = repair(&mut reg, &mut fs, &report.findings, &mut backup)?;
+        let report_only = report
+            .findings
+            .iter()
+            .filter(|finding| !finding.repairable())
+            .count();
+        let result = RepairResult {
+            backup: outcome.backup_file.display().to_string(),
+            removed: outcome.applied,
+            already_gone: outcome.already_gone,
+            left_alone: outcome.refused.saturating_sub(report_only)
+                + outcome.not_backed_up
+                + per_user_left,
+            per_user_left,
+            report_only,
+            needs_admin: outcome.denied,
+            errors: outcome.errors.clone(),
+            complete: scan_complete(&report),
+            warnings: report.warnings.clone(),
+            notes,
+        };
         if json {
-            let errors: Vec<String> = outcome
-                .errors
-                .iter()
-                .map(|err| format!("\"{}\"", escape_json(err)))
-                .collect();
-            println!(
-                "{{\"backup\":\"{}\",\"removed\":{},\"already_gone\":{},\"left_alone\":{},\"needs_admin\":{},\"errors\":[{}]}}",
-                escape_json(&outcome.backup_file.display().to_string()),
-                outcome.applied,
-                outcome.already_gone,
-                outcome.refused + outcome.not_backed_up,
-                outcome.denied,
-                errors.join(",")
-            );
+            println!("{}", result.json());
         } else {
             println!(
                 "backup {}  removed {}  already gone {}  left alone {}  errors {}",
-                outcome.backup_file.display(),
-                outcome.applied,
-                outcome.already_gone,
-                outcome.refused + outcome.not_backed_up,
-                outcome.errors.len()
+                result.backup,
+                result.removed,
+                result.already_gone,
+                result.left_alone,
+                result.errors.len()
             );
         }
         if outcome.denied > 0 {
@@ -350,11 +363,7 @@ fn repair_live(
         for err in &outcome.errors {
             eprintln!("hivemend: {err}");
         }
-        Ok(if outcome.errors.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(1)
-        })
+        Ok(ExitCode::from(result.exit_code()))
     }
     #[cfg(not(windows))]
     {
@@ -469,6 +478,64 @@ fn print_text(report: &hive_mend::ScanReport, notes: &[String]) {
     }
 }
 
+/// What `repair --yes` did, for its output and exit status.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct RepairResult {
+    backup: String,
+    removed: usize,
+    already_gone: usize,
+    /// Repairs requested but not done: refused, not backed up, changed
+    /// meanwhile, or per-user entries an administrator run leaves alone.
+    left_alone: usize,
+    per_user_left: usize,
+    /// Findings that only report and were never meant to change anything.
+    report_only: usize,
+    needs_admin: usize,
+    errors: Vec<String>,
+    complete: bool,
+    warnings: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RepairResult {
+    fn json(&self) -> String {
+        let strings = |items: &[String]| {
+            items
+                .iter()
+                .map(|item| format!("\"{}\"", escape_json(item)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"complete\":{},\"backup\":\"{}\",\"removed\":{},\"already_gone\":{},\"left_alone\":{},\"per_user_left\":{},\"report_only\":{},\"needs_admin\":{},\"errors\":[{}],\"warnings\":[{}],\"notes\":[{}]}}",
+            self.complete,
+            escape_json(&self.backup),
+            self.removed,
+            self.already_gone,
+            self.left_alone,
+            self.per_user_left,
+            self.report_only,
+            self.needs_admin,
+            strings(&self.errors),
+            strings(&self.warnings),
+            strings(&self.notes)
+        )
+    }
+
+    /// 1 on errors; 3 when the scan was incomplete or requested repairs
+    /// were left undone; 0 when everything requested was done.
+    fn exit_code(&self) -> u8 {
+        if !self.errors.is_empty() {
+            1
+        } else if !self.complete || self.left_alone > 0 {
+            3
+        } else {
+            0
+        }
+    }
+}
+
 /// One JSON document: whether the scan was complete, the findings, the
 /// scan's warnings, and notes.
 fn report_json(report: &hive_mend::ScanReport, notes: &[String]) -> String {
@@ -529,6 +596,46 @@ fn escape_json(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repair_results_do_not_look_clean_when_work_was_left() {
+        let base = RepairResult {
+            backup: r"C:\b\hive-mend.reg".into(),
+            removed: 3,
+            already_gone: 0,
+            left_alone: 0,
+            per_user_left: 0,
+            report_only: 2,
+            needs_admin: 0,
+            errors: Vec::new(),
+            complete: true,
+            warnings: Vec::new(),
+            notes: Vec::new(),
+        };
+        assert_eq!(
+            base.exit_code(),
+            0,
+            "report-only findings are not left work"
+        );
+        let skipped = RepairResult {
+            left_alone: 4,
+            per_user_left: 4,
+            notes: vec!["4 per-user entries left alone".into()],
+            ..base
+        };
+        assert_eq!(skipped.exit_code(), 3);
+        let json = skipped.json();
+        assert!(json.contains("\"left_alone\":4") && json.contains("\"per_user_left\":4"));
+        assert!(json.contains("\"notes\":[\"4 per-user entries left alone\"]"));
+        let incomplete = RepairResult {
+            left_alone: 0,
+            complete: false,
+            warnings: vec!["HKLM\\X: access denied".into()],
+            ..skipped
+        };
+        assert_eq!(incomplete.exit_code(), 3);
+        assert!(incomplete.json().starts_with("{\"complete\":false,"));
+    }
 
     #[test]
     fn json_strings_escape_every_control_character() {
