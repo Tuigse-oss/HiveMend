@@ -64,9 +64,102 @@ pub struct BackupPlan {
     pub unreadable: Vec<String>,
     /// Shortcut path and the copy kept next to the backup.
     pub file_copies: Vec<(String, PathBuf)>,
+    /// What the backup recorded for each registry target, to check just
+    /// before deleting that nothing has been added or changed since.
+    pub snapshots: Vec<Snapshot>,
+}
+
+/// A registry target as the backup recorded it: a whole key (`name` is
+/// `None`) or one value, with its `.reg` text, or `None` when it was
+/// already gone.
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Snapshot {
+    pub key: String,
+    pub name: Option<String>,
+    pub text: Option<String>,
+}
+
+/// A `.reg` section as a set of entries: each key header, and each value
+/// (with its continuation lines) under its key.
+fn reg_entries(text: &str) -> std::collections::HashSet<String> {
+    let mut entries = std::collections::HashSet::new();
+    let mut header = String::new();
+    let mut value = String::new();
+    for line in text.lines() {
+        let line = line.trim_end();
+        if line.is_empty() || line.starts_with(';') {
+            continue;
+        }
+        if !value.is_empty() {
+            value.push('\n');
+            value.push_str(line.trim_start());
+        } else if line.starts_with('[') {
+            header = line.to_ascii_lowercase();
+            entries.insert(header.clone());
+            continue;
+        } else {
+            value.push_str(line);
+        }
+        if !line.ends_with('\\') {
+            entries.insert(format!("{header}\u{1}{value}"));
+            value.clear();
+        }
+    }
+    entries
 }
 
 impl BackupPlan {
+    /// True when `repair`'s target holds nothing the backup did not record:
+    /// every key and value still there is in the backup exactly as it is
+    /// now, so whatever the delete removes can be put back. Entries removed
+    /// since (by earlier repairs in the same run) are fine; anything added
+    /// or changed, or a target that cannot be read, is not.
+    pub fn still_as_backed_up(&self, reg: &dyn Registry, repair: &Repair) -> bool {
+        let (key, name) = match repair {
+            Repair::DeleteKey { key } => (canonical_path(key), None),
+            Repair::DeleteValue { key, name } => (canonical_path(key), Some(name.as_str())),
+            Repair::DeleteFile { .. } | Repair::None => return true,
+        };
+        let Some(snapshot) = self.snapshots.iter().find(|snapshot| {
+            snapshot.key.eq_ignore_ascii_case(&key)
+                && match (&snapshot.name, name) {
+                    (None, None) => true,
+                    (Some(have), Some(want)) => have.eq_ignore_ascii_case(want),
+                    _ => false,
+                }
+        }) else {
+            return false;
+        };
+        let now = match name {
+            None => {
+                let mut section = String::new();
+                match export_tree(reg, &key, 0, &mut section) {
+                    Ok(()) => Some(section),
+                    Err(RegError::NotFound) => None,
+                    Err(_) => return false,
+                }
+            }
+            Some(want) => match reg.values(&key) {
+                Ok(values) => values
+                    .iter()
+                    .find(|value| value.name.eq_ignore_ascii_case(want))
+                    .map(|value| format!("[{key}]\r\n{}\r\n", format_value(value))),
+                Err(RegError::NotFound) => None,
+                Err(_) => return false,
+            },
+        };
+        match (now, &snapshot.text) {
+            // Gone now: deleting it is a no-op.
+            (None, _) => true,
+            // Appeared after the backup said it was gone.
+            (Some(_), None) => false,
+            (Some(now), Some(then)) => {
+                let recorded = reg_entries(then);
+                reg_entries(&now).is_subset(&recorded)
+            }
+        }
+    }
+
     pub fn covers(&self, key: &str) -> bool {
         let key = canonical_path(key);
         !self
@@ -150,6 +243,7 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     body.push_str("\r\n");
     body.push_str("; Restore it from the Restore page in Hivemend.\r\n");
     let mut unreadable = Vec::new();
+    let mut snapshots = Vec::new();
 
     for key in trees {
         let mut section = String::new();
@@ -157,8 +251,20 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
             Ok(()) => {
                 body.push_str("\r\n");
                 body.push_str(&section);
+                snapshots.push(Snapshot {
+                    key: key.clone(),
+                    name: None,
+                    text: Some(section),
+                });
             }
-            Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
+            Err(RegError::NotFound) => {
+                body.push_str(&format!("\r\n; already gone {key}\r\n"));
+                snapshots.push(Snapshot {
+                    key: key.clone(),
+                    name: None,
+                    text: None,
+                });
+            }
             Err(err) => {
                 body.push_str(&format!(
                     "\r\n; not backed up, left alone: {key}: {err}\r\n"
@@ -190,14 +296,33 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                         Some(value) => {
                             body.push_str(&format_value(value));
                             body.push_str("\r\n");
+                            snapshots.push(Snapshot {
+                                key: key.clone(),
+                                name: Some(name.clone()),
+                                text: Some(format!("[{key}]\r\n{}\r\n", format_value(value))),
+                            });
                         }
                         None => {
-                            body.push_str(&format!("; already gone {}\r\n", value_label(&name)))
+                            body.push_str(&format!("; already gone {}\r\n", value_label(&name)));
+                            snapshots.push(Snapshot {
+                                key: key.clone(),
+                                name: Some(name.clone()),
+                                text: None,
+                            });
                         }
                     }
                 }
             }
-            Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
+            Err(RegError::NotFound) => {
+                body.push_str(&format!("\r\n; already gone {key}\r\n"));
+                for name in names {
+                    snapshots.push(Snapshot {
+                        key: key.clone(),
+                        name: Some(name),
+                        text: None,
+                    });
+                }
+            }
             Err(err) => {
                 body.push_str(&format!(
                     "\r\n; not backed up, left alone: {key}: {err}\r\n"
@@ -233,6 +358,7 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
         body,
         unreadable,
         file_copies,
+        snapshots,
     }
 }
 
@@ -807,6 +933,48 @@ mod tests {
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 11);
         assert!(summary.machine_wide);
+    }
+
+    #[test]
+    fn nothing_is_deleted_unless_the_backup_still_covers_it() {
+        let tree = r"HKEY_CURRENT_USER\Software\Gone";
+        let run = r"HKEY_CURRENT_USER\Software\Run";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(tree, "a", "1");
+        reg.set_sz(&format!(r"{tree}\Child"), "b", "2");
+        reg.set_sz(run, "App", "C:\\old.exe");
+        let key = Repair::DeleteKey { key: tree.into() };
+        let value = Repair::DeleteValue {
+            key: run.into(),
+            name: "App".into(),
+        };
+        let reborn = Repair::DeleteKey {
+            key: r"HKEY_CURRENT_USER\Software\Later".into(),
+        };
+        let file = std::env::temp_dir().join("hm-snapshot-test.reg");
+        let plan = export_repairs(&reg, &[key.clone(), value.clone(), reborn.clone()], &file);
+        // Unchanged: deletable.
+        assert!(plan.still_as_backed_up(&reg, &key));
+        assert!(plan.still_as_backed_up(&reg, &value));
+        // Something removed since (an earlier repair in the same run) is fine.
+        let mut trimmed = reg.clone();
+        trimmed
+            .delete_value(&format!(r"{tree}\Child"), "b")
+            .unwrap();
+        assert!(plan.still_as_backed_up(&trimmed, &key));
+        // Added to since the backup: the new value is not in it.
+        let mut added = reg.clone();
+        added.set_sz(&format!(r"{tree}\Child"), "c", "3");
+        assert!(!plan.still_as_backed_up(&added, &key));
+        // Changed since the backup.
+        let mut changed = reg.clone();
+        changed.set_sz(run, "App", "C:\\new.exe");
+        assert!(!plan.still_as_backed_up(&changed, &value));
+        // Gone at backup time, back since: not in the backup.
+        let mut back = reg.clone();
+        assert!(plan.still_as_backed_up(&back, &reborn));
+        back.set_sz(r"HKEY_CURRENT_USER\Software\Later", "x", "1");
+        assert!(!plan.still_as_backed_up(&back, &reborn));
     }
 
     #[test]

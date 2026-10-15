@@ -1545,6 +1545,12 @@ fn apply_repair(
         done.note(format!("not backed up, left alone: {key}"));
         return;
     }
+    // Added to or changed since the backup was written: what the delete
+    // would remove is not all in the backup.
+    if !plan.still_as_backed_up(reg, repair) {
+        done.note(format!("changed since the backup, left alone: {key}"));
+        return;
+    }
     let result = match repair {
         Repair::DeleteKey { key } => reg.delete_tree(key),
         Repair::DeleteValue { key, name } => reg.delete_value(key, name),

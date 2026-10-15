@@ -488,6 +488,7 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
         body,
         unreadable,
         file_copies: Vec::new(),
+        snapshots: Vec::new(),
     }
 }
 

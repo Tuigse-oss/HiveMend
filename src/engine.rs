@@ -445,7 +445,7 @@ fn apply(
             if is_protected_key(key) {
                 return Applied::Refused;
             }
-            if !plan.covers(key) {
+            if !plan.covers(key) || !plan.still_as_backed_up(reg, &finding.repair) {
                 return Applied::NotBackedUp;
             }
             reg_result(reg.delete_value(key, name))
@@ -454,7 +454,7 @@ fn apply(
             if !key_delete_allowed(key) {
                 return Applied::Refused;
             }
-            if !plan.covers(key) {
+            if !plan.covers(key) || !plan.still_as_backed_up(reg, &finding.repair) {
                 return Applied::NotBackedUp;
             }
             reg_result(reg.delete_tree(key))
