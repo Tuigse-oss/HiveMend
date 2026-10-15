@@ -487,14 +487,7 @@ fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
 
 /// A value's registry type and raw bytes, as RegSetValueExW takes them.
 fn encode_value(data: &ValueKind) -> (u32, Vec<u8>) {
-    match data {
-        ValueKind::Sz(text) => (REG_SZ, sz_bytes(text)),
-        ValueKind::ExpandSz(text) => (REG_EXPAND_SZ, sz_bytes(text)),
-        ValueKind::Dword(value) => (REG_DWORD, value.to_le_bytes().to_vec()),
-        ValueKind::MultiSz(parts) => (REG_MULTI_SZ, multi_sz_bytes(parts)),
-        ValueKind::Binary(bytes) => (REG_BINARY, bytes.clone()),
-        ValueKind::Other { kind, bytes } => (*kind, bytes.clone()),
-    }
+    data.encoded()
 }
 
 fn failure(rc: u32, message: String) -> RegError {
@@ -1216,6 +1209,53 @@ mod live_tests {
     }
 
     #[test]
+    fn live_restore_writes_in_one_transaction_and_never_through_a_link() {
+        use crate::regfile::{RegOp, apply_ops};
+        let keys = LinkedKeys::create_named("Restore");
+        let mut reg = WindowsRegistry;
+        let restored = keys.path("Restored");
+        let ok = vec![
+            RegOp::CreateKey(restored.clone()),
+            RegOp::SetValue {
+                key: restored.clone(),
+                name: "x".into(),
+                data: ValueKind::Dword(7),
+            },
+        ];
+        apply_ops(&mut reg, &ok).expect("plain restore");
+        assert!(
+            reg.values(&restored)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "x" && v.data == ValueKind::Dword(7))
+        );
+        // Through the link: refused, and the first write of the same
+        // restore is rolled back with it.
+        let through = vec![
+            RegOp::SetValue {
+                key: restored.clone(),
+                name: "y".into(),
+                data: ValueKind::Dword(8),
+            },
+            RegOp::SetValue {
+                key: keys.path(r"Holder\Link"),
+                name: "planted".into(),
+                data: ValueKind::Dword(1),
+            },
+        ];
+        assert!(apply_ops(&mut reg, &through).is_err());
+        let target = reg.values(&keys.path("Target")).unwrap();
+        assert!(
+            !target.iter().any(|v| v.name == "planted"),
+            "written through a link"
+        );
+        assert!(
+            !reg.values(&restored).unwrap().iter().any(|v| v.name == "y"),
+            "a failed restore left part of itself"
+        );
+    }
+
+    #[test]
     fn live_set_value_creates_missing_parent_keys() {
         // A fresh profile has no StartupApproved key yet; writing a flag
         // there must create every missing level, not fail with not found.
@@ -1460,7 +1500,11 @@ mod live_tests {
 
     impl LinkedKeys {
         fn create() -> Self {
-            let root = format!(r"HKCU\Software\HiveMendLinkTest{}", std::process::id());
+            Self::create_named("")
+        }
+
+        fn create_named(tag: &str) -> Self {
+            let root = format!(r"HKCU\Software\HiveMendLinkTest{tag}{}", std::process::id());
             let subkey = root.strip_prefix("HKCU\\").unwrap().to_string();
             // The guard exists before any setup step can fail, so a failed
             // assert still cleans up.

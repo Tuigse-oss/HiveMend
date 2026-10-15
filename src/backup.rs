@@ -532,31 +532,6 @@ pub fn encode_reg(body: &str) -> Vec<u8> {
     bytes
 }
 
-/// The backup with every per-user section (HKCU, HKEY_USERS, HKCR) left
-/// out, for a restore run as administrator, and how many were left out.
-/// Lines before the first section (the header and markers) are kept.
-pub fn machine_sections_only(text: &str) -> (String, usize) {
-    let mut out = String::new();
-    let mut dropped = 0;
-    let mut keep = true;
-    for line in text.split_inclusive('\n') {
-        let trimmed = line.trim();
-        if let Some(key) = trimmed
-            .strip_prefix('[')
-            .and_then(|rest| rest.strip_suffix(']'))
-        {
-            keep = !crate::pathutil::per_user_key(key);
-            if !keep {
-                dropped += 1;
-            }
-        }
-        if keep {
-            out.push_str(line);
-        }
-    }
-    (out, dropped)
-}
-
 /// Read a `.reg` file written by this program or by Regedit (UTF-16 or ANSI).
 pub fn read_backup(path: &Path) -> Result<String, std::io::Error> {
     let bytes = std::fs::read(path)?;
@@ -571,6 +546,8 @@ pub struct BackupSummary {
     pub files: Vec<(String, PathBuf)>,
     /// Restoring writes to HKEY_LOCAL_MACHINE or another machine-wide hive.
     pub machine_wide: bool,
+    /// Restoring writes to HKEY_CURRENT_USER.
+    pub per_user: bool,
 }
 
 impl BackupSummary {
@@ -587,6 +564,10 @@ impl BackupSummary {
             if let Some(key) = line.strip_prefix('[') {
                 summary.keys += 1;
                 let upper = key.to_ascii_uppercase();
+                if upper.starts_with("HKEY_CURRENT_USER") || upper.starts_with("-HKEY_CURRENT_USER")
+                {
+                    summary.per_user = true;
+                }
                 if !upper.starts_with("HKEY_CURRENT_USER")
                     && !upper.starts_with("-HKEY_CURRENT_USER")
                 {
@@ -654,44 +635,6 @@ pub fn is_hive_mend_backup(text: &str) -> bool {
         let line = line.trim();
         line == BACKUP_MARKER || line == SERVICES_BACKUP_MARKER
     })
-}
-
-/// Merge a `.reg` file with the 64-bit `reg.exe`, the same as Regedit's Merge.
-/// Refuses files this program did not write.
-#[cfg(windows)]
-pub fn import_reg_file(path: &Path) -> Result<(), String> {
-    let text =
-        read_backup(path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    if !is_hive_mend_backup(&text) {
-        return Err(format!(
-            "{} is not a Hivemend backup; refusing to merge it",
-            path.display()
-        ));
-    }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // System32 from the API, not %SystemRoot%: an elevated restore must run
-    // the real reg.exe, whatever environment launched this process.
-    let system = crate::fs::host_known_dir(crate::fs::KnownDir::System)
-        .ok_or("could not locate the System32 folder")?;
-    let reg_exe = Path::new(&system).join("reg.exe");
-    let output = std::process::Command::new(reg_exe)
-        .arg("import")
-        .arg(path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|err| format!("could not start reg.exe: {err}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let mut message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if message.is_empty() {
-        message = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    }
-    if message.is_empty() {
-        message = format!("reg.exe import failed ({})", output.status);
-    }
-    Err(message)
 }
 
 #[cfg(test)]
@@ -855,23 +798,6 @@ mod tests {
     }
 
     #[test]
-    #[cfg(windows)]
-    fn import_rejects_foreign_reg_file_before_shelling_out() {
-        let dir = std::env::temp_dir().join(format!("hivemend-refuse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("crafted.reg");
-        std::fs::write(
-            &path,
-            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Evil]\r\n",
-        )
-        .unwrap();
-        let err = import_reg_file(&path).unwrap_err();
-        assert!(err.contains("not a Hivemend backup"), "unexpected: {err}");
-        // Must fail before reg.exe is ever invoked: safe on any platform.
-        std::fs::remove_dir_all(&dir).ok();
-    }
-
-    #[test]
     fn backup_exports_only_the_value_that_repair_would_remove() {
         let mut reg = MemoryRegistry::new();
         let run = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
@@ -931,25 +857,6 @@ mod tests {
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 11);
         assert!(summary.machine_wide);
-    }
-
-    #[test]
-    fn an_administrator_restore_leaves_per_user_sections_out() {
-        let text = "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\A]\r\n\"x\"=\"1\"\r\n\r\n[HKEY_CURRENT_USER\\Software\\B]\r\n\"y\"=\"2\"\r\n\r\n[-HKEY_USERS\\S-1-5-21\\C]\r\n\r\n[HKEY_CLASSES_ROOT\\D]\r\n@=\"d\"\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\E]\r\n\"z\"=\"3\"\r\n";
-        let (kept, dropped) = machine_sections_only(text);
-        assert_eq!(dropped, 3);
-        assert!(kept.contains("; Hive Mend backup."));
-        assert!(kept.contains("SOFTWARE\\A") && kept.contains("\"x\"=\"1\""));
-        assert!(kept.contains("SOFTWARE\\E") && kept.contains("\"z\"=\"3\""));
-        for gone in [
-            "Software\\B",
-            "\"y\"",
-            "S-1-5-21",
-            "HKEY_CLASSES_ROOT",
-            "@=\"d\"",
-        ] {
-            assert!(!kept.contains(gone), "{gone} survived");
-        }
     }
 
     #[test]

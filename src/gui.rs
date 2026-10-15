@@ -4521,6 +4521,13 @@ impl App {
         // folders can be changed by other accounts or by this account's
         // non-elevated programs, so their backups restore only without
         // elevation, which can change only this account's own entries.
+        if self.elevated && !backup.summary.machine_wide {
+            self.message(
+                "This backup only holds entries for your own account. Restore it from Hivemend started without administrator rights.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         if self.elevated && !backup.store.elevated_may_restore() {
             let place = if backup.store == Store::Legacy {
                 format!(
@@ -4537,14 +4544,17 @@ impl App {
             );
             return;
         }
-        if backup.summary.machine_wide && !self.elevated && !backup.store.elevated_may_restore() {
+        // A backup with entries for this account restores that part here;
+        // only a backup that is entirely machine-wide needs elevation first.
+        let only_machine = backup.summary.machine_wide && !backup.summary.per_user;
+        if only_machine && !self.elevated && !backup.store.elevated_may_restore() {
             self.message(
                 "This backup includes machine-wide entries but was not saved in the protected backup store, so Hivemend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
                 MB_ICONWARNING,
             );
             return;
         }
-        if backup.summary.machine_wide && !self.elevated {
+        if only_machine && !self.elevated {
             let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hivemend as administrator now?";
             if self.confirm(ask, Redo::Restore(row)) {
                 self.elevate();

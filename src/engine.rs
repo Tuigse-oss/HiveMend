@@ -210,6 +210,7 @@ mod tests {
                 inner: self.inner.begin()?,
                 deny_subkeys: Some(locked),
                 deny_values: None,
+                deny_writes: None,
             }))
         }
     }

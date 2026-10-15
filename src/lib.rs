@@ -14,6 +14,7 @@ mod model;
 mod pathutil;
 mod privacy;
 mod programs;
+mod regfile;
 mod registry;
 #[cfg(windows)]
 pub mod restorepoint;
@@ -33,11 +34,9 @@ mod windows_reg;
 #[cfg(windows)]
 mod windows_services;
 
-#[cfg(windows)]
-pub use backup::import_reg_file;
 pub use backup::{
     BackupInfo, BackupSummary, BackupWriter, backup_name, encode_reg, is_hive_mend_backup,
-    list_backups, machine_sections_only, read_backup, reserve_backup,
+    list_backups, read_backup, reserve_backup,
 };
 pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;
@@ -71,6 +70,7 @@ pub use privacy::{
     preview, privacy_reg_allowed, set_cookie_keep, uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
+pub use regfile::{ParsedBackup, RegOp, apply_ops, parse_backup};
 pub use registry::{MemoryRegistry, RegTransaction, Registry};
 pub use rules::decode_text_owned;
 pub use services::{
@@ -102,7 +102,7 @@ pub use store::restore_backup;
 pub use store::{
     LEGACY_DIR, Store, adopt_legacy_settings, backup_stores, backups_dir, backups_location,
     cookies_keep_file, custom_privacy_file, elevated, exclusions_file, protected_dir,
-    restore_files, settings_file, user_dir,
+    restore_files, restore_scope, settings_file, user_dir,
 };
 
 /// The shipped exe must start on a clean Windows install, which has no

@@ -266,6 +266,7 @@ pub(crate) struct DenyTx<'a> {
     pub inner: Box<dyn RegTransaction + 'a>,
     pub deny_subkeys: Option<String>,
     pub deny_values: Option<String>,
+    pub deny_writes: Option<String>,
 }
 
 #[cfg(test)]
@@ -291,10 +292,22 @@ impl Registry for DenyTx<'_> {
         self.inner.values(path)
     }
     fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        if Self::denied(&self.deny_writes, path) {
+            return Err(RegError::Denied("access denied".into()));
+        }
         self.inner.delete_value(path, name)
     }
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+        if Self::denied(&self.deny_writes, path) {
+            return Err(RegError::Denied("access denied".into()));
+        }
         self.inner.delete_tree(path)
+    }
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        if Self::denied(&self.deny_writes, path) {
+            return Err(RegError::Denied("access denied".into()));
+        }
+        self.inner.set_value(path, name, data)
     }
 }
 

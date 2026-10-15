@@ -371,7 +371,7 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
     let elevated = elevated();
     let mut fs = crate::fs::HostFs;
     let (real, bytes) = read_restorable(&mut fs, file, elevated)?;
-    let text = crate::rules::decode_text_owned(bytes.clone());
+    let text = crate::rules::decode_text_owned(bytes);
     if !is_hive_mend_backup(&text) {
         return Err(format!(
             "{} is not a Hivemend backup; refusing to restore it",
@@ -379,63 +379,71 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
         ));
     }
     let summary = BackupSummary::parse(&text);
-    // An administrator restore writes only machine-wide sections: a per-user
-    // key could be redirected by a program running without elevation. Those
-    // sections are restored from a normal window.
-    let mut notes = Vec::new();
-    let bytes = if elevated {
-        let (machine, dropped) = crate::backup::machine_sections_only(&text);
-        if dropped > 0 {
-            if !machine.contains("\n[") {
-                return Err(format!(
-                    "{} only holds per-user entries; restore it from Hivemend started without administrator rights",
-                    file.display()
-                ));
-            }
-            notes.push(format!(
-                "{dropped} per-user sections were left out; restore those from Hivemend started without administrator rights"
-            ));
-        }
-        crate::backup::encode_reg(&machine)
+    let parsed = crate::regfile::parse_backup(&text)
+        .map_err(|why| format!("{} cannot be restored: {why}", file.display()))?;
+    let (ops, notes) = restore_scope(parsed, elevated);
+    // Written through the link-refusing registry layer in one transaction:
+    // all of it, or nothing.
+    let (keys, values) = if ops.is_empty() {
+        (0, 0)
     } else {
-        bytes
+        crate::regfile::apply_ops(&mut crate::WindowsRegistry, &ops)
+            .map_err(|err| format!("nothing was restored: {err}"))?
     };
-    let snapshot_dir = if elevated {
-        protected_dir(&fs).ok_or("could not locate the ProgramData folder")?
-    } else {
-        user_dir(&fs).ok_or("could not locate the Local AppData folder")?
+    let applied = BackupSummary {
+        keys,
+        values,
+        files: summary.files.clone(),
+        machine_wide: elevated && keys > 0,
+        per_user: !elevated && keys > 0,
     };
-    if elevated {
-        ensure_protected(&snapshot_dir)?;
-    }
-    let snapshot = snapshot_dir.join(format!(
-        "restore-{}-{}.reg",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|span| span.as_nanos())
-            .unwrap_or(0)
-    ));
-    let snapshot_text = snapshot.display().to_string();
-    let pin = fs.pin_create_new(&snapshot_text)?;
-    if !path_under(&pin.real_path, &snapshot_dir.display().to_string()) {
-        let _ = fs.pin_delete(pin);
-        return Err("the restore snapshot did not land in the data folder".into());
-    }
-    let written = fs
-        .pin_write_at(&pin, 0, &bytes)
-        .and_then(|()| fs.pin_sync(&pin));
-    drop(pin);
-    let imported = written.and_then(|()| crate::backup::import_reg_file(&snapshot));
-    if let Ok(mut pin) = fs.pin(&snapshot_text)
-        && fs.pin_acquire(&mut pin, Access::Delete).is_ok()
-    {
-        let _ = fs.pin_delete(pin);
-    }
-    imported?;
     let (files, mut errors) = restore_files(&mut fs, &real, &summary);
     errors.extend(notes);
-    Ok((summary, files, errors))
+    Ok((applied, files, errors))
+}
+
+/// The operations this window may apply, and notes on what is left for the
+/// other kind of window. An administrator window writes only machine-wide
+/// keys (a per-user key can be redirected by programs running without
+/// elevation); a normal window writes only its own HKEY_CURRENT_USER.
+pub fn restore_scope(
+    parsed: crate::regfile::ParsedBackup,
+    elevated: bool,
+) -> (Vec<crate::regfile::RegOp>, Vec<String>) {
+    let (mine, other): (Vec<_>, Vec<_>) = parsed.ops.into_iter().partition(|op| {
+        if elevated {
+            !crate::pathutil::per_user_key(op.key())
+        } else {
+            op.key().starts_with("HKEY_CURRENT_USER")
+        }
+    });
+    let mut notes = Vec::new();
+    let mut other_keys: Vec<String> = other
+        .iter()
+        .map(|op| op.key().to_ascii_lowercase())
+        .collect();
+    other_keys.sort();
+    other_keys.dedup();
+    if !other_keys.is_empty() {
+        notes.push(if elevated {
+            format!(
+                "{} per-user keys were not restored here; restore this backup again from Hivemend started without administrator rights",
+                other_keys.len()
+            )
+        } else {
+            format!(
+                "{} machine-wide keys need administrator rights; restore this backup again from Hivemend run as administrator",
+                other_keys.len()
+            )
+        });
+    }
+    if parsed.left_out > 0 {
+        notes.push(format!(
+            "{} entries the repair did not remove were left out",
+            parsed.left_out
+        ));
+    }
+    (mine, notes)
 }
 
 /// Create the protected folder with its explicit owner and DACL, or check an
@@ -644,6 +652,37 @@ mod tests {
                 .collect(),
             ..BackupSummary::default()
         }
+    }
+
+    #[test]
+    fn each_window_restores_only_its_own_part_of_a_mixed_backup() {
+        let text = "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n\r\n\
+            [HKEY_LOCAL_MACHINE\\SOFTWARE\\A]\r\n\"x\"=dword:00000001\r\n\r\n\
+            [HKEY_CURRENT_USER\\Software\\B]\r\n\"y\"=\"2\"\r\n\r\n\
+            [HKEY_USERS\\S-1-5-21-9\\Software\\C]\r\n\"z\"=\"3\"\r\n";
+        let parsed = crate::regfile::parse_backup(text).unwrap();
+        let (admin, admin_notes) = restore_scope(parsed.clone(), true);
+        assert!(
+            admin
+                .iter()
+                .all(|op| op.key().starts_with("HKEY_LOCAL_MACHINE"))
+        );
+        assert!(!admin.is_empty());
+        assert!(
+            admin_notes[0].contains("2 per-user keys"),
+            "{admin_notes:?}"
+        );
+        let (normal, normal_notes) = restore_scope(parsed, false);
+        assert!(
+            normal
+                .iter()
+                .all(|op| op.key().starts_with("HKEY_CURRENT_USER"))
+        );
+        assert!(!normal.is_empty());
+        assert!(
+            normal_notes[0].contains("need administrator rights"),
+            "{normal_notes:?}"
+        );
     }
 
     #[test]
