@@ -10,7 +10,7 @@
 
 use std::collections::BTreeMap;
 
-use crate::diskspace::DirLister;
+use crate::diskspace::{DirLister, DiskEntry};
 use crate::pathutil::{has_unsafe_fs_component, path_under};
 
 /// A file's identity: volume serial number and file index.
@@ -89,10 +89,18 @@ pub struct DupReport {
     pub files_seen: u64,
     pub unreadable: u64,
     pub canceled: bool,
+    /// The search stopped at [`MAX_CANDIDATES`] files or
+    /// [`crate::diskspace::MAX_FOLDERS`] folders: only part of it was searched.
+    pub incomplete: bool,
 }
 
 /// How many leading bytes are compared before reading whole files.
 const PREFIX: u64 = 64 * 1024;
+
+/// The most files one search keeps as possible copies (about 200 MB of
+/// paths at most); past it the search compares what it has and says it is
+/// incomplete.
+pub const MAX_CANDIDATES: usize = 1_000_000;
 
 /// Folder names never searched: Windows' own bookkeeping.
 const SKIPPED_DIRS: [&str; 2] = ["$Recycle.Bin", "System Volume Information"];
@@ -108,31 +116,54 @@ pub fn find_duplicates(
     protected: &[String],
     progress: &mut dyn FnMut(&str, usize, usize) -> bool,
 ) -> DupReport {
+    find_within(
+        lister,
+        reader,
+        root,
+        min_bytes,
+        protected,
+        (MAX_CANDIDATES, crate::diskspace::MAX_FOLDERS),
+        progress,
+    )
+}
+
+fn find_within(
+    lister: &dyn DirLister,
+    reader: &dyn ContentReader,
+    root: &str,
+    min_bytes: u64,
+    protected: &[String],
+    (max_candidates, max_folders): (usize, usize),
+    progress: &mut dyn FnMut(&str, usize, usize) -> bool,
+) -> DupReport {
     let root = root.trim_end_matches('\\').to_string();
     let mut report = DupReport {
         root: root.clone(),
         ..DupReport::default()
     };
     let mut by_size: BTreeMap<u64, Vec<String>> = BTreeMap::new();
+    let mut kept = 0usize;
+    let mut folders = 1usize;
     let mut pending = vec![root];
     while let Some(dir) = pending.pop() {
-        if !progress(
-            &format!("Looking at {} files. Reading {dir}", report.files_seen),
-            0,
-            0,
-        ) {
+        let text = |seen: u64| format!("Looking at {seen} files. Reading {dir}");
+        if !progress(&text(report.files_seen), 0, 0) {
             report.canceled = true;
             return report;
         }
-        let Ok(listing) = lister.list(&format!("{dir}\\")) else {
-            report.unreadable += 1;
-            continue;
-        };
-        for entry in listing {
+        let mut listed = 0u64;
+        let mut visit = |entry: DiskEntry| -> bool {
+            listed += 1;
+            if listed.is_multiple_of(crate::diskspace::CHECK_EVERY)
+                && !progress(&text(report.files_seen), 0, 0)
+            {
+                report.canceled = true;
+                return false;
+            }
             if entry.name == "." || entry.name == ".." || entry.name.is_empty() || entry.link {
                 // Links, junctions, and cloud placeholders (reparse points)
                 // are never followed or read.
-                continue;
+                return true;
             }
             let path = format!("{dir}\\{}", entry.name);
             if entry.dir {
@@ -141,14 +172,34 @@ pub fn find_duplicates(
                     .any(|name| name.eq_ignore_ascii_case(&entry.name))
                     || protected.iter().any(|root| path_under(&path, root));
                 if !skipped {
+                    if folders >= max_folders {
+                        report.incomplete = true;
+                        return false;
+                    }
+                    folders += 1;
                     pending.push(path);
                 }
             } else {
                 report.files_seen += 1;
                 if entry.bytes >= min_bytes.max(1) {
+                    if kept >= max_candidates {
+                        report.incomplete = true;
+                        return false;
+                    }
+                    kept += 1;
                     by_size.entry(entry.bytes).or_default().push(path);
                 }
             }
+            true
+        };
+        if lister.list(&format!("{dir}\\"), &mut visit).is_err() {
+            report.unreadable += 1;
+        }
+        if report.canceled {
+            return report;
+        }
+        if report.incomplete {
+            break;
         }
     }
     let candidates: Vec<(u64, Vec<String>)> = by_size
@@ -486,7 +537,6 @@ pub fn recycle(held: &Held) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::diskspace::DiskEntry;
     use std::cell::RefCell;
     use std::collections::HashMap;
 
@@ -531,8 +581,13 @@ mod tests {
     }
 
     impl DirLister for World {
-        fn list(&self, dir: &str) -> Result<Vec<DiskEntry>, String> {
-            self.dirs.get(dir).cloned().ok_or("denied".into())
+        fn list(
+            &self,
+            dir: &str,
+            visit: &mut dyn FnMut(DiskEntry) -> bool,
+        ) -> Result<bool, String> {
+            let entries = self.dirs.get(dir).ok_or("denied")?;
+            Ok(entries.iter().cloned().all(visit))
         }
     }
 
@@ -617,6 +672,79 @@ mod tests {
 
     fn protected() -> Vec<String> {
         vec![r"C:\Windows".to_string()]
+    }
+
+    /// One folder of `files` same-sized files, made up as it is listed.
+    struct Many {
+        files: u64,
+    }
+
+    impl DirLister for Many {
+        fn list(
+            &self,
+            dir: &str,
+            visit: &mut dyn FnMut(DiskEntry) -> bool,
+        ) -> Result<bool, String> {
+            if dir != "C:\\" {
+                return Ok(true);
+            }
+            for index in 0..self.files {
+                let entry = DiskEntry {
+                    name: format!("f{index}.bin"),
+                    dir: false,
+                    link: false,
+                    bytes: 10,
+                };
+                if !visit(entry) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
+        }
+    }
+
+    #[test]
+    fn cancel_works_inside_one_huge_folder() {
+        let many = Many { files: 50_000_000 };
+        let mut seen = 0;
+        let report = find_duplicates(&many, &world(), "C:", 2, &[], &mut |text, _, _| {
+            seen += 1;
+            !text.starts_with("Looking at 1") || text.starts_with("Looking at 1 ")
+        });
+        assert!(report.canceled);
+        assert!(report.files_seen < 20_000, "{}", report.files_seen);
+        assert!(seen > 1);
+    }
+
+    #[test]
+    fn a_search_past_its_limits_compares_what_it_has_and_says_so() {
+        let mut world = world();
+        for index in 0..50u64 {
+            world.file(r"C:\Users", &format!("more{index}.bin"), 100 + index, b"zz");
+        }
+        let few = find_within(
+            &world,
+            &world,
+            r"C:\",
+            2,
+            &protected(),
+            (10, 1000),
+            &mut |_, _, _| true,
+        );
+        assert!(few.incomplete);
+        assert!(!few.canceled);
+        let shallow = find_within(
+            &world,
+            &world,
+            r"C:\",
+            2,
+            &protected(),
+            (1000, 1),
+            &mut |_, _, _| true,
+        );
+        assert!(shallow.incomplete);
+        let full = find_duplicates(&world, &world, r"C:\", 2, &protected(), &mut |_, _, _| true);
+        assert!(!full.incomplete);
     }
 
     #[test]

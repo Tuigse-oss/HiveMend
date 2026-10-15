@@ -141,6 +141,15 @@ pub trait FileView {
     }
     fn read(&self, path: &str) -> Option<Vec<u8>>;
     fn list(&self, dir: &str) -> Vec<DirItem>;
+    /// List `dir` one entry at a time without holding the whole listing;
+    /// `visit` returns false to stop. The default lists it whole first.
+    fn list_each(&self, dir: &str, visit: &mut dyn FnMut(DirItem) -> bool) {
+        for item in self.list(dir) {
+            if !visit(item) {
+                return;
+            }
+        }
+    }
     /// Precise kind for a staged path. Unknown paths report `Other`, which
     /// callers treat as unsafe to act on, so an answer that cannot be known is safe.
     fn kind_of(&self, path: &str) -> ItemKind {
@@ -1063,10 +1072,18 @@ impl FileView for HostFs {
     }
 
     fn list(&self, dir: &str) -> Vec<DirItem> {
-        let Ok(entries) = std::fs::read_dir(dir) else {
-            return Vec::new();
-        };
         let mut items = Vec::new();
+        self.list_each(dir, &mut |item| {
+            items.push(item);
+            true
+        });
+        items
+    }
+
+    fn list_each(&self, dir: &str, visit: &mut dyn FnMut(DirItem) -> bool) {
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
         for entry in entries.flatten() {
             let Ok(file_type) = entry.file_type() else {
                 continue;
@@ -1085,13 +1102,15 @@ impl FileView for HostFs {
                     .ok()
                     .and_then(|modified| modified.elapsed().ok())
             });
-            items.push(DirItem {
+            let item = DirItem {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 kind,
                 age,
-            });
+            };
+            if !visit(item) {
+                return;
+            }
         }
-        items
     }
 
     fn kind_of(&self, path: &str) -> ItemKind {

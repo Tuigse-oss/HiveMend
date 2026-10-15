@@ -26,7 +26,7 @@ use hive_mend::{
     WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
     backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
     exclusions_file, expand_target, format_bytes, format_uptime, gather_hives, gather_snapshot,
-    group_digits, list_backups, parse_custom, plan_profile, preview, repair_with_progress,
+    group_digits, list_backups, parse_custom, plan_profile, preview_with, repair_with_progress,
     restore_backup, scan_with_progress, settings_file, sort_services, start_services,
     still_reported, stop_services, user_dir,
 };
@@ -1712,7 +1712,10 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping after this category...");
                     self.show_progress();
-                } else if self.job == Job::Analyzing || self.job == Job::Finding {
+                } else if self.job == Job::Analyzing
+                    || self.job == Job::Finding
+                    || self.job == Job::Previewing
+                {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping...");
                     self.show_progress();
@@ -2896,24 +2899,38 @@ impl App {
         // Counting can walk large folders: do it off the window's thread so
         // the window stays responsive.
         self.job = Job::Previewing;
+        CANCEL.store(false, Ordering::SeqCst);
+        self.priv_preview = None;
         self.priv_note = "Counting what each category holds...".to_string();
+        set_progress(0, 0, "Counting what each category holds...");
         self.sync_controls();
+        self.show_progress();
         self.invalidate();
         let items = self.priv_items.clone();
         let hwnd = self.hwnd as isize;
         std::thread::spawn(move || {
-            let report = preview(
+            let report = preview_with(
                 &WindowsRegistry,
                 &HostFs,
                 &WindowsSystemTargets,
                 &WindowsProcessList,
                 &items,
+                &mut || !CANCEL.load(Ordering::SeqCst),
             );
             finish_job(hwnd, JobResult::PrivacyPreview { report });
         });
     }
 
     fn finish_priv_preview(&mut self, report: Preview) {
+        if report.canceled {
+            // A partial count is not a preview: Clean stays unavailable.
+            self.priv_preview = None;
+            self.priv_note = "Preview canceled. Preview again before cleaning.".to_string();
+            self.sync_controls();
+            self.fill_privacy();
+            self.invalidate();
+            return;
+        }
         self.priv_note = format!(
             "Preview: {} files, {} registry values, {} in scope.",
             report.files(),
@@ -3180,15 +3197,10 @@ impl App {
                 };
                 self.priv_outcome = Some(outcome);
                 self.message(&lines.join("\n"), icon);
-                let report = preview(
-                    &WindowsRegistry,
-                    &HostFs,
-                    &WindowsSystemTargets,
-                    &WindowsProcessList,
-                    &self.priv_items,
-                );
-                self.priv_preview = Some(report);
+                // Count again in the background, as Preview does.
+                self.priv_preview = None;
                 self.fill_privacy();
+                self.run_priv_preview();
             }
         }
     }
@@ -4767,6 +4779,8 @@ impl App {
                     "{}{} holds {} in {}.{unread}",
                     if report.canceled {
                         "Stopped early: "
+                    } else if report.incomplete {
+                        "Too many folders to count them all; partial totals: "
                     } else {
                         ""
                     },
@@ -4795,6 +4809,8 @@ impl App {
                             "{}{} of identical files in {}; keeping one of each frees {}.{unread}",
                             if report.canceled {
                                 "Stopped early: "
+                            } else if report.incomplete {
+                                "Too many files to search them all; from the part searched: "
                             } else {
                                 ""
                             },
@@ -5172,7 +5188,7 @@ impl App {
                 }
             }
             Page::Privacy => {
-                if matches!(self.job, Job::Cleaning) {
+                if matches!(self.job, Job::Cleaning | Job::Previewing) {
                     visible.push(self.progress);
                     place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
                     visible.push(self.btn_cancel);

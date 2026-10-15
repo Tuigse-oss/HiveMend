@@ -68,7 +68,8 @@ pub use privacy::{
     CleanOutcome, CookieKeep, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup,
     PrivacyItem, PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items,
     clean_with_progress, cookie_keep_choice, leave_browsers_alone, leave_per_user_registry,
-    mask_matches, parse_custom, preview, privacy_reg_allowed, set_cookie_keep, uninstall_present,
+    mask_matches, parse_custom, preview, preview_with, privacy_reg_allowed, set_cookie_keep,
+    uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
 pub use regfile::{ParsedBackup, RegOp, apply_ops, parse_backup};

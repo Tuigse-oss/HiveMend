@@ -869,6 +869,8 @@ impl PreviewItem {
 #[derive(Clone, Debug, Default)]
 pub struct Preview {
     pub items: Vec<PreviewItem>,
+    /// Stopped before every category was counted: not a complete preview.
+    pub canceled: bool,
 }
 
 impl Preview {
@@ -893,8 +895,26 @@ pub fn preview(
     procs: &dyn ProcessList,
     items: &[PrivacyItem],
 ) -> Preview {
+    preview_with(reg, fs, sys, procs, items, &mut || true)
+}
+
+/// [`preview`] that asks `keep_going` between categories, between folders,
+/// and every few thousand files inside a large folder, and stops as soon as
+/// it says no; the result is then marked canceled.
+pub fn preview_with(
+    reg: &dyn Registry,
+    fs: &dyn FileView,
+    sys: &dyn SystemTargets,
+    procs: &dyn ProcessList,
+    items: &[PrivacyItem],
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Preview {
     let mut out = Preview::default();
     for item in items {
+        if !keep_going() {
+            out.canceled = true;
+            return out;
+        }
         let mut row = PreviewItem::blank(&item.id);
         for warning in &item.warnings {
             row.note(warning.clone());
@@ -917,13 +937,17 @@ pub fn preview(
         // is walked once per item no matter how many targets name it.
         let mut walked = HashSet::new();
         for target in &item.targets {
-            preview_target(reg, fs, sys, target, &mut row, &mut walked);
+            if !preview_target(reg, fs, sys, target, &mut row, &mut walked, keep_going) {
+                out.canceled = true;
+                return out;
+            }
         }
         out.items.push(row);
     }
     out
 }
 
+/// False when `keep_going` stopped it.
 fn preview_target(
     reg: &dyn Registry,
     fs: &dyn FileView,
@@ -931,19 +955,20 @@ fn preview_target(
     target: &PrivacyTarget,
     row: &mut PreviewItem,
     walked: &mut HashSet<String>,
-) {
+    keep_going: &mut dyn FnMut() -> bool,
+) -> bool {
     match target {
         PrivacyTarget::RegTree { key } => {
             if !privacy_reg_allowed(key) {
                 row.note(format!("refused: {key}"));
-                return;
+                return true;
             }
             row.values += count_tree(reg, key, 0, row);
         }
         PrivacyTarget::RegValues { key, values } => {
             if !privacy_reg_allowed(key) {
                 row.note(format!("refused: {key}"));
-                return;
+                return true;
             }
             match reg.values(key) {
                 Ok(present) => {
@@ -977,11 +1002,26 @@ fn preview_target(
                 if !walked.insert(gate) {
                     continue;
                 }
-                let mut hits = Vec::new();
-                walk_files(fs, &dir, mask, *recursive, *min_age, 0, &mut hits, row);
-                for hit in hits {
-                    row.files += 1;
-                    row.bytes += hit.bytes;
+                let mut counted = (0usize, 0u64);
+                let finished = walk_files(
+                    fs,
+                    &dir,
+                    mask,
+                    *recursive,
+                    *min_age,
+                    0,
+                    &mut |hit| {
+                        counted.0 += 1;
+                        counted.1 += hit.bytes;
+                        true
+                    },
+                    keep_going,
+                    row,
+                );
+                row.files += counted.0;
+                row.bytes += counted.1;
+                if !finished {
+                    return false;
                 }
             }
         }
@@ -1019,7 +1059,7 @@ fn preview_target(
         PrivacyTarget::Cookies { dir, names, keep } => {
             if let CookieKeep::LeaveAlone(reason) = keep {
                 row.note(reason.clone());
-                return;
+                return true;
             }
             let (dirs, notes) = resolve_dirs(fs, dir);
             for note in notes {
@@ -1059,6 +1099,7 @@ fn preview_target(
             row.bytes += bytes;
         }
     }
+    true
 }
 
 /// Registry values under a tree, for preview counts and delete credit.
@@ -1098,6 +1139,14 @@ struct FileHit {
     min_age: Option<Duration>,
 }
 
+/// The most files one clean takes from one folder walk; past it the rest
+/// are left for another run, and the clean says so.
+const MAX_WALK_HITS: usize = 100_000;
+
+/// Walk `dir` for files matching `mask`, one entry at a time, handing each
+/// to `on_hit` (false stops the walk). `keep_going` is asked for every
+/// folder and every [`crate::diskspace::CHECK_EVERY`] entries. Returns false
+/// when the walk was stopped.
 #[allow(clippy::too_many_arguments)]
 fn walk_files(
     fs: &dyn FileView,
@@ -1106,44 +1155,79 @@ fn walk_files(
     recursive: bool,
     min_age: Option<Duration>,
     depth: usize,
-    hits: &mut Vec<FileHit>,
+    on_hit: &mut dyn FnMut(FileHit) -> bool,
+    keep_going: &mut dyn FnMut() -> bool,
     row: &mut PreviewItem,
-) {
+) -> bool {
     if depth > 64 {
-        return;
+        return true;
     }
-    for entry in fs.list(dir) {
+    if !keep_going() {
+        return false;
+    }
+    let mut subdirs = Vec::new();
+    let mut listed = 0u64;
+    let mut going = true;
+    fs.list_each(dir, &mut |entry| {
+        listed += 1;
+        if listed.is_multiple_of(crate::diskspace::CHECK_EVERY) && !keep_going() {
+            going = false;
+            return false;
+        }
         let path = format!("{dir}\\{}", entry.name);
         match entry.kind {
             ItemKind::File => {
                 if !mask_matches(&entry.name, mask) {
-                    continue;
+                    return true;
                 }
                 if let Some(min) = min_age {
                     match entry.age {
                         Some(age) if age >= min => {}
-                        Some(_) => continue,
+                        Some(_) => return true,
                         None => {
                             row.note(format!("age unknown: {path}"));
-                            continue;
+                            return true;
                         }
                     }
                 }
                 let bytes = fs.len(&path).unwrap_or(0);
-                hits.push(FileHit {
+                if !on_hit(FileHit {
                     path,
                     bytes,
                     min_age,
-                });
+                }) {
+                    going = false;
+                    return false;
+                }
             }
             ItemKind::Dir => {
                 if recursive {
-                    walk_files(fs, &path, mask, recursive, min_age, depth + 1, hits, row);
+                    subdirs.push(path);
                 }
             }
             ItemKind::Other => row.note(format!("not a plain file: {path}")),
         }
+        true
+    });
+    if !going {
+        return false;
     }
+    for path in subdirs {
+        if !walk_files(
+            fs,
+            &path,
+            mask,
+            recursive,
+            min_age,
+            depth + 1,
+            on_hit,
+            keep_going,
+            row,
+        ) {
+            return false;
+        }
+    }
+    true
 }
 
 fn with_sidecars(dir: &str, name: &str, sidecars: bool) -> Vec<String> {
@@ -1410,16 +1494,25 @@ fn execute_item(
                     }
                     let mut counter = PreviewItem::blank(&item.id);
                     let mut hits = Vec::new();
-                    walk_files(
+                    let finished = walk_files(
                         fs,
                         &dir,
                         mask,
                         *recursive,
                         *min_age,
                         0,
-                        &mut hits,
+                        &mut |hit| {
+                            hits.push(hit);
+                            hits.len() < MAX_WALK_HITS
+                        },
+                        &mut || true,
                         &mut counter,
                     );
+                    if !finished {
+                        done.note(format!(
+                            "{dir}: more than {MAX_WALK_HITS} files; the rest were left for another clean"
+                        ));
+                    }
                     for note in counter.restricted {
                         done.note(note);
                     }
@@ -2752,6 +2845,63 @@ mod tests {
             outcome.items[0].restricted
         );
         let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn a_canceled_preview_stops_inside_a_large_folder_and_says_so() {
+        let reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for index in 0..20_000 {
+            fs.add_file_bytes(&format!(r"{temp}\f{index}.tmp"), vec![0], Some(day * 9));
+        }
+        let sys = FakeSys::default();
+        let mut asked = 0;
+        let report = preview_with(
+            &reg,
+            &fs,
+            &sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut || {
+                asked += 1;
+                asked < 4
+            },
+        );
+        assert!(report.canceled);
+        let counted: usize = report.items.iter().map(|item| item.files).sum();
+        assert!(counted < 20_000, "{counted}");
+        let whole = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
+        assert!(!whole.canceled);
+        assert!(whole.files() >= 20_000);
+    }
+
+    #[test]
+    fn a_walk_stops_when_its_files_are_enough() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        for index in 0..50 {
+            fs.add_file_bytes(&format!(r"{temp}\sub\f{index}.tmp"), vec![0], None);
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut hits = Vec::new();
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |hit| {
+                hits.push(hit);
+                hits.len() < 10
+            },
+            &mut || true,
+            &mut row,
+        );
+        assert!(!finished);
+        assert_eq!(hits.len(), 10);
     }
 
     #[test]

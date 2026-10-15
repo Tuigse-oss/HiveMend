@@ -15,10 +15,16 @@ pub struct DiskEntry {
     pub bytes: u64,
 }
 
-/// Lists one folder. `Err` means it could not be read.
+/// Lists one folder, one entry at a time, without holding the whole
+/// listing: `visit` returns false to stop early. `Ok(true)` is a complete
+/// listing, `Ok(false)` one `visit` stopped, `Err` a folder that could not
+/// be read (entries already visited stay visited).
 pub trait DirLister {
-    fn list(&self, dir: &str) -> Result<Vec<DiskEntry>, String>;
+    fn list(&self, dir: &str, visit: &mut dyn FnMut(DiskEntry) -> bool) -> Result<bool, String>;
 }
+
+/// How often, in entries, a long listing checks whether to stop.
+pub const CHECK_EVERY: u64 = 4096;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct DirNode {
@@ -111,6 +117,8 @@ pub struct DiskReport {
     /// Junctions and links that were not followed.
     pub links_skipped: u64,
     pub canceled: bool,
+    /// The walk stopped at [`MAX_FOLDERS`]: the totals cover only part of it.
+    pub incomplete: bool,
 }
 
 impl DiskReport {
@@ -152,12 +160,25 @@ impl DiskReport {
 /// How many of the largest files a report keeps.
 pub const LARGEST_KEPT: usize = 100;
 
-/// Walk `root`. `progress(files, bytes, folder)` is called for each folder
-/// with the totals so far and returns false to stop; a stopped walk
-/// reports what it counted.
+/// The most folders one walk keeps in its tree (about 150 MB at most);
+/// past it the walk stops and says the report is incomplete.
+pub const MAX_FOLDERS: usize = 1_000_000;
+
+/// Walk `root`. `progress(files, bytes, folder)` is called for each folder,
+/// and every [`CHECK_EVERY`] entries inside a large one, with the totals so
+/// far, and returns false to stop; a stopped walk reports what it counted.
 pub fn analyze(
     lister: &dyn DirLister,
     root: &str,
+    progress: &mut dyn FnMut(u64, u64, &str) -> bool,
+) -> DiskReport {
+    analyze_within(lister, root, MAX_FOLDERS, progress)
+}
+
+fn analyze_within(
+    lister: &dyn DirLister,
+    root: &str,
+    max_folders: usize,
     progress: &mut dyn FnMut(u64, u64, &str) -> bool,
 ) -> DiskReport {
     let root = root.trim_end_matches('\\').to_string();
@@ -182,22 +203,28 @@ pub fn analyze(
             report.canceled = true;
             break;
         }
-        let listing = match lister.list(&format!("{path}\\")) {
-            Ok(listing) => listing,
-            Err(_) => {
-                report.unreadable += 1;
-                continue;
+        let mut listed = 0u64;
+        let mut stop = false;
+        let mut visit = |entry: DiskEntry| -> bool {
+            listed += 1;
+            if listed.is_multiple_of(CHECK_EVERY) && !progress(files_seen, bytes_seen, &path) {
+                report.canceled = true;
+                stop = true;
+                return false;
             }
-        };
-        for entry in listing {
             if entry.name == "." || entry.name == ".." || entry.name.is_empty() {
-                continue;
+                return true;
             }
             let full = format!("{path}\\{}", entry.name);
             if entry.dir {
                 if entry.link {
                     report.links_skipped += 1;
-                    continue;
+                    return true;
+                }
+                if report.nodes.len() >= max_folders {
+                    report.incomplete = true;
+                    stop = true;
+                    return false;
                 }
                 let child = report.nodes.len();
                 report.nodes.push(DirNode {
@@ -221,6 +248,13 @@ pub fn analyze(
                 }
                 keep_largest(&mut report.largest, full, entry.bytes);
             }
+            true
+        };
+        if lister.list(&format!("{path}\\"), &mut visit).is_err() {
+            report.unreadable += 1;
+        }
+        if stop {
+            break;
         }
     }
     // Children come after their parent, so one backward pass totals the tree.
@@ -251,7 +285,7 @@ pub struct HostLister;
 
 #[cfg(windows)]
 impl DirLister for HostLister {
-    fn list(&self, dir: &str) -> Result<Vec<DiskEntry>, String> {
+    fn list(&self, dir: &str, visit: &mut dyn FnMut(DiskEntry) -> bool) -> Result<bool, String> {
         use windows_sys::Win32::Foundation::{
             ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
         };
@@ -280,26 +314,29 @@ impl DirLister for HostLister {
         if handle == INVALID_HANDLE_VALUE {
             return Err(std::io::Error::last_os_error().to_string());
         }
-        let mut entries = Vec::new();
         loop {
             let len = data
                 .cFileName
                 .iter()
                 .position(|unit| *unit == 0)
                 .unwrap_or(data.cFileName.len());
-            entries.push(DiskEntry {
+            let entry = DiskEntry {
                 name: String::from_utf16_lossy(&data.cFileName[..len]),
                 dir: data.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY != 0,
                 link: data.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0,
                 bytes: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
-            });
+            };
+            if !visit(entry) {
+                unsafe { FindClose(handle) };
+                return Ok(false);
+            }
             if unsafe { FindNextFileW(handle, &mut data) } == 0 {
                 // Only the normal end of the listing is a complete folder;
-                // any other failure makes it unreadable, not smaller.
+                // any other failure makes it unreadable.
                 let error = unsafe { GetLastError() };
                 unsafe { FindClose(handle) };
                 if error == ERROR_NO_MORE_FILES {
-                    return Ok(entries);
+                    return Ok(true);
                 }
                 return Err(std::io::Error::from_raw_os_error(error as i32).to_string());
             }
@@ -335,8 +372,55 @@ mod tests {
     }
 
     impl DirLister for Fake {
-        fn list(&self, dir: &str) -> Result<Vec<DiskEntry>, String> {
-            self.dirs.get(dir).cloned().ok_or("denied".into())
+        fn list(
+            &self,
+            dir: &str,
+            visit: &mut dyn FnMut(DiskEntry) -> bool,
+        ) -> Result<bool, String> {
+            let entries = self.dirs.get(dir).ok_or("denied")?;
+            Ok(entries.iter().cloned().all(visit))
+        }
+    }
+
+    /// One folder with `files` files and `dirs` empty folders, made up as
+    /// it is listed, so nothing holds the whole listing.
+    struct Huge {
+        files: u64,
+        dirs: u64,
+    }
+
+    impl DirLister for Huge {
+        fn list(
+            &self,
+            dir: &str,
+            visit: &mut dyn FnMut(DiskEntry) -> bool,
+        ) -> Result<bool, String> {
+            if dir != "C:\\" {
+                return Ok(true);
+            }
+            for index in 0..self.dirs {
+                let entry = DiskEntry {
+                    name: format!("d{index}"),
+                    dir: true,
+                    link: false,
+                    bytes: 0,
+                };
+                if !visit(entry) {
+                    return Ok(false);
+                }
+            }
+            for index in 0..self.files {
+                let entry = DiskEntry {
+                    name: format!("f{index}.bin"),
+                    dir: false,
+                    link: false,
+                    bytes: 1,
+                };
+                if !visit(entry) {
+                    return Ok(false);
+                }
+            }
+            Ok(true)
         }
     }
 
@@ -410,5 +494,59 @@ mod tests {
         });
         assert!(report.canceled);
         assert_eq!(report.nodes[0].files, 1, "only the root was listed");
+    }
+
+    #[test]
+    fn cancel_works_inside_one_huge_folder() {
+        let huge = Huge {
+            files: 50_000_000,
+            dirs: 0,
+        };
+        let mut calls = 0;
+        let report = analyze(&huge, "C:", &mut |files, _, _| {
+            calls += 1;
+            files < 10_000
+        });
+        assert!(report.canceled);
+        // Stopped within a few thousand entries of asking, not at the end.
+        assert!(report.nodes[0].files < 20_000, "{}", report.nodes[0].files);
+        assert!(calls > 1);
+    }
+
+    #[test]
+    fn a_walk_past_the_folder_limit_stops_and_says_so() {
+        let huge = Huge {
+            files: 3,
+            dirs: 1_000,
+        };
+        let report = analyze_within(&huge, "C:", 100, &mut |_, _, _| true);
+        assert!(report.incomplete);
+        assert!(!report.canceled);
+        assert_eq!(report.nodes.len(), 100);
+    }
+}
+
+/// Live Windows test: a real listing stops when asked to.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    #[test]
+    fn live_a_listing_stops_part_way_through_a_large_folder() {
+        let system = crate::fs::host_known_dir(crate::fs::KnownDir::System).unwrap();
+        let mut seen = 0;
+        let whole = HostLister.list(&format!("{system}\\"), &mut |_| {
+            seen += 1;
+            true
+        });
+        let mut part = 0;
+        let stopped = HostLister.list(&format!("{system}\\"), &mut |_| {
+            part += 1;
+            part < 10
+        });
+        assert_eq!(whole, Ok(true));
+        assert!(seen > 1000, "{seen}");
+        assert_eq!(stopped, Ok(false));
+        assert_eq!(part, 10);
     }
 }
