@@ -84,6 +84,9 @@ pub struct Pinned {
     /// Names (hard links) the file has. Overwriting one changes them all.
     pub links: u32,
     pub hidden_system: bool,
+    /// Time since the object was last written, from the open handle, when
+    /// known. Age-based cleaning checks it on the object it deletes.
+    pub age: Option<Duration>,
     handle: PinHandle,
 }
 
@@ -297,9 +300,9 @@ fn norm(path: &str) -> String {
 impl FileView for MemoryFs {
     fn pin(&self, path: &str) -> Result<Pinned, String> {
         let key = self.resolve(path);
-        let (kind, len) = match self.nodes.get(&key) {
-            Some(FsNode::File { bytes, .. }) => (ItemKind::File, bytes.len() as u64),
-            Some(FsNode::Dir) => (ItemKind::Dir, 0),
+        let (kind, len, age) = match self.nodes.get(&key) {
+            Some(FsNode::File { bytes, age }) => (ItemKind::File, bytes.len() as u64, *age),
+            Some(FsNode::Dir) => (ItemKind::Dir, 0, None),
             Some(FsNode::Other) => return Err("refusing a reparse point".into()),
             None => return Err("file not found (os error 2)".into()),
         };
@@ -309,6 +312,7 @@ impl FileView for MemoryFs {
             len,
             links: self.links.get(&key).copied().unwrap_or(1),
             hidden_system: self.is_hidden_system(&key),
+            age,
             handle: PinHandle::Memory(key),
         })
     }
@@ -391,6 +395,7 @@ impl FileView for MemoryFs {
             len: 0,
             links: 1,
             hidden_system: false,
+            age: None,
             handle: PinHandle::Memory(key),
         })
     }
@@ -829,6 +834,15 @@ mod host {
         identify(file, path)
     }
 
+    /// How long ago a FILETIME (100 ns ticks since 1601) was, if it is in
+    /// the past.
+    fn filetime_age(ticks: u64) -> Option<std::time::Duration> {
+        const UNIX_OFFSET_SECS: u64 = 11_644_473_600;
+        let micros = (ticks / 10).checked_sub(UNIX_OFFSET_SECS * 1_000_000)?;
+        let when = std::time::UNIX_EPOCH + std::time::Duration::from_micros(micros);
+        std::time::SystemTime::now().duration_since(when).ok()
+    }
+
     fn identify(file: std::fs::File, path: &str) -> Result<Pinned, String> {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
         if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
@@ -856,6 +870,10 @@ mod host {
             links: info.nNumberOfLinks,
             hidden_system: attrs & (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM)
                 == (FILE_ATTRIBUTE_HIDDEN | FILE_ATTRIBUTE_SYSTEM),
+            age: filetime_age(
+                ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                    | info.ftLastWriteTime.dwLowDateTime as u64,
+            ),
             handle: PinHandle::Host(file),
         })
     }
@@ -994,6 +1012,7 @@ mod host {
             len: meta.len(),
             links: 1,
             hidden_system: false,
+            age: meta.modified().ok().and_then(|when| when.elapsed().ok()),
             handle: PinHandle::Host(file),
         })
     }
@@ -1011,6 +1030,7 @@ mod host {
             len: 0,
             links: 1,
             hidden_system: false,
+            age: None,
             handle: PinHandle::Host(file),
         })
     }
@@ -1047,6 +1067,20 @@ mod host {
 #[cfg(all(test, windows))]
 mod live_tests {
     use super::*;
+
+    #[test]
+    fn live_a_pinned_file_reports_its_age_from_the_handle() {
+        let path = std::env::temp_dir().join(format!("hm-age-{}.tmp", std::process::id()));
+        std::fs::write(&path, b"x").unwrap();
+        let pin = HostFs.pin(&path.display().to_string()).expect("pin");
+        let age = pin.age.expect("an age");
+        drop(pin);
+        let _ = std::fs::remove_file(&path);
+        assert!(
+            age < Duration::from_secs(120),
+            "a new file looked {age:?} old"
+        );
+    }
 
     #[test]
     fn live_known_dirs_are_absolute_and_nested_as_expected() {

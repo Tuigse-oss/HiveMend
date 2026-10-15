@@ -1074,6 +1074,9 @@ fn count_tree(reg: &dyn Registry, key: &str, depth: usize, row: &mut PreviewItem
 struct FileHit {
     path: String,
     bytes: u64,
+    /// The age the file had to have to be listed; checked again on the
+    /// object about to be deleted.
+    min_age: Option<Duration>,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1108,7 +1111,11 @@ fn walk_files(
                     }
                 }
                 let bytes = fs.len(&path).unwrap_or(0);
-                hits.push(FileHit { path, bytes });
+                hits.push(FileHit {
+                    path,
+                    bytes,
+                    min_age,
+                });
             }
             ItemKind::Dir => {
                 if recursive {
@@ -1436,7 +1443,11 @@ fn execute_item(
                                 continue;
                             }
                             let bytes = fs.len(&path).unwrap_or(0);
-                            let hit = FileHit { path, bytes };
+                            let hit = FileHit {
+                                path,
+                                bytes,
+                                min_age: None,
+                            };
                             delete_file(fs, &dir, &hit, &mut done, errors);
                         }
                     }
@@ -1468,7 +1479,11 @@ fn execute_item(
                                     continue;
                                 }
                                 let bytes = fs.len(&path).unwrap_or(0);
-                                let hit = FileHit { path, bytes };
+                                let hit = FileHit {
+                                    path,
+                                    bytes,
+                                    min_age: None,
+                                };
                                 delete_file(fs, &dir, &hit, &mut done, errors);
                             }
                         }
@@ -1625,6 +1640,17 @@ fn delete_file(
     };
     if pin.kind != ItemKind::File {
         done.note(format!("not a file: {}", hit.path));
+        return;
+    }
+    // A file listed for being old must still be old: it may have been
+    // written to, or replaced by a new file, since it was listed.
+    if let Some(min) = hit.min_age
+        && !pin.age.is_some_and(|age| age >= min)
+    {
+        done.note(format!(
+            "changed since it was listed, left alone: {}",
+            hit.path
+        ));
         return;
     }
     let real_root = fs
@@ -2209,7 +2235,11 @@ mod tests {
         let mut done = ItemOutcome::blank("test");
         let mut errors = Vec::new();
         for path in [format!(r"{root}\ok.tmp"), format!(r"{root}\out\keep.txt")] {
-            let hit = FileHit { path, bytes: 8 };
+            let hit = FileHit {
+                path,
+                bytes: 8,
+                min_age: None,
+            };
             delete_file(&mut fs, root, &hit, &mut done, &mut errors);
         }
         assert_eq!(done.files, 1);
@@ -2549,6 +2579,36 @@ mod tests {
             "WinRAR 7.10 (64-bit)",
         );
         assert!(uninstall_present(&reg, "WinRAR"));
+    }
+
+    #[test]
+    fn a_temp_file_written_since_it_was_listed_is_left_alone() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        // Listed as older than two days, but written an hour ago since.
+        fs.add_file_bytes(
+            &format!(r"{temp}\fresh.tmp"),
+            vec![1; 8],
+            Some(Duration::from_secs(3600)),
+        );
+        fs.add_file_bytes(&format!(r"{temp}\old.tmp"), vec![1; 8], Some(day * 3));
+        let mut done = ItemOutcome::blank("user-temp");
+        let mut errors = Vec::new();
+        for name in ["fresh.tmp", "old.tmp"] {
+            let hit = FileHit {
+                path: format!(r"{temp}\{name}"),
+                bytes: 8,
+                min_age: Some(day * 2),
+            };
+            delete_file(&mut fs, temp, &hit, &mut done, &mut errors);
+        }
+        assert!(
+            fs.exists(&format!(r"{temp}\fresh.tmp")),
+            "a recently written file was deleted"
+        );
+        assert!(!fs.exists(&format!(r"{temp}\old.tmp")));
+        assert_eq!(done.files, 1);
     }
 
     #[test]
