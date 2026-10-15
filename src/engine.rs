@@ -241,6 +241,16 @@ mod tests {
         );
         assert!(matches!(marked, Applied::NotBackedUp));
         assert!(fs.exists(&format!(r"{desktop}\marked.lnk")));
+        // A stream added after the copy, before the delete: it stays.
+        fs.add_file_bytes(&format!(r"{desktop}\late.lnk"), b"lnk".to_vec(), None);
+        fs.set_streams_late(&format!(r"{desktop}\late.lnk"));
+        let late = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\late.lnk"),
+            Some(&format!(r"{copies}\0004-late.lnk")),
+        );
+        assert!(matches!(late, Applied::NotBackedUp));
+        assert!(fs.exists(&format!(r"{desktop}\late.lnk")));
         let plain = delete_file_pinned(
             &mut fs,
             &format!(r"{desktop}\plain.lnk"),
@@ -931,29 +941,41 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
     if pin.kind != ItemKind::File || !file_delete_allowed(&real) || under_windows_dir(&*fs, &real) {
         return Applied::Refused;
     }
+    // A shortcut kept as a copy is taken so nothing else can write, rename,
+    // or delete it, and its length is read again through that hold.
     let access = if copy.is_some() {
-        Access::ReadDelete
+        Access::ReadDeleteExclusive
     } else {
         Access::Delete
     };
     if let Err(err) = fs.pin_acquire(&mut pin, access) {
         return Applied::Failed {
-            denied: err.contains("os error 5"),
+            denied: err.contains("os error 5") || err.contains("os error 32"),
             message: err,
         };
     }
     // The copy holds the main data stream only; a file with any named
     // stream (the download marker included) could not be put back whole,
-    // so it is left alone.
-    if copy.is_some() && fs.named_streams(&real) != Ok(false) {
+    // so it is left alone. Checked through the held handle.
+    if copy.is_some() && fs.pin_named_streams(&pin) != Ok(false) {
         return Applied::NotBackedUp;
     }
-    if let Some(copy) = copy
-        && let Err(err) = fs.pin_copy_to(&pin, copy)
-    {
-        return Applied::Failed {
-            message: format!("could not save a copy first: {err}"),
-            denied: false,
+    if let Some(copy) = copy {
+        let len = pin.len;
+        if let Err(err) = fs.pin_copy_to(&pin, copy) {
+            return Applied::Failed {
+                message: format!("could not save a copy first: {err}"),
+                denied: false,
+            };
+        }
+        // Deleted only while still exactly what was copied.
+        return match fs.pin_delete_unchanged(pin, len) {
+            Ok(()) => Applied::Removed,
+            Err(err) if err.contains("changed while") => Applied::NotBackedUp,
+            Err(err) => Applied::Failed {
+                denied: err.contains("os error 5"),
+                message: err,
+            },
         };
     }
     match fs.pin_delete(pin) {

@@ -83,6 +83,9 @@ pub enum Access {
     Read,
     /// Read and delete: a delete that keeps a copy first.
     ReadDelete,
+    /// Read and delete with only reading shared: nothing else can write,
+    /// rename, or delete it while held. Its length is read again through it.
+    ReadDeleteExclusive,
     /// Delete only.
     Delete,
     /// Delete, with only reading shared: refused while another program
@@ -183,6 +186,20 @@ pub trait FileView {
     fn pin_sync(&mut self, pin: &Pinned) -> Result<(), String>;
     /// Delete the pinned file, or empty folder.
     fn pin_delete(&mut self, pin: Pinned) -> Result<(), String>;
+    /// Delete the pinned file only if it is still as it was copied: it is
+    /// marked for deletion first, so nothing new (a data stream included)
+    /// can be opened on it, and then must still have no named data streams
+    /// and be `len` bytes long. Otherwise the mark is cleared and it stays.
+    fn pin_delete_unchanged(&mut self, pin: Pinned, len: u64) -> Result<(), String>;
+    /// Delete every pinned file together, or none: each is marked for
+    /// deletion through its handle, and if any mark fails, the marks already
+    /// made are cleared. The files go when their handles close.
+    fn pin_delete_all(&mut self, pins: Vec<Pinned>) -> Result<(), String>;
+    /// True when the pinned file has any named data stream (the download
+    /// marker included), read through its handle.
+    fn pin_named_streams(&self, pin: &Pinned) -> Result<bool, String> {
+        self.named_streams(&pin.real_path)
+    }
     /// Copy the pinned file's bytes to a new file at `to`, creating its
     /// folders. Never overwrites.
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String>;
@@ -256,6 +273,10 @@ pub struct MemoryFs {
     busy: Vec<String>,
     /// Files written after they were pinned: exclusive access sees a fresh age.
     written_since: Vec<String>,
+    /// Files whose deletion mark fails (a read-only file, say).
+    fail_delete: Vec<String>,
+    /// Files that gain a data stream after they are copied, before deletion.
+    streams_late: Vec<String>,
 }
 
 impl MemoryFs {
@@ -287,6 +308,16 @@ impl MemoryFs {
     /// Have `path` written after it is pinned and before it is deleted.
     pub fn set_written_since(&mut self, path: &str) {
         self.written_since.push(norm(path));
+    }
+
+    /// Make marking `path` for deletion fail.
+    pub fn set_fail_delete(&mut self, path: &str) {
+        self.fail_delete.push(norm(path));
+    }
+
+    /// Have `path` gain a data stream after it is copied.
+    pub fn set_streams_late(&mut self, path: &str) {
+        self.streams_late.push(norm(path));
     }
 
     /// Give a file the download marker (Zone.Identifier) and no other stream.
@@ -407,6 +438,14 @@ impl FileView for MemoryFs {
         if !self.nodes.contains_key(&key) {
             return Err("file not found (os error 2)".into());
         }
+        if access == Access::ReadDeleteExclusive {
+            if self.busy.contains(&key) {
+                return Err("the file is being used by another process (os error 32)".into());
+            }
+            if let Some(FsNode::File { bytes, .. }) = self.nodes.get(&key) {
+                pin.len = bytes.len() as u64;
+            }
+        }
         if access == Access::DeleteExclusive {
             if self.busy.contains(&key) {
                 return Err("the file is being used by another process (os error 32)".into());
@@ -450,6 +489,41 @@ impl FileView for MemoryFs {
             Some(FsNode::File { .. }) => Ok(()),
             _ => Err("file not found (os error 2)".into()),
         }
+    }
+
+    fn pin_delete_unchanged(&mut self, pin: Pinned, len: u64) -> Result<(), String> {
+        let key = self.pinned_key(&pin)?.to_string();
+        let now = match self.nodes.get(&key) {
+            Some(FsNode::File { bytes, .. }) => bytes.len() as u64,
+            _ => return Err("file not found (os error 2)".into()),
+        };
+        // Up to the deletion mark another program could still add a stream.
+        if self.streams_late.contains(&key) {
+            self.streams.push(key.clone());
+        }
+        if now != len || self.streams.contains(&key) || self.markers.contains(&key) {
+            return Err("it changed while it was being removed, so it was left alone".into());
+        }
+        if self.fail_delete.contains(&key) {
+            return Err("access is denied (os error 5)".into());
+        }
+        self.nodes.remove(&key);
+        Ok(())
+    }
+
+    fn pin_delete_all(&mut self, pins: Vec<Pinned>) -> Result<(), String> {
+        let mut keys = Vec::new();
+        for pin in &pins {
+            let key = self.pinned_key(pin)?.to_string();
+            if self.fail_delete.contains(&key) {
+                return Err(format!("{key}: access is denied (os error 5)"));
+            }
+            keys.push(key);
+        }
+        for key in keys {
+            self.nodes.remove(&key);
+        }
+        Ok(())
     }
 
     fn pin_delete(&mut self, pin: Pinned) -> Result<(), String> {
@@ -680,6 +754,17 @@ fn host_streams(path: &str, allow_marker: bool) -> Result<bool, String> {
 /// marker (Zone.Identifier), read through the handle.
 #[cfg(windows)]
 pub(crate) fn host_handle_streams(file: &std::fs::File) -> Result<bool, String> {
+    host_handle_named_streams(file, true)
+}
+
+/// True when the open file has a named data stream; with `allow_marker`,
+/// the download marker (Zone.Identifier) does not count. Read through the
+/// handle.
+#[cfg(windows)]
+pub(crate) fn host_handle_named_streams(
+    file: &std::fs::File,
+    allow_marker: bool,
+) -> Result<bool, String> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_MORE_DATA};
     use windows_sys::Win32::Storage::FileSystem::{
@@ -728,7 +813,7 @@ pub(crate) fn host_handle_streams(file: &std::fs::File) -> Result<bool, String> 
             .collect();
         let name = String::from_utf16_lossy(&units);
         if !name.eq_ignore_ascii_case("::$DATA")
-            && !name.eq_ignore_ascii_case(":Zone.Identifier:$DATA")
+            && !(allow_marker && name.eq_ignore_ascii_case(":Zone.Identifier:$DATA"))
         {
             return Ok(true);
         }
@@ -928,6 +1013,13 @@ impl FileView for HostFs {
             // Now that nothing else can write it, its age is final.
             pin.age = host::handle_age(&file);
         }
+        if access == Access::ReadDeleteExclusive {
+            // And its length.
+            pin.len = file
+                .metadata()
+                .map(|meta| meta.len())
+                .map_err(|err| err.to_string())?;
+        }
         pin.handle = PinHandle::Host(file);
         Ok(())
     }
@@ -976,6 +1068,68 @@ impl FileView for HostFs {
             return Err("not a host handle".into());
         };
         host::delete(file, &pin.real_path)
+    }
+
+    fn pin_delete_unchanged(&mut self, pin: Pinned, len: u64) -> Result<(), String> {
+        let PinHandle::Host(file) = pin.handle else {
+            return Err("not a host handle".into());
+        };
+        host::set_delete(&file, true).map_err(|err| format!("{}: {err}", pin.real_path))?;
+        // Marked for deletion: nothing new can be opened on it now, so what
+        // is checked here is what goes when the handle closes.
+        let streams = host::handle_streams(&file);
+        let now = file.metadata().map(|meta| meta.len());
+        if streams != Ok(false) || now.as_ref().ok() != Some(&len) {
+            let cleared = host::set_delete(&file, false);
+            drop(file);
+            return Err(match cleared {
+                Ok(()) => "it changed while it was being removed, so it was left alone".into(),
+                Err(err) => format!(
+                    "it changed while it was being removed, and its removal could not be called off: {err}"
+                ),
+            });
+        }
+        drop(file);
+        Ok(())
+    }
+
+    fn pin_delete_all(&mut self, pins: Vec<Pinned>) -> Result<(), String> {
+        let mut files = Vec::new();
+        for pin in pins {
+            let PinHandle::Host(file) = pin.handle else {
+                return Err("not a host handle".into());
+            };
+            files.push((file, pin.real_path));
+        }
+        for index in 0..files.len() {
+            if let Err(err) = host::set_delete(&files[index].0, true) {
+                // Call off every mark made so far: none of the set goes.
+                let mut stuck = Vec::new();
+                for (file, path) in &files[..index] {
+                    if host::set_delete(file, false).is_err() {
+                        stuck.push(path.clone());
+                    }
+                }
+                let path = &files[index].1;
+                return Err(if stuck.is_empty() {
+                    format!("{path}: {err}; nothing in its set was removed")
+                } else {
+                    format!(
+                        "{path}: {err}; and the removal of {} could not be called off",
+                        stuck.join(", ")
+                    )
+                });
+            }
+        }
+        drop(files);
+        Ok(())
+    }
+
+    fn pin_named_streams(&self, pin: &Pinned) -> Result<bool, String> {
+        let PinHandle::Host(file) = &pin.handle else {
+            return Err("not a host handle".into());
+        };
+        host::handle_streams(file)
     }
 
     fn named_streams(&self, path: &str) -> Result<bool, String> {
@@ -1438,10 +1592,13 @@ mod host {
     ) -> Result<std::fs::File, String> {
         let wanted = match access {
             Access::Read => GENERIC_READ | SYNCHRONIZE,
-            Access::ReadDelete => GENERIC_READ | DELETE | SYNCHRONIZE,
+            Access::ReadDelete | Access::ReadDeleteExclusive => GENERIC_READ | DELETE | SYNCHRONIZE,
             Access::Delete | Access::DeleteExclusive => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
         };
-        let share = if access == Access::DeleteExclusive {
+        let share = if matches!(
+            access,
+            Access::DeleteExclusive | Access::ReadDeleteExclusive
+        ) {
             FILE_SHARE_READ
         } else {
             SHARE_ALL
@@ -1510,6 +1667,28 @@ mod host {
 
     /// Mark the pinned object for deletion through its handle; it goes when
     /// the handle closes, here.
+    /// Mark (or unmark) the open file for deletion when its handles close.
+    pub fn set_delete(file: &std::fs::File, on: bool) -> Result<(), String> {
+        let info = FILE_DISPOSITION_INFO { DeleteFile: on };
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as _,
+                FileDispositionInfo,
+                &info as *const _ as *const _,
+                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+            )
+        };
+        if ok == 0 {
+            return Err(last_error());
+        }
+        Ok(())
+    }
+
+    /// Any named data stream, through the handle.
+    pub fn handle_streams(file: &std::fs::File) -> Result<bool, String> {
+        crate::fs::host_handle_named_streams(file, false)
+    }
+
     pub fn delete(file: std::fs::File, path: &str) -> Result<(), String> {
         let info = FILE_DISPOSITION_INFO { DeleteFile: true };
         let ok = unsafe {
@@ -1601,6 +1780,14 @@ mod host {
 
     pub fn write_at(file: &std::fs::File, buf: &[u8], offset: u64) -> std::io::Result<usize> {
         file.write_at(buf, offset)
+    }
+
+    pub fn set_delete(_file: &std::fs::File, _on: bool) -> Result<(), String> {
+        Ok(())
+    }
+
+    pub fn handle_streams(_file: &std::fs::File) -> Result<bool, String> {
+        Ok(false)
     }
 
     pub fn delete(_file: std::fs::File, path: &str) -> Result<(), String> {
@@ -1786,6 +1973,63 @@ mod live_tests {
         let err = at_link_result.err().unwrap_or_default();
         assert!(err.contains("link or junction"), "{err}");
         assert!(!leaked, "something was made through the junction");
+    }
+
+    #[test]
+    fn live_a_set_with_a_read_only_member_is_left_whole() {
+        let dir = std::env::temp_dir().join(format!("hm-set-ro-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let wal = dir.join("History-wal");
+        let db = dir.join("History");
+        std::fs::write(&wal, b"committed frames").unwrap();
+        std::fs::write(&db, b"database").unwrap();
+        let mut perms = std::fs::metadata(&db).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&db, perms).unwrap();
+        let mut fs = HostFs;
+        let mut pins = Vec::new();
+        // The side file first, so its mark is made and must be called off.
+        for path in [&wal, &db] {
+            let mut pin = fs.pin(&path.display().to_string()).unwrap();
+            fs.pin_acquire(&mut pin, Access::DeleteExclusive).unwrap();
+            pins.push(pin);
+        }
+        let result = fs.pin_delete_all(pins);
+        let both = (wal.exists(), db.exists());
+        let mut perms = std::fs::metadata(&db).unwrap().permissions();
+        #[allow(clippy::permissions_set_readonly_false)]
+        perms.set_readonly(false);
+        let _ = std::fs::set_permissions(&db, perms);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(result.is_err(), "a read-only member was deleted");
+        assert_eq!(both, (true, true), "part of the set was removed");
+    }
+
+    #[test]
+    fn live_a_shortcut_that_gains_a_stream_after_its_copy_stays() {
+        let dir = std::env::temp_dir().join(format!("hm-lnk-late-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lnk = dir.join("old.lnk");
+        std::fs::write(&lnk, b"shortcut bytes").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&lnk.display().to_string()).unwrap();
+        fs.pin_acquire(&mut pin, Access::ReadDeleteExclusive)
+            .unwrap();
+        let len = pin.len;
+        // Another program tries to change it while it is held.
+        let wrote_main = std::fs::OpenOptions::new().write(true).open(&lnk).is_ok();
+        let added = std::fs::write(format!("{}:late", lnk.display()), b"x").is_ok();
+        let result = fs.pin_delete_unchanged(pin, len);
+        let still_there = lnk.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(!wrote_main, "the main data could be written while held");
+        if added {
+            assert!(result.is_err(), "a shortcut with a new stream was deleted");
+            assert!(still_there);
+        } else {
+            assert!(result.is_ok(), "{result:?}");
+            assert!(!still_there);
+        }
     }
 
     #[test]

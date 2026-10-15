@@ -1862,14 +1862,20 @@ fn delete_file_set(
         }
         held.push((path.clone(), bytes, pin));
     }
-    for (path, bytes, pin) in held {
-        match fs.pin_delete(pin) {
-            Ok(()) => {
-                done.files += 1;
-                done.bytes += bytes;
-            }
-            Err(err) => errors.push(format!("{path}: {err}")),
+    // All marked for deletion together, or none: a set is never left with
+    // its database but without the journal or log it still needs.
+    let count = held.len();
+    let bytes: u64 = held.iter().map(|(_, bytes, _)| bytes).sum();
+    let first = held
+        .first()
+        .map(|(path, _, _)| path.clone())
+        .unwrap_or_default();
+    match fs.pin_delete_all(held.into_iter().map(|(_, _, pin)| pin).collect()) {
+        Ok(()) => {
+            done.files += count;
+            done.bytes += bytes;
         }
+        Err(err) => errors.push(format!("{first} and its side files: {err}")),
     }
 }
 
@@ -2921,6 +2927,38 @@ mod tests {
             "{:?}",
             done.restricted
         );
+    }
+
+    #[test]
+    fn a_set_member_that_cannot_be_deleted_keeps_the_whole_set() {
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        for failing in ["History", "History-wal"] {
+            let mut reg = seed_reg();
+            let mut fs = seed_fs();
+            // A read-only member: its deletion mark fails after every
+            // member was taken.
+            fs.set_fail_delete(&format!(r"{profile}\{failing}"));
+            let mut sys = FakeSys::default();
+            let mut backup = crate::backup::test_writer("hive-mend-privacy-set-fail");
+            let outcome = clean_with_progress(
+                &mut reg,
+                &mut fs,
+                &mut sys,
+                &quiet(),
+                &[builtin("chrome-data")],
+                &mut backup,
+                &mut |_, _, _| true,
+            )
+            .unwrap();
+            let _ = std::fs::remove_file(backup.path());
+            assert!(fs.exists(&format!(r"{profile}\History")), "{failing}");
+            assert!(fs.exists(&format!(r"{profile}\History-wal")), "{failing}");
+            assert!(
+                outcome.errors.iter().any(|err| err.contains("side files")),
+                "{failing}: {:?}",
+                outcome.errors
+            );
+        }
     }
 
     #[test]
