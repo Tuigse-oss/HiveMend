@@ -85,6 +85,10 @@ pub enum Access {
     ReadDelete,
     /// Delete only.
     Delete,
+    /// Delete, with only reading shared: refused while another program
+    /// has the file open to write or delete it, and no other program can
+    /// write to it while held. The pin's age is read again through it.
+    DeleteExclusive,
 }
 
 /// A file or folder opened by handle and identified. Every change goes
@@ -232,6 +236,10 @@ pub struct MemoryFs {
     streams: Vec<String>,
     /// Files with only the download marker (Zone.Identifier).
     markers: Vec<String>,
+    /// Files another program holds open to write: exclusive access fails.
+    busy: Vec<String>,
+    /// Files written after they were pinned: exclusive access sees a fresh age.
+    written_since: Vec<String>,
 }
 
 impl MemoryFs {
@@ -253,6 +261,16 @@ impl MemoryFs {
     /// Make `alias` (and everything under it) resolve to `real` when pinned.
     pub fn add_alias(&mut self, alias: &str, real: &str) {
         self.aliases.push((norm(alias), norm(real)));
+    }
+
+    /// Have another program hold `path` open for writing.
+    pub fn set_busy(&mut self, path: &str) {
+        self.busy.push(norm(path));
+    }
+
+    /// Have `path` written after it is pinned and before it is deleted.
+    pub fn set_written_since(&mut self, path: &str) {
+        self.written_since.push(norm(path));
     }
 
     /// Give a file the download marker (Zone.Identifier) and no other stream.
@@ -368,13 +386,20 @@ impl FileView for MemoryFs {
         })
     }
 
-    fn pin_acquire(&mut self, pin: &mut Pinned, _access: Access) -> Result<(), String> {
-        let key = self.pinned_key(pin)?;
-        if self.nodes.contains_key(key) {
-            Ok(())
-        } else {
-            Err("file not found (os error 2)".into())
+    fn pin_acquire(&mut self, pin: &mut Pinned, access: Access) -> Result<(), String> {
+        let key = self.pinned_key(pin)?.to_string();
+        if !self.nodes.contains_key(&key) {
+            return Err("file not found (os error 2)".into());
         }
+        if access == Access::DeleteExclusive {
+            if self.busy.contains(&key) {
+                return Err("the file is being used by another process (os error 32)".into());
+            }
+            if self.written_since.contains(&key) {
+                pin.age = Some(Duration::ZERO);
+            }
+        }
+        Ok(())
     }
 
     fn pin_read_at(&self, pin: &Pinned, offset: u64, len: usize) -> Option<Vec<u8>> {
@@ -686,6 +711,10 @@ impl FileView for HostFs {
             return Err("not a host handle".into());
         };
         let file = host::reopen(file, pin.kind, access, &pin.real_path)?;
+        if access == Access::DeleteExclusive {
+            // Now that nothing else can write it, its age is final.
+            pin.age = host::handle_age(&file);
+        }
         pin.handle = PinHandle::Host(file);
         Ok(())
     }
@@ -1055,7 +1084,12 @@ mod host {
         let wanted = match access {
             Access::Read => GENERIC_READ | SYNCHRONIZE,
             Access::ReadDelete => GENERIC_READ | DELETE | SYNCHRONIZE,
-            Access::Delete => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            Access::Delete | Access::DeleteExclusive => DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+        };
+        let share = if access == Access::DeleteExclusive {
+            FILE_SHARE_READ
+        } else {
+            SHARE_ALL
         };
         if kind == ItemKind::Dir {
             // ReOpenFile refuses directory handles, so open the real path
@@ -1063,7 +1097,7 @@ mod host {
             // if it is the very object still held open by the pin.
             let again = std::fs::OpenOptions::new()
                 .access_mode(wanted)
-                .share_mode(SHARE_ALL)
+                .share_mode(share)
                 .custom_flags(FLAGS)
                 .open(real_path)
                 .map_err(|err| err.to_string())?;
@@ -1076,7 +1110,7 @@ mod host {
             ReOpenFile(
                 file.as_raw_handle() as _,
                 wanted,
-                SHARE_ALL,
+                share,
                 FILE_FLAG_OPEN_REPARSE_POINT,
             )
         };
@@ -1084,6 +1118,18 @@ mod host {
             return Err(last_error());
         }
         Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+    }
+
+    /// How long ago the open file was last written.
+    pub fn handle_age(file: &std::fs::File) -> Option<std::time::Duration> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return None;
+        }
+        filetime_age(
+            ((info.ftLastWriteTime.dwHighDateTime as u64) << 32)
+                | info.ftLastWriteTime.dwLowDateTime as u64,
+        )
     }
 
     /// Volume serial and file index: the identity of an open object.
@@ -1181,6 +1227,13 @@ mod host {
         file.try_clone().map_err(|err| err.to_string())
     }
 
+    pub fn handle_age(file: &std::fs::File) -> Option<std::time::Duration> {
+        file.metadata()
+            .ok()
+            .and_then(|meta| meta.modified().ok())
+            .and_then(|when| when.elapsed().ok())
+    }
+
     pub fn read_at(file: &std::fs::File, buf: &mut [u8], offset: u64) -> std::io::Result<usize> {
         file.read_at(buf, offset)
     }
@@ -1240,6 +1293,46 @@ mod live_tests {
             age < Duration::from_secs(120),
             "a new file looked {age:?} old"
         );
+    }
+
+    #[test]
+    fn live_exclusive_delete_refuses_an_open_writer_and_rereads_the_age() {
+        let dir = std::env::temp_dir();
+        let pid = std::process::id();
+        let old = std::time::SystemTime::now() - Duration::from_secs(3 * 24 * 3600);
+        let busy = dir.join(format!("hm-excl-busy-{pid}.tmp"));
+        let written = dir.join(format!("hm-excl-written-{pid}.tmp"));
+        for path in [&busy, &written] {
+            let file = std::fs::File::create(path).unwrap();
+            file.set_modified(old).unwrap();
+        }
+        let mut fs = HostFs;
+        // Another program has it open for writing: exclusive access fails.
+        let writer = std::fs::OpenOptions::new().write(true).open(&busy).unwrap();
+        let mut pin = fs.pin(&busy.display().to_string()).expect("pin");
+        let refused = fs.pin_acquire(&mut pin, Access::DeleteExclusive);
+        drop(pin);
+        drop(writer);
+        // Old when pinned, written before the exclusive open: the age is new.
+        let mut pin = fs.pin(&written.display().to_string()).expect("pin");
+        let pinned_age = pin.age;
+        std::fs::write(&written, b"new").unwrap();
+        let taken = fs.pin_acquire(&mut pin, Access::DeleteExclusive);
+        let fresh_age = pin.age;
+        // Held exclusively, nobody else can open it to write.
+        let blocked = std::fs::OpenOptions::new().write(true).open(&written);
+        drop(pin);
+        let _ = std::fs::remove_file(&busy);
+        let _ = std::fs::remove_file(&written);
+        let err = refused.expect_err("an open writer was not noticed");
+        assert!(err.contains("os error 32"), "{err}");
+        assert!(pinned_age.unwrap() > Duration::from_secs(2 * 24 * 3600));
+        taken.expect("exclusive open");
+        assert!(
+            fresh_age.unwrap() < Duration::from_secs(120),
+            "{fresh_age:?}"
+        );
+        assert!(blocked.is_err(), "a writer got in while it was held");
     }
 
     #[test]

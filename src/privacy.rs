@@ -1449,22 +1449,8 @@ fn execute_item(
                         continue;
                     }
                     for name in names {
-                        for path in with_sidecars(&dir, name, *sidecars) {
-                            if fs.is_dir(&path) {
-                                done.note(format!("not a file: {path}"));
-                                continue;
-                            }
-                            if !fs.exists(&path) {
-                                continue;
-                            }
-                            let bytes = fs.len(&path).unwrap_or(0);
-                            let hit = FileHit {
-                                path,
-                                bytes,
-                                min_age: None,
-                            };
-                            delete_file(fs, &dir, &hit, &mut done, errors);
-                        }
+                        let set = with_sidecars(&dir, name, *sidecars);
+                        delete_file_set(fs, &dir, &set, &mut done, errors);
                     }
                 }
             }
@@ -1489,18 +1475,8 @@ fn execute_item(
                             trim_cookie_db(fs, &dir, &db, sites, &mut done, errors);
                         }
                         _ => {
-                            for path in with_sidecars(&dir, &db[dir.len() + 1..], true) {
-                                if !fs.exists(&path) || fs.is_dir(&path) {
-                                    continue;
-                                }
-                                let bytes = fs.len(&path).unwrap_or(0);
-                                let hit = FileHit {
-                                    path,
-                                    bytes,
-                                    min_age: None,
-                                };
-                                delete_file(fs, &dir, &hit, &mut done, errors);
-                            }
+                            let set = with_sidecars(&dir, &db[dir.len() + 1..], true);
+                            delete_file_set(fs, &dir, &set, &mut done, errors);
                         }
                     }
                 }
@@ -1655,17 +1631,6 @@ fn delete_file(
         done.note(format!("not a file: {}", hit.path));
         return;
     }
-    // A file listed for being old must still be old: it may have been
-    // written to, or replaced by a new file, since it was listed.
-    if let Some(min) = hit.min_age
-        && !pin.age.is_some_and(|age| age >= min)
-    {
-        done.note(format!(
-            "changed since it was listed, left alone: {}",
-            hit.path
-        ));
-        return;
-    }
     let real_root = fs
         .pin(root)
         .map(|pin| pin.real_path)
@@ -1677,9 +1642,25 @@ fn delete_file(
         ));
         return;
     }
-    let result = fs
-        .pin_acquire(&mut pin, Access::Delete)
-        .and_then(|()| fs.pin_delete(pin));
+    // A file listed for being old is taken so nothing else can write it,
+    // then its age is read again: written to, or replaced, since it was
+    // listed, or busy now, and it stays.
+    let result = if let Some(min) = hit.min_age {
+        match fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
+            Ok(()) if !pin.age.is_some_and(|age| age >= min) => {
+                done.note(format!(
+                    "changed since it was listed, left alone: {}",
+                    hit.path
+                ));
+                return;
+            }
+            Ok(()) => fs.pin_delete(pin),
+            Err(err) => Err(err),
+        }
+    } else {
+        fs.pin_acquire(&mut pin, Access::Delete)
+            .and_then(|()| fs.pin_delete(pin))
+    };
     match result {
         Ok(()) => {
             done.files += 1;
@@ -1697,6 +1678,74 @@ fn delete_file(
             done.note(format!("{}: {}", hit.path, short_reason(&err)));
         }
         Err(err) => errors.push(format!("{}: {err}", hit.path)),
+    }
+}
+
+/// Delete a database and its side files together, or none of them: every
+/// member present is checked and taken exclusively first, so if a program
+/// (a browser) has any of them open, the whole set is left alone and is
+/// never left half-removed.
+fn delete_file_set(
+    fs: &mut dyn FileView,
+    root: &str,
+    paths: &[String],
+    done: &mut ItemOutcome,
+    errors: &mut Vec<String>,
+) {
+    let mut held = Vec::new();
+    for path in paths {
+        if fs.is_dir(path) {
+            done.note(format!("not a file: {path}"));
+            return;
+        }
+        if !fs.exists(path) {
+            continue;
+        }
+        if !privacy_file_allowed(fs, root, path) {
+            done.note(format!("refused: {path}"));
+            return;
+        }
+        let mut pin = match fs.pin(path) {
+            Ok(pin) => pin,
+            Err(err) if err.contains("not found") || err.contains("os error 2") => continue,
+            Err(err) => {
+                done.note(format!("refused: {path}: {err}"));
+                return;
+            }
+        };
+        if pin.kind != ItemKind::File {
+            done.note(format!("not a file: {path}"));
+            return;
+        }
+        let real_root = fs
+            .pin(root)
+            .map(|pin| pin.real_path)
+            .unwrap_or_else(|_| root.to_string());
+        if !privacy_file_allowed(fs, &real_root, &pin.real_path) {
+            done.note(format!(
+                "refused: {path} (it resolves to {})",
+                pin.real_path
+            ));
+            return;
+        }
+        let bytes = pin.len;
+        if let Err(err) = fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
+            done.note(format!(
+                "{path}: {}, so its set was left alone",
+                short_reason(&err)
+            ));
+            return;
+        }
+        held.push((path.clone(), bytes, pin));
+    }
+    for (path, bytes, pin) in held {
+        match fs.pin_delete(pin) {
+            Ok(()) => {
+                done.files += 1;
+                done.bytes += bytes;
+            }
+            Err(err) => errors.push(format!("{path}: {err}")),
+        }
     }
 }
 
@@ -2632,6 +2681,85 @@ mod tests {
         );
         assert!(!fs.exists(&format!(r"{temp}\old.tmp")));
         assert_eq!(done.files, 1);
+    }
+
+    #[test]
+    fn an_old_file_written_or_opened_after_listing_is_left_alone() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for name in ["written.tmp", "busy.tmp", "old.tmp"] {
+            fs.add_file_bytes(&format!(r"{temp}\{name}"), vec![1; 8], Some(day * 3));
+        }
+        // Old when pinned, written between the pin and the exclusive open.
+        fs.set_written_since(&format!(r"{temp}\written.tmp"));
+        // Held open by another program for writing.
+        fs.set_busy(&format!(r"{temp}\busy.tmp"));
+        let mut done = ItemOutcome::blank("user-temp");
+        let mut errors = Vec::new();
+        for name in ["written.tmp", "busy.tmp", "old.tmp"] {
+            let hit = FileHit {
+                path: format!(r"{temp}\{name}"),
+                bytes: 8,
+                min_age: Some(day * 2),
+            };
+            delete_file(&mut fs, temp, &hit, &mut done, &mut errors);
+        }
+        assert!(fs.exists(&format!(r"{temp}\written.tmp")));
+        assert!(fs.exists(&format!(r"{temp}\busy.tmp")));
+        assert!(!fs.exists(&format!(r"{temp}\old.tmp")));
+        assert_eq!(done.files, 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            done.restricted
+                .iter()
+                .any(|note| note.contains("busy.tmp") && note.contains("in use")),
+            "{:?}",
+            done.restricted
+        );
+    }
+
+    #[test]
+    fn a_browser_database_with_any_member_in_use_is_left_whole() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        fs.add_file_bytes(
+            &format!(r"{profile}\Network\Cookies-journal"),
+            vec![0; 2],
+            None,
+        );
+        // The side file is open (the browser came back): neither goes.
+        fs.set_busy(&format!(r"{profile}\Network\Cookies-journal"));
+        // History's sidecar is open: History stays too.
+        fs.set_busy(&format!(r"{profile}\History-wal"));
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-set-in-use");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("chrome-data")],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(fs.exists(&format!(r"{profile}\Network\Cookies")));
+        assert!(fs.exists(&format!(r"{profile}\Network\Cookies-journal")));
+        assert!(fs.exists(&format!(r"{profile}\History")));
+        assert!(fs.exists(&format!(r"{profile}\History-wal")));
+        assert_eq!(outcome.items[0].files, 0);
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("Cookies-journal") && note.contains("in use")),
+            "{:?}",
+            outcome.items[0].restricted
+        );
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
