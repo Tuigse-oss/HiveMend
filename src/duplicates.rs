@@ -97,9 +97,10 @@ pub struct DupReport {
 /// How many leading bytes are compared before reading whole files.
 const PREFIX: u64 = 64 * 1024;
 
-/// The most files one search keeps as possible copies (about 200 MB of
-/// paths at most); past it the search compares what it has and says it is
-/// incomplete.
+/// The most files one search keeps as possible copies, with the path
+/// bytes it keeps (candidates and queued folders) capped at
+/// [`crate::diskspace::MAX_RETAINED_BYTES`]; past either the search compares
+/// what it has and says it is incomplete.
 pub const MAX_CANDIDATES: usize = 1_000_000;
 
 /// Folder names never searched: Windows' own bookkeeping.
@@ -143,6 +144,7 @@ fn find_within(
     };
     let mut by_size: BTreeMap<u64, Vec<String>> = BTreeMap::new();
     let mut kept = 0usize;
+    let mut retained = 0usize;
     let mut folders = 1usize;
     let mut pending = vec![root];
     while let Some(dir) = pending.pop() {
@@ -172,7 +174,8 @@ fn find_within(
                     .any(|name| name.eq_ignore_ascii_case(&entry.name))
                     || protected.iter().any(|root| path_under(&path, root));
                 if !skipped {
-                    if folders >= max_folders {
+                    retained += path.len();
+                    if folders >= max_folders || retained > crate::diskspace::MAX_RETAINED_BYTES {
                         report.incomplete = true;
                         return false;
                     }
@@ -182,7 +185,8 @@ fn find_within(
             } else {
                 report.files_seen += 1;
                 if entry.bytes >= min_bytes.max(1) {
-                    if kept >= max_candidates {
+                    retained += path.len();
+                    if kept >= max_candidates || retained > crate::diskspace::MAX_RETAINED_BYTES {
                         report.incomplete = true;
                         return false;
                     }

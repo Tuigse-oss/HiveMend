@@ -160,9 +160,11 @@ impl DiskReport {
 /// How many of the largest files a report keeps.
 pub const LARGEST_KEPT: usize = 100;
 
-/// The most folders one walk keeps in its tree (about 150 MB at most);
-/// past it the walk stops and says the report is incomplete.
+/// The most folders one walk keeps in its tree, and the most bytes of
+/// folder names and queued paths it keeps (long paths count in full); past
+/// either the walk stops and says the report is incomplete.
 pub const MAX_FOLDERS: usize = 1_000_000;
+pub const MAX_RETAINED_BYTES: usize = 256 * 1024 * 1024;
 
 /// Walk `root`. `progress(files, bytes, folder)` is called for each folder,
 /// and every [`CHECK_EVERY`] entries inside a large one, with the totals so
@@ -198,6 +200,7 @@ fn analyze_within(
     let mut bytes_seen = 0u64;
     // (node, path) to visit, depth first.
     let mut pending = vec![(0usize, root.clone())];
+    let mut retained = root.len();
     while let Some((node, path)) = pending.pop() {
         if !progress(files_seen, bytes_seen, &path) {
             report.canceled = true;
@@ -221,7 +224,8 @@ fn analyze_within(
                     report.links_skipped += 1;
                     return true;
                 }
-                if report.nodes.len() >= max_folders {
+                retained += entry.name.len() + full.len();
+                if report.nodes.len() >= max_folders || retained > MAX_RETAINED_BYTES {
                     report.incomplete = true;
                     stop = true;
                     return false;

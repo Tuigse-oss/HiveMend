@@ -723,12 +723,18 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
     (dirs, notes)
 }
 
+/// The most profile folders looked at under one folder.
+const MAX_PROFILES: usize = 1_000;
+
 fn child_dirs(fs: &dyn FileView, dir: &str) -> Vec<String> {
-    fs.list(dir)
-        .into_iter()
-        .filter(|item| item.kind == ItemKind::Dir)
-        .map(|item| format!("{dir}\\{}", item.name))
-        .collect()
+    let mut dirs = Vec::new();
+    fs.list_each(dir, &mut |item| {
+        if item.kind == ItemKind::Dir {
+            dirs.push(format!("{dir}\\{}", item.name));
+        }
+        dirs.len() < MAX_PROFILES
+    });
+    dirs
 }
 
 /// Firefox profiles from `profiles.ini` plus the `Profiles` folder, so a
@@ -1003,6 +1009,7 @@ fn preview_target(
                     continue;
                 }
                 let mut counted = (0usize, 0u64);
+                let mut budget = WalkBudget::new();
                 let finished = walk_files(
                     fs,
                     &dir,
@@ -1016,11 +1023,16 @@ fn preview_target(
                         true
                     },
                     keep_going,
+                    &mut budget,
                     row,
                 );
                 row.files += counted.0;
                 row.bytes += counted.1;
-                if !finished {
+                if budget.exhausted {
+                    row.note(format!(
+                        "{dir}: more than {MAX_WALK_FOLDERS} folders; only part of it was counted"
+                    ));
+                } else if !finished {
                     return false;
                 }
             }
@@ -1139,9 +1151,30 @@ struct FileHit {
     min_age: Option<Duration>,
 }
 
-/// The most files one clean takes from one folder walk; past it the rest
-/// are left for another run, and the clean says so.
+/// The most files one clean takes from one folder walk, and the most bytes
+/// of their paths; past either the rest are left for another run, and the
+/// clean says so.
 const MAX_WALK_HITS: usize = 100_000;
+const MAX_WALK_HIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most folders one walk visits or queues; past it the walk stops and
+/// says it covered only part.
+const MAX_WALK_FOLDERS: usize = 100_000;
+
+/// Folders a walk may still queue, and whether it ran out.
+struct WalkBudget {
+    folders_left: usize,
+    exhausted: bool,
+}
+
+impl WalkBudget {
+    fn new() -> Self {
+        Self {
+            folders_left: MAX_WALK_FOLDERS,
+            exhausted: false,
+        }
+    }
+}
 
 /// Walk `dir` for files matching `mask`, one entry at a time, handing each
 /// to `on_hit` (false stops the walk). `keep_going` is asked for every
@@ -1157,6 +1190,7 @@ fn walk_files(
     depth: usize,
     on_hit: &mut dyn FnMut(FileHit) -> bool,
     keep_going: &mut dyn FnMut() -> bool,
+    budget: &mut WalkBudget,
     row: &mut PreviewItem,
 ) -> bool {
     if depth > 64 {
@@ -1202,6 +1236,12 @@ fn walk_files(
             }
             ItemKind::Dir => {
                 if recursive {
+                    if budget.folders_left == 0 {
+                        budget.exhausted = true;
+                        going = false;
+                        return false;
+                    }
+                    budget.folders_left -= 1;
                     subdirs.push(path);
                 }
             }
@@ -1222,6 +1262,7 @@ fn walk_files(
             depth + 1,
             on_hit,
             keep_going,
+            budget,
             row,
         ) {
             return false;
@@ -1257,6 +1298,8 @@ pub struct ItemOutcome {
     pub skipped_running: bool,
     pub gated_out: bool,
     pub note: String,
+    /// Cancel stopped this category part way; the rest of it was left.
+    pub canceled: bool,
 }
 
 impl ItemOutcome {
@@ -1373,19 +1416,26 @@ pub fn clean_with_progress(
                     done += 1;
                     continue;
                 }
-                outcome.items.push(execute_item(
+                let step = execute_item(
                     reg,
                     fs,
                     sys,
                     procs,
+                    &mut || progress(done, total, &item.name),
                     item,
                     &repairs,
                     pre,
                     backup,
                     &mut entry,
                     &mut outcome.errors,
-                ));
+                );
+                let canceled = step.canceled;
+                outcome.items.push(step);
                 done += 1;
+                if canceled {
+                    outcome.canceled = true;
+                    return Ok(outcome);
+                }
             }
         }
     }
@@ -1451,6 +1501,7 @@ fn execute_item(
     fs: &mut dyn FileView,
     sys: &mut dyn SystemTargets,
     procs: &dyn ProcessList,
+    keep_going: &mut dyn FnMut() -> bool,
     item: &PrivacyItem,
     repairs: &[PlannedRepair],
     pre: Vec<String>,
@@ -1506,6 +1557,8 @@ fn execute_item(
                     }
                     let mut counter = PreviewItem::blank(&item.id);
                     let mut hits = Vec::new();
+                    let mut hit_bytes = 0usize;
+                    let mut budget = WalkBudget::new();
                     let finished = walk_files(
                         fs,
                         &dir,
@@ -1514,22 +1567,40 @@ fn execute_item(
                         *min_age,
                         0,
                         &mut |hit| {
+                            hit_bytes += hit.path.len();
                             hits.push(hit);
-                            hits.len() < MAX_WALK_HITS
+                            hits.len() < MAX_WALK_HITS && hit_bytes < MAX_WALK_HIT_BYTES
                         },
-                        &mut || true,
+                        keep_going,
+                        &mut budget,
                         &mut counter,
                     );
-                    if !finished {
-                        done.note(format!(
-                            "{dir}: more than {MAX_WALK_HITS} files; the rest were left for another clean"
-                        ));
-                    }
                     for note in counter.restricted {
                         done.note(note);
                     }
                     done.restricted_extra += counter.restricted_extra;
-                    for hit in hits {
+                    if budget.exhausted {
+                        done.note(format!(
+                            "{dir}: more than {MAX_WALK_FOLDERS} folders; the rest were left for another clean"
+                        ));
+                    } else if !finished
+                        && hits.len() < MAX_WALK_HITS
+                        && hit_bytes < MAX_WALK_HIT_BYTES
+                    {
+                        // Canceled while listing: nothing from this walk goes.
+                        done.canceled = true;
+                        return done;
+                    } else if !finished {
+                        done.note(format!(
+                            "{dir}: more than {} files; the rest were left for another clean",
+                            hits.len()
+                        ));
+                    }
+                    for (index, hit) in hits.into_iter().enumerate() {
+                        if index % 256 == 255 && !keep_going() {
+                            done.canceled = true;
+                            return done;
+                        }
                         delete_file(fs, &dir, &hit, &mut done, errors);
                     }
                 }
@@ -3035,6 +3106,68 @@ mod tests {
     }
 
     #[test]
+    fn a_walk_out_of_folders_stops_and_says_so() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        for index in 0..50 {
+            fs.add_dir(&format!(r"{temp}\d{index}"));
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut budget = WalkBudget {
+            folders_left: 5,
+            exhausted: false,
+        };
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |_| true,
+            &mut || true,
+            &mut budget,
+            &mut row,
+        );
+        assert!(!finished);
+        assert!(budget.exhausted);
+    }
+
+    #[test]
+    fn cancel_stops_a_clean_inside_a_large_folder() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for index in 0..20_000 {
+            fs.add_file_bytes(&format!(r"{temp}\c{index}.tmp"), vec![0], Some(day * 9));
+        }
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-inside");
+        let mut calls = 0;
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut backup,
+            // Yes for the category itself and the start of its walk; no
+            // from the first check inside the folder.
+            &mut |_, _, _| {
+                calls += 1;
+                calls <= 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert_eq!(outcome.items[0].files, 0, "files went after Cancel");
+        assert!(fs.exists(&format!(r"{temp}\c19999.tmp")));
+    }
+
+    #[test]
     fn a_walk_stops_when_its_files_are_enough() {
         let mut fs = MemoryFs::with_windows_dirs();
         let temp = r"C:\Users\test\AppData\Local\Temp";
@@ -3055,6 +3188,7 @@ mod tests {
                 hits.len() < 10
             },
             &mut || true,
+            &mut WalkBudget::new(),
             &mut row,
         );
         assert!(!finished);

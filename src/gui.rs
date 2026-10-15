@@ -1081,7 +1081,6 @@ impl App {
         // An administrator window takes no policy from the per-user folder,
         // which programs running without elevation can change: it starts
         // from the built-in settings (restore points on) and never saves.
-        // The ignore list is still read, since it can only hide entries.
         let settings = if elevated {
             Settings::default()
         } else {
@@ -1581,9 +1580,12 @@ impl App {
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
+        // An administrator window never looks at the keep list, not even
+        // its timestamp: its Privacy page does not depend on that file.
         if page == Page::Privacy
             && !self.busy()
-            && (self.priv_items.is_empty() || self.priv_keep_stamp != keep_list_stamp())
+            && (self.priv_items.is_empty()
+                || (!self.elevated && self.priv_keep_stamp != keep_list_stamp()))
         {
             self.rebuild_privacy();
         }
@@ -1708,11 +1710,8 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping the scan...");
                     self.show_progress();
-                } else if self.job == Job::Cleaning {
-                    CANCEL.store(true, Ordering::SeqCst);
-                    progress_text("Stopping after this category...");
-                    self.show_progress();
-                } else if self.job == Job::Analyzing
+                } else if self.job == Job::Cleaning
+                    || self.job == Job::Analyzing
                     || self.job == Job::Finding
                     || self.job == Job::Previewing
                 {
@@ -2767,71 +2766,10 @@ impl App {
     // ---- privacy ----
 
     fn rebuild_privacy(&mut self) {
-        let mut items = build_items();
-        // The custom list and the remembered ticks live in the per-user
-        // folder, which programs running without elevation can edit. An
-        // elevated window acts on neither: it starts with nothing ticked and
-        // shows why the custom list is left out.
-        if self.elevated {
-            if custom_privacy_file().exists() {
-                let mut custom = parse_custom("", &HostFs);
-                custom.warnings.push(
-                    "Custom items are not used while Hivemend runs as administrator. Start it without administrator rights to clean them."
-                        .to_string(),
-                );
-                items.push(custom);
-            }
-        } else if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
-            let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
-            if !custom.targets.is_empty() || !custom.warnings.is_empty() {
-                items.push(custom);
-            }
-        }
-        // Cookies to keep. The list only ever spares cookies, but an
-        // elevated window edits no database in a folder a normal program can
-        // change: with a list, it leaves cookies alone instead.
-        self.priv_keep_stamp = keep_list_stamp();
-        if self.elevated {
-            hive_mend::leave_per_user_registry(&mut items);
-        }
-        // An administrator window reads no per-user policy: it leaves browser
-        // data alone entirely, without looking at the keep list.
-        let (keep, warnings) = if self.elevated {
-            hive_mend::leave_browsers_alone(&mut items);
-            (
-                hive_mend::CookieKeep::LeaveAlone(
-                    "Browser data is cleaned from Hivemend started without administrator rights."
-                        .to_string(),
-                ),
-                Vec::new(),
-            )
-        } else {
-            hive_mend::cookie_keep_choice(
-                std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned),
-                false,
-            )
-        };
-        hive_mend::set_cookie_keep(&mut items, &keep);
-        for item in items.iter_mut().filter(|item| {
-            item.targets
-                .iter()
-                .any(|target| matches!(target, hive_mend::PrivacyTarget::Cookies { .. }))
-        }) {
-            item.warnings.extend(
-                warnings
-                    .iter()
-                    .map(|warning| format!("cookies-keep.txt {warning}")),
-            );
-        }
-        let ticked: Vec<String> = if self.elevated {
-            Vec::new()
-        } else {
-            self.settings.privacy_ticked.clone()
-        };
-        self.priv_checked = items
-            .iter()
-            .map(|item| ticked.iter().any(|id| id == &item.id))
-            .collect();
+        let ticked = self.settings.privacy_ticked.clone();
+        let (items, checked, stamp) = privacy_plan(self.elevated, &mut PolicyOnDisk, &ticked);
+        self.priv_keep_stamp = stamp;
+        self.priv_checked = checked;
         self.priv_items = items;
         self.priv_preview = None;
         self.priv_outcome = None;
@@ -7958,6 +7896,88 @@ fn copy_text(hwnd: HWND, value: &str) {
 /// Queue a shell open for after the handler returns: ShellExecuteW can pump
 /// messages (its own error dialog, a DDE or COM wait).
 /// When the cookies-to-keep list last changed, or None if there is none.
+/// The per-user files Privacy reads: the custom list, the cookies-to-keep
+/// list, and the keep list's timestamp.
+trait PolicyFiles {
+    fn custom(&mut self) -> std::io::Result<Vec<u8>>;
+    fn keep(&mut self) -> std::io::Result<String>;
+    fn keep_stamp(&mut self) -> Option<std::time::SystemTime>;
+}
+
+struct PolicyOnDisk;
+
+impl PolicyFiles for PolicyOnDisk {
+    fn custom(&mut self) -> std::io::Result<Vec<u8>> {
+        std::fs::read(custom_privacy_file())
+    }
+    fn keep(&mut self) -> std::io::Result<String> {
+        std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned)
+    }
+    fn keep_stamp(&mut self) -> Option<std::time::SystemTime> {
+        keep_list_stamp()
+    }
+}
+
+/// The Privacy page's categories, which are ticked, and the keep list's
+/// timestamp. The custom list, the remembered ticks, and the keep list live
+/// in the per-user folder, which programs running without elevation can
+/// edit: an elevated window touches none of them, not even to see whether
+/// they exist. It starts with nothing ticked and says why custom items and
+/// browser data are left out.
+fn privacy_plan(
+    elevated: bool,
+    files: &mut dyn PolicyFiles,
+    ticked: &[String],
+) -> (Vec<PrivacyItem>, Vec<bool>, Option<std::time::SystemTime>) {
+    let mut items = build_items();
+    if elevated {
+        let mut custom = parse_custom("", &HostFs);
+        custom.warnings.push(
+            "Custom items are not used while Hivemend runs as administrator. Start it without administrator rights to clean them."
+                .to_string(),
+        );
+        items.push(custom);
+    } else if let Ok(bytes) = files.custom() {
+        let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
+        if !custom.targets.is_empty() || !custom.warnings.is_empty() {
+            items.push(custom);
+        }
+    }
+    let stamp = if elevated { None } else { files.keep_stamp() };
+    if elevated {
+        hive_mend::leave_per_user_registry(&mut items);
+    }
+    let (keep, warnings) = if elevated {
+        hive_mend::leave_browsers_alone(&mut items);
+        (
+            hive_mend::CookieKeep::LeaveAlone(
+                "Browser data is cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            ),
+            Vec::new(),
+        )
+    } else {
+        hive_mend::cookie_keep_choice(files.keep(), false)
+    };
+    hive_mend::set_cookie_keep(&mut items, &keep);
+    for item in items.iter_mut().filter(|item| {
+        item.targets
+            .iter()
+            .any(|target| matches!(target, hive_mend::PrivacyTarget::Cookies { .. }))
+    }) {
+        item.warnings.extend(
+            warnings
+                .iter()
+                .map(|warning| format!("cookies-keep.txt {warning}")),
+        );
+    }
+    let checked = items
+        .iter()
+        .map(|item| !elevated && ticked.iter().any(|id| id == &item.id))
+        .collect();
+    (items, checked, stamp)
+}
+
 fn keep_list_stamp() -> Option<std::time::SystemTime> {
     std::fs::metadata(hive_mend::cookies_keep_file())
         .and_then(|meta| meta.modified())
@@ -8086,6 +8106,44 @@ fn exe_path() -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts every look at the per-user files and gives fixed contents.
+    #[derive(Default)]
+    struct Watched {
+        looks: usize,
+    }
+
+    impl PolicyFiles for Watched {
+        fn custom(&mut self) -> std::io::Result<Vec<u8>> {
+            self.looks += 1;
+            Ok(b"file=%TEMP%\\x.tmp\r\n".to_vec())
+        }
+        fn keep(&mut self) -> std::io::Result<String> {
+            self.looks += 1;
+            Ok("github.com\r\n".into())
+        }
+        fn keep_stamp(&mut self) -> Option<std::time::SystemTime> {
+            self.looks += 1;
+            Some(std::time::SystemTime::now())
+        }
+    }
+
+    #[test]
+    fn an_administrator_privacy_page_never_looks_at_per_user_files() {
+        let mut files = Watched::default();
+        let ticked = vec!["user-temp".to_string(), "chrome-data".to_string()];
+        let (items, checked, stamp) = privacy_plan(true, &mut files, &ticked);
+        assert_eq!(files.looks, 0, "a per-user file was read or checked");
+        assert!(stamp.is_none());
+        assert!(checked.iter().all(|on| !on), "remembered ticks were used");
+        let custom = items.iter().find(|item| item.id == "custom").unwrap();
+        assert!(custom.targets.is_empty());
+        // The same plan whatever those files hold: a normal window reads them.
+        let mut normal = Watched::default();
+        let (_, checked, _) = privacy_plan(false, &mut normal, &ticked);
+        assert!(normal.looks >= 3);
+        assert!(checked.iter().any(|on| *on));
+    }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVING, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
     };
