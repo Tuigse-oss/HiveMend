@@ -179,6 +179,7 @@ fn same_target(left: &Repair, right: &Repair) -> bool {
 mod tests {
     use super::*;
     use crate::fs::MemoryFs;
+    use crate::model::ValueKind;
     use crate::model::{RegValue, ScannerId};
     use crate::registry::MemoryRegistry;
 
@@ -331,6 +332,162 @@ mod tests {
         assert!(text.contains("; entry 2\r\n"));
         assert!(!text.contains("; entry 2 was not removed"));
         let _ = std::fs::remove_file(backup.path());
+    }
+
+    /// The real backup a mixed repair writes restores every registry entry
+    /// it removed, whether or not the file part was refused.
+    #[test]
+    fn a_mixed_repair_backup_restores_every_registry_entry() {
+        use crate::regfile::{RegOp, apply_ops, parse_backup};
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        for refuse_file in [false, true] {
+            let mut reg = MemoryRegistry::new();
+            reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+            reg.set(
+                &format!(r"{base}\Stale\Child"),
+                "raw",
+                ValueKind::Other {
+                    kind: 11,
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+            );
+            let mut fs = MemoryFs::with_windows_dirs();
+            let shortcut = if refuse_file {
+                r"C:\Windows\old.lnk".to_string()
+            } else {
+                r"C:\Users\me\Desktop\old.lnk".to_string()
+            };
+            fs.add_file_bytes(&shortcut, b"lnk".to_vec(), None);
+            let temp = r"C:\Users\me\AppData\Local\Temp\x.tmp";
+            fs.add_file_bytes(temp, vec![0; 4], None);
+            let mut lnk = temp_file_finding(&shortcut);
+            lnk.repair = Repair::DeleteFile {
+                path: shortcut.clone(),
+                keep_copy: true,
+            };
+            let findings = [lnk, temp_file_finding(temp), uninstall_finding("Stale")];
+            let mut backup = crate::backup::test_writer("hive-mend-mixed");
+            let outcome = repair(&mut reg, &mut fs, &findings, &mut backup).unwrap();
+            let text = crate::backup::read_backup(backup.path()).unwrap();
+            let _ = std::fs::remove_file(backup.path());
+            assert!(
+                reg.subkeys(&format!(r"{base}\Stale")).is_err(),
+                "not removed"
+            );
+            assert!(text.contains("; Files"), "{text}");
+            let parsed = parse_backup(&text).unwrap();
+            assert!(parsed.unconfirmed.is_empty(), "{:?}", parsed.unconfirmed);
+            assert!(
+                parsed
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, RegOp::CreateKey(key) if key.ends_with(r"Stale\Child"))),
+                "{text}"
+            );
+            let summary = crate::backup::BackupSummary::parse(&text);
+            assert_eq!(summary.keys, 2, "the listing agrees with the restore");
+            let mut fresh = MemoryRegistry::new();
+            apply_ops(&mut fresh, &parsed.ops).unwrap();
+            assert_eq!(
+                fresh.values(&format!(r"{base}\Stale\Child")).unwrap()[0].data,
+                ValueKind::Other {
+                    kind: 11,
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8]
+                }
+            );
+            assert_eq!(
+                fresh.values(&format!(r"{base}\Stale")).unwrap()[0].data,
+                ValueKind::Sz("Stale".into())
+            );
+            assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
+        }
+    }
+
+    #[test]
+    fn an_entry_without_its_removed_line_is_never_restored() {
+        use crate::regfile::parse_backup;
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        reg.set_sz(&format!(r"{base}\Other"), "DisplayName", "Other");
+        // Stale changes elsewhere, so its transaction aborts.
+        reg.changed_elsewhere.push(format!(r"{base}\Stale"));
+        let mut backup = crate::backup::test_writer("hive-mend-unconfirmed");
+        repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Stale"), uninstall_finding("Other")],
+            &mut backup,
+        )
+        .unwrap();
+        let text = crate::backup::read_backup(backup.path()).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        // Even if the "was not removed" line had not been written (a run
+        // stopped there), entry 1 has no "removed" line: never restored.
+        let without_note = text.replace("; entry 1 was not removed\r\n", "");
+        for text in [&text, &without_note] {
+            let parsed = parse_backup(text).unwrap();
+            assert!(
+                parsed.ops.iter().all(|op| !op.key().ends_with("Stale")),
+                "an aborted entry would be restored"
+            );
+            assert!(parsed.ops.iter().any(|op| op.key().ends_with("Other")));
+        }
+        let parsed = parse_backup(&without_note).unwrap();
+        assert_eq!(parsed.unconfirmed.len(), 1, "it is listed for review");
+        // A save cut off after the last confirmed entry loses only the tail.
+        let cut = format!("{text}\r\n; entry 3\r\n[{base}\\Half]\r\n\"x\"=hex:01,02,\\");
+        let parsed = parse_backup(&cut).unwrap();
+        assert!(parsed.cut_off);
+        assert!(parsed.ops.iter().any(|op| op.key().ends_with("Other")));
+    }
+
+    #[test]
+    fn an_administrator_leaves_keys_others_can_change_alone() {
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Open"), "DisplayName", "Open");
+        reg.set_sz(&format!(r"{base}\Open\Deep"), "x", "1");
+        reg.set_sz(&format!(r"{base}\Closed"), "DisplayName", "Closed");
+        reg.untrusted.push(format!(r"{base}\Open\Deep"));
+        let mut backup = crate::backup::test_writer("hive-mend-untrusted");
+        let outcome = repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Open"), uninstall_finding("Closed")],
+            &mut backup,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(reg.values(&format!(r"{base}\Open\Deep")).is_ok(), "changed");
+        assert!(reg.values(&format!(r"{base}\Closed")).is_err());
+        assert_eq!(outcome.applied, 1);
+        // A restore into such a key changes nothing at all.
+        let ops = vec![
+            crate::regfile::RegOp::CreateKey(format!(r"{base}\New")),
+            crate::regfile::RegOp::CreateKey(format!(r"{base}\Open\Deep\Below")),
+        ];
+        assert!(crate::regfile::apply_ops(&mut reg, &ops).is_err());
+        assert!(reg.values(&format!(r"{base}\New")).is_err());
+    }
+
+    #[test]
+    fn a_key_that_appears_during_removal_stops_it() {
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Test";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Tree"), "x", "1");
+        {
+            let mut tx = reg.begin().unwrap();
+            let expected = vec![crate::pathutil::canonical_path(&format!(r"{base}\Tree"))];
+            // A child that was not there when the tree was recorded.
+            tx.set_value(&format!(r"{base}\Tree\Late"), "y", &ValueKind::Dword(1))
+                .unwrap();
+            assert!(
+                tx.delete_tree_exact(&format!(r"{base}\Tree"), &expected)
+                    .is_err()
+            );
+        }
+        assert!(reg.values(&format!(r"{base}\Tree")).is_ok());
     }
 
     #[test]
@@ -498,7 +655,14 @@ pub fn repair_with_progress(
         backup_file: backup.path().to_path_buf(),
         ..RepairOutcome::default()
     };
+    let mut stopped: Option<String> = None;
     for (index, finding) in findings.iter().enumerate() {
+        if let Some(why) = stopped.take() {
+            // Everything after a failed backup write is left alone.
+            outcome.errors.push(why);
+            outcome.not_backed_up += findings.len() - index;
+            break;
+        }
         let applied = match &finding.repair {
             Repair::DeleteValue { key, .. } if is_protected_key(key) => Applied::Refused,
             Repair::DeleteKey { key } if !key_delete_allowed(key) => Applied::Refused,
@@ -507,6 +671,27 @@ pub fn repair_with_progress(
                     Ok(Deleted::Removed) => Applied::Removed,
                     Ok(Deleted::AlreadyGone) => Applied::AlreadyGone,
                     Ok(Deleted::NotBackedUp) => Applied::NotBackedUp,
+                    Ok(Deleted::TooLarge) => {
+                        outcome.errors.push(format!(
+                            "{}: left alone; its backup would be larger than a restore accepts",
+                            finding.key
+                        ));
+                        Applied::NotBackedUp
+                    }
+                    Ok(Deleted::BackupFailed(why)) => {
+                        stopped = Some(format!(
+                            "the backup could not be written ({why}), so the repair stopped; nothing more was changed"
+                        ));
+                        Applied::NotBackedUp
+                    }
+                    Ok(Deleted::RemovedUnconfirmed(why)) => {
+                        stopped = Some(format!(
+                            "{}: removed, but its backup record could not be completed ({why}); its saved data is in the backup as entry {}, which a restore lists but does not put back by itself. The repair stopped",
+                            finding.key,
+                            index + 1
+                        ));
+                        Applied::Removed
+                    }
                     Err(err) => reg_result(Err(err)),
                 }
             }
@@ -531,6 +716,9 @@ pub fn repair_with_progress(
             }
         }
         progress(index + 1, findings.len());
+    }
+    if let Some(why) = stopped {
+        outcome.errors.push(why);
     }
     Ok(outcome)
 }
@@ -563,17 +751,30 @@ fn reg_result(result: Result<(), RegError>) -> Applied {
 pub(crate) enum Deleted {
     Removed,
     AlreadyGone,
-    /// Its backup section could not be read in full; nothing was removed.
+    /// Its backup section could not be read in full, or would not restore;
+    /// nothing was removed.
     NotBackedUp,
+    /// Its section would make the backup larger than a restore accepts;
+    /// nothing was removed.
+    TooLarge,
+    /// The backup could not be written; nothing was removed, and the job
+    /// stops here.
+    BackupFailed(String),
+    /// Removed, but the line confirming it could not be written, so a
+    /// restore will not put it back by itself; the job stops here.
+    RemovedUnconfirmed(String),
 }
 
 /// Remove one registry target (`DeleteKey` or `DeleteValue`) in its own
-/// transaction, recording it in `backup` as entry `entry` first:
-/// touch every key it covers, export its section through the transaction,
-/// append and flush that section, delete, commit. On any failure the
-/// transaction rolls back and a line in the backup marks the entry as not
-/// removed, so a restore leaves it out. Callers check their own safety
-/// rules (protected keys) before calling.
+/// transaction, recording it in `backup` as entry `entry`: touch every key
+/// it covers (refusing any an administrator must not change), export its
+/// section through the transaction, check that the section reads back as a
+/// restore would read it, append and flush it, delete exactly the keys
+/// touched, commit, and only then append `; entry N removed`. A restore
+/// puts back only confirmed entries, so a run that stops at any point
+/// never offers back data that was not removed. On any failure the
+/// transaction rolls back. Callers check their own safety rules
+/// (protected keys) before calling.
 pub(crate) fn delete_in_transaction(
     reg: &mut dyn Registry,
     repair: &Repair,
@@ -585,8 +786,14 @@ pub(crate) fn delete_in_transaction(
         Repair::DeleteValue { key, .. } => (key.as_str(), false),
         Repair::DeleteFile { .. } | Repair::None => return Ok(Deleted::NotBackedUp),
     };
+    if backup.has_failed() {
+        return Ok(Deleted::BackupFailed(
+            "an earlier write to the backup failed".into(),
+        ));
+    }
     let mut tx = reg.begin()?;
-    match touch_all(&mut *tx, key, tree, 0) {
+    let mut touched = Vec::new();
+    match touch_all(&mut *tx, key, tree, 0, &mut touched) {
         Ok(()) => {}
         Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
         // Part of it cannot be read, so it could not be backed up anyway.
@@ -600,49 +807,78 @@ pub(crate) fn delete_in_transaction(
         Err(err) => return Err(err),
     }
     let (section, unreadable) = registry_sections(&*tx, std::slice::from_ref(repair));
-    if !unreadable.is_empty() {
+    if !unreadable.is_empty() || !reads_back(&section) {
         return Ok(Deleted::NotBackedUp);
     }
-    backup
-        .append(&format!("\r\n; entry {entry}\r\n{section}"))
-        .map_err(|err| RegError::Message(format!("the backup could not be saved: {err}")))?;
+    match backup.append(&format!("\r\n; entry {entry}\r\n{section}")) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
+            return Ok(Deleted::TooLarge);
+        }
+        Err(err) => return Ok(Deleted::BackupFailed(err.to_string())),
+    }
     let deleted = match repair {
-        Repair::DeleteKey { key } => tx.delete_tree(key),
+        Repair::DeleteKey { key } => tx.delete_tree_exact(key, &touched),
         Repair::DeleteValue { key, name } => tx.delete_value(key, name),
         Repair::DeleteFile { .. } | Repair::None => Ok(()),
     };
+    // Lines saying an entry was not removed are only for people reading
+    // the file: an unconfirmed entry is never restored anyway.
+    let not_removed = |backup: &mut BackupWriter| {
+        let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
+    };
     match deleted {
         Ok(()) => {}
-        Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
+        Err(RegError::NotFound) => {
+            not_removed(backup);
+            return Ok(Deleted::AlreadyGone);
+        }
         Err(err) => {
-            let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
+            not_removed(backup);
             return Err(err);
         }
     }
-    match tx.commit() {
+    if let Err(err) = tx.commit() {
+        not_removed(backup);
+        return Err(err);
+    }
+    match backup.append(&format!("; entry {entry} removed\r\n")) {
         Ok(()) => Ok(Deleted::Removed),
-        Err(err) => {
-            let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
-            Err(err)
-        }
+        Err(err) => Ok(Deleted::RemovedUnconfirmed(err.to_string())),
     }
 }
 
+/// True when `section` reads back, through the restore's own parser, as
+/// at least one change: the backup will put back what it is about to stand
+/// for.
+fn reads_back(section: &str) -> bool {
+    let probe = format!(
+        "Windows Registry Editor Version 5.00\r\n\r\n{}\r\n; entry 1\r\n{section}; entry 1 removed\r\n",
+        crate::regfile::FORMAT_2
+    );
+    crate::regfile::parse_backup(&probe)
+        .is_ok_and(|parsed| !parsed.ops.is_empty() && parsed.unconfirmed.is_empty())
+}
+
 /// Touch `key` and, for a tree, every key below it, so a change to any of
-/// them from elsewhere fails the transaction's commit.
+/// them from elsewhere fails the transaction's commit; `touched` receives
+/// each key, the set the delete may remove and nothing more.
 fn touch_all(
     tx: &mut dyn RegTransaction,
     key: &str,
     tree: bool,
     depth: usize,
+    touched: &mut Vec<String>,
 ) -> Result<(), RegError> {
     if depth > 512 {
         return Err(RegError::Message(format!("{key} is nested too deeply")));
     }
+    tx.require_trusted(key)?;
     tx.touch(key)?;
+    touched.push(crate::pathutil::canonical_path(key));
     if tree {
         for child in tx.subkeys(key)? {
-            touch_all(tx, &format!("{key}\\{child}"), true, depth + 1)?;
+            touch_all(tx, &format!("{key}\\{child}"), true, depth + 1, touched)?;
         }
     }
     Ok(())

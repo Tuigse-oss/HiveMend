@@ -38,22 +38,72 @@ pub struct ParsedBackup {
     /// Entries the backup marks as not removed (a repair that was rolled
     /// back); their sections are left out of `ops`.
     pub left_out: usize,
+    /// Format 2 entries whose removal was never confirmed (the run stopped
+    /// between saving and finishing them): left out of `ops`, by number,
+    /// with the first key each one names.
+    pub unconfirmed: Vec<(usize, String)>,
+    /// The end of the file, after the last confirmed entry, could not be
+    /// read (an interrupted save) and was left out.
+    pub cut_off: bool,
 }
 
+/// The header line of backups whose numbered entries count only once a
+/// `; entry N removed` line follows them. Older backups count every
+/// entry not marked `was not removed`.
+pub const FORMAT_2: &str = "; Format 2: an entry is restored only after its \"removed\" line.";
+
 /// Parse a backup's registry sections. Anything this program does not
-/// write is an error, so a damaged or foreign file restores nothing.
+/// write is an error, so a damaged or foreign file restores nothing; the
+/// one exception is a cut-off end after the last confirmed entry of a
+/// format 2 backup, which only an interrupted save leaves.
 pub fn parse_backup(text: &str) -> Result<ParsedBackup, String> {
-    let mut lines = text.lines().map(|line| line.trim_end_matches('\r'));
+    match parse_lines(text, usize::MAX) {
+        Ok(parsed) => Ok(parsed),
+        Err((message, line)) => {
+            let lines: Vec<&str> = text.lines().collect();
+            let format_2 = lines
+                .iter()
+                .any(|line| line.trim_end_matches('\r') == FORMAT_2);
+            let last_confirmed = lines
+                .iter()
+                .rposition(|line| is_confirmation(line.trim_end_matches('\r').trim()));
+            match last_confirmed {
+                Some(last) if format_2 && line > last + 1 => {
+                    let mut parsed = parse_lines(text, last + 1).map_err(|(message, _)| message)?;
+                    parsed.cut_off = true;
+                    Ok(parsed)
+                }
+                _ => Err(message),
+            }
+        }
+    }
+}
+
+fn is_confirmation(line: &str) -> bool {
+    line.strip_prefix("; entry ")
+        .and_then(|rest| rest.strip_suffix(" removed"))
+        .is_some_and(|id| id.parse::<usize>().is_ok())
+}
+
+/// Parse the first `limit` lines. An error carries its 1-based line.
+fn parse_lines(text: &str, limit: usize) -> Result<ParsedBackup, (String, usize)> {
+    let mut lines = text
+        .lines()
+        .take(limit)
+        .map(|line| line.trim_end_matches('\r'));
     match lines.next().map(|line| line.trim_start_matches('\u{feff}')) {
         Some("Windows Registry Editor Version 5.00") => {}
-        _ => return Err("it does not start like a registry export".into()),
+        _ => return Err(("it does not start like a registry export".into(), 1)),
     }
     // (entry, op); entry 0 is outside any numbered entry.
     let mut ops: Vec<(usize, RegOp)> = Vec::new();
     let mut not_removed: Vec<usize> = Vec::new();
+    let mut confirmed: Vec<usize> = Vec::new();
+    let mut format_2 = false;
     let mut entry = 0usize;
     let mut key: Option<String> = None;
     let mut pending = String::new();
+    let bad = |line: usize| (bad(line), line);
     for (number, raw) in lines.enumerate() {
         let line_no = number + 2;
         if !pending.is_empty() {
@@ -63,14 +113,19 @@ pub fn parse_backup(text: &str) -> Result<ParsedBackup, String> {
             if line.is_empty() {
                 continue;
             }
+            if line == FORMAT_2 {
+                format_2 = true;
+                continue;
+            }
             if let Some(comment) = line.strip_prefix(';') {
                 let comment = comment.trim();
-                if comment == "Files" {
-                    break;
-                }
+                // File records and notes are comments: the registry
+                // entries after them are read on.
                 if let Some(rest) = comment.strip_prefix("entry ") {
                     if let Some(id) = rest.strip_suffix(" was not removed") {
                         not_removed.push(id.parse().map_err(|_| bad(line_no))?);
+                    } else if let Some(id) = rest.strip_suffix(" removed") {
+                        confirmed.push(id.parse().map_err(|_| bad(line_no))?);
                     } else {
                         entry = rest.parse().map_err(|_| bad(line_no))?;
                         key = None;
@@ -105,15 +160,33 @@ pub fn parse_backup(text: &str) -> Result<ParsedBackup, String> {
         ops.push((entry, value_op(&key, &line).ok_or_else(|| bad(line_no))?));
     }
     if !pending.is_empty() {
-        return Err("it ends in the middle of a value".into());
+        return Err(("it ends in the middle of a value".into(), usize::MAX));
     }
     let left_out = not_removed.len();
+    let mut unconfirmed: Vec<(usize, String)> = Vec::new();
+    let keep = |entry: usize| {
+        entry == 0 || (!not_removed.contains(&entry) && (!format_2 || confirmed.contains(&entry)))
+    };
+    for (entry, op) in &ops {
+        if !keep(*entry)
+            && format_2
+            && !not_removed.contains(entry)
+            && !unconfirmed.iter().any(|(have, _)| have == entry)
+        {
+            unconfirmed.push((*entry, op.key().to_string()));
+        }
+    }
     let ops = ops
         .into_iter()
-        .filter(|(entry, _)| *entry == 0 || !not_removed.contains(entry))
+        .filter(|(entry, _)| keep(*entry))
         .map(|(_, op)| op)
         .collect();
-    Ok(ParsedBackup { ops, left_out })
+    Ok(ParsedBackup {
+        ops,
+        left_out,
+        unconfirmed,
+        cut_off: false,
+    })
 }
 
 fn bad(line: usize) -> String {
@@ -202,6 +275,11 @@ pub fn apply_ops(reg: &mut dyn Registry, ops: &[RegOp]) -> Result<(usize, usize)
     let mut tx = reg.begin()?;
     let mut keys = 0;
     let mut values = 0;
+    // Every destination is checked before anything is written: an
+    // administrator restore leaves keys others can change alone, whole.
+    for op in ops {
+        tx.require_trusted(op.key())?;
+    }
     for op in ops {
         match op {
             RegOp::CreateKey(key) => {

@@ -32,7 +32,7 @@ pub const LEGACY_DIR: &str = r"C:\HiveMend";
 const APP: &str = "HiveMend";
 /// Largest backup a restore will read.
 #[cfg_attr(not(windows), allow(dead_code))]
-const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
+use crate::backup::MAX_BACKUP_BYTES;
 
 /// Which store a backup came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -347,14 +347,18 @@ fn restore_one(
 pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>), String> {
     let elevated = elevated();
     let mut fs = crate::fs::HostFs;
-    let (real, bytes) = read_restorable(&mut fs, file, elevated)?;
+    let (real, mut bytes) = read_restorable(&mut fs, file, elevated)?;
+    let mut unsigned_tail = false;
     if elevated {
-        signed::verify(&mut fs, &real, &bytes).map_err(|why| {
+        let signed = signed::verify(&mut fs, &real, &bytes).map_err(|why| {
             format!(
                 "{} is not restored with administrator rights: {why}",
                 file.display()
             )
         })?;
+        // Only what the signature covers is used.
+        unsigned_tail = signed < bytes.len();
+        bytes.truncate(signed);
     }
     let text = crate::rules::decode_text_owned(bytes);
     if !is_hive_mend_backup(&text) {
@@ -384,6 +388,12 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
     };
     let (files, mut errors) = restore_files(&mut fs, &real, &summary);
     errors.extend(notes);
+    if unsigned_tail {
+        errors.push(
+            "the end of the backup, written after its last signature, was left out (an interrupted save)"
+                .into(),
+        );
+    }
     Ok((applied, files, errors))
 }
 
@@ -621,7 +631,8 @@ mod signed {
 
     /// The signature beside `real` must be in the protected store, owned
     /// and writable only by administrators, and match `bytes` exactly.
-    pub fn verify(fs: &mut dyn FileView, real: &str, bytes: &[u8]) -> Result<(), String> {
+    /// Returns how many leading bytes the signature covers.
+    pub fn verify(fs: &mut dyn FileView, real: &str, bytes: &[u8]) -> Result<usize, String> {
         verify_in(fs, &root()?, real, bytes)
     }
 
@@ -631,7 +642,7 @@ mod signed {
         root: &Path,
         real: &str,
         bytes: &[u8],
-    ) -> Result<(), String> {
+    ) -> Result<usize, String> {
         let sig_path = crate::backup::signature_path(Path::new(real))
             .display()
             .to_string();
@@ -647,7 +658,7 @@ mod signed {
             }
             Err(err) => return Err(format!("its signature: {err}")),
         };
-        if pin.kind != ItemKind::File || pin.links != 1 || pin.len != 64 {
+        if pin.kind != ItemKind::File || pin.links != 1 || pin.len > 1 << 20 {
             return Err("its signature file is not one Hivemend wrote".into());
         }
         let store = root.join("backups").display().to_string();
@@ -657,21 +668,34 @@ mod signed {
         check_owner_and_dacl(&pin, &sig_path)?;
         fs.pin_acquire(&mut pin, Access::Read)?;
         let stored = fs
-            .pin_read_at(&pin, 0, 64)
-            .filter(|text| text.len() == 64)
+            .pin_read_at(&pin, 0, pin.len as usize)
+            .filter(|text| text.len() as u64 == pin.len)
             .ok_or("could not read its signature")?;
+        let stored = String::from_utf8_lossy(&stored).into_owned();
+        // Each line signs one prefix of the backup; the longest that
+        // matches wins, so an interrupted last append costs only itself.
+        let mut generations = crate::backup::signature_generations(&stored, bytes.len() as u64);
+        generations.retain(|(len, _)| *len <= bytes.len() as u64);
+        generations.sort_by_key(|(len, _)| *len);
         let mut mac = Hmac::new(&key_in(root)?)?;
-        mac.add(bytes)?;
-        let expected = crate::backup::signature_text(&mac.current()?);
-        // Compared in full, whatever differs first.
-        let differs = stored
-            .iter()
-            .zip(expected.as_bytes())
-            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
-        if differs != 0 {
-            return Err("its signature does not match its contents (it was changed after Hivemend wrote it, or not written by Hivemend)".into());
+        let mut fed = 0usize;
+        let mut verified = None;
+        for (len, hex) in generations {
+            let len = len as usize;
+            mac.add(&bytes[fed..len])?;
+            fed = len;
+            let expected = crate::backup::signature_text(&mac.current()?);
+            // Compared in full, whatever differs first.
+            let differs = hex
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+            if differs == 0 && hex.len() == expected.len() {
+                verified = Some(len);
+            }
         }
-        Ok(())
+        verified.ok_or_else(|| "its signature does not match its contents (it was changed after Hivemend wrote it, or not written by Hivemend)".to_string())
     }
 
     #[cfg(test)]
@@ -716,6 +740,16 @@ pub fn restore_scope(
                 other_keys.len()
             )
         });
+    }
+    for (entry, key) in &parsed.unconfirmed {
+        notes.push(format!(
+            "entry {entry} ({key}) was not confirmed as removed (the repair stopped while saving it), so it was not restored; its saved data is still in the backup file"
+        ));
+    }
+    if parsed.cut_off {
+        notes.push(
+            "the end of the backup could not be read (an interrupted save) and was left out".into(),
+        );
     }
     if parsed.left_out > 0 {
         notes.push(format!(
@@ -835,14 +869,7 @@ fn check_handle_security(
     also: Option<&str>,
     also_bits: u32,
 ) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
-    };
-    use windows_sys::Win32::Security::{
-        ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSID,
-    };
-    const WRITE_BITS: u32 = 0x0000_0002 // write data / add file
+    const FILE_WRITE_BITS: u32 = 0x0000_0002 // write data / add file
         | 0x0000_0004 // append data / add subfolder
         | 0x0000_0010 // write extended attributes
         | 0x0000_0040 // delete child
@@ -852,15 +879,77 @@ fn check_handle_security(
         | 0x0008_0000 // write owner
         | 0x1000_0000 // generic all
         | 0x4000_0000; // generic write
+    check_security(
+        handle,
+        windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT,
+        shown,
+        FILE_WRITE_BITS | also_bits,
+        &|sid| also == Some(sid),
+        if also.is_some() {
+            "this account or an administrator account"
+        } else {
+            "an administrator account"
+        },
+    )
+}
+
+/// Security an administrator window requires of a registry key it changes
+/// (or of the nearest existing key above one it creates): owned by, and
+/// changeable only by, SYSTEM, Administrators, TrustedInstaller, or
+/// Windows' own service accounts; never by an account that programs
+/// running without elevation use.
+#[cfg(windows)]
+pub(crate) fn check_registry_key_security(
+    key: std::os::windows::io::RawHandle,
+    shown: &str,
+) -> Result<(), String> {
+    const KEY_WRITE_BITS: u32 = 0x0000_0002 // set value
+        | 0x0000_0004 // create subkey
+        | 0x0000_0020 // create link
+        | 0x0001_0000 // delete
+        | 0x0004_0000 // write DAC
+        | 0x0008_0000 // write owner
+        | 0x1000_0000 // generic all
+        | 0x4000_0000; // generic write
+    // LOCAL SERVICE, NETWORK SERVICE, and per-service SIDs (NT SERVICE\x).
+    let service =
+        |sid: &str| sid == "S-1-5-19" || sid == "S-1-5-20" || sid.starts_with("S-1-5-80-");
+    check_security(
+        key,
+        windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY,
+        shown,
+        KEY_WRITE_BITS,
+        &service,
+        "an administrator or system account",
+    )
+}
+
+/// Owner must be trusted; every allow ACE that grants one of `write_bits`
+/// must name a trusted SID (or `extra`), or be CREATOR OWNER on an
+/// inherit-only ACE. A missing DACL means everyone has full control.
+#[cfg(windows)]
+fn check_security(
+    handle: std::os::windows::io::RawHandle,
+    object_type: windows_sys::Win32::Security::Authorization::SE_OBJECT_TYPE,
+    shown: &str,
+    write_bits: u32,
+    extra: &dyn Fn(&str) -> bool,
+    owner_should_be: &str,
+) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSID,
+    };
     const INHERIT_ONLY: u8 = 0x08;
-    let trusted = |sid: &str| TRUSTED_SIDS.contains(&sid) || also == Some(sid);
+    let trusted = |sid: &str| TRUSTED_SIDS.contains(&sid) || extra(sid);
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
     let rc = unsafe {
         GetSecurityInfo(
             handle as _,
-            SE_FILE_OBJECT,
+            object_type,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
@@ -889,12 +978,7 @@ fn check_handle_security(
         let owner_sid = sid_text(owner);
         if !trusted(&owner_sid) {
             return Err(format!(
-                "{shown} is owned by {owner_sid}, not {}",
-                if also.is_some() {
-                    "this account or an administrator account"
-                } else {
-                    "an administrator account"
-                }
+                "{shown} is owned by {owner_sid}, not {owner_should_be}"
             ));
         }
         if dacl.is_null() {
@@ -914,7 +998,7 @@ fn check_handle_security(
                 continue;
             }
             let mask = unsafe { *((ace as *const u8).add(4) as *const u32) };
-            if mask & (WRITE_BITS | also_bits) == 0 {
+            if mask & write_bits == 0 {
                 continue;
             }
             // Plain and callback allow entries carry the SID right after the
@@ -1290,10 +1374,20 @@ mod live_tests {
             let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
             // Unchanged: accepted.
             signed::verify_in(&mut fs, &root, &real, &bytes)?;
-            // One byte changed: refused.
+            // Unchanged: every byte is covered.
+            assert_eq!(
+                signed::verify_in(&mut fs, &root, &real, &bytes)?,
+                bytes.len()
+            );
+            // The last append changed: only the earlier, signed part counts.
             let mut changed = bytes.clone();
             *changed.last_mut().unwrap() ^= 1;
-            let err = signed::verify_in(&mut fs, &root, &real, &changed).unwrap_err();
+            let covered = signed::verify_in(&mut fs, &root, &real, &changed)?;
+            assert!(covered < bytes.len(), "{covered}");
+            // A byte of the first append changed: nothing counts.
+            let mut early = bytes.clone();
+            early[4] ^= 1;
+            let err = signed::verify_in(&mut fs, &root, &real, &early).unwrap_err();
             assert!(err.contains("does not match"), "{err}");
             // A file with the marker that Hivemend did not write: refused.
             let forged = backups.join("forged.reg");

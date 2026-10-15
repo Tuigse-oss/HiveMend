@@ -1652,6 +1652,27 @@ fn apply_repair(
         Ok(crate::engine::Deleted::NotBackedUp) => {
             done.note(format!("not backed up, left alone: {key}"));
         }
+        Ok(crate::engine::Deleted::TooLarge) => {
+            done.note(format!(
+                "left alone, its backup would be larger than a restore accepts: {key}"
+            ));
+        }
+        Ok(crate::engine::Deleted::BackupFailed(why)) => {
+            // The writer refuses everything after a failed write, so no
+            // registry entry is removed from here on; say so once.
+            let message = format!(
+                "the backup could not be written ({why}); no more registry entries were removed"
+            );
+            if !errors.contains(&message) {
+                errors.push(message);
+            }
+        }
+        Ok(crate::engine::Deleted::RemovedUnconfirmed(why)) => {
+            done.values += credit;
+            errors.push(format!(
+                "{key}: removed, but its backup record could not be completed ({why}); its saved data is in the backup as entry {entry}, which a restore lists but does not put back by itself"
+            ));
+        }
         Err(RegError::NotFound) => done.already_gone += 1,
         Err(RegError::Denied(message)) => done.note(format!("{key}: {message}")),
         Err(RegError::Message(message)) => errors.push(format!("{key}: {message}")),

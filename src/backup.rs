@@ -32,9 +32,17 @@ pub struct BackupWriter {
     file: std::fs::File,
     path: PathBuf,
     started: bool,
+    /// Bytes written so far.
+    len: u64,
+    /// A write failed: nothing more is written, so the job stops.
+    failed: bool,
     /// The keyed signature kept beside it, for administrator backups.
     signature: Option<(std::fs::File, Box<dyn RunningMac>)>,
 }
+
+/// The largest backup Hivemend restores, and so the largest it writes: an
+/// append that would pass it is refused before anything is written.
+pub const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
 
 /// A keyed checksum over everything fed to it so far. Sent along with its
 /// writer to the thread that does the work.
@@ -50,9 +58,42 @@ pub fn signature_path(backup: &Path) -> PathBuf {
     PathBuf::from(path)
 }
 
-/// The signature file's text: the checksum in lowercase hex.
+/// A checksum in lowercase hex.
 pub fn signature_text(mac: &[u8]) -> String {
     mac.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The signature file holds one line per append, never rewritten:
+/// `<length> <checksum of the backup's first length bytes>`. A restore uses
+/// the longest prefix whose line matches, so an interrupted append leaves
+/// every earlier one usable.
+pub fn signature_line(len: u64, mac: &[u8]) -> String {
+    format!("{len} {}\r\n", signature_text(mac))
+}
+
+/// The (length, checksum hex) lines of a signature file, longest first;
+/// a cut-off last line is ignored. The single checksum an earlier version
+/// wrote counts as covering the whole backup (`whole_len`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn signature_generations(text: &str, whole_len: u64) -> Vec<(u64, String)> {
+    let hex = |part: &str| {
+        part.len() >= 16
+            && part.len().is_multiple_of(2)
+            && part.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    let whole = text.trim();
+    if whole.len() == 64 && hex(whole) {
+        return vec![(whole_len, text.trim().to_ascii_lowercase())];
+    }
+    let mut found: Vec<(u64, String)> = text
+        .split("\r\n")
+        .filter_map(|line| {
+            let (len, mac) = line.split_once(' ')?;
+            (hex(mac)).then_some((len.parse().ok()?, mac.to_ascii_lowercase()))
+        })
+        .collect();
+    found.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+    found
 }
 
 fn create_reserved(path: &Path) -> std::io::Result<std::fs::File> {
@@ -105,6 +146,8 @@ impl BackupWriter {
                         file,
                         path,
                         started: false,
+                        len: 0,
+                        failed: false,
                         signature: None,
                     });
                 }
@@ -144,10 +187,24 @@ impl BackupWriter {
         self.signature.is_some()
     }
 
+    /// True once a write has failed; every later append fails too.
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
     /// Append `text` as UTF-16 (with the byte-order mark first) and flush it
-    /// to disk.
+    /// to disk, then add its signature line. An append that would make the
+    /// backup larger than [`MAX_BACKUP_BYTES`] is refused (`FileTooLarge`)
+    /// before anything is written. If a write fails, the backup is cut back
+    /// to its last complete append and no more is written: the caller
+    /// stops, and nothing is removed on the strength of an incomplete record.
     pub fn append(&mut self, text: &str) -> std::io::Result<()> {
-        use std::io::Write;
+        use std::io::{Seek, Write};
+        if self.failed {
+            return Err(std::io::Error::other(
+                "an earlier write to the backup failed, so nothing more is written",
+            ));
+        }
         let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
         if !self.started {
             bytes.extend([0xFF, 0xFE]);
@@ -155,27 +212,39 @@ impl BackupWriter {
         for unit in text.encode_utf16() {
             bytes.extend(unit.to_le_bytes());
         }
-        self.file.write_all(&bytes)?;
-        self.file.sync_data()?;
+        let new_len = self.len + bytes.len() as u64;
+        if new_len > MAX_BACKUP_BYTES {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "the backup would be larger than Hivemend can restore (64 MB)",
+            ));
+        }
+        let written = (&self.file)
+            .write_all(&bytes)
+            .and_then(|()| self.file.sync_data());
+        if let Err(err) = written {
+            self.failed = true;
+            let _ = self.file.set_len(self.len);
+            let _ = (&self.file).seek(std::io::SeekFrom::Start(self.len));
+            let _ = self.file.sync_data();
+            return Err(err);
+        }
+        self.len = new_len;
         self.started = true;
         if let Some((file, mac)) = &mut self.signature {
-            // The signature always covers exactly the bytes on disk: it is
-            // rewritten in place (its length never changes) after each
-            // flushed append. A failure here fails the append, so nothing
-            // is removed on the strength of an unsigned record.
-            let mac = mac.update(&bytes).map_err(std::io::Error::other)?;
-            let text = signature_text(&mac);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::FileExt;
-                file.seek_write(text.as_bytes(), 0)?;
+            // One new line per append; earlier lines are never touched, so
+            // a failure here leaves every earlier append verifiable.
+            let signed = mac
+                .update(&bytes)
+                .map_err(std::io::Error::other)
+                .and_then(|mac| {
+                    (&*file).write_all(signature_line(new_len, &mac).as_bytes())?;
+                    file.sync_data()
+                });
+            if let Err(err) = signed {
+                self.failed = true;
+                return Err(err);
             }
-            #[cfg(not(windows))]
-            {
-                use std::os::unix::fs::FileExt;
-                file.write_at(text.as_bytes(), 0)?;
-            }
-            file.sync_data()?;
         }
         Ok(())
     }
@@ -322,6 +391,8 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
 
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
     body.push_str(BACKUP_MARKER);
+    body.push_str("\r\n");
+    body.push_str(crate::regfile::FORMAT_2);
     body.push_str("\r\n");
     body.push_str(HEADER_END);
     let mut unreadable = Vec::new();
@@ -610,31 +681,32 @@ pub struct BackupSummary {
 }
 
 impl BackupSummary {
+    /// What a restore of `text` would do, from the same parser the restore
+    /// uses, so the listing and the restore never disagree. A file the
+    /// parser refuses shows no registry changes.
     pub fn parse(text: &str) -> Self {
+        use crate::regfile::RegOp;
         let mut summary = Self::default();
-        let mut continued = false;
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
-            let was_continued = continued;
-            continued = line.ends_with('\\');
-            if was_continued {
-                continue;
-            }
-            if let Some(key) = line.strip_prefix('[') {
-                summary.keys += 1;
-                let upper = key.to_ascii_uppercase();
-                if upper.starts_with("HKEY_CURRENT_USER") || upper.starts_with("-HKEY_CURRENT_USER")
+        if let Ok(parsed) = crate::regfile::parse_backup(text) {
+            for op in &parsed.ops {
+                match op {
+                    RegOp::CreateKey(_) | RegOp::DeleteKey(_) => summary.keys += 1,
+                    RegOp::SetValue { .. } | RegOp::DeleteValue { .. } => summary.values += 1,
+                }
+                if op
+                    .key()
+                    .to_ascii_uppercase()
+                    .starts_with("HKEY_CURRENT_USER")
                 {
                     summary.per_user = true;
-                }
-                if !upper.starts_with("HKEY_CURRENT_USER")
-                    && !upper.starts_with("-HKEY_CURRENT_USER")
-                {
+                } else {
                     summary.machine_wide = true;
                 }
-            } else if line.starts_with('"') || line.starts_with('@') {
-                summary.values += 1;
-            } else if let Some(rest) = line.strip_prefix(FILE_LINE)
+            }
+        }
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix(FILE_LINE)
                 && let Some((original, copy)) = rest.split_once(FILE_ARROW)
             {
                 summary
@@ -978,12 +1050,74 @@ mod tests {
         }
     }
 
+    /// Signs like `Sum` until `fail_after` appends, then fails.
+    struct FailsLater {
+        sum: Sum,
+        left: usize,
+    }
+
+    impl RunningMac for FailsLater {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            if self.left == 0 {
+                return Err("injected signing failure".into());
+            }
+            self.left -= 1;
+            self.sum.update(bytes)
+        }
+    }
+
+    #[test]
+    fn a_failed_append_keeps_every_earlier_signature_and_stops_the_writer() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-fail-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer
+            .sign_with(Box::new(FailsLater {
+                sum: Sum(0),
+                left: 2,
+            }))
+            .unwrap();
+        writer
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        writer.append("; entry 1\r\n").unwrap();
+        let signed_len = std::fs::metadata(writer.path()).unwrap().len();
+        let err = writer.append("; entry 1 removed\r\n").unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert!(writer.has_failed());
+        // Nothing more is written after a failure.
+        assert!(writer.append("; entry 2\r\n").is_err());
+        let sig = std::fs::read_to_string(signature_path(writer.path())).unwrap();
+        let generations = signature_generations(&sig, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The two complete appends are still signed, as they were.
+        assert_eq!(generations.len(), 2);
+        assert_eq!(generations[0].0, signed_len);
+    }
+
+    #[test]
+    fn an_append_past_the_restore_limit_is_refused_before_writing() {
+        let mut writer = test_writer("hive-mend-too-large");
+        writer
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        let before = std::fs::metadata(writer.path()).unwrap().len();
+        let huge = "x".repeat((MAX_BACKUP_BYTES / 2) as usize);
+        let err = writer.append(&huge).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        // Refused whole, and the writer still works for smaller entries.
+        assert!(!writer.has_failed());
+        assert_eq!(std::fs::metadata(writer.path()).unwrap().len(), before);
+        writer.append("; small\r\n").unwrap();
+        let _ = std::fs::remove_file(writer.path());
+    }
+
     #[test]
     fn the_signature_always_covers_exactly_what_is_on_disk() {
         let dir = std::env::temp_dir().join(format!("hm-sig-{}", std::process::id()));
         let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
         writer.sign_with(Box::new(Sum(0))).unwrap();
         let sig = signature_path(writer.path());
+        let mut expected = String::new();
         for text in [
             "Windows Registry Editor Version 5.00\r\n",
             "; entry 1\r\n",
@@ -992,11 +1126,13 @@ mod tests {
             writer.append(text).unwrap();
             let bytes = std::fs::read(writer.path()).unwrap();
             let sum: u64 = bytes.iter().map(|byte| u64::from(*byte)).sum();
-            assert_eq!(
-                std::fs::read_to_string(&sig).unwrap(),
-                signature_text(&sum.to_be_bytes())
-            );
+            // One more line per append; the earlier lines stay as they were.
+            expected.push_str(&signature_line(bytes.len() as u64, &sum.to_be_bytes()));
+            assert_eq!(std::fs::read_to_string(&sig).unwrap(), expected);
         }
+        let generations = signature_generations(&expected, 0);
+        assert_eq!(generations.len(), 3);
+        assert!(generations[0].0 > generations[1].0, "longest first");
         // Too late to start signing once written.
         assert!(writer.sign_with(Box::new(Sum(0))).is_err());
         let path = writer.path().to_path_buf();

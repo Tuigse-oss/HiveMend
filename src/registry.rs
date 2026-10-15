@@ -45,10 +45,56 @@ pub trait Registry {
 /// Once a key has been written in it ([`touch`](RegTransaction::touch)),
 /// any change to that key from outside makes the commit fail, so nothing
 /// is applied. Dropping it uncommitted rolls everything back.
+/// Every key of the subtree at `path`, canonical, parent first.
+pub fn list_subtree<R: Registry + ?Sized>(
+    reg: &R,
+    path: &str,
+    depth: usize,
+    found: &mut Vec<String>,
+) -> Result<(), RegError> {
+    if depth > 512 {
+        return Err(RegError::Message(format!("{path} is nested too deeply")));
+    }
+    found.push(canonical_path(path));
+    for child in reg.subkeys(path)? {
+        list_subtree(reg, &format!("{path}\\{child}"), depth + 1, found)?;
+    }
+    Ok(())
+}
+
+/// The same set of key paths, in any order and case.
+pub fn same_keys(a: &[String], b: &[String]) -> bool {
+    let norm = |keys: &[String]| {
+        let mut keys: Vec<String> = keys.iter().map(|key| key.to_ascii_lowercase()).collect();
+        keys.sort();
+        keys
+    };
+    norm(a) == norm(b)
+}
+
 pub trait RegTransaction: Registry {
     /// Write to `key` inside the transaction (and undo the write), so a
     /// change to it from anywhere else before commit aborts the commit.
     fn touch(&mut self, key: &str) -> Result<(), RegError>;
+    /// Delete `path` and its subtree only while its keys are exactly
+    /// `expected` (canonical paths): a key that appeared after they were
+    /// listed fails the delete, so nothing unrecorded is removed.
+    fn delete_tree_exact(&mut self, path: &str, expected: &[String]) -> Result<(), RegError> {
+        let mut found = Vec::new();
+        list_subtree(self, path, 0, &mut found)?;
+        if !same_keys(&found, expected) {
+            return Err(RegError::Message(format!(
+                "{path} changed while it was being removed"
+            )));
+        }
+        self.delete_tree(path)
+    }
+    /// Refuse `key` when this process must not change it. An elevated
+    /// window refuses keys programs running without elevation can change.
+    fn require_trusted(&self, key: &str) -> Result<(), RegError> {
+        let _ = key;
+        Ok(())
+    }
     fn commit(self: Box<Self>) -> Result<(), RegError>;
 }
 
@@ -70,6 +116,9 @@ pub struct MemoryRegistry {
     /// Test hook: keys "another program" changes while a transaction is
     /// open. A commit that touched any of them fails, as on Windows.
     pub changed_elsewhere: Vec<String>,
+    /// Test hook: keys (and everything below) that programs running without
+    /// elevation could change, which an administrator transaction refuses.
+    pub untrusted: Vec<String>,
 }
 
 impl MemoryRegistry {
@@ -234,6 +283,22 @@ impl Registry for MemoryTransaction<'_> {
 }
 
 impl RegTransaction for MemoryTransaction<'_> {
+    fn require_trusted(&self, key: &str) -> Result<(), RegError> {
+        let key = canonical_path(key);
+        if self.work.untrusted.iter().any(|root| {
+            let root = canonical_path(root);
+            key.eq_ignore_ascii_case(&root)
+                || key
+                    .to_ascii_lowercase()
+                    .starts_with(&format!("{}\\", root.to_ascii_lowercase()))
+        }) {
+            return Err(RegError::Denied(format!(
+                "{key} can be changed without administrator rights; an administrator window leaves it alone"
+            )));
+        }
+        Ok(())
+    }
+
     fn touch(&mut self, key: &str) -> Result<(), RegError> {
         self.work.node(key).ok_or(RegError::NotFound)?;
         self.touched.push(canonical_path(key));
