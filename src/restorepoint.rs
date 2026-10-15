@@ -53,8 +53,8 @@ pub fn begin(description: &str) -> Result<RestorePoint, String> {
 }
 
 /// Close the restore point: keep it after a repair that ran, or cancel it
-/// when nothing was changed.
-pub fn end(point: RestorePoint, keep: bool) {
+/// when nothing was changed. An error means Windows did not confirm it.
+pub fn end(point: RestorePoint, keep: bool) -> Result<(), String> {
     let kind = if keep {
         MODIFY_SETTINGS
     } else {
@@ -62,5 +62,12 @@ pub fn end(point: RestorePoint, keep: bool) {
     };
     let spec = info(END_SYSTEM_CHANGE, kind, point.sequence, "");
     let mut status = STATEMGRSTATUS::default();
-    unsafe { SRSetRestorePointW(&spec, &mut status) };
+    let ok = unsafe { SRSetRestorePointW(&spec, &mut status) };
+    if ok == 0 || status.nStatus != 0 {
+        return Err(format!(
+            "Windows did not confirm it ({})",
+            std::io::Error::from_raw_os_error(status.nStatus as i32)
+        ));
+    }
+    Ok(())
 }

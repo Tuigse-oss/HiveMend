@@ -71,12 +71,19 @@ pub fn data_roots(fs: &dyn FileView) -> Vec<String> {
     for dir in [user_dir(fs), protected_dir(fs)].into_iter().flatten() {
         roots.push(dir.display().to_string());
     }
+    // Where per-user files go when Local AppData cannot be located: inside
+    // Temp, so it must be protected from Temp cleaning explicitly.
+    roots.push(fallback_dir().display().to_string());
     roots
+}
+
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(APP)
 }
 
 fn user_file(name: &str) -> PathBuf {
     user_dir(&crate::fs::HostFs)
-        .unwrap_or_else(|| std::env::temp_dir().join(APP))
+        .unwrap_or_else(fallback_dir)
         .join(name)
 }
 
@@ -617,6 +624,21 @@ mod tests {
     }
 
     #[test]
+    fn the_fallback_data_folder_is_always_protected() {
+        // With no Local AppData, per-user files land in Temp\HiveMend; Temp
+        // cleaning must still refuse that folder.
+        let fs = MemoryFs::new();
+        assert!(user_dir(&fs).is_none());
+        let roots = data_roots(&fs);
+        let fallback = fallback_dir().display().to_string();
+        assert!(roots.contains(&fallback), "{roots:?}");
+        assert!(
+            user_file("settings.ini")
+                .starts_with(user_dir(&crate::fs::HostFs).unwrap_or_else(fallback_dir))
+        );
+    }
+
+    #[test]
     fn an_elevated_restore_reads_only_from_the_protected_store() {
         let mut fs = fs();
         let user = format!(r"{LOCAL}\HiveMend\backups\hive-mend-1.reg");
@@ -723,7 +745,10 @@ mod tests {
         ] {
             assert!(roots.iter().any(|root| path_under(&path, root)), "{path}");
         }
-        assert_eq!(roots.len(), 3);
+        // The legacy folder, Local AppData, ProgramData, and the Temp
+        // fallback for when Local AppData cannot be located.
+        assert_eq!(roots.len(), 4);
+        assert!(roots.contains(&fallback_dir().display().to_string()));
     }
 }
 

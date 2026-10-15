@@ -3503,7 +3503,7 @@ impl App {
         let params = (!launch.params.is_empty()).then_some(launch.params.as_str());
         shell_open(self.hwnd, &launch.exe, params);
         self.programs_note = format!(
-            "Started the uninstaller for {}. Click Refresh when it finishes.",
+            "Asked Windows to start the uninstaller for {}. Click Refresh when it finishes.",
             program.name
         );
         self.invalidate();
@@ -4333,10 +4333,15 @@ impl App {
                 restore_note = match point {
                     Some(Ok(point)) => {
                         let changed = repaired.as_ref().is_ok_and(|outcome| outcome.applied > 0);
-                        hive_mend::restorepoint::end(point, changed);
-                        changed.then(|| {
-                            "Windows also saved a restore point before the repair. (Windows keeps at most one a day, so it may reuse today's.)".to_string()
-                        })
+                        match hive_mend::restorepoint::end(point, changed) {
+                            Ok(()) => changed.then(|| {
+                                "Windows also saved a restore point before the repair. (Windows keeps at most one a day, so it may reuse today's.)".to_string()
+                            }),
+                            Err(why) if changed => Some(format!(
+                                "The Windows restore point may not have been saved: {why}. The registry backup was saved as usual."
+                            )),
+                            Err(_) => None,
+                        }
                     }
                     Some(Err(why)) => Some(format!(
                         "No Windows restore point was made: {why}. The registry backup was saved as usual."
@@ -4937,15 +4942,17 @@ impl App {
                     place(self.list, left, list_top, width, list_h);
                     let mut x = left;
                     for (control, w) in [
-                        (self.btn_scan, 110),
-                        (self.btn_all, 96),
-                        (self.btn_none, 104),
-                        (self.btn_ignore, 156),
+                        (self.btn_scan, 104),
+                        (self.btn_all, 88),
+                        (self.btn_none, 98),
+                        (self.btn_ignore, 150),
                     ] {
                         place(control, x, button_y, self.s(w), button_h);
                         x += self.s(w + 8);
                     }
-                    let repair_w = self.s(200);
+                    // Whatever room is left, up to the usual width, so it
+                    // never covers Ignore at the minimum window size.
+                    let repair_w = (right - x).clamp(self.s(150), self.s(200));
                     place(
                         self.btn_repair,
                         right - repair_w,
@@ -6608,7 +6615,15 @@ impl App {
 
     unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "Settings", None);
-        self.subtitle(hdc, rect, "Changes are saved as you make them.");
+        self.subtitle(
+            hdc,
+            rect,
+            if self.elevated {
+                "As administrator, changes last until Hivemend closes and the ignore list is read-only. Start Hivemend normally to save them."
+            } else {
+                "Changes are saved as you make them."
+            },
+        );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
         text(

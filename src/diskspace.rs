@@ -252,7 +252,9 @@ pub struct HostLister;
 #[cfg(windows)]
 impl DirLister for HostLister {
     fn list(&self, dir: &str) -> Result<Vec<DiskEntry>, String> {
-        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Foundation::{
+            ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
+        };
         use windows_sys::Win32::Storage::FileSystem::{
             FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT, FIND_FIRST_EX_LARGE_FETCH,
             FindClose, FindExInfoBasic, FindExSearchNameMatch, FindFirstFileExW, FindNextFileW,
@@ -292,11 +294,16 @@ impl DirLister for HostLister {
                 bytes: (u64::from(data.nFileSizeHigh) << 32) | u64::from(data.nFileSizeLow),
             });
             if unsafe { FindNextFileW(handle, &mut data) } == 0 {
-                break;
+                // Only the normal end of the listing is a complete folder;
+                // any other failure makes it unreadable, not smaller.
+                let error = unsafe { GetLastError() };
+                unsafe { FindClose(handle) };
+                if error == ERROR_NO_MORE_FILES {
+                    return Ok(entries);
+                }
+                return Err(std::io::Error::from_raw_os_error(error as i32).to_string());
             }
         }
-        unsafe { FindClose(handle) };
-        Ok(entries)
     }
 }
 

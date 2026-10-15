@@ -73,10 +73,14 @@ pub fn list_programs(reg: &dyn Registry) -> Vec<InstalledProgram> {
         for sub in reg.subkeys(&root).unwrap_or_default() {
             let key = format!(r"{root}\{sub}");
             if let Some(program) = read_program(reg, &key, &sub, scope)
+                // Only a true duplicate (the same product seen twice, with
+                // the same uninstall command) is folded; distinct installs
+                // that share a name and version are all listed.
                 && !programs.iter().any(|have| {
                     have.scope == program.scope
                         && have.name.eq_ignore_ascii_case(&program.name)
                         && have.version == program.version
+                        && have.uninstall.eq_ignore_ascii_case(&program.uninstall)
                 })
             {
                 programs.push(program);
@@ -305,7 +309,20 @@ mod tests {
         let wow = format!(r"HKLM\SOFTWARE\WOW6432Node\{UNINSTALL}\App");
         reg.set_sz(&wow, "DisplayName", "Paint Pro");
         reg.set_sz(&wow, "DisplayVersion", "2.1");
-        reg.set_sz(&wow, "UninstallString", "x.exe");
+        reg.set_sz(
+            &wow,
+            "UninstallString",
+            r#""C:\Program Files\Paint Pro\uninst.exe" /S"#,
+        );
+        // A distinct 32-bit install sharing the name and version stays.
+        let wow32 = format!(r"HKLM\SOFTWARE\WOW6432Node\{UNINSTALL}\App32");
+        reg.set_sz(&wow32, "DisplayName", "Paint Pro");
+        reg.set_sz(&wow32, "DisplayVersion", "2.1");
+        reg.set_sz(
+            &wow32,
+            "UninstallString",
+            r#""C:\Program Files (x86)\Paint Pro\uninst.exe" /S"#,
+        );
         let user = format!(r"HKCU\Software\{UNINSTALL}\Chat");
         reg.set_sz(&user, "DisplayName", "chat");
         reg.set_sz(
@@ -320,7 +337,8 @@ mod tests {
     fn lists_programs_like_programs_and_features() {
         let programs = list_programs(&world());
         let names: Vec<&str> = programs.iter().map(|p| p.name.as_str()).collect();
-        assert_eq!(names, ["chat", "Paint Pro", "Runtime"]);
+        assert_eq!(names, ["chat", "Paint Pro", "Paint Pro", "Runtime"]);
+        assert!(programs[2].key.ends_with("App32"));
         let paint = &programs[1];
         assert_eq!(paint.installed, "2026-09-14");
         assert_eq!(paint.size, Some(2048 * 1024));
@@ -328,7 +346,7 @@ mod tests {
         assert_eq!(programs[0].scope, ProgramScope::User);
         // An MSI product without its own command uninstalls by product code.
         assert_eq!(
-            programs[2].uninstall,
+            programs[3].uninstall,
             "MsiExec.exe /X{11111111-2222-3333-4444-555555555555}"
         );
     }
