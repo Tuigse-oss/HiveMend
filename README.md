@@ -51,7 +51,11 @@ hivemend repair --yes
 hivemend hives
 ```
 
-`scan` never writes. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes.
+`scan` never changes the registry. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes, and only while each still reads exactly as the backup recorded it: anything added or changed since is left alone.
+
+`--format json` prints one JSON document: `complete`, `findings`, `warnings`, and `notes` for a scan, or the outcome of `repair --yes`. Exit codes: 0 when a complete scan found nothing, 2 when there are findings, 3 when the scan could not read everything (or was stopped) and found nothing, so it cannot be called clean, and 1 on an error.
+
+Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, and `--backup-dir` is refused unless it is the protected store.
 
 ### Where data is kept
 
@@ -61,8 +65,14 @@ your account can change. Backups made as administrator go to
 `%ProgramData%\HiveMend\backups`, a folder Hivemend creates owned by
 Administrators and writable only by SYSTEM and Administrators; if that
 folder already exists with any other owner or permissions, Hivemend
-refuses to use it rather than repair it. Running as administrator, Hive
-Mend restores only from that protected folder.
+refuses to use it rather than repair it. Running as administrator,
+Hivemend restores only from that protected folder.
+
+Restore accepts only `.reg` files carrying Hivemend's backup marker
+line. The marker only guards against restoring the wrong file by
+accident; anyone can write it, so it does not prove where a file came
+from. What protects a restore run as administrator is where the file
+is: the protected folder, which only administrators can write.
 
 Older versions kept everything in `C:\HiveMend`, which every account on
 the PC can change. Hivemend never moves or deletes that folder. Its
@@ -97,23 +107,40 @@ Monitor, Tools, Settings, and About.
 - Repairs run as administrator first ask Windows for a System Restore
   point ("Hivemend repair"), on top of Hivemend's own `.reg` backup. It
   needs System Protection turned on for the system drive, and Windows
-  makes at most one a day; if none is made the repair still proceeds and
-  says why. Settings can turn this off.
+  makes at most one a day; if none is made, or Windows does not confirm
+  it, the repair still proceeds and says so. Settings can turn this off
+  in a normal window.
+- A window run as administrator acts only on what programs running
+  without elevation cannot redirect. It leaves registry entries in your
+  own part of the registry (HKCU, HKEY_USERS, HKCR) to a normal window,
+  restores only the machine-wide part of a backup, starts no
+  uninstallers, changes no startup items for your account, removes no
+  duplicates, edits no cookie database, and does not read or save your
+  settings: it starts from the built-in defaults (restore points on) and
+  forgets changes when it closes. The ignore list is read but not
+  changed.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
   startup type of a highlighted row). Changing a startup type writes a
   `services-*.reg` backup first and can be undone on the Restore page;
   starting or stopping a service is transient and is not backed up.
   Boot drivers and the services Windows needs to boot, update, or stay
-  secure are always refused. Listing is read-only; changing anything
-  needs administrator rights.
+  secure are always refused (including the firewall's filtering engine,
+  BFE, and UAC's Appinfo). Listing is read-only; changing anything needs
+  administrator rights. A backup records an absent delayed-start flag as
+  absent, and if a change's second step fails, the first is put back.
 - Privacy lists cleanable categories (history lists, temp files,
   clipboard, Recycle Bin, browser caches, application histories, and
   custom items). Preview counts what each holds, tick what to
   clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
   for good. The built-in history and cookie cleaning waits for a closed
-  browser and never touches saved logins, autofill, or bookmarks. Custom
+  browser (checked again just before each category runs) and never
+  touches saved logins, saved addresses or cards, or bookmarks. For
+  Chrome and Edge it clears browsing history and cookies; for Firefox it
+  clears cookies and saved form entries, and leaves browsing history and
+  bookmarks (they share one file). A Temp file listed for being older
+  than two days is left alone if it was written to since. Custom
   items you add can name any allowed Temp or browser-profile file, so add
   only paths you understand. The built-in categories are user-scope, and
   no administrator rights are needed. There is no free-space wipe:
@@ -128,16 +155,17 @@ Monitor, Tools, Settings, and About.
   `StartupApproved` switch Task Manager uses, so nothing is deleted and
   the two always agree. The previous switches are saved to a
   `startup-*.reg` backup first and can be undone on the Restore page.
-  Items that start for all users need administrator rights.
+  Items that start for all users need administrator rights, and items
+  for your account are changed from a normal window. A flag that cannot
+  be read is left alone rather than recorded as absent.
 - Programs lists installed programs as Programs and Features does
   (name, publisher, install date, size, version) and starts a program's
   own uninstaller; Hivemend never removes program files itself. The
   registered command is resolved to one existing `.exe` (a bare tool name
   such as `MsiExec.exe` only from System32, an app alias such as
-  `winget.exe` only from your WindowsApps folder) or refused. Run as
-  administrator, it only starts uninstallers kept in the Windows or
-  Program Files folders, and leaves programs installed just for your
-  account to a normal window.
+  `winget.exe` only from your WindowsApps folder) or refused. A window
+  run as administrator starts no uninstallers: from a normal window, the
+  uninstaller asks for administrator rights itself if it needs them.
 - Disk Space adds up a fixed drive or your user folder and lists the
   biggest folders (double-click or Enter to go in, Backspace to go up),
   the 100 largest files, and the space by kind of file. Sizes are file
@@ -151,9 +179,12 @@ Monitor, Tools, Settings, and About.
   counted as a copy. Tick Extra Copies ticks all but the first copy of
   each set. Ticked files go to the Recycle Bin (Windows warns first if a
   file would be deleted for good instead). One copy of every set is
-  always kept, and just before moving, each file is compared byte by
-  byte with the kept copy and left alone if it no longer matches.
-  Removing is only done without administrator rights.
+  always kept and held open so it cannot change or go away meanwhile.
+  Each file to move is held open against writes from its checks until
+  it is moved: its real location must be outside the protected folders
+  (a SUBST drive or junction cannot hide it), it must have no extra data
+  streams besides the download marker, and its bytes must still match
+  the kept copy. Removing is only done without administrator rights.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.
@@ -195,12 +226,14 @@ value=HKCU\Software\MyApp\Settings|RecentFile1
 
 ## Releases
 
-Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one ships `SHA256SUMS.txt`, the exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
+Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one is a zip holding `Hivemend.exe`, the MIT and Apache-2.0 license files, `THIRD-PARTY-NOTICES.txt` (the license and copyright notices of the crates built into the program and of the Rust standard library), and this README, with `SHA256SUMS.txt` beside it. The exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
 
 ```bash
-gh attestation verify Hivemend-v0.1.0-x86_64-windows.exe --repo bradwilliamson/HiveMend
-cargo audit bin Hivemend-v0.1.0-x86_64-windows.exe
+gh attestation verify Hivemend-v0.1.0-x86_64-windows.zip --repo bradwilliamson/HiveMend
+cargo audit bin Hivemend.exe
 ```
+
+After changing `Cargo.lock`, regenerate the notices with `python3 scripts/third-party-notices.py`; a test fails until they cover every linked crate.
 
 ## Security
 

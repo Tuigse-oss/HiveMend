@@ -7183,7 +7183,7 @@ impl App {
             left,
             right,
             y,
-            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0).",
+            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0). Notices for the open-source parts it includes are in THIRD-PARTY-NOTICES.txt, shipped with it.",
         ) + gap;
         y = paragraph(
             hdc,

@@ -169,3 +169,51 @@ mod runtime_tests {
         );
     }
 }
+
+#[cfg(test)]
+mod notices_tests {
+    /// Crates that only run while building; keep in step with
+    /// scripts/third-party-notices.py.
+    const BUILD_ONLY: &[&str] = &[
+        "cc",
+        "clap_derive",
+        "find-msvc-tools",
+        "heck",
+        "hive-mend",
+        "pkg-config",
+        "proc-macro2",
+        "quote",
+        "shlex",
+        "syn",
+        "unicode-ident",
+        "vcpkg",
+    ];
+
+    #[test]
+    fn the_notices_cover_every_linked_crate() {
+        let lock = include_str!("../Cargo.lock");
+        let notices = include_str!("../THIRD-PARTY-NOTICES.txt");
+        let mut lines = lock.lines();
+        while let Some(line) = lines.next() {
+            let Some(name) = line
+                .strip_prefix("name = \"")
+                .and_then(|rest| rest.strip_suffix('"'))
+            else {
+                continue;
+            };
+            let version = lines
+                .next()
+                .and_then(|line| line.strip_prefix("version = \""))
+                .and_then(|rest| rest.strip_suffix('"'))
+                .unwrap_or_default();
+            if BUILD_ONLY.contains(&name) {
+                continue;
+            }
+            assert!(
+                notices.contains(&format!("{name} {version} (license:")),
+                "{name} {version} is missing from THIRD-PARTY-NOTICES.txt; run scripts/third-party-notices.py"
+            );
+        }
+        assert!(notices.contains("The Rust Standard Library"));
+    }
+}
