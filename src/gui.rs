@@ -45,7 +45,6 @@ use windows_sys::Win32::System::DataExchange::{
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -929,12 +928,19 @@ fn flush_deferred(hwnd: HWND) {
 /// Show queued native UI, one item at a time, with no handler active. Runs
 /// only from flush_deferred, after the guard is released. A flush nested in
 /// one of these modal loops leaves the queue to the loop already running.
+/// The next queued native item. The queue's lock is released before this
+/// returns: a modal call made with it held would leave any handler that runs
+/// inside the dialog and queues a message waiting on it forever.
+fn pop_native() -> Option<Native> {
+    lock(&NATIVE).pop_front()
+}
+
 fn run_native(hwnd: HWND) {
     if SHOWING.swap(true, Ordering::SeqCst) {
         return;
     }
     let title = wide("Hivemend");
-    while let Some(next) = lock(&NATIVE).pop_front() {
+    while let Some(next) = pop_native() {
         if unsafe { IsWindow(hwnd) } == 0 {
             if let Native::Menu { menu, .. } = next {
                 unsafe { DestroyMenu(menu as HMENU) };
@@ -1002,17 +1008,34 @@ fn run_native(hwnd: HWND) {
                 }
             }
             Native::Shell { file, args } => {
-                let file = wide(&file);
-                let args = args.as_deref().map(wide);
-                unsafe {
+                let target = wide(&file);
+                let params = args.as_deref().map(wide);
+                let result = unsafe {
                     ShellExecuteW(
                         hwnd,
                         wide("open").as_ptr(),
-                        file.as_ptr(),
-                        args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
+                        target.as_ptr(),
+                        params
+                            .as_ref()
+                            .map_or(std::ptr::null(), |params| params.as_ptr()),
                         std::ptr::null(),
                         SW_SHOWNORMAL,
-                    );
+                    )
+                };
+                // Values of 32 and below are errors; say so instead of
+                // leaving it looking as if the program started.
+                let code = result as isize;
+                if code <= 32 {
+                    let why = match code {
+                        2 | 3 => "it was not found".to_string(),
+                        5 => "access was denied".to_string(),
+                        1223 => "it was canceled".to_string(),
+                        other => format!("error {other}"),
+                    };
+                    let text = wide(&format!("Windows could not open {file}: {why}."));
+                    unsafe {
+                        MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    }
                 }
             }
         }
@@ -1046,6 +1069,16 @@ impl Drop for HandlerGuard {
 impl App {
     fn new(hwnd: HWND) -> Self {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let elevated = unsafe { IsUserAnAdmin() } != 0;
+        // An administrator window takes no policy from the per-user folder,
+        // which programs running without elevation can change: it starts
+        // from the built-in settings (restore points on) and never saves.
+        // The ignore list is still read, since it can only hide entries.
+        let settings = if elevated {
+            Settings::default()
+        } else {
+            Settings::load(&settings_file())
+        };
         let mut app = Self {
             hwnd,
             page: Page::Status,
@@ -1057,8 +1090,8 @@ impl App {
             hotspots: Vec::new(),
             hover: None,
             tracking: false,
-            elevated: unsafe { IsUserAnAdmin() } != 0,
-            settings: Settings::load(&settings_file()),
+            elevated,
+            settings,
             exclusions: Exclusions::load(&exclusions_file()),
             backups: all_backups(),
             job: Job::Idle,
@@ -2053,6 +2086,13 @@ impl App {
     }
 
     fn ignore_rows(&mut self, rows: &[usize]) {
+        if self.elevated {
+            self.message(
+                "The ignore list is changed from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         if rows.is_empty() {
             self.message(
                 "Click a row to highlight it first. Hold Ctrl or Shift to pick several.",
@@ -2220,7 +2260,7 @@ impl App {
                     let arg = format!("/select,\"{}\"", finding.key);
                     shell_open(self.hwnd, "explorer.exe", Some(&arg));
                 } else {
-                    open_in_regedit(self.hwnd, &finding.key);
+                    open_in_regedit(self.hwnd, &finding.key, self.elevated);
                 }
             }
             MENU_IGNORE => self.ignore_rows(rows),
@@ -2731,29 +2771,24 @@ impl App {
         // elevated window edits no database in a folder a normal program can
         // change: with a list, it leaves cookies alone instead.
         self.priv_keep_stamp = keep_list_stamp();
-        if let Ok(bytes) = std::fs::read(hive_mend::cookies_keep_file()) {
-            let (sites, warnings) = hive_mend::parse_keep_list(&decode_text_owned(bytes));
-            let keep = if sites.is_empty() {
-                hive_mend::CookieKeep::All
-            } else if self.elevated {
-                hive_mend::CookieKeep::LeaveAlone(
-                    "You keep some cookies, so an administrator window leaves cookies alone. Start Hivemend without administrator rights to clean them."
-                        .to_string(),
-                )
-            } else {
-                hive_mend::CookieKeep::Sites(sites)
-            };
-            hive_mend::set_cookie_keep(&mut items, &keep);
-            for item in items
-                .iter_mut()
-                .filter(|item| item.detail.contains("cookies") || item.detail.contains("Cookies"))
-            {
-                item.warnings.extend(
-                    warnings
-                        .iter()
-                        .map(|warning| format!("cookies-keep.txt {warning}")),
-                );
-            }
+        if self.elevated {
+            hive_mend::leave_per_user_registry(&mut items);
+        }
+        let (keep, warnings) = hive_mend::cookie_keep_choice(
+            std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned),
+            self.elevated,
+        );
+        hive_mend::set_cookie_keep(&mut items, &keep);
+        for item in items.iter_mut().filter(|item| {
+            item.targets
+                .iter()
+                .any(|target| matches!(target, hive_mend::PrivacyTarget::Cookies { .. }))
+        }) {
+            item.warnings.extend(
+                warnings
+                    .iter()
+                    .map(|warning| format!("cookies-keep.txt {warning}")),
+            );
         }
         let ticked: Vec<String> = if self.elevated {
             Vec::new()
@@ -2772,6 +2807,13 @@ impl App {
 
     /// Open the cookies-to-keep list in Notepad, creating it with help text.
     fn edit_cookie_keep(&mut self) {
+        if self.elevated {
+            self.message(
+                "Edit your cookies-to-keep list from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         let file = hive_mend::cookies_keep_file();
         if !file.exists() {
             if let Some(parent) = file.parent() {
@@ -3243,6 +3285,20 @@ impl App {
             );
             return;
         }
+        // Your own items are changed from a normal window: an administrator
+        // window does not write into your hive, which programs running
+        // without elevation can redirect.
+        if self.elevated
+            && picked
+                .iter()
+                .any(|item| item.scope == hive_mend::StartupScope::User)
+        {
+            self.message(
+                "Items for your account are changed from Hivemend started without administrator rights. Highlight only items for all users here.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         if !self.elevated
             && picked
                 .iter()
@@ -3350,7 +3406,7 @@ impl App {
             .filter(|path| path.as_bytes().get(1) == Some(&b':'))
             .unwrap_or_else(|| format!(r"{}\{}", item.location, item.name));
         if target.starts_with("HKEY_") {
-            open_in_regedit(self.hwnd, &item.location);
+            open_in_regedit(self.hwnd, &item.location, self.elevated);
         } else {
             let arg = format!("/select,\"{target}\"");
             shell_open(self.hwnd, "explorer.exe", Some(&arg));
@@ -3411,10 +3467,13 @@ impl App {
         let Some(program) = self.programs.get(row).cloned() else {
             return;
         };
-        if self.elevated && program.scope == hive_mend::ProgramScope::User {
+        // An administrator window never starts uninstallers: one started
+        // from here would run with administrator rights, whatever wrote it.
+        // From a normal window, the uninstaller asks for rights itself.
+        if self.elevated {
             self.message(
                 &format!(
-                    "{} is installed just for your account. Open Hivemend without administrator rights to uninstall it.",
+                    "Uninstall {} from Hivemend started without administrator rights. Its uninstaller will ask for administrator rights itself if it needs them.",
                     program.name
                 ),
                 MB_ICONINFORMATION,
@@ -4114,10 +4173,27 @@ impl App {
         if self.busy() {
             return;
         }
-        let selected = self.ticked();
+        let mut selected = self.ticked();
         if selected.is_empty() {
             self.message(
                 "Tick the entries you want to repair first.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        // An administrator window leaves per-user registry entries to a
+        // normal window: a program running without elevation can redirect
+        // keys in those hives.
+        let per_user = if self.elevated {
+            let before = selected.len();
+            selected.retain(|finding| !finding.per_user());
+            before - selected.len()
+        } else {
+            0
+        };
+        if selected.is_empty() {
+            self.message(
+                "The ticked entries are in your own part of the registry. Repair them from Hivemend started without administrator rights.",
                 MB_ICONINFORMATION,
             );
             return;
@@ -4142,6 +4218,14 @@ impl App {
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
         );
+        if per_user > 0 {
+            question.push_str(&format!(
+                "\n\n{per_user} ticked {} in your own part of the registry {} left alone; repair {} from Hivemend started without administrator rights.",
+                if per_user == 1 { "entry" } else { "entries" },
+                if per_user == 1 { "is" } else { "are" },
+                if per_user == 1 { "it" } else { "them" },
+            ));
+        }
         let permanent = selected.iter().filter(|f| f.permanent()).count();
         if permanent > 0 {
             question.push_str(&format!(
@@ -4494,6 +4578,11 @@ impl App {
     // ---- settings ------------------------------------------------------
 
     fn save_settings(&self) {
+        // Never written from an administrator window: a program running
+        // without elevation could redirect the per-user folder.
+        if self.elevated {
+            return;
+        }
         let _ = self.settings.save(&settings_file());
     }
 
@@ -4505,6 +4594,13 @@ impl App {
     }
 
     fn unignore(&mut self) {
+        if self.elevated {
+            self.message(
+                "The ignore list is changed from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         let rows = selected_rows(self.ignored_list);
         if rows.is_empty() {
             self.message(
@@ -7848,23 +7944,41 @@ fn drive_used_bytes(path: &str) -> u64 {
 }
 
 fn shell_open(_hwnd: HWND, file: &str, args: Option<&str>) {
+    // A bare program name would be looked up through folders a normal
+    // program can change, which matters most in an administrator window.
+    // Windows' own tools (explorer.exe, regedit.exe) live in the Windows
+    // folder, so name them there.
+    let file = if file.contains(['\\', '/', ':']) {
+        file.to_string()
+    } else {
+        match hive_mend::host_known_dir(hive_mend::KnownDir::Windows) {
+            Some(root) => format!(r"{}\{file}", root.trim_end_matches('\\')),
+            None => {
+                lock(&NATIVE).push_back(Native::Message {
+                    text: format!("Could not locate the Windows folder to start {file}."),
+                    icon: MB_ICONWARNING,
+                });
+                return;
+            }
+        }
+    };
     lock(&NATIVE).push_back(Native::Shell {
-        file: file.to_string(),
+        file,
         args: args.map(str::to_string),
     });
 }
 
 /// Registry Editor opens at its saved `LastKey`, so set that and start it.
-fn open_in_regedit(hwnd: HWND, key: &str) {
-    let data = wide(&format!("Computer\\{key}"));
-    unsafe {
-        RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            wide(r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit").as_ptr(),
-            wide("LastKey").as_ptr(),
-            REG_SZ,
-            data.as_ptr() as *const _,
-            (data.len() * 2) as u32,
+/// The setting is written through the link-refusing registry layer, and
+/// only from a normal window: an administrator window does not write into
+/// the user's own hive, so Registry Editor opens where it last was.
+fn open_in_regedit(hwnd: HWND, key: &str, elevated: bool) {
+    if !elevated {
+        use hive_mend::Registry;
+        let _ = WindowsRegistry.set_value(
+            r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Applets\Regedit",
+            "LastKey",
+            &hive_mend::ValueKind::Sz(format!("Computer\\{key}")),
         );
     }
     shell_open(hwnd, "regedit.exe", Some("-m"));
@@ -7889,6 +8003,20 @@ mod tests {
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVING, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
     };
+
+    #[test]
+    fn the_native_queue_is_unlocked_while_an_item_is_shown() {
+        // Stands in for a handler that runs inside a message box and queues
+        // another message: it must be able to take the lock.
+        lock(&NATIVE).push_back(Native::Message {
+            text: "first".into(),
+            icon: 0,
+        });
+        let item = pop_native();
+        assert!(item.is_some());
+        assert!(NATIVE.try_lock().is_ok(), "the lock outlived the pop");
+        lock(&NATIVE).clear();
+    }
 
     #[test]
     fn modal_loop_starters_never_take_the_guard() {

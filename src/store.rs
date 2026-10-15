@@ -349,6 +349,27 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
         ));
     }
     let summary = BackupSummary::parse(&text);
+    // An administrator restore writes only machine-wide sections: a per-user
+    // key could be redirected by a program running without elevation. Those
+    // sections are restored from a normal window.
+    let mut notes = Vec::new();
+    let bytes = if elevated {
+        let (machine, dropped) = crate::backup::machine_sections_only(&text);
+        if dropped > 0 {
+            if !machine.contains("\n[") {
+                return Err(format!(
+                    "{} only holds per-user entries; restore it from Hivemend started without administrator rights",
+                    file.display()
+                ));
+            }
+            notes.push(format!(
+                "{dropped} per-user sections were left out; restore those from Hivemend started without administrator rights"
+            ));
+        }
+        crate::backup::encode_reg(&machine)
+    } else {
+        bytes
+    };
     let snapshot_dir = if elevated {
         protected_dir(&fs).ok_or("could not locate the ProgramData folder")?
     } else {
@@ -382,7 +403,8 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
         let _ = fs.pin_delete(pin);
     }
     imported?;
-    let (files, errors) = restore_files(&mut fs, &real, &summary);
+    let (files, mut errors) = restore_files(&mut fs, &real, &summary);
+    errors.extend(notes);
     Ok((summary, files, errors))
 }
 

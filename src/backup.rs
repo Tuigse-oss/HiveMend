@@ -409,11 +409,41 @@ pub fn write_backup(path: &Path, body: &str) -> Result<(), std::io::Error> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
+    std::fs::write(path, encode_reg(body))
+}
+
+/// A `.reg` body as Regedit writes it: UTF-16LE with a byte-order mark.
+pub fn encode_reg(body: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];
     for unit in body.encode_utf16() {
         bytes.extend(unit.to_le_bytes());
     }
-    std::fs::write(path, bytes)
+    bytes
+}
+
+/// The backup with every per-user section (HKCU, HKEY_USERS, HKCR) left
+/// out, for a restore run as administrator, and how many were left out.
+/// Lines before the first section (the header and markers) are kept.
+pub fn machine_sections_only(text: &str) -> (String, usize) {
+    let mut out = String::new();
+    let mut dropped = 0;
+    let mut keep = true;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if let Some(key) = trimmed
+            .strip_prefix('[')
+            .and_then(|rest| rest.strip_suffix(']'))
+        {
+            keep = !crate::pathutil::per_user_key(key);
+            if !keep {
+                dropped += 1;
+            }
+        }
+        if keep {
+            out.push_str(line);
+        }
+    }
+    (out, dropped)
 }
 
 /// Read a `.reg` file written by this program or by Regedit (UTF-16 or ANSI).
@@ -777,6 +807,25 @@ mod tests {
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 11);
         assert!(summary.machine_wide);
+    }
+
+    #[test]
+    fn an_administrator_restore_leaves_per_user_sections_out() {
+        let text = "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\A]\r\n\"x\"=\"1\"\r\n\r\n[HKEY_CURRENT_USER\\Software\\B]\r\n\"y\"=\"2\"\r\n\r\n[-HKEY_USERS\\S-1-5-21\\C]\r\n\r\n[HKEY_CLASSES_ROOT\\D]\r\n@=\"d\"\r\n\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\E]\r\n\"z\"=\"3\"\r\n";
+        let (kept, dropped) = machine_sections_only(text);
+        assert_eq!(dropped, 3);
+        assert!(kept.contains("; Hive Mend backup."));
+        assert!(kept.contains("SOFTWARE\\A") && kept.contains("\"x\"=\"1\""));
+        assert!(kept.contains("SOFTWARE\\E") && kept.contains("\"z\"=\"3\""));
+        for gone in [
+            "Software\\B",
+            "\"y\"",
+            "S-1-5-21",
+            "HKEY_CLASSES_ROOT",
+            "@=\"d\"",
+        ] {
+            assert!(!kept.contains(gone), "{gone} survived");
+        }
     }
 
     #[test]

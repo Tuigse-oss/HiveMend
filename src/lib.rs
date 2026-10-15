@@ -36,8 +36,8 @@ mod windows_services;
 #[cfg(windows)]
 pub use backup::import_reg_file;
 pub use backup::{
-    BackupInfo, BackupSummary, backup_name, is_hive_mend_backup, list_backups, read_backup,
-    reserve_backup_path, write_backup,
+    BackupInfo, BackupSummary, backup_name, encode_reg, is_hive_mend_backup, list_backups,
+    machine_sections_only, read_backup, reserve_backup_path, write_backup,
 };
 pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;
@@ -60,16 +60,16 @@ pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 #[cfg(windows)]
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
-pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
-pub use pathutil::{paths_in_command, protected_roots};
+pub use model::{Error, Finding, Repair, ScanOptions, ScannerId, ValueKind};
+pub use pathutil::{paths_in_command, per_user_key, protected_roots};
 pub use privacy::{
     CleanOutcome, CookieKeep, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup,
     PrivacyItem, PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items,
-    clean_with_progress, mask_matches, parse_custom, preview, privacy_reg_allowed, set_cookie_keep,
-    uninstall_present,
+    clean_with_progress, cookie_keep_choice, leave_per_user_registry, mask_matches, parse_custom,
+    preview, privacy_reg_allowed, set_cookie_keep, uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
-pub use registry::MemoryRegistry;
+pub use registry::{MemoryRegistry, Registry};
 pub use rules::decode_text_owned;
 pub use services::{
     MemoryServiceStore, NEVER_TOUCH, SUGGESTED, ServiceChange, ServiceInfo, ServiceOutcome,

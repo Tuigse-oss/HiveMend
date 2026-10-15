@@ -4,6 +4,15 @@ pub fn lnk_target(bytes: &[u8]) -> Option<String> {
         return None;
     }
     let flags = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+    // ForceNoLinkInfo: Windows ignores the cached path. HasExpString: the
+    // target comes from an environment-variable block. Either way the
+    // cached local path is not what the shortcut opens, so give no answer
+    // rather than one that could make a working shortcut look broken.
+    const FORCE_NO_LINK_INFO: u32 = 0x100;
+    const HAS_EXP_STRING: u32 = 0x200;
+    if flags & (FORCE_NO_LINK_INFO | HAS_EXP_STRING) != 0 {
+        return None;
+    }
     let mut cursor = 76usize;
     if flags & 0x1 != 0 {
         if cursor + 2 > bytes.len() {
@@ -21,6 +30,24 @@ pub fn lnk_target(bytes: &[u8]) -> Option<String> {
     let info_flags = u32::from_le_bytes(info[8..12].try_into().ok()?);
     if info_size > info.len() || header_size < 28 || info_flags & 0x1 == 0 {
         return None;
+    }
+    // The target is the base path plus a common suffix. A non-empty suffix
+    // (in either form) is not modelled here, so give no answer.
+    let suffix_empty =
+        |offset: usize| offset == 0 || info.get(offset).is_none_or(|byte| *byte == 0);
+    let suffix_off = u32::from_le_bytes(info[24..28].try_into().ok()?) as usize;
+    if suffix_off >= info_size || !suffix_empty(suffix_off) {
+        return None;
+    }
+    if header_size >= 0x24 && 36 <= info.len() {
+        let suffix_wide = u32::from_le_bytes(info[32..36].try_into().ok()?) as usize;
+        if suffix_wide != 0
+            && (suffix_wide + 1 >= info_size
+                || info[suffix_wide] != 0
+                || info[suffix_wide + 1] != 0)
+        {
+            return None;
+        }
     }
     if header_size >= 0x24 && header_size + 4 <= info.len() {
         let unicode_off = u32::from_le_bytes(info[28..32].try_into().ok()?) as usize;
@@ -65,7 +92,8 @@ fn read_utf16(bytes: &[u8]) -> Option<String> {
         units.push(unit);
         index += 2;
     }
-    Some(String::from_utf16_lossy(&units))
+    // Strict: a replacement character would name a different, missing file.
+    String::from_utf16(&units).ok()
 }
 
 pub fn sample_lnk(target: &str) -> Vec<u8> {
@@ -122,6 +150,23 @@ mod tests {
         bytes[20..24].copy_from_slice(&0x2u32.to_le_bytes());
         bytes.extend(info);
         bytes
+    }
+
+    #[test]
+    fn shortcuts_that_do_not_use_the_cached_path_give_no_target() {
+        for flag in [0x100u32, 0x200] {
+            let mut bytes = sample_lnk(r"C:\Missing\old.exe");
+            let flags = u32::from_le_bytes(bytes[20..24].try_into().unwrap()) | flag;
+            bytes[20..24].copy_from_slice(&flags.to_le_bytes());
+            assert_eq!(lnk_target(&bytes), None, "flag {flag:#x}");
+        }
+        // A non-empty common path suffix is part of the target.
+        let mut bytes = ansi_lnk(b"C:\\Share\0sub\\app.exe");
+        let info = 76;
+        // Point CommonPathSuffixOffset at "sub\app.exe".
+        let suffix_at = 28 + b"C:\\Share\0".len() as u32;
+        bytes[info + 24..info + 28].copy_from_slice(&suffix_at.to_le_bytes());
+        assert_eq!(lnk_target(&bytes), None);
     }
 
     #[test]

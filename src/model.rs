@@ -189,6 +189,17 @@ pub struct Finding {
 }
 
 impl Finding {
+    /// A registry repair in a hive the signed-in user can write, which an
+    /// administrator window leaves to a normal window.
+    pub fn per_user(&self) -> bool {
+        match &self.repair {
+            Repair::DeleteValue { key, .. } | Repair::DeleteKey { key } => {
+                crate::pathutil::per_user_key(key)
+            }
+            Repair::None | Repair::DeleteFile { .. } => false,
+        }
+    }
+
     pub fn repairable(&self) -> bool {
         !matches!(self.repair, Repair::None)
     }

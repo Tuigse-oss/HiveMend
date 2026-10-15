@@ -11,6 +11,21 @@ pub fn canonical_hive(name: &str) -> Option<&'static str> {
     }
 }
 
+/// A key in a hive the signed-in user can write: HKCU, HKEY_USERS, or
+/// HKCR (which merges in the user's own classes). An administrator window
+/// leaves these to a normal window.
+pub fn per_user_key(path: &str) -> bool {
+    let hive = path
+        .trim_start_matches('-')
+        .split('\\')
+        .next()
+        .unwrap_or("");
+    matches!(
+        canonical_hive(hive),
+        Some("HKEY_CURRENT_USER" | "HKEY_USERS" | "HKEY_CLASSES_ROOT")
+    )
+}
+
 pub fn canonical_path(path: &str) -> String {
     // Split on backslash only. A forward slash is a legal character inside a
     // registry key name (for example a `text/html` content-type key), so

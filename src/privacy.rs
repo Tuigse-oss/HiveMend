@@ -432,6 +432,68 @@ pub fn build_items() -> Vec<PrivacyItem> {
     builtin_items()
 }
 
+/// What to do with cookies, from reading the keep list. Anything uncertain
+/// (an unreadable list, a line that is not a site, an elevated window with
+/// sites listed) leaves cookies alone: it must never widen what is removed.
+/// Returns the choice and the list's warnings.
+pub fn cookie_keep_choice(
+    read: std::io::Result<String>,
+    elevated: bool,
+) -> (CookieKeep, Vec<String>) {
+    let text = match read {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (CookieKeep::All, Vec::new());
+        }
+        Err(err) => {
+            return (
+                CookieKeep::LeaveAlone(format!(
+                    "Cookies are left alone: your cookies-to-keep list could not be read ({err})."
+                )),
+                Vec::new(),
+            );
+        }
+        Ok(text) => text,
+    };
+    let (sites, warnings) = crate::cookies::parse_keep_list(&text);
+    let keep = if !warnings.is_empty() {
+        CookieKeep::LeaveAlone(
+            "Cookies are left alone until every line of your cookies-to-keep list is a site name."
+                .to_string(),
+        )
+    } else if sites.is_empty() {
+        CookieKeep::All
+    } else if elevated {
+        CookieKeep::LeaveAlone(
+            "You keep some cookies, so an administrator window leaves cookies alone. Start Hivemend without administrator rights to clean them."
+                .to_string(),
+        )
+    } else {
+        CookieKeep::Sites(sites)
+    };
+    (keep, warnings)
+}
+
+/// For an administrator window: drop per-user registry targets, which a
+/// program running without elevation can redirect, and say so on the row.
+/// Their history is cleaned from a normal window.
+pub fn leave_per_user_registry(items: &mut [PrivacyItem]) {
+    for item in items {
+        let before = item.targets.len();
+        item.targets.retain(|target| match target {
+            PrivacyTarget::RegTree { key } | PrivacyTarget::RegValues { key, .. } => {
+                !crate::pathutil::per_user_key(key)
+            }
+            _ => true,
+        });
+        if item.targets.len() != before {
+            item.warnings.push(
+                "Its registry entries are cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            );
+        }
+    }
+}
+
 /// Apply the cookies-to-keep choice to every item that holds cookies.
 pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
     for item in items {
@@ -1458,6 +1520,13 @@ fn trim_cookie_db(
         return;
     }
     let real = match fs.pin(db) {
+        // A second name for the database would be edited too.
+        Ok(pin) if pin.kind == ItemKind::File && pin.links > 1 => {
+            done.note(format!(
+                "refused: {db} has more than one name (a hard link)"
+            ));
+            return;
+        }
         Ok(pin) if pin.kind == ItemKind::File => pin.real_path.clone(),
         Ok(_) => {
             done.note(format!("not a file: {db}"));
@@ -1477,8 +1546,16 @@ fn trim_cookie_db(
         return;
     }
     match crate::cookies::trim_cookies(std::path::Path::new(&real), sites) {
-        Ok(count) => done.cookies += count.removed,
-        Err(err) => errors.push(format!("cookies in {db} were left as they were: {err}")),
+        Ok(trimmed) => {
+            done.cookies += trimmed.count.removed;
+            for copy in trimmed.leftovers {
+                errors.push(format!(
+                    "a copy of the old cookies could not be deleted; delete it yourself: {}",
+                    copy.display()
+                ));
+            }
+        }
+        Err(err) => errors.push(format!("cookies in {db}: {err}")),
     }
 }
 
@@ -2346,6 +2423,46 @@ mod tests {
             "History + wal, Cookies + journal"
         );
         let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn an_administrator_window_leaves_per_user_registry_targets() {
+        let mut items = builtin_items();
+        let before: usize = items.iter().map(|item| item.targets.len()).sum();
+        leave_per_user_registry(&mut items);
+        let after: usize = items.iter().map(|item| item.targets.len()).sum();
+        assert!(after < before);
+        for item in &items {
+            for target in &item.targets {
+                if let PrivacyTarget::RegTree { key } | PrivacyTarget::RegValues { key, .. } =
+                    target
+                {
+                    assert!(!crate::pathutil::per_user_key(key), "{key}");
+                }
+            }
+        }
+        let run = items.iter().find(|item| item.id == "run-dialog").unwrap();
+        assert!(!run.warnings.is_empty());
+    }
+
+    #[test]
+    fn an_uncertain_keep_list_never_widens_what_is_removed() {
+        use std::io::{Error, ErrorKind};
+        let absent = cookie_keep_choice(Err(Error::from(ErrorKind::NotFound)), false);
+        assert_eq!(absent.0, CookieKeep::All);
+        let unreadable = cookie_keep_choice(Err(Error::from(ErrorKind::PermissionDenied)), false);
+        assert!(matches!(unreadable.0, CookieKeep::LeaveAlone(_)));
+        let invalid = cookie_keep_choice(Ok("not a site\n".into()), false);
+        assert!(matches!(invalid.0, CookieKeep::LeaveAlone(_)));
+        assert_eq!(invalid.1.len(), 1);
+        let mixed = cookie_keep_choice(Ok("github.com\nnot a site\n".into()), false);
+        assert!(matches!(mixed.0, CookieKeep::LeaveAlone(_)));
+        let comments = cookie_keep_choice(Ok("# nothing kept\n".into()), false);
+        assert_eq!(comments.0, CookieKeep::All);
+        let sites = cookie_keep_choice(Ok("github.com\n".into()), false);
+        assert_eq!(sites.0, CookieKeep::Sites(vec!["github.com".into()]));
+        let elevated = cookie_keep_choice(Ok("github.com\n".into()), true);
+        assert!(matches!(elevated.0, CookieKeep::LeaveAlone(_)));
     }
 
     #[test]
