@@ -3950,11 +3950,11 @@ impl App {
                     &group,
                     &remove,
                     &protected,
-                    &mut |path| {
+                    &mut |path, held| {
                         done += 1;
                         set_progress(done, count.max(1), &format!("Moving {path}"));
                         post(hwnd, WM_JOB_PROGRESS);
-                        hive_mend::recycle(path)
+                        hive_mend::recycle(held)
                     },
                 );
                 results.extend(outcomes);

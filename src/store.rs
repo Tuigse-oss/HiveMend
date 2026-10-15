@@ -531,6 +531,18 @@ const TRUSTED_SIDS: &[&str] = &[
 /// everyone has full control, so it fails.
 #[cfg(windows)]
 fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
+    let handle = pin.raw_handle().ok_or("not a host handle")?;
+    check_handle_owner_and_dacl(handle, shown, None)
+}
+
+/// [`check_owner_and_dacl`] on an open handle; `also` is one more SID
+/// trusted beside the administrator ones (the account's own folder).
+#[cfg(windows)]
+pub(crate) fn check_handle_owner_and_dacl(
+    handle: std::os::windows::io::RawHandle,
+    shown: &str,
+    also: Option<&str>,
+) -> Result<(), String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
@@ -549,7 +561,7 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
         | 0x1000_0000 // generic all
         | 0x4000_0000; // generic write
     const INHERIT_ONLY: u8 = 0x08;
-    let handle = pin.raw_handle().ok_or("not a host handle")?;
+    let trusted = |sid: &str| TRUSTED_SIDS.contains(&sid) || also == Some(sid);
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
@@ -583,9 +595,14 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
     };
     let result = (|| {
         let owner_sid = sid_text(owner);
-        if !TRUSTED_SIDS.contains(&owner_sid.as_str()) {
+        if !trusted(&owner_sid) {
             return Err(format!(
-                "{shown} is owned by {owner_sid}, not an administrator account"
+                "{shown} is owned by {owner_sid}, not {}",
+                if also.is_some() {
+                    "this account or an administrator account"
+                } else {
+                    "an administrator account"
+                }
             ));
         }
         if dacl.is_null() {
@@ -615,7 +632,7 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
             }
             let sid = sid_text(unsafe { (ace as *mut u8).add(8) } as PSID);
             let creator_owner = sid == "S-1-3-0" && header.AceFlags & INHERIT_ONLY != 0;
-            if !TRUSTED_SIDS.contains(&sid.as_str()) && !creator_owner {
+            if !trusted(&sid) && !creator_owner {
                 return Err(format!("{shown} lets {sid} change it"));
             }
         }

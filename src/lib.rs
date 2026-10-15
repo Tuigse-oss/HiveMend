@@ -14,6 +14,7 @@ mod model;
 mod pathutil;
 mod privacy;
 mod programs;
+mod recycle;
 mod regfile;
 mod registry;
 #[cfg(windows)]

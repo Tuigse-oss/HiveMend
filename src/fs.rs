@@ -640,6 +640,69 @@ fn host_streams(path: &str, allow_marker: bool) -> Result<bool, String> {
     Ok(extra)
 }
 
+/// True when the open file has a named data stream besides the download
+/// marker (Zone.Identifier), read through the handle.
+#[cfg(windows)]
+pub(crate) fn host_handle_streams(file: &std::fs::File) -> Result<bool, String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, ERROR_MORE_DATA};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_STREAM_INFO, FileStreamInfo, GetFileInformationByHandleEx,
+    };
+    let mut buffer = vec![0u64; 512];
+    loop {
+        let ok = unsafe {
+            GetFileInformationByHandleEx(
+                file.as_raw_handle() as _,
+                FileStreamInfo,
+                buffer.as_mut_ptr() as _,
+                (buffer.len() * 8) as u32,
+            )
+        };
+        if ok != 0 {
+            break;
+        }
+        let err = std::io::Error::last_os_error();
+        match err.raw_os_error().map(|code| code as u32) {
+            // No streams at all: nothing extra.
+            Some(ERROR_HANDLE_EOF) => return Ok(false),
+            Some(ERROR_MORE_DATA) if buffer.len() < 1 << 20 => {
+                buffer.resize(buffer.len() * 4, 0);
+            }
+            _ => return Err(format!("could not list its data streams: {err}")),
+        }
+    }
+    let base = buffer.as_ptr() as *const u8;
+    let total = buffer.len() * 8;
+    let head = std::mem::offset_of!(FILE_STREAM_INFO, StreamName);
+    let mut offset = 0usize;
+    loop {
+        if offset + head > total {
+            return Err("unreadable data stream list".into());
+        }
+        let entry = unsafe { &*(base.add(offset) as *const FILE_STREAM_INFO) };
+        let bytes = entry.StreamNameLength as usize;
+        if offset + head + bytes > total {
+            return Err("unreadable data stream list".into());
+        }
+        let units: Vec<u16> = (0..bytes / 2)
+            .map(|i| unsafe {
+                std::ptr::read_unaligned(base.add(offset + head + i * 2) as *const u16)
+            })
+            .collect();
+        let name = String::from_utf16_lossy(&units);
+        if !name.eq_ignore_ascii_case("::$DATA")
+            && !name.eq_ignore_ascii_case(":Zone.Identifier:$DATA")
+        {
+            return Ok(true);
+        }
+        if entry.NextEntryOffset == 0 {
+            return Ok(false);
+        }
+        offset += entry.NextEntryOffset as usize;
+    }
+}
+
 /// Where an open file really is, from its handle, as a drive path.
 #[cfg(windows)]
 pub(crate) fn host_final_path(file: &std::fs::File) -> Result<String, String> {

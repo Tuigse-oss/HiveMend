@@ -19,6 +19,8 @@ rusqlite = { version = "0.40.2", default-features = false, features = ["bundled"
 
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61.2", features = [
+    "Wdk_Foundation",
+    "Wdk_Storage_FileSystem",
     "Wdk_System_Registry",
     "Win32_Foundation",
     "Win32_Graphics_Gdi",

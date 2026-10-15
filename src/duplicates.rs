@@ -4,7 +4,9 @@
 //! it happens: one copy of every set is always kept, protected folders are
 //! refused, and a file is only removed when its bytes still match the kept
 //! copy and it is not the same file reached by another name (a hard link).
-//! Removed files go to the Recycle Bin.
+//! Both files are held open from the check to the move, and everything
+//! after opening them goes through those handles, so the file moved is
+//! the file that was compared. Removed files go to the Recycle Bin.
 
 use std::collections::BTreeMap;
 
@@ -19,11 +21,12 @@ pub trait ContentReader {
     /// The file's identity, length, and a 128-bit hash of its first
     /// `limit` bytes (all of it when `None`).
     fn fingerprint(&self, path: &str, limit: Option<u64>) -> Result<(FileId, u64, u128), String>;
-    /// True when both files hold exactly the same bytes.
-    fn same_content(&self, a: &str, b: &str) -> Result<bool, String>;
-    /// Hold the file open: while the result lives, other programs cannot
-    /// write to it, and when `keep` is set (the copy being kept) cannot
-    /// delete or rename it either.
+    /// True when both held files hold exactly the same bytes, read
+    /// through their handles.
+    fn same_content(&self, a: &Held, b: &Held) -> Result<bool, String>;
+    /// Hold the file open: while the result lives, no other program can
+    /// write to, delete, or rename it. A file to remove (`keep` false) is
+    /// held with the right to move it, so it can go by that same handle.
     fn hold(&self, path: &str, keep: bool) -> Result<Held, String>;
 }
 
@@ -35,16 +38,32 @@ pub struct Held {
     /// It has named data streams besides the download marker
     /// (Zone.Identifier), which a byte compare does not cover.
     pub extra_streams: bool,
-    _guard: Box<dyn std::any::Any>,
+    /// Identity and length, from the handle.
+    pub id: FileId,
+    pub len: u64,
+    guard: Box<dyn std::any::Any>,
 }
 
 impl Held {
-    pub fn new(real_path: String, extra_streams: bool, guard: Box<dyn std::any::Any>) -> Self {
+    pub fn new(
+        real_path: String,
+        extra_streams: bool,
+        id: FileId,
+        len: u64,
+        guard: Box<dyn std::any::Any>,
+    ) -> Self {
         Self {
             real_path,
             extra_streams,
-            _guard: guard,
+            id,
+            len,
+            guard,
         }
+    }
+
+    /// What holds it open (an open file, on the host).
+    pub fn guard<T: 'static>(&self) -> Option<&T> {
+        self.guard.downcast_ref()
     }
 }
 
@@ -213,16 +232,17 @@ pub fn find_duplicates(
 /// Remove `remove` (indexes into the set's files) with `recycle`, checking
 /// each file just before: a copy of the set is kept and held open (so it
 /// cannot change or go away meanwhile), each file to remove is held open
-/// against writes from its check until it is moved, its real location must
-/// be outside the protected folders, it must not be the kept copy under
-/// another name, it must have no extra data streams, and its bytes must
+/// against writes, renames and deletes from its check until `recycle` moves
+/// it by that handle, its real location must be outside the protected
+/// folders, it must not be the kept copy under another name, it must have
+/// no extra data streams, and its bytes, read through both handles, must
 /// still match the kept copy. Returns each path with what happened.
 pub fn remove_checked(
     reader: &dyn ContentReader,
     group: &DupGroup,
     remove: &[usize],
     protected: &[String],
-    recycle: &mut dyn FnMut(&str) -> Result<(), String>,
+    recycle: &mut dyn FnMut(&str, &Held) -> Result<(), String>,
 ) -> Vec<(String, Result<(), String>)> {
     let kept: Vec<&String> = group
         .files
@@ -231,11 +251,11 @@ pub fn remove_checked(
         .filter(|(index, _)| !remove.contains(index))
         .map(|(_, path)| path)
         .collect();
-    // The first kept copy that can be held and still has the set's size.
+    // The first kept copy that can be held and still has the set's size;
+    // it stays held until every file of the set is done.
     let keeper = kept.iter().find_map(|path| {
         let held = reader.hold(path, true).ok()?;
-        let (id, len, _) = reader.fingerprint(path, Some(0)).ok()?;
-        (len == group.bytes).then_some((*path, id, held))
+        (held.len == group.bytes).then_some(held)
     });
     let mut out = Vec::new();
     for index in remove {
@@ -243,7 +263,7 @@ pub fn remove_checked(
             continue;
         };
         let verdict = (|| {
-            let (keep_path, keep_id, _) = keeper
+            let keeper = keeper
                 .as_ref()
                 .ok_or("no copy of this set is being kept, or the kept copy changed")?;
             let bytes = path.as_bytes();
@@ -274,20 +294,18 @@ pub fn remove_checked(
             if held.extra_streams {
                 return Err("it has extra data streams a byte compare does not cover".to_string());
             }
-            let (id, len, _) = reader.fingerprint(path, Some(0))?;
-            if id == *keep_id {
+            if held.id == keeper.id {
                 return Err("it is the kept copy under another name (a hard link)".to_string());
             }
-            if len != group.bytes {
+            if held.len != group.bytes {
                 return Err("it changed since the search".to_string());
             }
-            if !reader.same_content(keep_path, path)? {
+            if !reader.same_content(keeper, &held)? {
                 return Err("its contents no longer match the kept copy".to_string());
             }
-            // Still held against writes: what was compared is what goes.
-            let moved = recycle(path);
-            drop(held);
-            moved
+            // Still held against writes and renames: what was compared is
+            // what goes, moved by this handle.
+            recycle(path, &held)
         })();
         out.push((path.clone(), verdict));
     }
@@ -362,26 +380,28 @@ fn check_plain(file: &std::fs::File) -> Result<(FileId, u64), String> {
 impl ContentReader for HostContent {
     fn hold(&self, path: &str, keep: bool) -> Result<Held, String> {
         use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Foundation::GENERIC_READ;
         use windows_sys::Win32::Storage::FileSystem::{
-            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+            DELETE, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, SYNCHRONIZE,
         };
-        // No FILE_SHARE_WRITE: nothing can change it while held. The kept
-        // copy also withholds FILE_SHARE_DELETE, so it cannot go away.
-        let share = if keep {
-            FILE_SHARE_READ
+        // Only reading is shared: nothing can write, rename, or delete it
+        // while held. A file to remove is also opened with delete access,
+        // which is what moves it to the Recycle Bin by this handle.
+        let access = if keep {
+            GENERIC_READ | SYNCHRONIZE
         } else {
-            FILE_SHARE_READ | FILE_SHARE_DELETE
+            GENERIC_READ | DELETE | SYNCHRONIZE
         };
         let file = std::fs::OpenOptions::new()
-            .read(true)
-            .share_mode(share)
+            .access_mode(access)
+            .share_mode(FILE_SHARE_READ)
             .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
             .open(path)
             .map_err(|err| err.to_string())?;
-        check_plain(&file)?;
+        let (id, len) = check_plain(&file)?;
         let real_path = crate::fs::host_final_path(&file)?;
-        let extra_streams = crate::fs::host_extra_streams(path)?;
-        Ok(Held::new(real_path, extra_streams, Box::new(file)))
+        let extra_streams = crate::fs::host_handle_streams(&file)?;
+        Ok(Held::new(real_path, extra_streams, id, len, Box::new(file)))
     }
 
     fn fingerprint(&self, path: &str, limit: Option<u64>) -> Result<(FileId, u64, u128), String> {
@@ -406,56 +426,61 @@ impl ContentReader for HostContent {
         Ok((id, len, hash))
     }
 
-    fn same_content(&self, a: &str, b: &str) -> Result<bool, String> {
-        use std::io::Read;
-        let (mut left, _, left_len) = open_plain(a)?;
-        let (mut right, _, right_len) = open_plain(b)?;
+    fn same_content(&self, a: &Held, b: &Held) -> Result<bool, String> {
+        use std::os::windows::fs::FileExt;
+        let (Some(left), Some(right)) = (a.guard::<std::fs::File>(), b.guard::<std::fs::File>())
+        else {
+            return Err("not held by Hivemend".into());
+        };
+        let (_, left_len) = check_plain(left)?;
+        let (_, right_len) = check_plain(right)?;
         if left_len != right_len {
             return Ok(false);
         }
         let mut one = vec![0u8; 1 << 20];
         let mut two = vec![0u8; 1 << 20];
-        loop {
-            self.stopped()?;
-            let read = left.read(&mut one).map_err(|err| err.to_string())?;
-            if read == 0 {
-                return Ok(right.read(&mut two[..1]).map_err(|err| err.to_string())? == 0);
+        let mut offset = 0u64;
+        // Read at explicit offsets, so it never depends on where an
+        // earlier read left either handle.
+        let fill = |file: &std::fs::File, buf: &mut [u8], at: u64| -> Result<usize, String> {
+            let mut got = 0;
+            while got < buf.len() {
+                let read = file
+                    .seek_read(&mut buf[got..], at + got as u64)
+                    .map_err(|err| err.to_string())?;
+                if read == 0 {
+                    break;
+                }
+                got += read;
             }
-            right
-                .read_exact(&mut two[..read])
-                .map_err(|err| err.to_string())?;
-            if one[..read] != two[..read] {
+            Ok(got)
+        };
+        while offset < left_len {
+            self.stopped()?;
+            let want = ((left_len - offset) as usize).min(one.len());
+            if fill(left, &mut one[..want], offset)? != want
+                || fill(right, &mut two[..want], offset)? != want
+            {
                 return Ok(false);
             }
+            if one[..want] != two[..want] {
+                return Ok(false);
+            }
+            offset += want as u64;
         }
+        Ok(true)
     }
 }
 
-/// Move one file to the Recycle Bin. Windows warns first if the file
-/// would be deleted for good instead (a drive without a Recycle Bin, or a
-/// file too big for it); declining leaves it in place.
+/// Move a held file to this account's Recycle Bin by its handle. A file
+/// that cannot go there that way (a drive without a Recycle Bin) is left
+/// where it is; nothing is ever deleted for good.
 #[cfg(windows)]
-pub fn recycle(path: &str) -> Result<(), String> {
-    use windows_sys::Win32::UI::Shell::{
-        FO_DELETE, FOF_ALLOWUNDO, FOF_NOCONFIRMATION, FOF_NOERRORUI, FOF_SILENT,
-        FOF_WANTNUKEWARNING, SHFILEOPSTRUCTW, SHFileOperationW,
-    };
-    // Double NUL terminated, as SHFileOperationW requires.
-    let from: Vec<u16> = path.encode_utf16().chain([0, 0]).collect();
-    let mut op: SHFILEOPSTRUCTW = unsafe { std::mem::zeroed() };
-    op.wFunc = FO_DELETE;
-    op.pFrom = from.as_ptr();
-    op.fFlags =
-        (FOF_ALLOWUNDO | FOF_NOCONFIRMATION | FOF_SILENT | FOF_NOERRORUI | FOF_WANTNUKEWARNING)
-            as u16;
-    let status = unsafe { SHFileOperationW(&mut op) };
-    if status != 0 {
-        return Err(format!("the Recycle Bin refused it ({status:#x})"));
-    }
-    if op.fAnyOperationsAborted != 0 {
-        return Err("left in place".into());
-    }
-    Ok(())
+pub fn recycle(held: &Held) -> Result<(), String> {
+    let file = held
+        .guard::<std::fs::File>()
+        .ok_or("not held by Hivemend")?;
+    crate::recycle::recycle_held(file).map(|_| ())
 }
 
 #[cfg(test)]
@@ -526,9 +551,13 @@ mod tests {
             }
             Ok((*id, content.len() as u64, hash))
         }
-        fn same_content(&self, a: &str, b: &str) -> Result<bool, String> {
+        fn same_content(&self, a: &Held, b: &Held) -> Result<bool, String> {
             let files = self.files.borrow();
-            Ok(files.get(a).ok_or("missing")?.1 == files.get(b).ok_or("missing")?.1)
+            let content = |held: &Held| {
+                let path = held.guard::<String>().ok_or("not held")?;
+                files.get(path).map(|(_, content)| content).ok_or("missing")
+            };
+            Ok(content(a)? == content(b)?)
         }
         fn hold(&self, path: &str, _keep: bool) -> Result<Held, String> {
             if !self.files.borrow().contains_key(path) {
@@ -542,10 +571,13 @@ mod tests {
                         .map(|rest| format!("{real}{rest}"))
                 })
                 .unwrap_or_else(|| path.to_string());
+            let (id, content) = self.files.borrow()[path].clone();
             Ok(Held::new(
                 real,
                 self.streams.contains(&path.to_string()),
-                Box::new(()),
+                id,
+                content.len() as u64,
+                Box::new(path.to_string()),
             ))
         }
     }
@@ -556,7 +588,8 @@ mod tests {
     /// Remove with a recorder in place of the Recycle Bin.
     fn remove(world: &World, group: &DupGroup, remove: &[usize]) -> (Results, Vec<String>) {
         let mut moved = Vec::new();
-        let results = remove_checked(world, group, remove, &protected(), &mut |path| {
+        let results = remove_checked(world, group, remove, &protected(), &mut |path, held| {
+            assert_eq!(held.guard::<String>().map(String::as_str), Some(path));
             moved.push(path.to_string());
             Ok(())
         });
@@ -675,5 +708,125 @@ mod tests {
                 .is_err_and(|why| why.contains("streams"))
         );
         assert!(moved.is_empty());
+    }
+}
+
+/// Live Windows test: a real Recycle Bin move of a temporary file, which it
+/// then removes again.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+
+    fn forget_recycled(item: &str) {
+        let _ = std::fs::remove_file(item);
+        if let Some((dir, name)) = item.rsplit_once('\\')
+            && let Some(rest) = name.strip_prefix("$R")
+        {
+            let _ = std::fs::remove_file(format!("{dir}\\$I{rest}"));
+        }
+    }
+
+    #[test]
+    fn live_only_the_checked_copy_reaches_the_recycle_bin() {
+        let base = std::env::temp_dir().join(format!("hm-dup-live-{}", std::process::id()));
+        let dir = base.join("set");
+        std::fs::create_dir_all(&dir).unwrap();
+        let keep = dir.join("keep.bin");
+        let cand = dir.join("cand.bin");
+        std::fs::write(&keep, b"same bytes").unwrap();
+        std::fs::write(&cand, b"same bytes").unwrap();
+        let group = DupGroup {
+            bytes: 10,
+            files: vec![keep.display().to_string(), cand.display().to_string()],
+        };
+        let mut swaps = Vec::new();
+        let mut landed = None;
+        let mut replaced = false;
+        let results = remove_checked(
+            &HostContent::default(),
+            &group,
+            &[1],
+            &[],
+            &mut |path, held| {
+                // Between the check and the move, nothing may change or
+                // swap out either file.
+                let write =
+                    |at: &std::path::Path| std::fs::OpenOptions::new().write(true).open(at).is_ok();
+                swaps.push((
+                    "rename it",
+                    std::fs::rename(path, dir.join("x.bin")).is_ok(),
+                ));
+                swaps.push(("delete it", std::fs::remove_file(path).is_ok()));
+                swaps.push(("write it", write(std::path::Path::new(path))));
+                swaps.push(("delete the keeper", std::fs::remove_file(&keep).is_ok()));
+                swaps.push(("write the keeper", write(&keep)));
+                // A folder rename with a stand-in left at the old path must
+                // not change which file moves.
+                if std::fs::rename(&dir, base.join("set-moved")).is_ok() {
+                    std::fs::create_dir(&dir).unwrap();
+                    std::fs::write(&cand, b"stand in!!").unwrap();
+                    replaced = true;
+                }
+                let file = held.guard::<std::fs::File>().unwrap();
+                let to = crate::recycle::recycle_held(file)?;
+                landed = Some((to, held.id));
+                Ok(())
+            },
+        );
+        let (to, checked) = landed.clone().unwrap_or_default();
+        let moved = std::fs::File::open(&to).ok();
+        let moved_id = moved.as_ref().and_then(|file| check_plain(file).ok());
+        let moved_bytes = std::fs::read(&to).ok();
+        let keeper_dir = if replaced {
+            base.join("set-moved")
+        } else {
+            dir.clone()
+        };
+        let keeper_bytes = std::fs::read(keeper_dir.join("keep.bin")).ok();
+        let stand_in = replaced.then(|| std::fs::read(&cand).ok());
+        drop(moved);
+        forget_recycled(&to);
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(results[0].1.is_ok(), "{results:?}");
+        for (what, worked) in &swaps {
+            assert!(!worked, "could {what} while it was held");
+        }
+        assert!(to.contains("\\$Recycle.Bin\\S-1-"), "{to}");
+        assert_eq!(
+            moved_id.map(|(id, _)| id),
+            Some(checked),
+            "another file moved"
+        );
+        assert_eq!(moved_bytes.as_deref(), Some(&b"same bytes"[..]));
+        assert_eq!(keeper_bytes.as_deref(), Some(&b"same bytes"[..]));
+        if let Some(stand_in) = stand_in {
+            assert_eq!(stand_in.as_deref(), Some(&b"stand in!!"[..]));
+        }
+    }
+
+    #[test]
+    fn live_a_copy_open_for_writing_is_left_where_it_is() {
+        let base = std::env::temp_dir().join(format!("hm-dup-busy-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let keep = base.join("keep.bin");
+        let cand = base.join("cand.bin");
+        std::fs::write(&keep, b"same").unwrap();
+        std::fs::write(&cand, b"same").unwrap();
+        let writer = std::fs::OpenOptions::new().write(true).open(&cand).unwrap();
+        let group = DupGroup {
+            bytes: 4,
+            files: vec![keep.display().to_string(), cand.display().to_string()],
+        };
+        let mut called = false;
+        let results = remove_checked(&HostContent::default(), &group, &[1], &[], &mut |_, _| {
+            called = true;
+            Ok(())
+        });
+        drop(writer);
+        let still = std::fs::read(&cand).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(results[0].1.is_err(), "{results:?}");
+        assert!(!called);
+        assert_eq!(still.as_deref(), Some(&b"same"[..]));
     }
 }
