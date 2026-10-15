@@ -813,7 +813,11 @@ unsafe extern "system" fn wnd_proc(
             WM_CLOSE => {
                 if matches!(
                     app.job,
-                    Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning
+                    Job::Repairing
+                        | Job::Restoring
+                        | Job::Services
+                        | Job::Cleaning
+                        | Job::Recycling
                 ) {
                     app.message(
                         "Hivemend is still working. Please wait for it to finish before closing.",
