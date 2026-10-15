@@ -36,8 +36,8 @@ mod windows_services;
 #[cfg(windows)]
 pub use backup::import_reg_file;
 pub use backup::{
-    BackupInfo, BackupSummary, backup_name, encode_reg, is_hive_mend_backup, list_backups,
-    machine_sections_only, read_backup, reserve_backup_path, write_backup,
+    BackupInfo, BackupSummary, BackupWriter, backup_name, encode_reg, is_hive_mend_backup,
+    list_backups, machine_sections_only, read_backup, reserve_backup,
 };
 pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;

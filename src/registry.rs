@@ -258,3 +258,52 @@ impl RegTransaction for MemoryTransaction<'_> {
         Ok(())
     }
 }
+
+/// Test helper: a transaction that refuses to read one key, as a locked-down
+/// ACL would, wrapped around another transaction.
+#[cfg(test)]
+pub(crate) struct DenyTx<'a> {
+    pub inner: Box<dyn RegTransaction + 'a>,
+    pub deny_subkeys: Option<String>,
+    pub deny_values: Option<String>,
+}
+
+#[cfg(test)]
+impl DenyTx<'_> {
+    fn denied(rule: &Option<String>, path: &str) -> bool {
+        rule.as_ref()
+            .is_some_and(|locked| canonical_path(path).eq_ignore_ascii_case(locked))
+    }
+}
+
+#[cfg(test)]
+impl Registry for DenyTx<'_> {
+    fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+        if Self::denied(&self.deny_subkeys, path) {
+            return Err(RegError::Denied("access denied".into()));
+        }
+        self.inner.subkeys(path)
+    }
+    fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+        if Self::denied(&self.deny_values, path) {
+            return Err(RegError::Denied("access denied".into()));
+        }
+        self.inner.values(path)
+    }
+    fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        self.inner.delete_value(path, name)
+    }
+    fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+        self.inner.delete_tree(path)
+    }
+}
+
+#[cfg(test)]
+impl RegTransaction for DenyTx<'_> {
+    fn touch(&mut self, key: &str) -> Result<(), RegError> {
+        self.inner.touch(key)
+    }
+    fn commit(self: Box<Self>) -> Result<(), RegError> {
+        self.inner.commit()
+    }
+}

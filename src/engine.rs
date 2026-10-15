@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use crate::backup::{BackupPlan, export_backup, write_backup};
+use crate::backup::{BackupPlan, BackupWriter, export_backup, registry_sections};
 use crate::fs::{Access, FileView, ItemKind};
 use crate::ignore::{IgnoreDb, load_ignore_file};
 use crate::model::{Error, Finding, Repair, ScanOptions, ScannerId};
 use crate::pathutil::{
     canonical_path, file_delete_allowed, is_protected_key, key_delete_allowed, under_windows_dir,
 };
-use crate::registry::{RegError, Registry};
+use crate::registry::{RegError, RegTransaction, Registry};
 use crate::rules::{RuleSet, builtin_deep_roots, decode_text_owned, load_rules_file};
 use crate::scanners::{ScanCtx, run_scanner};
 
@@ -204,6 +204,14 @@ mod tests {
         fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
             self.inner.delete_tree(path)
         }
+        fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+            let locked = self.locked.clone();
+            Ok(Box::new(crate::registry::DenyTx {
+                inner: self.inner.begin()?,
+                deny_subkeys: Some(locked),
+                deny_values: None,
+            }))
+        }
     }
 
     #[test]
@@ -269,17 +277,14 @@ mod tests {
         fs.add_file_bytes(r"C:\Users\me\Documents\thesis.docx", vec![3; 4], None);
         fs.add_alias(&format!(r"{temp}\sys"), r"C:\Windows\System32");
         fs.add_alias(&format!(r"{temp}\docs"), r"C:\Users\me\Documents");
-        let backup = std::env::temp_dir().join(format!(
-            "hive-mend-pinned-delete-{}.reg",
-            std::process::id()
-        ));
+        let mut backup = crate::backup::test_writer("hive-mend-pinned-delete");
         let findings = [
             temp_file_finding(&format!(r"{temp}\real.tmp")),
             temp_file_finding(&format!(r"{temp}\sys\kernel.dll")),
             temp_file_finding(&format!(r"{temp}\docs\thesis.docx")),
         ];
-        let outcome = repair(&mut MemoryRegistry::new(), &mut fs, &findings, &backup).unwrap();
-        let _ = std::fs::remove_file(&backup);
+        let outcome = repair(&mut MemoryRegistry::new(), &mut fs, &findings, &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
         assert_eq!(outcome.applied, 1);
         assert_eq!(outcome.refused, 2);
         assert!(!fs.exists(&format!(r"{temp}\real.tmp")));
@@ -288,6 +293,68 @@ mod tests {
             fs.read(r"C:\Users\me\Documents\thesis.docx"),
             Some(vec![3; 4])
         );
+    }
+
+    #[test]
+    fn a_registry_entry_changed_during_repair_is_not_removed() {
+        let base = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        reg.set_sz(&format!(r"{base}\Stale\Child"), "x", "1");
+        reg.set_sz(&format!(r"{base}\Other"), "DisplayName", "Other");
+        // Another program writes under Stale while the repair runs.
+        reg.changed_elsewhere.push(format!(r"{base}\Stale\Child"));
+        let mut backup = crate::backup::test_writer("hive-mend-tx-conflict");
+        let findings = [uninstall_finding("Stale"), uninstall_finding("Other")];
+        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup).unwrap();
+        assert_eq!(outcome.applied, 1, "{:?}", outcome.errors);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            reg.subkeys(&format!(r"{base}\Stale")).is_ok(),
+            "a changed entry was removed"
+        );
+        assert!(reg.values(&format!(r"{base}\Other")).is_err());
+        let text = crate::backup::read_backup(backup.path()).unwrap();
+        assert!(text.contains("; entry 1\r\n"));
+        assert!(text.contains("; entry 1 was not removed"));
+        assert!(text.contains("; entry 2\r\n"));
+        assert!(!text.contains("; entry 2 was not removed"));
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn without_registry_transactions_nothing_is_removed() {
+        // A registry that cannot offer transactions: scan-only.
+        struct NoTx(MemoryRegistry);
+        impl Registry for NoTx {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                self.0.subkeys(path)
+            }
+            fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+                self.0.values(path)
+            }
+            fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+                self.0.delete_value(path, name)
+            }
+            fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+                self.0.delete_tree(path)
+            }
+        }
+        let base = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut inner = MemoryRegistry::new();
+        inner.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        let mut reg = NoTx(inner);
+        let mut backup = crate::backup::test_writer("hive-mend-no-tx");
+        let outcome = repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Stale")],
+            &mut backup,
+        )
+        .unwrap();
+        assert_eq!(outcome.applied, 0);
+        assert!(reg.0.values(&format!(r"{base}\Stale")).is_ok());
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -300,14 +367,14 @@ mod tests {
             inner,
             locked: canonical_path(&format!(r"{base}\Locked")),
         };
-        let backup = std::env::temp_dir().join("hive-mend-locked-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-locked-test");
         let findings = [uninstall_finding("Readable"), uninstall_finding("Locked")];
-        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &backup).unwrap();
+        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup).unwrap();
         assert_eq!(outcome.applied, 1);
         assert_eq!(outcome.not_backed_up, 1);
         assert!(reg.inner.subkeys(&format!(r"{base}\Locked")).is_ok());
         assert!(reg.inner.values(&format!(r"{base}\Readable")).is_err());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -386,32 +453,55 @@ pub fn repair(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     findings: &[Finding],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
 ) -> Result<RepairOutcome, Error> {
-    repair_with_progress(reg, fs, findings, backup_file, &mut |_, _| {})
+    repair_with_progress(reg, fs, findings, backup, &mut |_, _| {})
 }
 
-/// Writes the backup, then removes each finding the backup covers.
+/// Removes each finding, recording it in `backup` first.
 /// `progress(done, total)` runs after each finding.
 ///
-/// A value added between the backup read and its deletion would be removed
-/// without being in the backup; the window is milliseconds, and anything
-/// the backup could not read is skipped rather than deleted.
+/// Each registry finding is removed in its own registry transaction: its
+/// keys are touched first, its backup section is read through the
+/// transaction and flushed to disk, then it is deleted and committed. If
+/// anything else changes those keys meanwhile, the commit fails and nothing
+/// is removed. Where transactions are not available, registry findings are
+/// left alone (scan-only); there is no fallback to an ordinary delete.
 pub fn repair_with_progress(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     findings: &[Finding],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<RepairOutcome, Error> {
-    let plan = export_backup(reg, findings, backup_file);
-    write_backup(backup_file, &plan.body)?;
+    // The header and the shortcut copies' lines go first; registry entries
+    // are appended one by one as each is removed.
+    let files: Vec<Finding> = findings
+        .iter()
+        .filter(|finding| matches!(finding.repair, Repair::DeleteFile { .. }))
+        .cloned()
+        .collect();
+    let plan = export_backup(reg, &files, backup.path());
+    backup.append(&plan.body)?;
     let mut outcome = RepairOutcome {
-        backup_file: backup_file.to_path_buf(),
+        backup_file: backup.path().to_path_buf(),
         ..RepairOutcome::default()
     };
     for (index, finding) in findings.iter().enumerate() {
-        match apply(reg, fs, finding, &plan) {
+        let applied = match &finding.repair {
+            Repair::DeleteValue { key, .. } if is_protected_key(key) => Applied::Refused,
+            Repair::DeleteKey { key } if !key_delete_allowed(key) => Applied::Refused,
+            Repair::DeleteValue { .. } | Repair::DeleteKey { .. } => {
+                match delete_in_transaction(reg, &finding.repair, backup, index + 1) {
+                    Ok(Deleted::Removed) => Applied::Removed,
+                    Ok(Deleted::AlreadyGone) => Applied::AlreadyGone,
+                    Ok(Deleted::NotBackedUp) => Applied::NotBackedUp,
+                    Err(err) => reg_result(Err(err)),
+                }
+            }
+            _ => apply(reg, fs, finding, &plan),
+        };
+        match applied {
             Applied::Removed => {
                 outcome.applied += 1;
                 outcome.resolved.push(finding.clone());
@@ -457,6 +547,96 @@ fn reg_result(result: Result<(), RegError>) -> Applied {
     }
 }
 
+/// What one transactional registry removal did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Deleted {
+    Removed,
+    AlreadyGone,
+    /// Its backup section could not be read in full; nothing was removed.
+    NotBackedUp,
+}
+
+/// Remove one registry target (`DeleteKey` or `DeleteValue`) in its own
+/// transaction, recording it in `backup` as entry `entry` first:
+/// touch every key it covers, export its section through the transaction,
+/// append and flush that section, delete, commit. On any failure the
+/// transaction rolls back and a line in the backup marks the entry as not
+/// removed, so a restore leaves it out. Callers check their own safety
+/// rules (protected keys) before calling.
+pub(crate) fn delete_in_transaction(
+    reg: &mut dyn Registry,
+    repair: &Repair,
+    backup: &mut BackupWriter,
+    entry: usize,
+) -> Result<Deleted, RegError> {
+    let (key, tree) = match repair {
+        Repair::DeleteKey { key } => (key.as_str(), true),
+        Repair::DeleteValue { key, .. } => (key.as_str(), false),
+        Repair::DeleteFile { .. } | Repair::None => return Ok(Deleted::NotBackedUp),
+    };
+    let mut tx = reg.begin()?;
+    match touch_all(&mut *tx, key, tree, 0) {
+        Ok(()) => {}
+        Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
+        // Part of it cannot be read, so it could not be backed up anyway.
+        Err(_)
+            if !registry_sections(&*tx, std::slice::from_ref(repair))
+                .1
+                .is_empty() =>
+        {
+            return Ok(Deleted::NotBackedUp);
+        }
+        Err(err) => return Err(err),
+    }
+    let (section, unreadable) = registry_sections(&*tx, std::slice::from_ref(repair));
+    if !unreadable.is_empty() {
+        return Ok(Deleted::NotBackedUp);
+    }
+    backup
+        .append(&format!("\r\n; entry {entry}\r\n{section}"))
+        .map_err(|err| RegError::Message(format!("the backup could not be saved: {err}")))?;
+    let deleted = match repair {
+        Repair::DeleteKey { key } => tx.delete_tree(key),
+        Repair::DeleteValue { key, name } => tx.delete_value(key, name),
+        Repair::DeleteFile { .. } | Repair::None => Ok(()),
+    };
+    match deleted {
+        Ok(()) => {}
+        Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
+        Err(err) => {
+            let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
+            return Err(err);
+        }
+    }
+    match tx.commit() {
+        Ok(()) => Ok(Deleted::Removed),
+        Err(err) => {
+            let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
+            Err(err)
+        }
+    }
+}
+
+/// Touch `key` and, for a tree, every key below it, so a change to any of
+/// them from elsewhere fails the transaction's commit.
+fn touch_all(
+    tx: &mut dyn RegTransaction,
+    key: &str,
+    tree: bool,
+    depth: usize,
+) -> Result<(), RegError> {
+    if depth > 512 {
+        return Err(RegError::Message(format!("{key} is nested too deeply")));
+    }
+    tx.touch(key)?;
+    if tree {
+        for child in tx.subkeys(key)? {
+            touch_all(tx, &format!("{key}\\{child}"), true, depth + 1)?;
+        }
+    }
+    Ok(())
+}
+
 fn apply(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
@@ -465,23 +645,10 @@ fn apply(
 ) -> Applied {
     match &finding.repair {
         Repair::None => Applied::Refused,
-        Repair::DeleteValue { key, name } => {
-            if is_protected_key(key) {
-                return Applied::Refused;
-            }
-            if !plan.covers(key) || !plan.still_as_backed_up(reg, &finding.repair) {
-                return Applied::NotBackedUp;
-            }
-            reg_result(reg.delete_value(key, name))
-        }
-        Repair::DeleteKey { key } => {
-            if !key_delete_allowed(key) {
-                return Applied::Refused;
-            }
-            if !plan.covers(key) || !plan.still_as_backed_up(reg, &finding.repair) {
-                return Applied::NotBackedUp;
-            }
-            reg_result(reg.delete_tree(key))
+        // Registry removals happen only in delete_in_transaction.
+        Repair::DeleteValue { .. } | Repair::DeleteKey { .. } => {
+            let _ = reg;
+            Applied::Refused
         }
         Repair::DeleteFile { path, keep_copy } => {
             if !file_delete_allowed(path) {
@@ -588,12 +755,12 @@ mod live_tests {
                 keep_copy: false,
             },
         };
-        let backup = dir.join("backup.reg");
+        let mut backup = crate::backup::BackupWriter::reserve(&dir, "backup").unwrap();
         let outcome = repair(
             &mut MemoryRegistry::new(),
             &mut HostFs,
             std::slice::from_ref(&finding),
-            &backup,
+            &mut backup,
         );
         // remove_dir_all removes the junction itself, never its target.
         let _ = std::fs::remove_dir_all(&dir);

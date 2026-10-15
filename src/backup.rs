@@ -24,37 +24,153 @@ pub fn backup_name(now: SystemTime) -> String {
     format!("hive-mend-{}.reg", ymd_hms(secs))
 }
 
-/// Reserve a unique backup path by creating the file now. Two repairs within
-/// the same second would otherwise derive the same second-resolution name and
-/// the second would truncate the first, destroying its recovery record. The
-/// returned file exists (empty); the caller fills it with [`write_backup`],
-/// and its sidecar directory is derived from this unique name.
-pub fn reserve_backup_path(dir: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let base = backup_name(now);
-    let stem = base.strip_suffix(".reg").unwrap_or(&base);
-    for attempt in 0..10_000u32 {
-        let name = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{stem}-{attempt}.reg")
-        };
-        let path = dir.join(&name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
+/// A reserved backup file, written only through the handle that created
+/// it, so nothing else can be truncated or redirected in its place.
+/// Every [`append`](BackupWriter::append) is flushed to disk before it
+/// returns: a repair deletes only after its record is durable.
+pub struct BackupWriter {
+    file: std::fs::File,
+    path: PathBuf,
+    started: bool,
+}
+
+impl BackupWriter {
+    /// Reserve `<dir>\<stem>.reg`, or `<stem>-2.reg` and so on, by creating
+    /// it. Two repairs in the same second never share a file.
+    pub fn reserve(dir: &Path, stem: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        for attempt in 0..10_000u32 {
+            let name = if attempt == 0 {
+                format!("{stem}.reg")
+            } else {
+                format!("{stem}-{}.reg", attempt + 1)
+            };
+            let path = dir.join(&name);
+            let mut options = std::fs::OpenOptions::new();
+            options.write(true).create_new(true);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::OpenOptionsExt;
+                // Delete access, so an unused reservation is removed through
+                // this handle; read sharing only, so nothing else can write,
+                // rename, or delete it while it is held.
+                const DELETE: u32 = 0x0001_0000;
+                const GENERIC_WRITE: u32 = 0x4000_0000;
+                const SYNCHRONIZE: u32 = 0x0010_0000;
+                const FILE_SHARE_READ: u32 = 0x1;
+                options.access_mode(GENERIC_WRITE | DELETE | SYNCHRONIZE);
+                options.share_mode(FILE_SHARE_READ);
+            }
+            match options.open(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file,
+                        path,
+                        started: false,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique backup name",
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// True until something has been written.
+    pub fn is_empty(&self) -> bool {
+        !self.started
+    }
+
+    /// Append `text` as UTF-16 (with the byte-order mark first) and flush it
+    /// to disk.
+    pub fn append(&mut self, text: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+        if !self.started {
+            bytes.extend([0xFF, 0xFE]);
+        }
+        for unit in text.encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        self.file.write_all(&bytes)?;
+        self.file.sync_data()?;
+        self.started = true;
+        Ok(())
+    }
+
+    /// Remove an unused reservation, through its own handle. A file that
+    /// has been written is a recovery record and is kept.
+    pub fn discard(self) {
+        if self.started {
+            return;
+        }
+        #[cfg(windows)]
         {
-            Ok(_) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
+            use std::os::windows::io::AsRawHandle;
+            use windows_sys::Win32::Storage::FileSystem::{
+                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+            };
+            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+            unsafe {
+                SetFileInformationByHandle(
+                    self.file.as_raw_handle() as _,
+                    FileDispositionInfo,
+                    &info as *const _ as *const _,
+                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+                );
+            }
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = std::fs::remove_file(&self.path);
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not reserve a unique backup name",
-    ))
 }
+
+/// A writer for tests, reserved in this process's own temp folder.
+#[cfg(test)]
+pub(crate) fn test_writer(stem: &str) -> BackupWriter {
+    let dir = std::env::temp_dir().join(format!("hm-tests-{}", std::process::id()));
+    BackupWriter::reserve(&dir, stem).expect("reserve a test backup")
+}
+
+/// Reserve the next `hive-mend-<time>.reg` in `dir`.
+pub fn reserve_backup(dir: &Path, now: SystemTime) -> std::io::Result<BackupWriter> {
+    let name = backup_name(now);
+    BackupWriter::reserve(dir, name.strip_suffix(".reg").unwrap_or(&name))
+}
+
+/// The registry sections a backup holds for `repairs`, without the file's
+/// header, and the keys that could not be read.
+pub fn registry_sections(reg: &dyn Registry, repairs: &[Repair]) -> (String, Vec<String>) {
+    let registry: Vec<Repair> = repairs
+        .iter()
+        .filter(|repair| {
+            matches!(
+                repair,
+                Repair::DeleteKey { .. } | Repair::DeleteValue { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    let plan = export_repairs(reg, &registry, Path::new("unused.reg"));
+    let body = plan
+        .body
+        .split_once(HEADER_END)
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_default();
+    (body, plan.unreadable)
+}
+
+/// The last line of every backup's header.
+const HEADER_END: &str = "; Restore it from the Restore page in Hivemend.\r\n";
 
 /// What a repair is about to remove, in `.reg` form.
 pub struct BackupPlan {
@@ -64,102 +180,9 @@ pub struct BackupPlan {
     pub unreadable: Vec<String>,
     /// Shortcut path and the copy kept next to the backup.
     pub file_copies: Vec<(String, PathBuf)>,
-    /// What the backup recorded for each registry target, to check just
-    /// before deleting that nothing has been added or changed since.
-    pub snapshots: Vec<Snapshot>,
-}
-
-/// A registry target as the backup recorded it: a whole key (`name` is
-/// `None`) or one value, with its `.reg` text, or `None` when it was
-/// already gone.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct Snapshot {
-    pub key: String,
-    pub name: Option<String>,
-    pub text: Option<String>,
-}
-
-/// A `.reg` section as a set of entries: each key header, and each value
-/// (with its continuation lines) under its key.
-fn reg_entries(text: &str) -> std::collections::HashSet<String> {
-    let mut entries = std::collections::HashSet::new();
-    let mut header = String::new();
-    let mut value = String::new();
-    for line in text.lines() {
-        let line = line.trim_end();
-        if line.is_empty() || line.starts_with(';') {
-            continue;
-        }
-        if !value.is_empty() {
-            value.push('\n');
-            value.push_str(line.trim_start());
-        } else if line.starts_with('[') {
-            header = line.to_ascii_lowercase();
-            entries.insert(header.clone());
-            continue;
-        } else {
-            value.push_str(line);
-        }
-        if !line.ends_with('\\') {
-            entries.insert(format!("{header}\u{1}{value}"));
-            value.clear();
-        }
-    }
-    entries
 }
 
 impl BackupPlan {
-    /// True when `repair`'s target holds nothing the backup did not record:
-    /// every key and value still there is in the backup exactly as it is
-    /// now, so whatever the delete removes can be put back. Entries removed
-    /// since (by earlier repairs in the same run) are fine; anything added
-    /// or changed, or a target that cannot be read, is not.
-    pub fn still_as_backed_up(&self, reg: &dyn Registry, repair: &Repair) -> bool {
-        let (key, name) = match repair {
-            Repair::DeleteKey { key } => (canonical_path(key), None),
-            Repair::DeleteValue { key, name } => (canonical_path(key), Some(name.as_str())),
-            Repair::DeleteFile { .. } | Repair::None => return true,
-        };
-        let Some(snapshot) = self.snapshots.iter().find(|snapshot| {
-            snapshot.key.eq_ignore_ascii_case(&key)
-                && match (&snapshot.name, name) {
-                    (None, None) => true,
-                    (Some(have), Some(want)) => have.eq_ignore_ascii_case(want),
-                    _ => false,
-                }
-        }) else {
-            return false;
-        };
-        let now = match name {
-            None => {
-                let mut section = String::new();
-                match export_tree(reg, &key, 0, &mut section) {
-                    Ok(()) => Some(section),
-                    Err(RegError::NotFound) => None,
-                    Err(_) => return false,
-                }
-            }
-            Some(want) => match reg.values(&key) {
-                Ok(values) => values
-                    .iter()
-                    .find(|value| value.name.eq_ignore_ascii_case(want))
-                    .map(|value| format!("[{key}]\r\n{}\r\n", format_value(value))),
-                Err(RegError::NotFound) => None,
-                Err(_) => return false,
-            },
-        };
-        match (now, &snapshot.text) {
-            // Gone now: deleting it is a no-op.
-            (None, _) => true,
-            // Appeared after the backup said it was gone.
-            (Some(_), None) => false,
-            (Some(now), Some(then)) => {
-                let recorded = reg_entries(then);
-                reg_entries(&now).is_subset(&recorded)
-            }
-        }
-    }
-
     pub fn covers(&self, key: &str) -> bool {
         let key = canonical_path(key);
         !self
@@ -241,9 +264,8 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
     body.push_str(BACKUP_MARKER);
     body.push_str("\r\n");
-    body.push_str("; Restore it from the Restore page in Hivemend.\r\n");
+    body.push_str(HEADER_END);
     let mut unreadable = Vec::new();
-    let mut snapshots = Vec::new();
 
     for key in trees {
         let mut section = String::new();
@@ -251,19 +273,9 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
             Ok(()) => {
                 body.push_str("\r\n");
                 body.push_str(&section);
-                snapshots.push(Snapshot {
-                    key: key.clone(),
-                    name: None,
-                    text: Some(section),
-                });
             }
             Err(RegError::NotFound) => {
                 body.push_str(&format!("\r\n; already gone {key}\r\n"));
-                snapshots.push(Snapshot {
-                    key: key.clone(),
-                    name: None,
-                    text: None,
-                });
             }
             Err(err) => {
                 body.push_str(&format!(
@@ -296,33 +308,14 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                         Some(value) => {
                             body.push_str(&format_value(value));
                             body.push_str("\r\n");
-                            snapshots.push(Snapshot {
-                                key: key.clone(),
-                                name: Some(name.clone()),
-                                text: Some(format!("[{key}]\r\n{}\r\n", format_value(value))),
-                            });
                         }
                         None => {
                             body.push_str(&format!("; already gone {}\r\n", value_label(&name)));
-                            snapshots.push(Snapshot {
-                                key: key.clone(),
-                                name: Some(name.clone()),
-                                text: None,
-                            });
                         }
                     }
                 }
             }
-            Err(RegError::NotFound) => {
-                body.push_str(&format!("\r\n; already gone {key}\r\n"));
-                for name in names {
-                    snapshots.push(Snapshot {
-                        key: key.clone(),
-                        name: Some(name),
-                        text: None,
-                    });
-                }
-            }
+            Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
             Err(err) => {
                 body.push_str(&format!(
                     "\r\n; not backed up, left alone: {key}: {err}\r\n"
@@ -358,7 +351,6 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
         body,
         unreadable,
         file_copies,
-        snapshots,
     }
 }
 
@@ -529,13 +521,6 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     let month = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let year = (if month <= 2 { y + 1 } else { y }) as i32;
     (year, month, day)
-}
-
-pub fn write_backup(path: &Path, body: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    std::fs::write(path, encode_reg(body))
 }
 
 /// A `.reg` body as Regedit writes it: UTF-16LE with a byte-order mark.
@@ -767,16 +752,29 @@ mod tests {
     }
 
     #[test]
-    fn reserve_backup_path_never_reuses_a_name() {
+    fn a_reserved_backup_is_written_through_its_own_handle() {
         let dir = std::env::temp_dir().join(format!("hivemend-reserve-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let now = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let first = reserve_backup_path(&dir, now).unwrap();
-        let second = reserve_backup_path(&dir, now).unwrap();
-        assert_ne!(first, second);
-        assert!(first.exists() && second.exists());
+        let mut first = reserve_backup(&dir, now).unwrap();
+        let second = reserve_backup(&dir, now).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().exists() && second.path().exists());
         // The matching sidecar directories differ too.
-        assert_ne!(files_dir(&first), files_dir(&second));
+        assert_ne!(files_dir(first.path()), files_dir(second.path()));
+        first
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        first.append("; Hive Mend backup.\r\n").unwrap();
+        let text = read_backup(first.path()).unwrap();
+        assert!(text.starts_with("Windows Registry Editor Version 5.00"));
+        assert!(is_hive_mend_backup(&text));
+        // An unused reservation goes; a written one is kept.
+        let (first_path, second_path) = (first.path().to_path_buf(), second.path().to_path_buf());
+        first.discard();
+        second.discard();
+        assert!(first_path.exists());
+        assert!(!second_path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -933,48 +931,6 @@ mod tests {
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 11);
         assert!(summary.machine_wide);
-    }
-
-    #[test]
-    fn nothing_is_deleted_unless_the_backup_still_covers_it() {
-        let tree = r"HKEY_CURRENT_USER\Software\Gone";
-        let run = r"HKEY_CURRENT_USER\Software\Run";
-        let mut reg = MemoryRegistry::new();
-        reg.set_sz(tree, "a", "1");
-        reg.set_sz(&format!(r"{tree}\Child"), "b", "2");
-        reg.set_sz(run, "App", "C:\\old.exe");
-        let key = Repair::DeleteKey { key: tree.into() };
-        let value = Repair::DeleteValue {
-            key: run.into(),
-            name: "App".into(),
-        };
-        let reborn = Repair::DeleteKey {
-            key: r"HKEY_CURRENT_USER\Software\Later".into(),
-        };
-        let file = std::env::temp_dir().join("hm-snapshot-test.reg");
-        let plan = export_repairs(&reg, &[key.clone(), value.clone(), reborn.clone()], &file);
-        // Unchanged: deletable.
-        assert!(plan.still_as_backed_up(&reg, &key));
-        assert!(plan.still_as_backed_up(&reg, &value));
-        // Something removed since (an earlier repair in the same run) is fine.
-        let mut trimmed = reg.clone();
-        trimmed
-            .delete_value(&format!(r"{tree}\Child"), "b")
-            .unwrap();
-        assert!(plan.still_as_backed_up(&trimmed, &key));
-        // Added to since the backup: the new value is not in it.
-        let mut added = reg.clone();
-        added.set_sz(&format!(r"{tree}\Child"), "c", "3");
-        assert!(!plan.still_as_backed_up(&added, &key));
-        // Changed since the backup.
-        let mut changed = reg.clone();
-        changed.set_sz(run, "App", "C:\\new.exe");
-        assert!(!plan.still_as_backed_up(&changed, &value));
-        // Gone at backup time, back since: not in the backup.
-        let mut back = reg.clone();
-        assert!(plan.still_as_backed_up(&back, &reborn));
-        back.set_sz(r"HKEY_CURRENT_USER\Software\Later", "x", "1");
-        assert!(!plan.still_as_backed_up(&back, &reborn));
     }
 
     #[test]

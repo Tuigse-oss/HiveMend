@@ -2389,7 +2389,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_services_backup_file() else {
+        let Some(mut backup) = next_services_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -2407,7 +2407,8 @@ impl App {
             } else {
                 format!("these {} services", selected.len())
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -2423,7 +2424,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 8));
         }
         if !self.confirm(&question, Redo::ServicesApply) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Services;
@@ -2441,7 +2442,7 @@ impl App {
                 &mut ScmServiceStore,
                 &WindowsRegistry,
                 &selected,
-                &backup_file,
+                &mut backup,
                 &mut |done, total| {
                     set_progress(
                         done,
@@ -2598,7 +2599,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_services_backup_file() else {
+        let Some(mut backup) = next_services_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -2617,7 +2618,8 @@ impl App {
                 format!("these {} services", changes.len())
             },
             to.label(),
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -2626,7 +2628,7 @@ impl App {
             question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
         }
         if !self.confirm(&question, Redo::SetRows(rows.to_vec(), to)) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Services;
@@ -2640,7 +2642,7 @@ impl App {
                 &mut ScmServiceStore,
                 &WindowsRegistry,
                 &changes,
-                &backup_file,
+                &mut backup,
                 &mut |done, total| {
                     set_progress(
                         done,
@@ -3030,7 +3032,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_privacy_backup_file() else {
+        let Some(mut backup) = next_privacy_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -3045,7 +3047,8 @@ impl App {
             } else {
                 "categories"
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -3065,7 +3068,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 10));
         }
         if !self.confirm(&question, Redo::PrivacyClean) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Cleaning;
@@ -3083,7 +3086,7 @@ impl App {
                 &mut WindowsSystemTargets,
                 &WindowsProcessList,
                 &selected,
-                &backup_file,
+                &mut backup,
                 &mut |done, total, name| {
                     set_progress(
                         done,
@@ -3360,7 +3363,7 @@ impl App {
         if !self.confirm(&question, Redo::Startup(rows.to_vec(), enable)) {
             return;
         }
-        let Some(backup_file) = next_backup_file_with("startup") else {
+        let Some(mut backup) = next_backup_file_with("startup") else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -3369,8 +3372,7 @@ impl App {
         };
         let refs: Vec<&hive_mend::StartupItem> = picked.iter().collect();
         let (body, refused) = hive_mend::startup_backup(&WindowsRegistry, &refs);
-        if let Err(err) = hive_mend::write_backup(&backup_file, &body) {
-            discard_reserved_backup(&backup_file);
+        if let Err(err) = backup.append(&body) {
             self.message(
                 &format!("The backup could not be written, so nothing was changed.\n\n{err}"),
                 MB_ICONWARNING,
@@ -3398,7 +3400,7 @@ impl App {
         for error in outcome.errors.iter().take(5) {
             lines.push(format!("Failed: {error}"));
         }
-        lines.push(format!("Backup: {}", backup_file.display()));
+        lines.push(format!("Backup: {}", backup.path().display()));
         self.refresh_startup();
         self.refresh_backups();
         self.message(
@@ -4226,7 +4228,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_backup_file() else {
+        let Some(mut backup) = next_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -4241,7 +4243,8 @@ impl App {
             } else {
                 "entries"
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -4268,7 +4271,7 @@ impl App {
             ));
         }
         if !self.confirm(&question, Redo::Repair) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Repairing;
@@ -4328,6 +4331,7 @@ impl App {
                 .collect();
             let mut restore_note = None;
             let result = if confirmed.is_empty() {
+                backup.discard();
                 Ok(RepairOutcome {
                     backup_file: PathBuf::new(),
                     ..RepairOutcome::default()
@@ -4347,7 +4351,7 @@ impl App {
                     &mut WindowsRegistry,
                     &mut HostFs,
                     &confirmed,
-                    &backup_file,
+                    &mut backup,
                     &mut |done, _| {
                         set_progress(
                             total + done * 2,
@@ -7467,12 +7471,12 @@ fn local_time_text(time: SystemTime) -> String {
 
 /// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, reserved so a name is never
 /// reused; `None` when no name could be reserved.
-fn next_backup_file() -> Option<PathBuf> {
+fn next_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("hive-mend")
 }
 
 /// `services-YYYYMMDD-HHMMSS.reg` in local time, reserved; `None` on failure.
-fn next_services_backup_file() -> Option<PathBuf> {
+fn next_services_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("services")
 }
 
@@ -7486,7 +7490,7 @@ fn all_backups() -> Vec<BackupInfo> {
     all
 }
 
-fn next_privacy_backup_file() -> Option<PathBuf> {
+fn next_privacy_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("privacy")
 }
 
@@ -7494,7 +7498,7 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
+fn next_backup_file_with(prefix: &str) -> Option<hive_mend::BackupWriter> {
     let Ok(dir) = backups_dir() else {
         return None;
     };
@@ -7506,40 +7510,9 @@ fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
         )
     };
-    // Reserve the name by creating the (empty) file now, so a second window
-    // choosing a name in the same second cannot land on this one and later
-    // overwrite its backup. A cancelled job removes the placeholder with
-    // `discard_reserved_backup`. Return None rather than an unreserved name:
-    // the caller aborts the job instead of writing a backup it never reserved.
-    for attempt in 0..10_000u32 {
-        let name = if attempt == 0 {
-            format!("{prefix}-{stamp}.reg")
-        } else {
-            format!("{prefix}-{stamp}-{}.reg", attempt + 1)
-        };
-        let path = dir.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Some(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        }
-    }
-    None
-}
-
-/// Remove a just-reserved backup placeholder after the user cancels. Only an
-/// empty file is removed, so a real backup is never deleted.
-fn discard_reserved_backup(path: &std::path::Path) {
-    if std::fs::metadata(path)
-        .map(|meta| meta.len() == 0)
-        .unwrap_or(false)
-    {
-        let _ = std::fs::remove_file(path);
-    }
+    // Reserved by creating it, and written only through this handle. None
+    // when nothing could be reserved: the caller then changes nothing.
+    hive_mend::BackupWriter::reserve(&dir, &format!("{prefix}-{stamp}")).ok()
 }
 
 // ---- Win32 helpers -----------------------------------------------------

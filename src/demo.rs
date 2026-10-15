@@ -244,12 +244,12 @@ mod tests {
             key: planted.key.clone(),
             name: "Shell".into(),
         };
-        let backup = std::env::temp_dir().join("hive-mend-test-backup.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-test-backup");
         let outcome = repair(
             &mut sample.reg,
             &mut sample.fs,
             &[startup, planted],
-            &backup,
+            &mut backup,
         )
         .unwrap();
         assert_eq!(outcome.applied, 1);
@@ -266,8 +266,8 @@ mod tests {
             .values(r"HKLM\SOFTWARE\Microsoft\Windows NT\CurrentVersion\Winlogon")
             .unwrap();
         assert!(winlogon.iter().any(|value| value.name == "Shell"));
-        let saved = std::fs::read(&backup).unwrap();
+        let saved = std::fs::read(backup.path()).unwrap();
         assert_eq!(&saved[..2], &[0xFF, 0xFE]);
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 }

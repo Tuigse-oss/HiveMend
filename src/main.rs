@@ -313,9 +313,9 @@ fn repair_live(
         }
         // Reserve a unique, already-created backup file so a second repair in
         // the same second cannot overwrite this one's recovery record.
-        let backup_file = hive_mend::reserve_backup_path(backup_dir, SystemTime::now())?;
+        let mut backup = hive_mend::reserve_backup(backup_dir, SystemTime::now())?;
         let mut fs = HostFs;
-        let outcome = repair(&mut reg, &mut fs, &report.findings, &backup_file)?;
+        let outcome = repair(&mut reg, &mut fs, &report.findings, &mut backup)?;
         if json {
             let errors: Vec<String> = outcome
                 .errors

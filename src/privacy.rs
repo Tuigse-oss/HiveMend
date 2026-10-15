@@ -9,10 +9,10 @@
 //! Windows directory, no thumbnail or Prefetch cleaning.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::backup::{export_repairs, write_backup};
+use crate::backup::{BackupWriter, export_repairs};
 use crate::fs::{Access, FileView, ItemKind};
 use crate::model::{Error, Repair};
 use crate::pathutil::{
@@ -1202,7 +1202,7 @@ pub fn clean_with_progress(
     sys: &mut dyn SystemTargets,
     procs: &dyn ProcessList,
     items: &[PrivacyItem],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
     progress: &mut dyn FnMut(usize, usize, &str) -> bool,
 ) -> Result<CleanOutcome, Error> {
     enum Planned {
@@ -1238,26 +1238,19 @@ pub fn clean_with_progress(
         planned.push(Planned::Run { repairs, pre });
     }
 
-    let all: Vec<Repair> = planned
-        .iter()
-        .flat_map(|step| match step {
-            Planned::Run { repairs, .. } => {
-                repairs.iter().map(|(repair, _)| repair.clone()).collect()
-            }
-            Planned::Skip(_) => Vec::new(),
-        })
-        .collect();
-    let plan = export_repairs(reg, &all, backup_file);
-    write_backup(backup_file, &plan.body)?;
+    // The header now; each registry entry is appended as it is removed.
+    let header = export_repairs(reg, &[], backup.path());
+    backup.append(&header.body)?;
 
     let total = planned
         .iter()
         .filter(|step| matches!(step, Planned::Run { .. }))
         .count();
     let mut outcome = CleanOutcome {
-        backup_file: backup_file.to_path_buf(),
+        backup_file: backup.path().to_path_buf(),
         ..CleanOutcome::default()
     };
+    let mut entry = 0usize;
     let mut done = 0usize;
     for (item, step) in items.iter().zip(planned) {
         match step {
@@ -1284,7 +1277,8 @@ pub fn clean_with_progress(
                     item,
                     &repairs,
                     pre,
-                    &plan,
+                    backup,
+                    &mut entry,
                     &mut outcome.errors,
                 ));
                 done += 1;
@@ -1355,7 +1349,8 @@ fn execute_item(
     item: &PrivacyItem,
     repairs: &[PlannedRepair],
     pre: Vec<String>,
-    plan: &crate::backup::BackupPlan,
+    backup: &mut BackupWriter,
+    entry: &mut usize,
     errors: &mut Vec<String>,
 ) -> ItemOutcome {
     let mut done = ItemOutcome::blank(&item.id);
@@ -1366,7 +1361,8 @@ fn execute_item(
         done.note(note);
     }
     for (repair, credit) in repairs {
-        apply_repair(reg, repair, *credit, plan, &mut done, errors);
+        *entry += 1;
+        apply_repair(reg, repair, *credit, backup, *entry, &mut done, errors);
     }
     let mut walked = HashSet::new();
     for target in &item.targets {
@@ -1529,7 +1525,8 @@ fn apply_repair(
     reg: &mut dyn Registry,
     repair: &Repair,
     credit: usize,
-    plan: &crate::backup::BackupPlan,
+    backup: &mut BackupWriter,
+    entry: usize,
     done: &mut ItemOutcome,
     errors: &mut Vec<String>,
 ) {
@@ -1541,23 +1538,14 @@ fn apply_repair(
         done.note(format!("refused: {key}"));
         return;
     }
-    if !plan.covers(key) {
-        done.note(format!("not backed up, left alone: {key}"));
-        return;
-    }
-    // Added to or changed since the backup was written: what the delete
-    // would remove is not all in the backup.
-    if !plan.still_as_backed_up(reg, repair) {
-        done.note(format!("changed since the backup, left alone: {key}"));
-        return;
-    }
-    let result = match repair {
-        Repair::DeleteKey { key } => reg.delete_tree(key),
-        Repair::DeleteValue { key, name } => reg.delete_value(key, name),
-        Repair::DeleteFile { .. } | Repair::None => return,
-    };
-    match result {
-        Ok(()) => done.values += credit,
+    // Recorded, removed, and committed in one registry transaction; a
+    // change from elsewhere meanwhile leaves it in place.
+    match crate::engine::delete_in_transaction(reg, repair, backup, entry) {
+        Ok(crate::engine::Deleted::Removed) => done.values += credit,
+        Ok(crate::engine::Deleted::AlreadyGone) => done.already_gone += 1,
+        Ok(crate::engine::Deleted::NotBackedUp) => {
+            done.note(format!("not backed up, left alone: {key}"));
+        }
         Err(RegError::NotFound) => done.already_gone += 1,
         Err(RegError::Denied(message)) => done.note(format!("{key}: {message}")),
         Err(RegError::Message(message)) => errors.push(format!("{key}: {message}")),
@@ -2070,7 +2058,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-test");
         // chrome-data is vetoed by a running browser; user-temp is not ticked.
         let procs = FakeProcs {
             running: vec!["chrome.exe".into()],
@@ -2087,7 +2075,7 @@ mod tests {
             &mut sys,
             &procs,
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -2101,11 +2089,11 @@ mod tests {
         assert!(fs.exists(r"C:\Users\test\AppData\Local\Temp\old.tmp"));
         assert!(reg.values(&format!(r"{EXPLORER}\RunMRU")).is_err());
         // The backup covers the removed values and restores through reg.exe.
-        let body = crate::backup::read_backup(&backup).unwrap();
+        let body = crate::backup::read_backup(backup.path()).unwrap();
         assert!(body.contains("RunMRU"));
         assert!(body.contains("mspaint"));
         assert!(body.starts_with("Windows Registry Editor Version 5.00"));
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2134,6 +2122,15 @@ mod tests {
             fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
                 self.inner.delete_tree(path)
             }
+
+            fn begin(&mut self) -> Result<Box<dyn crate::registry::RegTransaction + '_>, RegError> {
+                let locked = self.locked.clone();
+                Ok(Box::new(crate::registry::DenyTx {
+                    inner: self.inner.begin()?,
+                    deny_subkeys: None,
+                    deny_values: Some(locked),
+                }))
+            }
         }
 
         let mut reg = Locked {
@@ -2142,7 +2139,7 @@ mod tests {
         };
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-locked-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-locked-test");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let outcome = clean_with_progress(
             &mut reg,
@@ -2150,7 +2147,7 @@ mod tests {
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -2164,7 +2161,7 @@ mod tests {
         );
         assert_eq!(row("typed-paths").values, 1);
         assert!(reg.inner.values(&format!(r"{EXPLORER}\RunMRU")).is_ok());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2326,21 +2323,21 @@ mod tests {
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert_eq!(report.items[0].other, 1);
         assert_eq!(report.items[1].files, 2);
-        let backup = std::env::temp_dir().join("hive-mend-privacy-special-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-special-test");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert!(sys.cleared && sys.emptied);
         assert_eq!(outcome.items[0].other, 1);
         assert_eq!(outcome.items[1].files, 2);
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2359,7 +2356,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-cancel-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-test");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let mut calls = 0;
         let outcome = clean_with_progress(
@@ -2368,7 +2365,7 @@ mod tests {
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| {
                 calls += 1;
                 calls < 2
@@ -2379,7 +2376,7 @@ mod tests {
         assert_eq!(outcome.items.len(), 1);
         assert_eq!(outcome.items[0].id, "run-dialog");
         assert!(reg.values(&format!(r"{EXPLORER}\RunMRU")).is_err());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2402,20 +2399,20 @@ mod tests {
         assert!(!report.items[0].gated_out);
         assert_eq!(report.items[0].values, 1);
         assert!(report.items[1].gated_out);
-        let backup = std::env::temp_dir().join("hive-mend-privacy-plugin-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-plugin-test");
         let outcome = clean_with_progress(
             &mut reg,
             &mut MemoryFs::with_windows_dirs(),
             &mut FakeSys::default(),
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert_eq!(outcome.items[0].values, 1);
         assert!(outcome.items[1].gated_out);
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2439,14 +2436,14 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-sidecar-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-sidecar-test");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
             &[builtin("chrome-data")],
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -2464,7 +2461,7 @@ mod tests {
                 r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
             )
         );
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2479,14 +2476,14 @@ mod tests {
             None,
         );
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-network-cookies.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-network-cookies");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
             &[builtin("chrome-data")],
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -2497,7 +2494,7 @@ mod tests {
             outcome.items[0].files, 4,
             "History + wal, Cookies + journal"
         );
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2536,20 +2533,20 @@ mod tests {
         let mut sys = FakeSys::default();
         let history = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History";
         assert!(fs.exists(history));
-        let backup = std::env::temp_dir().join("hive-mend-privacy-starts-later.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-starts-later");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &StartsLater(std::cell::Cell::new(0)),
             &[builtin("chrome-data")],
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert!(outcome.items[0].skipped_running);
         assert!(fs.exists(history), "a running browser's files were cleaned");
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2657,14 +2654,14 @@ mod tests {
                 .iter()
                 .any(|note| note == "kept by request")
         );
-        let backup = std::env::temp_dir().join("hive-mend-privacy-cookies-alone.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cookies-alone");
         clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -2673,6 +2670,6 @@ mod tests {
             !fs.exists(&format!(r"{profile}\History")),
             "history still goes"
         );
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 }
