@@ -1589,15 +1589,7 @@ fn trim_cookie_db(
         return;
     }
     match crate::cookies::trim_cookies(std::path::Path::new(&real), sites) {
-        Ok(trimmed) => {
-            done.cookies += trimmed.count.removed;
-            for copy in trimmed.leftovers {
-                errors.push(format!(
-                    "a copy of the old cookies could not be deleted; delete it yourself: {}",
-                    copy.display()
-                ));
-            }
-        }
+        Ok(count) => done.cookies += count.removed,
         Err(err) => errors.push(format!("cookies in {db}: {err}")),
     }
 }
