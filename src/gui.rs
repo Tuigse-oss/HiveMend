@@ -3369,7 +3369,7 @@ impl App {
         )];
         if !refused.is_empty() {
             lines.push(format!(
-                "Left alone (name cannot be backed up): {}",
+                "Left alone (its current setting could not be recorded): {}",
                 refused.join(", ")
             ));
         }

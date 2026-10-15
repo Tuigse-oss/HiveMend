@@ -10,9 +10,10 @@ use windows_sys::Win32::Foundation::{
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
     HKEY_USERS, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ,
-    KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_LINK, REG_MULTI_SZ,
-    REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey, RegCreateKeyExW,
-    RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW, RegSetValueExW,
+    KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_CREATED_NEW_KEY, REG_DWORD, REG_EXPAND_SZ,
+    REG_LINK, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW,
+    RegQueryValueExW, RegSetValueExW,
 };
 
 use crate::model::{RegValue, ValueKind};
@@ -287,6 +288,7 @@ fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
     }
     let wide = wide(&leaf);
     let mut key: HKEY = ptr::null_mut();
+    let mut disposition = 0u32;
     let rc = unsafe {
         RegCreateKeyExW(
             parent.key,
@@ -297,13 +299,21 @@ fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
             KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
             ptr::null(),
             &mut key,
-            ptr::null_mut(),
+            &mut disposition,
         )
     };
     if rc != ERROR_SUCCESS || key.is_null() {
         return Err(failure(rc, format!("RegCreateKeyExW {path} failed ({rc})")));
     }
     let opened = Opened { key, close: true };
+    // The key was missing a moment ago. If the create opened an existing
+    // key instead, something appeared in between, possibly a link that the
+    // create followed: refuse rather than write to whatever it reached.
+    if disposition != REG_CREATED_NEW_KEY {
+        return Err(RegError::Message(format!(
+            "{path} appeared while it was being created; nothing was written"
+        )));
+    }
     if is_link(opened.key)? {
         return Err(RegError::Message(format!(
             "{path} became a registry link while it was created"

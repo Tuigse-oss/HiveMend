@@ -180,6 +180,16 @@ fn enumerate(manager: &ScHandle) -> Result<Vec<ServiceInfo>, StoreError> {
     Err(scm_error(ERROR_MORE_DATA, "listing services"))
 }
 
+/// The Start value a start type is written as, for the types Hivemend sets.
+fn start_dword(to: StartType) -> Option<u32> {
+    match to {
+        StartType::Automatic | StartType::AutomaticDelayed => Some(2),
+        StartType::Manual => Some(3),
+        StartType::Disabled => Some(4),
+        StartType::Boot | StartType::System => None,
+    }
+}
+
 fn query_start(manager: &ScHandle, name: &str) -> Option<StartType> {
     let service = open_service(manager, name, SERVICE_QUERY_CONFIG).ok()?;
     let mut needed = 0u32;
@@ -284,6 +294,8 @@ impl ServiceStore for ScmServiceStore {
             }
         };
         let manager = open_manager(SC_MANAGER_CONNECT)?;
+        // Read first, so a failed second step can be undone.
+        let prior = query_start(&manager, name);
         let service = open_service(&manager, name, SERVICE_CHANGE_CONFIG)?;
         let ok = unsafe {
             ChangeServiceConfigW(
@@ -318,7 +330,36 @@ impl ServiceStore for ScmServiceStore {
                 )
             };
             if ok == 0 {
-                return Err(scm_error(last_error(), name));
+                let failed = scm_error(last_error(), name);
+                // Start already changed: put it back, so a failed request
+                // never leaves a different mode behind.
+                let restored = prior.and_then(start_dword).is_some_and(|dword| unsafe {
+                    ChangeServiceConfigW(
+                        service.handle,
+                        SERVICE_NO_CHANGE,
+                        dword,
+                        SERVICE_NO_CHANGE,
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null_mut(),
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                        ptr::null(),
+                    ) != 0
+                });
+                return Err(StoreError {
+                    message: format!(
+                        "{}; {}",
+                        failed.message,
+                        if restored {
+                            "the start type was put back as it was"
+                        } else {
+                            "the start type could not be put back, so restore this change's backup"
+                        }
+                    ),
+                    denied: failed.denied,
+                });
             }
         }
         Ok(())

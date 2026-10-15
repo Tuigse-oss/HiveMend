@@ -237,6 +237,12 @@ pub const NEVER_TOUCH: &[&str] = &[
     "WdNisSvc",
     "Sense",
     "MpsSvc",
+    // The firewall's filtering engine; the firewall and IPsec stop without it.
+    "BFE",
+    "SecurityHealthService",
+    "wscsvc",
+    // UAC elevation.
+    "Appinfo",
     "wuauserv",
     "BITS",
     "WaaSMedicSvc",
@@ -248,6 +254,13 @@ pub const NEVER_TOUCH: &[&str] = &[
     "Power",
     "ProfSvc",
     "Schedule",
+    "LSM",
+    "BrokerInfrastructure",
+    "SystemEventsBroker",
+    "CoreMessagingRegistrar",
+    "UserManager",
+    "gpsvc",
+    "Winmgmt",
 ];
 
 pub fn is_never_touch(name: &str) -> bool {
@@ -422,6 +435,12 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
                         crate::model::ValueKind::Dword(data) => {
                             body.push_str(&format!("\r\n[{key}]\r\n"));
                             body.push_str(&format!("\"Start\"=dword:{data:08x}\r\n"));
+                            if delayed.is_none() {
+                                // Absent is part of the state: a change to
+                                // Automatic (Delayed) creates the flag, and
+                                // restoring must remove it again.
+                                body.push_str("\"DelayedAutostart\"=-\r\n");
+                            }
                             if let Some(delayed) = delayed {
                                 match &delayed.data {
                                     crate::model::ValueKind::Dword(data) => {
@@ -796,6 +815,19 @@ mod tests {
     }
 
     #[test]
+    fn the_firewall_engine_and_uac_are_never_touched() {
+        for name in ["BFE", "bfe", "MpsSvc", "Appinfo", "wscsvc"] {
+            assert!(is_never_touch(name), "{name}");
+        }
+        for name in SUGGESTED.targets.iter().map(|target| target.name) {
+            assert!(
+                !is_never_touch(name),
+                "{name} is both suggested and protected"
+            );
+        }
+    }
+
+    #[test]
     fn start_backup_parses_machine_wide_and_flags_unreadable() {
         let mut reg = MemoryRegistry::new();
         reg.set_dword(&service_key("DiagTrack"), "Start", 2);
@@ -807,6 +839,14 @@ mod tests {
         );
         assert!(plan.body.contains("\"Start\"=dword:00000002"));
         assert!(plan.body.contains("\"DelayedAutostart\"=dword:00000001"));
+        // A service with no delay flag records its absence, so restoring
+        // after a change to Automatic (Delayed) removes the flag again.
+        let diag = plan
+            .body
+            .split("\r\n\r\n")
+            .find(|section| section.contains("DiagTrack"))
+            .unwrap();
+        assert!(diag.contains("\"DelayedAutostart\"=-"), "{diag}");
         // The exported services backup must be one Restore will accept.
         assert!(crate::backup::is_hive_mend_backup(&plan.body));
         assert_eq!(plan.unreadable.len(), 1);
@@ -814,7 +854,10 @@ mod tests {
         assert!(plan.covers(&service_key("DiagTrack")));
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 2);
-        assert_eq!(summary.values, 3);
+        assert_eq!(
+            summary.values, 4,
+            "two Start values, a delay flag, and an absent delay flag"
+        );
         assert!(summary.machine_wide);
         assert!(summary.files.is_empty());
     }

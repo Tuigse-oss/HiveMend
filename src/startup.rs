@@ -174,6 +174,11 @@ pub fn filetime_now() -> u64 {
 /// or a delete line when there is none, so restoring puts every flag back
 /// exactly. Items whose flag cannot be represented are reported, not
 /// changed.
+/// An item's identity for refusals: its flag's key and name.
+pub fn item_id(item: &StartupItem) -> String {
+    format!(r"{}\{}", item.approved_key, item.name)
+}
+
 pub fn startup_backup(reg: &dyn Registry, items: &[&StartupItem]) -> (String, Vec<String>) {
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
     body.push_str("; Hive Mend backup.\r\n");
@@ -182,12 +187,22 @@ pub fn startup_backup(reg: &dyn Registry, items: &[&StartupItem]) -> (String, Ve
     let mut refused = Vec::new();
     for item in items {
         if item.name.chars().any(|ch| (ch as u32) < 0x20) {
-            refused.push(item.name.clone());
+            refused.push(item_id(item));
             continue;
         }
-        let current = flags(reg, &item.approved_key)
-            .into_iter()
-            .find(|value| value.name.eq_ignore_ascii_case(&item.name));
+        // Only a successful read can prove the flag is absent. Anything
+        // else leaves the item out, so nothing is changed without a record
+        // of exactly what was there.
+        let current = match reg.values(&item.approved_key) {
+            Ok(values) => values
+                .into_iter()
+                .find(|value| value.name.eq_ignore_ascii_case(&item.name)),
+            Err(RegError::NotFound) => None,
+            Err(_) => {
+                refused.push(item_id(item));
+                continue;
+            }
+        };
         body.push_str(&format!("\r\n[{}]\r\n", item.approved_key));
         match current {
             Some(value) => body.push_str(&format_value(&value)),
@@ -220,7 +235,7 @@ pub fn set_startup(
 ) -> StartupOutcome {
     let mut outcome = StartupOutcome::default();
     for item in items {
-        if skip.contains(&item.name) {
+        if skip.contains(&item_id(item)) {
             continue;
         }
         if item.enabled == enable {
@@ -333,6 +348,48 @@ mod tests {
             .find(|value| value.name == again[0].name)
             .unwrap();
         assert_eq!(flag.data, ValueKind::Binary(approved_bytes(false, 1234)));
+    }
+
+    #[test]
+    fn an_unreadable_flag_is_refused_not_recorded_as_absent() {
+        struct Broken(MemoryRegistry);
+        impl Registry for Broken {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                self.0.subkeys(path)
+            }
+            fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+                if path.contains("StartupApproved") {
+                    return Err(RegError::Message("the read failed".into()));
+                }
+                self.0.values(path)
+            }
+            fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+                self.0.delete_value(path, name)
+            }
+            fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+                self.0.delete_tree(path)
+            }
+            fn set_value(
+                &mut self,
+                path: &str,
+                name: &str,
+                data: &ValueKind,
+            ) -> Result<(), RegError> {
+                self.0.set_value(path, name, data)
+            }
+        }
+        let (reg, fs) = world();
+        let items = list_startup(&reg, &fs);
+        let chat = items.iter().find(|item| item.name == "Chat").unwrap();
+        let mut broken = Broken(reg.clone());
+        let (body, refused) = startup_backup(&broken, &[chat]);
+        assert_eq!(refused, [item_id(chat)]);
+        assert!(
+            !body.contains("\"Chat\"=-"),
+            "absence was recorded without proof"
+        );
+        let outcome = set_startup(&mut broken, &[chat], true, 1, &refused);
+        assert_eq!(outcome.changed, 0, "a refused item was changed");
     }
 
     #[test]

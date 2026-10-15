@@ -3,7 +3,9 @@
 
 use std::ptr;
 
-use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+use windows_sys::Win32::Foundation::{
+    CloseHandle, ERROR_NO_MORE_FILES, GetLastError, INVALID_HANDLE_VALUE,
+};
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, CountClipboardFormats, EmptyClipboard, OpenClipboard,
 };
@@ -30,7 +32,9 @@ impl ProcessList for WindowsProcessList {
         unsafe {
             let mut entry: PROCESSENTRY32W = std::mem::zeroed();
             entry.dwSize = std::mem::size_of::<PROCESSENTRY32W>() as u32;
-            let mut found = false;
+            // Only reaching the normal end of the list proves the program is
+            // not running; any other failure counts as running (fail closed).
+            let mut found = true;
             if Process32FirstW(snapshot, &mut entry) != 0 {
                 loop {
                     let len = entry
@@ -40,10 +44,10 @@ impl ProcessList for WindowsProcessList {
                         .unwrap_or(entry.szExeFile.len());
                     let name = String::from_utf16_lossy(&entry.szExeFile[..len]);
                     if name.eq_ignore_ascii_case(exe) {
-                        found = true;
                         break;
                     }
                     if Process32NextW(snapshot, &mut entry) == 0 {
+                        found = GetLastError() != ERROR_NO_MORE_FILES;
                         break;
                     }
                 }

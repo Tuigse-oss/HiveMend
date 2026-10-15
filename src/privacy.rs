@@ -91,6 +91,9 @@ pub enum DirSpec {
     Chromium { vendor: String, sub: String },
     /// Every Firefox profile dir plus `sub`.
     Firefox { sub: String },
+    /// Every Firefox local profile dir (`%LOCALAPPDATA%\Mozilla\Firefox\
+    /// Profiles\<profile>`) plus `sub`, where Firefox keeps its cache.
+    FirefoxLocal { sub: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -316,7 +319,7 @@ fn builtin_items() -> Vec<PrivacyItem> {
         PrivacyGroup::Browsers,
         "Cached web files. Locked files are skipped.",
         vec![PrivacyTarget::DirFiles {
-            dir: DirSpec::Firefox {
+            dir: DirSpec::FirefoxLocal {
                 sub: "cache2".into(),
             },
             mask: "*.*".into(),
@@ -371,9 +374,9 @@ fn builtin_items() -> Vec<PrivacyItem> {
     }
     let mut fox = item(
         "firefox-data",
-        "Firefox history + cookies (closed)",
+        "Firefox cookies + form history (closed)",
         PrivacyGroup::Browsers,
-        "Browsing history and cookies, only while the browser is closed.",
+        "Cookies and saved form entries, only while the browser is closed. Browsing history and bookmarks stay.",
         vec![
             PrivacyTarget::ExactFiles {
                 dir: DirSpec::Firefox { sub: String::new() },
@@ -505,12 +508,19 @@ pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
             }
         }
         if holds {
+            // Firefox's item clears form history; Chrome's and Edge's clear
+            // browsing history.
+            let other = if item.id.starts_with("firefox") {
+                "Saved form entries"
+            } else {
+                "Browsing history"
+            };
             item.detail = match keep {
                 CookieKeep::All => {
-                    "Browsing history and cookies, only while the browser is closed.".to_string()
+                    format!("{other} and cookies, only while the browser is closed.")
                 }
                 CookieKeep::Sites(sites) => format!(
-                    "Browsing history and cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
+                    "{other} and cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
                     if sites.len() == 1 {
                         "the 1 site".to_string()
                     } else {
@@ -518,8 +528,7 @@ pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
                     }
                 ),
                 CookieKeep::LeaveAlone(_) => {
-                    "Browsing history, only while the browser is closed. Cookies are left alone."
-                        .to_string()
+                    format!("{other}, only while the browser is closed. Cookies are left alone.")
                 }
             };
         }
@@ -576,6 +585,8 @@ pub fn uninstall_present(reg: &dyn Registry, needle: &str) -> bool {
     for root in [
         r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        // Programs installed just for this account.
+        r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
     ] {
         let Ok(entries) = reg.subkeys(root) else {
             continue;
@@ -643,6 +654,24 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             }
             let users = format!("{base}\\{vendor}\\User Data");
             for profile in child_dirs(fs, &users) {
+                let dir = if sub.is_empty() {
+                    profile
+                } else {
+                    format!("{profile}\\{sub}")
+                };
+                if fs.is_dir(&dir) {
+                    push(dir);
+                }
+            }
+        }
+        DirSpec::FirefoxLocal { sub } => {
+            let base = expand_env(fs, "%LOCALAPPDATA%");
+            if base.contains('%') {
+                notes.push("%LOCALAPPDATA% is not set".to_string());
+                return (dirs, notes);
+            }
+            let profiles = format!("{base}\\Mozilla\\Firefox\\Profiles");
+            for profile in child_dirs(fs, &profiles) {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -1230,6 +1259,16 @@ pub fn clean_with_progress(
                 if !progress(done, total, &item.name) {
                     outcome.canceled = true;
                     return Ok(outcome);
+                }
+                // Check again right before acting: the program may have
+                // started since the plan was made (earlier items take time).
+                if let Some(exe) = item.veto_exes.iter().find(|exe| procs.running(exe)) {
+                    let mut skip = ItemOutcome::blank(&item.id);
+                    skip.skipped_running = true;
+                    skip.note(format!("close {exe} first"));
+                    outcome.items.push(skip);
+                    done += 1;
+                    continue;
                 }
                 outcome.items.push(execute_item(
                     reg,
@@ -2443,6 +2482,73 @@ mod tests {
         }
         let run = items.iter().find(|item| item.id == "run-dialog").unwrap();
         assert!(!run.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_browser_that_starts_after_planning_is_still_respected() {
+        // Closed while the plan is made, running by the time its turn comes.
+        struct StartsLater(std::cell::Cell<u32>);
+        impl ProcessList for StartsLater {
+            fn running(&self, _exe: &str) -> bool {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                calls > 1
+            }
+        }
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let history = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History";
+        assert!(fs.exists(history));
+        let backup = std::env::temp_dir().join("hive-mend-privacy-starts-later.reg");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &StartsLater(std::cell::Cell::new(0)),
+            &[builtin("chrome-data")],
+            &backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(outcome.items[0].skipped_running);
+        assert!(fs.exists(history), "a running browser's files were cleaned");
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn firefox_cache_is_found_in_the_local_profile_folder() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
+        fs.set_var("APPDATA", r"C:\Users\test\AppData\Roaming");
+        let cache = r"C:\Users\test\AppData\Local\Mozilla\Firefox\Profiles\abc.default\cache2";
+        fs.add_file_bytes(&format!(r"{cache}\entries\A1"), vec![0; 10], None);
+        let (dirs, _) = resolve_dirs(
+            &fs,
+            &DirSpec::FirefoxLocal {
+                sub: "cache2".into(),
+            },
+        );
+        assert_eq!(dirs, [cache.to_string()]);
+        let fox = builtin("firefox-data");
+        assert!(fox.name.contains("form history"));
+        assert!(
+            !fox.detail
+                .to_ascii_lowercase()
+                .starts_with("browsing history")
+        );
+    }
+
+    #[test]
+    fn a_program_installed_for_this_account_counts_as_installed() {
+        let mut reg = MemoryRegistry::new();
+        assert!(!uninstall_present(&reg, "WinRAR"));
+        reg.set_sz(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinRAR archiver",
+            "DisplayName",
+            "WinRAR 7.10 (64-bit)",
+        );
+        assert!(uninstall_present(&reg, "WinRAR"));
     }
 
     #[test]
