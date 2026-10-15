@@ -55,7 +55,7 @@ hivemend hives
 
 `--format json` prints one JSON document: `complete`, `findings`, `warnings`, and `notes` for a scan; for `repair --yes`, `complete`, `backup`, `removed`, `already_gone`, `left_alone` (asked for but not done: refused, not backed up, changed meanwhile, or left for a normal window), `per_user_left`, `report_only`, `needs_admin`, `errors`, `warnings`, and `notes`. Scan exit codes: 0 when a complete scan found nothing, 2 when there are findings, 3 when the scan could not read everything (or was stopped) and found nothing, so it cannot be called clean, and 1 on an error. Repair exit codes: 0 when everything asked for was done, 3 when the scan was incomplete or something asked for was left undone, and 1 on errors.
 
-Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, leaves alone any machine-wide key that accounts other than SYSTEM, Administrators, TrustedInstaller, or Windows' service accounts can change, does not read your ignore list, and `--backup-dir` is refused unless it is the protected store.
+Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, leaves alone any machine-wide key that accounts other than SYSTEM, Administrators, TrustedInstaller, or Windows' service accounts can change (Windows' legacy TERMINAL SERVER USER entry, which no standard account carries, does not count), and says which, does not read your ignore list, and `--backup-dir` is refused unless it is the protected store.
 
 ### Where data is kept
 
