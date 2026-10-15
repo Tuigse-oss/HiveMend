@@ -206,6 +206,30 @@ mod tests {
         }
     }
 
+    #[test]
+    fn a_shortcut_with_extra_data_streams_is_not_removed() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(&format!(r"{desktop}\plain.lnk"), b"lnk".to_vec(), None);
+        fs.add_file_bytes(&format!(r"{desktop}\streams.lnk"), b"lnk".to_vec(), None);
+        fs.add_stream(&format!(r"{desktop}\streams.lnk"));
+        let copies = r"C:\Users\me\AppData\Local\HiveMend\backups\b-files";
+        let streams = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\streams.lnk"),
+            Some(&format!(r"{copies}\0001-streams.lnk")),
+        );
+        assert!(matches!(streams, Applied::NotBackedUp));
+        assert!(fs.exists(&format!(r"{desktop}\streams.lnk")));
+        let plain = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\plain.lnk"),
+            Some(&format!(r"{copies}\0002-plain.lnk")),
+        );
+        assert!(matches!(plain, Applied::Removed));
+        assert!(fs.exists(&format!(r"{copies}\0002-plain.lnk")));
+    }
+
     fn uninstall_finding(name: &str) -> Finding {
         let key = format!(
             r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
@@ -503,6 +527,11 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
             denied: err.contains("os error 5"),
             message: err,
         };
+    }
+    // The copy holds the main data stream only; a file with other named
+    // streams could not be put back whole, so it is left alone.
+    if copy.is_some() && fs.extra_streams(&real) != Ok(false) {
+        return Applied::NotBackedUp;
     }
     if let Some(copy) = copy
         && let Err(err) = fs.pin_copy_to(&pin, copy)

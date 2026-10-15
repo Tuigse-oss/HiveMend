@@ -344,55 +344,6 @@ fn check_plain(file: &std::fs::File) -> Result<(FileId, u64), String> {
     Ok((id, len))
 }
 
-/// Named data streams besides the main one and the download marker.
-#[cfg(windows)]
-fn has_extra_streams(path: &str) -> Result<bool, String> {
-    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, GetLastError, INVALID_HANDLE_VALUE};
-    use windows_sys::Win32::Storage::FileSystem::{
-        FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
-        WIN32_FIND_STREAM_DATA,
-    };
-    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
-    let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
-    let handle = unsafe {
-        FindFirstStreamW(
-            wide.as_ptr(),
-            FindStreamInfoStandard,
-            &mut data as *mut _ as *mut _,
-            0,
-        )
-    };
-    if handle == INVALID_HANDLE_VALUE {
-        return if unsafe { GetLastError() } == ERROR_HANDLE_EOF {
-            Ok(false)
-        } else {
-            Err(std::io::Error::last_os_error().to_string())
-        };
-    }
-    let mut extra = false;
-    loop {
-        let len = data
-            .cStreamName
-            .iter()
-            .position(|unit| *unit == 0)
-            .unwrap_or(data.cStreamName.len());
-        let name = String::from_utf16_lossy(&data.cStreamName[..len]).to_ascii_lowercase();
-        if name != "::$data" && name != ":zone.identifier:$data" {
-            extra = true;
-            break;
-        }
-        if unsafe { FindNextStreamW(handle, &mut data as *mut _ as *mut _) } == 0 {
-            if unsafe { GetLastError() } != ERROR_HANDLE_EOF {
-                unsafe { FindClose(handle) };
-                return Err(std::io::Error::last_os_error().to_string());
-            }
-            break;
-        }
-    }
-    unsafe { FindClose(handle) };
-    Ok(extra)
-}
-
 #[cfg(windows)]
 impl ContentReader for HostContent {
     fn hold(&self, path: &str, keep: bool) -> Result<Held, String> {
@@ -415,7 +366,7 @@ impl ContentReader for HostContent {
             .map_err(|err| err.to_string())?;
         check_plain(&file)?;
         let real_path = crate::fs::host_final_path(&file)?;
-        let extra_streams = has_extra_streams(path)?;
+        let extra_streams = crate::fs::host_extra_streams(path)?;
         Ok(Held::new(real_path, extra_streams, Box::new(file)))
     }
 

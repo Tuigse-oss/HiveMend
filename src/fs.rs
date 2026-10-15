@@ -178,6 +178,13 @@ pub trait FileView {
     /// callers check [`Pinned::real_path`] and delete it if it landed
     /// somewhere it should not.
     fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String>;
+    /// True when the file has named data streams besides the download
+    /// marker (Zone.Identifier). A copy of the main stream does not hold
+    /// them, so such a file cannot be backed up by copying.
+    fn extra_streams(&self, path: &str) -> Result<bool, String> {
+        let _ = path;
+        Ok(false)
+    }
     fn var(&self, name: &str) -> Option<String>;
     /// Where a system folder really is. On the host this comes from the
     /// Windows APIs, never the environment, which a launcher controls. The
@@ -215,6 +222,8 @@ pub struct MemoryFs {
     /// and SUBST drives: `pin` reports the real path.
     aliases: Vec<(String, String)>,
     links: HashMap<String, u32>,
+    /// Files with named data streams besides the download marker.
+    streams: Vec<String>,
 }
 
 impl MemoryFs {
@@ -236,6 +245,11 @@ impl MemoryFs {
     /// Make `alias` (and everything under it) resolve to `real` when pinned.
     pub fn add_alias(&mut self, alias: &str, real: &str) {
         self.aliases.push((norm(alias), norm(real)));
+    }
+
+    /// Give a file a named data stream besides the download marker.
+    pub fn add_stream(&mut self, path: &str) {
+        self.streams.push(norm(path));
     }
 
     /// Give a file `count` hard links.
@@ -313,6 +327,10 @@ fn norm(path: &str) -> String {
 }
 
 impl FileView for MemoryFs {
+    fn extra_streams(&self, path: &str) -> Result<bool, String> {
+        Ok(self.streams.contains(&self.resolve(path)))
+    }
+
     fn pin(&self, path: &str) -> Result<Pinned, String> {
         let key = self.resolve(path);
         let (kind, len, age) = match self.nodes.get(&key) {
@@ -523,6 +541,55 @@ fn on_local_fixed_drive(path: &str) -> bool {
     !path.starts_with("\\\\")
 }
 
+/// Named data streams besides the main one and the download marker.
+#[cfg(windows)]
+pub(crate) fn host_extra_streams(path: &str) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+        WIN32_FIND_STREAM_DATA,
+    };
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
+    let handle = unsafe {
+        FindFirstStreamW(
+            wide.as_ptr(),
+            FindStreamInfoStandard,
+            &mut data as *mut _ as *mut _,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return if unsafe { GetLastError() } == ERROR_HANDLE_EOF {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        };
+    }
+    let mut extra = false;
+    loop {
+        let len = data
+            .cStreamName
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(data.cStreamName.len());
+        let name = String::from_utf16_lossy(&data.cStreamName[..len]).to_ascii_lowercase();
+        if name != "::$data" && name != ":zone.identifier:$data" {
+            extra = true;
+            break;
+        }
+        if unsafe { FindNextStreamW(handle, &mut data as *mut _ as *mut _) } == 0 {
+            if unsafe { GetLastError() } != ERROR_HANDLE_EOF {
+                unsafe { FindClose(handle) };
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            break;
+        }
+    }
+    unsafe { FindClose(handle) };
+    Ok(extra)
+}
+
 /// Where an open file really is, from its handle, as a drive path.
 #[cfg(windows)]
 pub(crate) fn host_final_path(file: &std::fs::File) -> Result<String, String> {
@@ -642,6 +709,18 @@ impl FileView for HostFs {
             return Err("not a host handle".into());
         };
         host::delete(file, &pin.real_path)
+    }
+
+    fn extra_streams(&self, path: &str) -> Result<bool, String> {
+        #[cfg(windows)]
+        {
+            host_extra_streams(path)
+        }
+        #[cfg(not(windows))]
+        {
+            let _ = path;
+            Ok(false)
+        }
     }
 
     fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
@@ -1088,6 +1167,26 @@ mod host {
 #[cfg(all(test, windows))]
 mod live_tests {
     use super::*;
+
+    #[test]
+    fn live_extra_data_streams_are_seen_and_the_download_marker_is_not() {
+        let path = std::env::temp_dir().join(format!("hm-streams-{}.lnk", std::process::id()));
+        let text = path.display().to_string();
+        std::fs::write(&path, b"lnk").unwrap();
+        let plain = host_extra_streams(&text);
+        std::fs::write(
+            format!("{text}:Zone.Identifier"),
+            b"[ZoneTransfer]\r\nZoneId=3",
+        )
+        .unwrap();
+        let marked = host_extra_streams(&text);
+        std::fs::write(format!("{text}:notes"), b"hidden").unwrap();
+        let extra = host_extra_streams(&text);
+        let _ = std::fs::remove_file(&path);
+        assert_eq!(plain, Ok(false));
+        assert_eq!(marked, Ok(false));
+        assert_eq!(extra, Ok(true));
+    }
 
     #[test]
     fn live_a_pinned_file_reports_its_age_from_the_handle() {
