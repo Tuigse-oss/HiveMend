@@ -92,6 +92,10 @@ pub fn custom_privacy_file() -> PathBuf {
     user_file("privacy-custom.ini")
 }
 
+pub fn cookies_keep_file() -> PathBuf {
+    user_file("cookies-keep.txt")
+}
+
 /// Copy per-user files from the legacy folder the first time, when the
 /// per-user copy does not exist yet. Only a non-elevated instance does this:
 /// the legacy folder is writable by every account, which is no worse than the

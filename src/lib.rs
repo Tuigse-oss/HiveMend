@@ -1,5 +1,6 @@
 pub mod art;
 mod backup;
+mod cookies;
 mod demo;
 mod diskspace;
 mod duplicates;
@@ -38,6 +39,7 @@ pub use backup::{
     BackupInfo, BackupSummary, backup_name, is_hive_mend_backup, list_backups, read_backup,
     reserve_backup_path, write_backup,
 };
+pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;
 #[cfg(windows)]
 pub use diskspace::HostLister;
@@ -61,9 +63,10 @@ pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key}
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
 pub use pathutil::{paths_in_command, protected_roots};
 pub use privacy::{
-    CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,
-    PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,
-    mask_matches, parse_custom, preview, privacy_reg_allowed, uninstall_present,
+    CleanOutcome, CookieKeep, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup,
+    PrivacyItem, PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items,
+    clean_with_progress, mask_matches, parse_custom, preview, privacy_reg_allowed, set_cookie_keep,
+    uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
 pub use registry::MemoryRegistry;
@@ -96,8 +99,8 @@ pub use windows_services::ScmServiceStore;
 pub use store::restore_backup;
 pub use store::{
     LEGACY_DIR, Store, adopt_legacy_settings, backup_stores, backups_dir, backups_location,
-    custom_privacy_file, elevated, exclusions_file, protected_dir, restore_files, settings_file,
-    user_dir,
+    cookies_keep_file, custom_privacy_file, elevated, exclusions_file, protected_dir,
+    restore_files, settings_file, user_dir,
 };
 
 /// The shipped exe must start on a clean Windows install, which has no

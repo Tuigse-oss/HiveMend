@@ -167,6 +167,17 @@ Scottish symbols for each tool, in the same green and gold as the window,
 rendered at the screen's own scale. Nothing is loaded from image files.
 `cargo run --example icon_sheet -- icons.png` writes a preview sheet.
 
+Cookies to keep live in `%LOCALAPPDATA%\HiveMend\cookies-keep.txt`, one site
+per line (`github.com` keeps its subdomains too); the Cookies to Keep button
+on the Privacy page opens it in Notepad. With an empty list, cleaning a
+browser's history and cookies deletes its cookie database (for Chrome and
+Edge, `Network\Cookies`). With sites listed, Hivemend edits the database
+instead, only while the browser is closed: it copies the database, removes
+every other cookie in one SQLite transaction, checks the database, and puts
+the copy back if anything fails. The copy is deleted after a good edit, so
+no spare set of cookies is left behind. A window running as administrator
+leaves cookies alone when the list has sites.
+
 Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
 and your own history keys are allowed; anything else is refused with a

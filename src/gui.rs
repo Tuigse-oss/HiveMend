@@ -129,6 +129,7 @@ const ID_SVC_STOP: u16 = 1305;
 const ID_PRIV_PREVIEW: u16 = 1400;
 const ID_PRIV_ALL: u16 = 1401;
 const ID_PRIV_NONE: u16 = 1402;
+const ID_PRIV_KEEP: u16 = 1404;
 const ID_PRIV_CLEAN: u16 = 1403;
 const ID_FINDINGS: u16 = 2000;
 const ID_PROGRESS: u16 = 2001;
@@ -587,6 +588,9 @@ struct App {
     btn_priv_preview: HWND,
     btn_priv_all: HWND,
     btn_priv_none: HWND,
+    btn_priv_keep: HWND,
+    /// When the cookies-to-keep list was last read, to notice edits.
+    priv_keep_stamp: Option<std::time::SystemTime>,
     btn_priv_clean: HWND,
 }
 
@@ -1140,6 +1144,8 @@ impl App {
             btn_priv_preview: std::ptr::null_mut(),
             btn_priv_all: std::ptr::null_mut(),
             btn_priv_none: std::ptr::null_mut(),
+            btn_priv_keep: std::ptr::null_mut(),
+            priv_keep_stamp: None,
             btn_priv_clean: std::ptr::null_mut(),
         };
         app.create_controls();
@@ -1319,6 +1325,7 @@ impl App {
         self.btn_priv_preview = button(hwnd, ID_PRIV_PREVIEW, "Preview", BS_PUSHBUTTON);
         self.btn_priv_all = button(hwnd, ID_PRIV_ALL, "Tick All", BS_PUSHBUTTON);
         self.btn_priv_none = button(hwnd, ID_PRIV_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_priv_keep = button(hwnd, ID_PRIV_KEEP, "Cookies to Keep", BS_PUSHBUTTON);
         self.btn_priv_clean = button(hwnd, ID_PRIV_CLEAN, "Clean Ticked", BS_PUSHBUTTON);
         self.apply_fonts();
         self.fill_backups();
@@ -1352,6 +1359,7 @@ impl App {
             self.btn_priv_preview,
             self.btn_priv_all,
             self.btn_priv_none,
+            self.btn_priv_keep,
             self.btn_priv_clean,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
@@ -1525,7 +1533,10 @@ impl App {
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
-        if page == Page::Privacy && self.priv_items.is_empty() && !self.busy() {
+        if page == Page::Privacy
+            && !self.busy()
+            && (self.priv_items.is_empty() || self.priv_keep_stamp != keep_list_stamp())
+        {
             self.rebuild_privacy();
         }
         self.sync_controls();
@@ -1680,6 +1691,7 @@ impl App {
             ID_PRIV_PREVIEW => self.run_priv_preview(),
             ID_PRIV_ALL => self.priv_tick_all(true),
             ID_PRIV_NONE => self.priv_tick_all(false),
+            ID_PRIV_KEEP => self.edit_cookie_keep(),
             ID_PRIV_CLEAN => self.start_privacy_clean(),
             _ => {}
         }
@@ -2715,6 +2727,34 @@ impl App {
                 items.push(custom);
             }
         }
+        // Cookies to keep. The list only ever spares cookies, but an
+        // elevated window edits no database in a folder a normal program can
+        // change: with a list, it leaves cookies alone instead.
+        self.priv_keep_stamp = keep_list_stamp();
+        if let Ok(bytes) = std::fs::read(hive_mend::cookies_keep_file()) {
+            let (sites, warnings) = hive_mend::parse_keep_list(&decode_text_owned(bytes));
+            let keep = if sites.is_empty() {
+                hive_mend::CookieKeep::All
+            } else if self.elevated {
+                hive_mend::CookieKeep::LeaveAlone(
+                    "You keep some cookies, so an administrator window leaves cookies alone. Start Hivemend without administrator rights to clean them."
+                        .to_string(),
+                )
+            } else {
+                hive_mend::CookieKeep::Sites(sites)
+            };
+            hive_mend::set_cookie_keep(&mut items, &keep);
+            for item in items
+                .iter_mut()
+                .filter(|item| item.detail.contains("cookies") || item.detail.contains("Cookies"))
+            {
+                item.warnings.extend(
+                    warnings
+                        .iter()
+                        .map(|warning| format!("cookies-keep.txt {warning}")),
+                );
+            }
+        }
         let ticked: Vec<String> = if self.elevated {
             Vec::new()
         } else {
@@ -2728,6 +2768,34 @@ impl App {
         self.priv_preview = None;
         self.priv_outcome = None;
         self.fill_privacy();
+    }
+
+    /// Open the cookies-to-keep list in Notepad, creating it with help text.
+    fn edit_cookie_keep(&mut self) {
+        let file = hive_mend::cookies_keep_file();
+        if !file.exists() {
+            if let Some(parent) = file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let help = "# Cookies to keep: one site per line, such as github.com.\r\n# Its subdomains are kept too. Every other cookie is removed when\r\n# you clean a browser's history and cookies. Save, then go back to\r\n# Hivemend's Privacy page.\r\n";
+            if let Err(err) = std::fs::write(&file, help) {
+                self.message(
+                    &format!("Could not create {}: {err}", file.display()),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        }
+        let Some(system) = hive_mend::host_known_dir(hive_mend::KnownDir::System) else {
+            self.message("Could not locate Notepad.", MB_ICONWARNING);
+            return;
+        };
+        let notepad = format!(r"{system}\notepad.exe");
+        shell_open(
+            self.hwnd,
+            &notepad,
+            Some(&format!("\"{}\"", file.display())),
+        );
     }
 
     fn save_priv_ticks(&mut self) {
@@ -2794,6 +2862,9 @@ impl App {
         }
         if row.other > 0 {
             parts.push(count(row.other, "item", "items"));
+        }
+        if row.cookies > 0 {
+            parts.push(count(row.cookies, "cookie", "cookies"));
         }
         if row.bytes > 0 {
             parts.push(format_bytes(row.bytes));
@@ -2978,6 +3049,13 @@ impl App {
                     format_bytes(outcome.bytes()),
                     outcome.values()
                 )];
+                let cookies: usize = outcome.items.iter().map(|item| item.cookies).sum();
+                if cookies > 0 {
+                    lines.push(format!(
+                        "Removed {} and kept the ones for sites on your list.",
+                        count(cookies, "cookie", "cookies")
+                    ));
+                }
                 if outcome.canceled {
                     lines.push("Canceled: categories after the stop were left alone.".to_string());
                 }
@@ -3057,6 +3135,9 @@ impl App {
         }
         if item.other > 0 {
             parts.push(count(item.other, "item", "items"));
+        }
+        if item.cookies > 0 {
+            parts.push(count(item.cookies, "cookie", "cookies"));
         }
         if parts.is_empty() {
             parts.push("already empty".to_string());
@@ -4942,19 +5023,22 @@ impl App {
                         self.btn_priv_preview,
                         self.btn_priv_all,
                         self.btn_priv_none,
+                        self.btn_priv_keep,
                         self.btn_priv_clean,
                     ]);
                     place(self.priv_list, left, list_top, width, list_h);
                     let mut x = left;
                     for (control, w) in [
-                        (self.btn_priv_preview, 110),
-                        (self.btn_priv_all, 96),
-                        (self.btn_priv_none, 104),
+                        (self.btn_priv_preview, 100),
+                        (self.btn_priv_all, 90),
+                        (self.btn_priv_none, 100),
+                        (self.btn_priv_keep, 136),
                     ] {
                         place(control, x, button_y, self.s(w), button_h);
                         x += self.s(w + 8);
                     }
-                    let clean_w = self.s(220);
+                    // Whatever room is left, up to the usual width.
+                    let clean_w = (right - x).clamp(self.s(140), self.s(220));
                     place(
                         self.btn_priv_clean,
                         right - clean_w,
@@ -5146,6 +5230,7 @@ impl App {
             self.btn_priv_preview,
             self.btn_priv_all,
             self.btn_priv_none,
+            self.btn_priv_keep,
         ] {
             unsafe { EnableWindow(control, idle as i32) };
         }
@@ -7699,6 +7784,13 @@ fn copy_text(hwnd: HWND, value: &str) {
 
 /// Queue a shell open for after the handler returns: ShellExecuteW can pump
 /// messages (its own error dialog, a DDE or COM wait).
+/// When the cookies-to-keep list last changed, or None if there is none.
+fn keep_list_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(hive_mend::cookies_keep_file())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
 /// Duplicates smaller than this are not worth the reading.
 const DUP_MIN_BYTES: u64 = 1024 * 1024;
 

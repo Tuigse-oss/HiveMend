@@ -117,8 +117,26 @@ pub enum PrivacyTarget {
         names: Vec<String>,
         sidecars: bool,
     },
+    /// A browser's cookie database in each profile (`names` relative to the
+    /// profile, first match used), with its SQLite side files.
+    Cookies {
+        dir: DirSpec,
+        names: Vec<String>,
+        keep: CookieKeep,
+    },
     Clipboard,
     RecycleBin,
+}
+
+/// What a clean does with cookie databases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CookieKeep {
+    /// Delete the database files.
+    All,
+    /// Remove every cookie except those for these sites.
+    Sites(Vec<String>),
+    /// Leave cookies alone, for this reason.
+    LeaveAlone(String),
 }
 
 #[derive(Clone, Debug)]
@@ -328,17 +346,25 @@ fn builtin_items() -> Vec<PrivacyItem> {
             name,
             PrivacyGroup::Browsers,
             "Browsing history and cookies, only while the browser is closed.",
-            vec![PrivacyTarget::ExactFiles {
-                dir: DirSpec::Chromium {
-                    vendor: vendor.into(),
-                    sub: String::new(),
+            vec![
+                PrivacyTarget::ExactFiles {
+                    dir: DirSpec::Chromium {
+                        vendor: vendor.into(),
+                        sub: String::new(),
+                    },
+                    names: vec!["History".to_string()],
+                    sidecars: true,
                 },
-                names: ["History", "Cookies"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                sidecars: true,
-            }],
+                // Version 96 and later keep cookies under Network.
+                PrivacyTarget::Cookies {
+                    dir: DirSpec::Chromium {
+                        vendor: vendor.into(),
+                        sub: String::new(),
+                    },
+                    names: vec![r"Network\Cookies".to_string(), "Cookies".to_string()],
+                    keep: CookieKeep::All,
+                },
+            ],
         );
         closed.veto_exes.push(exe.to_string());
         items.push(closed);
@@ -348,14 +374,18 @@ fn builtin_items() -> Vec<PrivacyItem> {
         "Firefox history + cookies (closed)",
         PrivacyGroup::Browsers,
         "Browsing history and cookies, only while the browser is closed.",
-        vec![PrivacyTarget::ExactFiles {
-            dir: DirSpec::Firefox { sub: String::new() },
-            names: ["cookies.sqlite", "formhistory.sqlite"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            sidecars: true,
-        }],
+        vec![
+            PrivacyTarget::ExactFiles {
+                dir: DirSpec::Firefox { sub: String::new() },
+                names: vec!["formhistory.sqlite".to_string()],
+                sidecars: true,
+            },
+            PrivacyTarget::Cookies {
+                dir: DirSpec::Firefox { sub: String::new() },
+                names: vec!["cookies.sqlite".to_string()],
+                keep: CookieKeep::All,
+            },
+        ],
     );
     fox.veto_exes.push("firefox.exe".to_string());
     items.push(fox);
@@ -400,6 +430,46 @@ fn builtin_items() -> Vec<PrivacyItem> {
 /// The privacy categories offered on this PC.
 pub fn build_items() -> Vec<PrivacyItem> {
     builtin_items()
+}
+
+/// Apply the cookies-to-keep choice to every item that holds cookies.
+pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
+    for item in items {
+        let mut holds = false;
+        for target in &mut item.targets {
+            if let PrivacyTarget::Cookies { keep: have, .. } = target {
+                *have = keep.clone();
+                holds = true;
+            }
+        }
+        if holds {
+            item.detail = match keep {
+                CookieKeep::All => {
+                    "Browsing history and cookies, only while the browser is closed.".to_string()
+                }
+                CookieKeep::Sites(sites) => format!(
+                    "Browsing history and cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
+                    if sites.len() == 1 {
+                        "the 1 site".to_string()
+                    } else {
+                        format!("the {} sites", sites.len())
+                    }
+                ),
+                CookieKeep::LeaveAlone(_) => {
+                    "Browsing history, only while the browser is closed. Cookies are left alone."
+                        .to_string()
+                }
+            };
+        }
+    }
+}
+
+/// The first cookie database present in a profile, of `names`.
+fn cookie_db(fs: &dyn FileView, dir: &str, names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .map(|name| format!("{dir}\\{name}"))
+        .find(|path| fs.exists(path) && !fs.is_dir(path))
 }
 
 /// Case-insensitive `*`/`?` mask over a file name. `*.*` matches everything.
@@ -664,6 +734,8 @@ pub struct PreviewItem {
     pub values: usize,
     /// Non-file, non-value payloads (clipboard).
     pub other: usize,
+    /// Cookies removed from a database that is kept.
+    pub cookies: usize,
     pub bytes: u64,
     pub restricted: Vec<String>,
     pub restricted_extra: usize,
@@ -834,6 +906,40 @@ fn preview_target(
                 }
             }
         }
+        PrivacyTarget::Cookies { dir, names, keep } => {
+            if let CookieKeep::LeaveAlone(reason) = keep {
+                row.note(reason.clone());
+                return;
+            }
+            let (dirs, notes) = resolve_dirs(fs, dir);
+            for note in notes {
+                row.note(note);
+            }
+            for dir in dirs {
+                if !walked.insert(format!("cookies\0{}", dir.to_ascii_lowercase())) {
+                    continue;
+                }
+                let Some(db) = cookie_db(fs, &dir, names) else {
+                    continue;
+                };
+                match keep {
+                    CookieKeep::Sites(sites) => {
+                        match crate::cookies::count_cookies(std::path::Path::new(&db), sites) {
+                            Ok(count) => row.cookies += count.removed,
+                            Err(err) => row.note(format!("cannot read {db}: {err}")),
+                        }
+                    }
+                    _ => {
+                        for path in with_sidecars(&dir, &db[dir.len() + 1..], true) {
+                            if fs.exists(&path) && !fs.is_dir(&path) {
+                                row.files += 1;
+                                row.bytes += fs.len(&path).unwrap_or(0);
+                            }
+                        }
+                    }
+                }
+            }
+        }
         PrivacyTarget::Clipboard => {
             row.other += sys.clipboard_items();
         }
@@ -941,6 +1047,8 @@ pub struct ItemOutcome {
     pub files: usize,
     pub values: usize,
     pub other: usize,
+    /// Cookies removed from a database that is kept.
+    pub cookies: usize,
     pub bytes: u64,
     pub already_gone: usize,
     pub restricted: Vec<String>,
@@ -1124,6 +1232,7 @@ fn collect_repairs(
             }
             PrivacyTarget::DirFiles { .. }
             | PrivacyTarget::ExactFiles { .. }
+            | PrivacyTarget::Cookies { .. }
             | PrivacyTarget::Clipboard
             | PrivacyTarget::RecycleBin => {}
         }
@@ -1232,6 +1341,39 @@ fn execute_item(
                     }
                 }
             }
+            PrivacyTarget::Cookies { dir, names, keep } => {
+                if let CookieKeep::LeaveAlone(reason) = keep {
+                    done.note(reason.clone());
+                    continue;
+                }
+                let (dirs, notes) = resolve_dirs(fs, dir);
+                for note in notes {
+                    done.note(note);
+                }
+                for dir in dirs {
+                    if !walked.insert(format!("cookies\0{}", dir.to_ascii_lowercase())) {
+                        continue;
+                    }
+                    let Some(db) = cookie_db(fs, &dir, names) else {
+                        continue;
+                    };
+                    match keep {
+                        CookieKeep::Sites(sites) => {
+                            trim_cookie_db(fs, &dir, &db, sites, &mut done, errors);
+                        }
+                        _ => {
+                            for path in with_sidecars(&dir, &db[dir.len() + 1..], true) {
+                                if !fs.exists(&path) || fs.is_dir(&path) {
+                                    continue;
+                                }
+                                let bytes = fs.len(&path).unwrap_or(0);
+                                let hit = FileHit { path, bytes };
+                                delete_file(fs, &dir, &hit, &mut done, errors);
+                            }
+                        }
+                    }
+                }
+            }
             PrivacyTarget::Clipboard => {
                 if sys.clipboard_items() == 0 {
                     done.already_gone += 1;
@@ -1297,6 +1439,46 @@ fn apply_repair(
         Err(RegError::NotFound) => done.already_gone += 1,
         Err(RegError::Denied(message)) => done.note(format!("{key}: {message}")),
         Err(RegError::Message(message)) => errors.push(format!("{key}: {message}")),
+    }
+}
+
+/// Trim one cookie database to the kept sites, after the same location
+/// checks a delete gets: the file and the profile are both resolved, so a
+/// link cannot carry the edit outside the profile.
+fn trim_cookie_db(
+    fs: &mut dyn FileView,
+    root: &str,
+    db: &str,
+    sites: &[String],
+    done: &mut ItemOutcome,
+    errors: &mut Vec<String>,
+) {
+    if !privacy_file_allowed(fs, root, db) {
+        done.note(format!("refused: {db}"));
+        return;
+    }
+    let real = match fs.pin(db) {
+        Ok(pin) if pin.kind == ItemKind::File => pin.real_path.clone(),
+        Ok(_) => {
+            done.note(format!("not a file: {db}"));
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {db}: {err}"));
+            return;
+        }
+    };
+    let real_root = fs
+        .pin(root)
+        .map(|pin| pin.real_path)
+        .unwrap_or_else(|_| root.to_string());
+    if !privacy_file_allowed(fs, &real_root, &real) {
+        done.note(format!("refused: {db} (it resolves to {real})"));
+        return;
+    }
+    match crate::cookies::trim_cookies(std::path::Path::new(&real), sites) {
+        Ok(count) => done.cookies += count.removed,
+        Err(err) => errors.push(format!("cookies in {db} were left as they were: {err}")),
     }
 }
 
@@ -2129,6 +2311,78 @@ mod tests {
             fs.exists(
                 r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
             )
+        );
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn current_chromium_cookies_under_network_are_cleaned() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        fs.add_file_bytes(
+            &format!(r"{profile}\Network\Cookies-journal"),
+            vec![0; 2],
+            None,
+        );
+        let mut sys = FakeSys::default();
+        let backup = std::env::temp_dir().join("hive-mend-privacy-network-cookies.reg");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("chrome-data")],
+            &backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(!fs.exists(&format!(r"{profile}\Network\Cookies")));
+        assert!(!fs.exists(&format!(r"{profile}\Network\Cookies-journal")));
+        assert!(!fs.exists(&format!(r"{profile}\History")));
+        assert_eq!(
+            outcome.items[0].files, 4,
+            "History + wal, Cookies + journal"
+        );
+        let _ = std::fs::remove_file(&backup);
+    }
+
+    #[test]
+    fn cookies_left_alone_are_not_touched() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        let mut items = vec![builtin("chrome-data")];
+        set_cookie_keep(
+            &mut items,
+            &CookieKeep::LeaveAlone("kept by request".into()),
+        );
+        assert!(items[0].detail.contains("Cookies are left alone"));
+        let mut sys = FakeSys::default();
+        let report = preview(&reg, &fs, &sys, &quiet(), &items);
+        assert!(
+            report.items[0]
+                .restricted
+                .iter()
+                .any(|note| note == "kept by request")
+        );
+        let backup = std::env::temp_dir().join("hive-mend-privacy-cookies-alone.reg");
+        clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &items,
+            &backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(fs.exists(&format!(r"{profile}\Network\Cookies")));
+        assert!(
+            !fs.exists(&format!(r"{profile}\History")),
+            "history still goes"
         );
         let _ = std::fs::remove_file(&backup);
     }
