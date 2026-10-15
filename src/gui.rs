@@ -3749,7 +3749,9 @@ impl App {
             let mut last = std::time::Instant::now();
             let report = hive_mend::find_duplicates(
                 &hive_mend::HostLister,
-                &hive_mend::HostContent,
+                &hive_mend::HostContent {
+                    stop: Some(&CANCEL),
+                },
                 &root,
                 DUP_MIN_BYTES,
                 &protected,
@@ -3918,7 +3920,7 @@ impl App {
             let mut done = 0;
             for (group, remove) in plan {
                 let outcomes = hive_mend::remove_checked(
-                    &hive_mend::HostContent,
+                    &hive_mend::HostContent::default(),
                     &group,
                     &remove,
                     &protected,

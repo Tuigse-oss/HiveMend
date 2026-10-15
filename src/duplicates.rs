@@ -295,9 +295,23 @@ pub fn remove_checked(
 }
 
 /// The host's files, read through a handle that does not follow links.
+/// When `stop` is set, reading a large file gives up between chunks once
+/// it turns true, so Cancel does not wait for a whole file.
 #[cfg(windows)]
 #[derive(Clone, Copy, Debug, Default)]
-pub struct HostContent;
+pub struct HostContent {
+    pub stop: Option<&'static std::sync::atomic::AtomicBool>,
+}
+
+#[cfg(windows)]
+impl HostContent {
+    fn stopped(&self) -> Result<(), String> {
+        match self.stop {
+            Some(flag) if flag.load(std::sync::atomic::Ordering::SeqCst) => Err("stopped".into()),
+            _ => Ok(()),
+        }
+    }
+}
 
 #[cfg(windows)]
 fn open_plain(path: &str) -> Result<(std::fs::File, FileId, u64), String> {
@@ -380,6 +394,7 @@ impl ContentReader for HostContent {
         let mut reader = file.take(limit.unwrap_or(u64::MAX));
         let mut buffer = vec![0u8; 1 << 20];
         loop {
+            self.stopped()?;
             let read = reader.read(&mut buffer).map_err(|err| err.to_string())?;
             if read == 0 {
                 break;
@@ -401,6 +416,7 @@ impl ContentReader for HostContent {
         let mut one = vec![0u8; 1 << 20];
         let mut two = vec![0u8; 1 << 20];
         loop {
+            self.stopped()?;
             let read = left.read(&mut one).map_err(|err| err.to_string())?;
             if read == 0 {
                 return Ok(right.read(&mut two[..1]).map_err(|err| err.to_string())? == 0);
