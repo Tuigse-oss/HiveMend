@@ -241,23 +241,31 @@ mod tests {
         );
         assert!(matches!(marked, Applied::NotBackedUp));
         assert!(fs.exists(&format!(r"{desktop}\marked.lnk")));
-        // A stream added after the copy, before the delete: it stays.
-        fs.add_file_bytes(&format!(r"{desktop}\late.lnk"), b"lnk".to_vec(), None);
-        fs.set_streams_late(&format!(r"{desktop}\late.lnk"));
-        let late = delete_file_pinned(
+        // A backup folder on another drive cannot take it: it stays.
+        fs.add_file_bytes(&format!(r"{desktop}\far.lnk"), b"far".to_vec(), None);
+        fs.set_other_volume(r"D:\Backups");
+        let far = delete_file_pinned(
             &mut fs,
-            &format!(r"{desktop}\late.lnk"),
-            Some(&format!(r"{copies}\0004-late.lnk")),
+            &format!(r"{desktop}\far.lnk"),
+            Some(r"D:\Backups\b-files\0004-far.lnk"),
         );
-        assert!(matches!(late, Applied::NotBackedUp));
-        assert!(fs.exists(&format!(r"{desktop}\late.lnk")));
+        assert!(matches!(far, Applied::NotBackedUp));
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\far.lnk")),
+            Some(b"far".to_vec())
+        );
+        // A plain shortcut is moved into the backup, never deleted.
         let plain = delete_file_pinned(
             &mut fs,
             &format!(r"{desktop}\plain.lnk"),
             Some(&format!(r"{copies}\0002-plain.lnk")),
         );
         assert!(matches!(plain, Applied::Removed));
-        assert!(fs.exists(&format!(r"{copies}\0002-plain.lnk")));
+        assert!(!fs.exists(&format!(r"{desktop}\plain.lnk")));
+        assert_eq!(
+            fs.read(&format!(r"{copies}\0002-plain.lnk")),
+            Some(b"lnk".to_vec())
+        );
     }
 
     fn uninstall_finding(name: &str) -> Finding {
@@ -411,6 +419,66 @@ mod tests {
             );
             assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
         }
+    }
+
+    /// At every size limit, each entry is either removed and confirmed, or
+    /// left exactly as it was: a limit never leaves a removal unconfirmed.
+    #[test]
+    fn no_size_limit_leaves_a_removal_unconfirmed() {
+        use crate::regfile::parse_backup;
+        struct Sum(u64);
+        impl crate::backup::RunningMac for Sum {
+            fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+                self.0 = bytes
+                    .iter()
+                    .fold(self.0, |sum, byte| sum + u64::from(*byte));
+                Ok(self.0.to_be_bytes().to_vec())
+            }
+        }
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let findings = [uninstall_finding("One"), uninstall_finding("Two")];
+        let mut checked = 0;
+        for signed in [false, true] {
+            for limit in (200..1600u64).step_by(7) {
+                let mut reg = MemoryRegistry::new();
+                reg.set_sz(&format!(r"{base}\One"), "DisplayName", "One");
+                reg.set_sz(&format!(r"{base}\Two"), "DisplayName", "Two");
+                let mut backup = crate::backup::test_writer("hive-mend-limits");
+                if signed {
+                    backup.sign_with(Box::new(Sum(0))).unwrap();
+                    // The signature limit is the tight one here.
+                    backup.limit_for_test(u64::MAX, limit / 2);
+                } else {
+                    backup.limit_for_test(limit, u64::MAX);
+                }
+                let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup);
+                let text = crate::backup::read_backup(backup.path()).unwrap_or_default();
+                let _ = std::fs::remove_file(backup.path());
+                let _ = std::fs::remove_file(crate::backup::signature_path(backup.path()));
+                let Ok(outcome) = outcome else {
+                    // Not even the header fitted: nothing may have changed.
+                    assert!(reg.values(&format!(r"{base}\One")).is_ok());
+                    continue;
+                };
+                let parsed = parse_backup(&text).unwrap();
+                assert!(parsed.unconfirmed.is_empty(), "limit {limit}: {text}");
+                for name in ["One", "Two"] {
+                    let gone = reg.values(&format!(r"{base}\{name}")).is_err();
+                    let restorable = parsed.ops.iter().any(|op| op.key().ends_with(name));
+                    assert_eq!(gone, restorable, "limit {limit} signed {signed}: {name}");
+                }
+                assert!(
+                    outcome
+                        .errors
+                        .iter()
+                        .all(|err| !err.contains("could not be completed")),
+                    "{:?}",
+                    outcome.errors
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60);
     }
 
     #[test]
@@ -841,7 +909,10 @@ pub(crate) fn delete_in_transaction(
     if !unreadable.is_empty() || !reads_back(&section) {
         return Ok(Deleted::NotBackedUp);
     }
-    match backup.append(&format!("\r\n; entry {entry}\r\n{section}")) {
+    // Room for the confirmation is reserved with the entry: an entry that
+    // could be removed but not then confirmed is never started.
+    let confirmation = format!("; entry {entry} removed\r\n");
+    match backup.append_reserving(&format!("\r\n; entry {entry}\r\n{section}"), &confirmation) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
             return Ok(Deleted::TooLarge);
@@ -873,7 +944,7 @@ pub(crate) fn delete_in_transaction(
         not_removed(backup);
         return Err(err);
     }
-    match backup.append(&format!("; entry {entry} removed\r\n")) {
+    match backup.append(&confirmation) {
         Ok(()) => Ok(Deleted::Removed),
         Err(err) => Ok(Deleted::RemovedUnconfirmed(err.to_string())),
     }
@@ -996,20 +1067,19 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
     if copy.is_some() && fs.pin_named_streams(&pin) != Ok(false) {
         return Applied::NotBackedUp;
     }
+    // The shortcut itself goes into the backup, moved by this handle with
+    // all its data: nothing is deleted, and an interruption leaves it
+    // either where it was or in the backup. A backup folder on another
+    // drive cannot take it, and it stays.
     if let Some(copy) = copy {
-        let len = pin.len;
-        if let Err(err) = fs.pin_copy_to(&pin, copy) {
-            return Applied::Failed {
-                message: format!("could not save a copy first: {err}"),
-                denied: false,
-            };
-        }
-        // Deleted only while still exactly what was copied.
-        return match fs.pin_delete_unchanged(pin, len) {
+        let (dir, name) = copy.rsplit_once('\\').unwrap_or(("", copy));
+        return match fs.pin_move_into(pin, dir, name) {
             Ok(()) => Applied::Removed,
-            Err(err) if err.contains("changed while") => Applied::NotBackedUp,
+            Err(err) if err.contains("os error 17") || err.contains("os error 183") => {
+                Applied::NotBackedUp
+            }
             Err(err) => Applied::Failed {
-                denied: err.contains("os error 5"),
+                denied: err.contains("os error 5") || err.contains("os error 32"),
                 message: err,
             },
         };

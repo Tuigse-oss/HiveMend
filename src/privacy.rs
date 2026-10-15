@@ -327,20 +327,21 @@ fn builtin_items() -> Vec<PrivacyItem> {
             min_age: None,
         }],
     ));
-    // Closed-browser lists stay clear of saved logins, autofill, and
-    // bookmarks: Login Data, Web Data, and places.sqlite hold passwords
-    // and bookmarks, which no confirm can give back.
+    // Browser databases are only ever edited, never deleted: a database and
+    // its journal or log cannot be removed together all-or-nothing across a
+    // crash, so cookies are removed from inside the database by SQLite.
+    // Saved logins, autofill, bookmarks, and history are not touched.
     for (vendor, id, name, exe) in [
         (
             "Google\\Chrome",
             "chrome-data",
-            "Chrome history + cookies (closed)",
+            "Chrome cookies (closed)",
             "chrome.exe",
         ),
         (
             "Microsoft\\Edge",
             "edge-data",
-            "Edge history + cookies (closed)",
+            "Edge cookies (closed)",
             "msedge.exe",
         ),
     ] {
@@ -348,16 +349,8 @@ fn builtin_items() -> Vec<PrivacyItem> {
             id,
             name,
             PrivacyGroup::Browsers,
-            "Browsing history and cookies, only while the browser is closed.",
+            "Cookies, only while the browser is closed.",
             vec![
-                PrivacyTarget::ExactFiles {
-                    dir: DirSpec::Chromium {
-                        vendor: vendor.into(),
-                        sub: String::new(),
-                    },
-                    names: vec!["History".to_string()],
-                    sidecars: true,
-                },
                 // Version 96 and later keep cookies under Network.
                 PrivacyTarget::Cookies {
                     dir: DirSpec::Chromium {
@@ -374,21 +367,14 @@ fn builtin_items() -> Vec<PrivacyItem> {
     }
     let mut fox = item(
         "firefox-data",
-        "Firefox cookies + form history (closed)",
+        "Firefox cookies (closed)",
         PrivacyGroup::Browsers,
-        "Cookies and saved form entries, only while the browser is closed. Browsing history and bookmarks stay.",
-        vec![
-            PrivacyTarget::ExactFiles {
-                dir: DirSpec::Firefox { sub: String::new() },
-                names: vec!["formhistory.sqlite".to_string()],
-                sidecars: true,
-            },
-            PrivacyTarget::Cookies {
-                dir: DirSpec::Firefox { sub: String::new() },
-                names: vec!["cookies.sqlite".to_string()],
-                keep: CookieKeep::All,
-            },
-        ],
+        "Cookies, only while the browser is closed.",
+        vec![PrivacyTarget::Cookies {
+            dir: DirSpec::Firefox { sub: String::new() },
+            names: vec!["cookies.sqlite".to_string()],
+            keep: CookieKeep::All,
+        }],
     );
     fox.veto_exes.push("firefox.exe".to_string());
     items.push(fox);
@@ -527,28 +513,17 @@ pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
             }
         }
         if holds {
-            // Firefox's item clears form history; Chrome's and Edge's clear
-            // browsing history.
-            let other = if item.id.starts_with("firefox") {
-                "Saved form entries"
-            } else {
-                "Browsing history"
-            };
             item.detail = match keep {
-                CookieKeep::All => {
-                    format!("{other} and cookies, only while the browser is closed.")
-                }
+                CookieKeep::All => "Cookies, only while the browser is closed.".to_string(),
                 CookieKeep::Sites(sites) => format!(
-                    "{other} and cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
+                    "Cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
                     if sites.len() == 1 {
                         "the 1 site".to_string()
                     } else {
                         format!("the {} sites", sites.len())
                     }
                 ),
-                CookieKeep::LeaveAlone(_) => {
-                    format!("{other}, only while the browser is closed. Cookies are left alone.")
-                }
+                CookieKeep::LeaveAlone(_) => "Cookies are left alone.".to_string(),
             };
         }
     }
@@ -672,7 +647,7 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
                 return (dirs, notes);
             }
             let users = format!("{base}\\{vendor}\\User Data");
-            for profile in child_dirs(fs, &users) {
+            for profile in child_dirs(fs, &users, &mut notes) {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -690,7 +665,7 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
                 return (dirs, notes);
             }
             let profiles = format!("{base}\\Mozilla\\Firefox\\Profiles");
-            for profile in child_dirs(fs, &profiles) {
+            for profile in child_dirs(fs, &profiles, &mut notes) {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -708,7 +683,7 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
                 return (dirs, notes);
             }
             let home = format!("{base}\\Mozilla\\Firefox");
-            for profile in firefox_profiles(fs, &home) {
+            for profile in firefox_profiles(fs, &home, &mut notes) {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -726,20 +701,33 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
 /// The most profile folders looked at under one folder.
 const MAX_PROFILES: usize = 1_000;
 
-fn child_dirs(fs: &dyn FileView, dir: &str) -> Vec<String> {
+/// Folders in `dir`, at most [`MAX_PROFILES`]; a note says when there
+/// were more, so the rest is never taken as looked at.
+fn child_dirs(fs: &dyn FileView, dir: &str, notes: &mut Vec<String>) -> Vec<String> {
     let mut dirs = Vec::new();
+    let mut more = false;
     fs.list_each(dir, &mut |item| {
-        if item.kind == ItemKind::Dir {
-            dirs.push(format!("{dir}\\{}", item.name));
+        if item.kind != ItemKind::Dir {
+            return true;
         }
-        dirs.len() < MAX_PROFILES
+        if dirs.len() == MAX_PROFILES {
+            more = true;
+            return false;
+        }
+        dirs.push(format!("{dir}\\{}", item.name));
+        true
     });
+    if more {
+        notes.push(format!(
+            "{dir}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
+        ));
+    }
     dirs
 }
 
 /// Firefox profiles from `profiles.ini` plus the `Profiles` folder, so a
 /// missing ini still finds default locations.
-fn firefox_profiles(fs: &dyn FileView, home: &str) -> Vec<String> {
+fn firefox_profiles(fs: &dyn FileView, home: &str, notes: &mut Vec<String>) -> Vec<String> {
     let mut profiles = Vec::new();
     let mut push = |dir: String| {
         if !profiles
@@ -775,7 +763,7 @@ fn firefox_profiles(fs: &dyn FileView, home: &str) -> Vec<String> {
             }
         }
     }
-    for profile in child_dirs(fs, &format!("{home}\\Profiles")) {
+    for profile in child_dirs(fs, &format!("{home}\\Profiles"), notes) {
         push(profile);
     }
     profiles
@@ -1009,7 +997,7 @@ fn preview_target(
                     continue;
                 }
                 let mut counted = (0usize, 0u64);
-                let mut budget = WalkBudget::new();
+                let mut budget = WalkBudget::new(false);
                 let finished = walk_files(
                     fs,
                     &dir,
@@ -1028,11 +1016,10 @@ fn preview_target(
                 );
                 row.files += counted.0;
                 row.bytes += counted.1;
-                if budget.exhausted {
-                    row.note(format!(
-                        "{dir}: more than {MAX_WALK_FOLDERS} folders; only part of it was counted"
-                    ));
-                } else if !finished {
+                if let Some(note) = budget.shortfall(&dir) {
+                    row.note(note);
+                }
+                if !finished && !budget.exhausted {
                     return false;
                 }
             }
@@ -1057,13 +1044,16 @@ fn preview_target(
                     continue;
                 }
                 for name in names {
-                    for path in with_sidecars(&dir, name, *sidecars) {
-                        if fs.is_dir(&path) {
-                            row.note(format!("not a file: {path}"));
-                        } else if fs.exists(&path) {
-                            row.files += 1;
-                            row.bytes += fs.len(&path).unwrap_or(0);
-                        }
+                    if *sidecars {
+                        row.note(format!("{dir}\\{name}: database files are not deleted"));
+                        continue;
+                    }
+                    let path = format!("{dir}\\{name}");
+                    if fs.is_dir(&path) {
+                        row.note(format!("not a file: {path}"));
+                    } else if fs.exists(&path) {
+                        row.files += 1;
+                        row.bytes += fs.len(&path).unwrap_or(0);
                     }
                 }
             }
@@ -1091,14 +1081,10 @@ fn preview_target(
                             Err(err) => row.note(format!("cannot read {db}: {err}")),
                         }
                     }
-                    _ => {
-                        for path in with_sidecars(&dir, &db[dir.len() + 1..], true) {
-                            if fs.exists(&path) && !fs.is_dir(&path) {
-                                row.files += 1;
-                                row.bytes += fs.len(&path).unwrap_or(0);
-                            }
-                        }
-                    }
+                    _ => match crate::cookies::count_cookies(std::path::Path::new(&db), &[]) {
+                        Ok(count) => row.cookies += count.removed,
+                        Err(err) => row.note(format!("cannot read {db}: {err}")),
+                    },
                 }
             }
         }
@@ -1162,19 +1148,59 @@ const MAX_WALK_HIT_BYTES: usize = 64 * 1024 * 1024;
 const MAX_WALK_FOLDERS: usize = 100_000;
 
 /// Folders a walk may still queue, and whether it ran out.
+/// What a walk may still keep, and why it stopped short, if it did.
 struct WalkBudget {
     folders_left: usize,
+    /// Bytes of path text it may still keep: queued folders always, and
+    /// the files it hands on when `charge_hits` (a clean keeps them).
+    bytes_left: usize,
+    charge_hits: bool,
+    /// A folder or byte limit was reached.
     exhausted: bool,
+    /// Folders deeper than the walk goes were not looked at.
+    too_deep: bool,
 }
 
 impl WalkBudget {
-    fn new() -> Self {
+    fn new(charge_hits: bool) -> Self {
         Self {
             folders_left: MAX_WALK_FOLDERS,
+            bytes_left: MAX_WALK_HIT_BYTES,
+            charge_hits,
             exhausted: false,
+            too_deep: false,
+        }
+    }
+
+    /// Take `bytes` of path text from the budget, or say it ran out.
+    fn charge(&mut self, bytes: usize) -> bool {
+        if bytes > self.bytes_left {
+            self.exhausted = true;
+            return false;
+        }
+        self.bytes_left -= bytes;
+        true
+    }
+
+    /// The note saying how a walk of `dir` fell short, if it did.
+    fn shortfall(&self, dir: &str) -> Option<String> {
+        if self.exhausted {
+            Some(format!(
+                "{dir}: too large to go through at once (more than {MAX_WALK_FOLDERS} folders or {} MB of paths); the rest was not looked at",
+                MAX_WALK_HIT_BYTES / (1024 * 1024)
+            ))
+        } else if self.too_deep {
+            Some(format!(
+                "{dir}: folders more than {MAX_WALK_DEPTH} levels down were not looked at"
+            ))
+        } else {
+            None
         }
     }
 }
+
+/// How deep a walk goes.
+const MAX_WALK_DEPTH: usize = 64;
 
 /// Walk `dir` for files matching `mask`, one entry at a time, handing each
 /// to `on_hit` (false stops the walk). `keep_going` is asked for every
@@ -1193,7 +1219,9 @@ fn walk_files(
     budget: &mut WalkBudget,
     row: &mut PreviewItem,
 ) -> bool {
-    if depth > 64 {
+    if depth > MAX_WALK_DEPTH {
+        // Not looked at, and said so: never reported as covered.
+        budget.too_deep = true;
         return true;
     }
     if !keep_going() {
@@ -1224,6 +1252,10 @@ fn walk_files(
                         }
                     }
                 }
+                if budget.charge_hits && !budget.charge(path.len()) {
+                    going = false;
+                    return false;
+                }
                 let bytes = fs.len(&path).unwrap_or(0);
                 if !on_hit(FileHit {
                     path,
@@ -1236,7 +1268,7 @@ fn walk_files(
             }
             ItemKind::Dir => {
                 if recursive {
-                    if budget.folders_left == 0 {
+                    if budget.folders_left == 0 || !budget.charge(path.len()) {
                         budget.exhausted = true;
                         going = false;
                         return false;
@@ -1269,16 +1301,6 @@ fn walk_files(
         }
     }
     true
-}
-
-fn with_sidecars(dir: &str, name: &str, sidecars: bool) -> Vec<String> {
-    let mut paths = vec![format!("{dir}\\{name}")];
-    if sidecars {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            paths.push(format!("{dir}\\{name}{suffix}"));
-        }
-    }
-    paths
 }
 
 // ---- clean ----
@@ -1557,8 +1579,7 @@ fn execute_item(
                     }
                     let mut counter = PreviewItem::blank(&item.id);
                     let mut hits = Vec::new();
-                    let mut hit_bytes = 0usize;
-                    let mut budget = WalkBudget::new();
+                    let mut budget = WalkBudget::new(true);
                     let finished = walk_files(
                         fs,
                         &dir,
@@ -1567,9 +1588,8 @@ fn execute_item(
                         *min_age,
                         0,
                         &mut |hit| {
-                            hit_bytes += hit.path.len();
                             hits.push(hit);
-                            hits.len() < MAX_WALK_HITS && hit_bytes < MAX_WALK_HIT_BYTES
+                            hits.len() < MAX_WALK_HITS
                         },
                         keep_going,
                         &mut budget,
@@ -1579,18 +1599,14 @@ fn execute_item(
                         done.note(note);
                     }
                     done.restricted_extra += counter.restricted_extra;
-                    if budget.exhausted {
-                        done.note(format!(
-                            "{dir}: more than {MAX_WALK_FOLDERS} folders; the rest were left for another clean"
-                        ));
-                    } else if !finished
-                        && hits.len() < MAX_WALK_HITS
-                        && hit_bytes < MAX_WALK_HIT_BYTES
-                    {
+                    if let Some(note) = budget.shortfall(&dir) {
+                        done.note(note);
+                    }
+                    if !finished && !budget.exhausted && hits.len() < MAX_WALK_HITS {
                         // Canceled while listing: nothing from this walk goes.
                         done.canceled = true;
                         return done;
-                    } else if !finished {
+                    } else if !finished && !budget.exhausted {
                         done.note(format!(
                             "{dir}: more than {} files; the rest were left for another clean",
                             hits.len()
@@ -1628,8 +1644,26 @@ fn execute_item(
                         if started(&mut done).is_some() {
                             return done;
                         }
-                        let set = with_sidecars(&dir, name, *sidecars);
-                        delete_file_set(fs, &dir, &set, &mut done, errors);
+                        // A file with side files is a database set, which
+                        // Hivemend does not delete.
+                        if *sidecars {
+                            done.note(format!("{dir}\\{name}: database files are not deleted"));
+                            continue;
+                        }
+                        let path = format!("{dir}\\{name}");
+                        if fs.is_dir(&path) {
+                            done.note(format!("not a file: {path}"));
+                            continue;
+                        }
+                        if !fs.exists(&path) {
+                            continue;
+                        }
+                        let hit = FileHit {
+                            bytes: fs.len(&path).unwrap_or(0),
+                            path,
+                            min_age: None,
+                        };
+                        delete_file(fs, &dir, &hit, &mut done, errors);
                     }
                 }
             }
@@ -1656,10 +1690,9 @@ fn execute_item(
                         CookieKeep::Sites(sites) => {
                             trim_cookie_db(fs, &dir, &db, sites, &mut done, errors);
                         }
-                        _ => {
-                            let set = with_sidecars(&dir, &db[dir.len() + 1..], true);
-                            delete_file_set(fs, &dir, &set, &mut done, errors);
-                        }
+                        // Every cookie, by the same edit: the database is
+                        // never deleted.
+                        _ => trim_cookie_db(fs, &dir, &db, &[], &mut done, errors),
                     }
                 }
             }
@@ -1874,80 +1907,6 @@ fn delete_file(
             done.note(format!("{}: {}", hit.path, short_reason(&err)));
         }
         Err(err) => errors.push(format!("{}: {err}", hit.path)),
-    }
-}
-
-/// Delete a database and its side files together, or none of them: every
-/// member present is checked and taken exclusively first, so if a program
-/// (a browser) has any of them open, the whole set is left alone and is
-/// never left half-removed.
-fn delete_file_set(
-    fs: &mut dyn FileView,
-    root: &str,
-    paths: &[String],
-    done: &mut ItemOutcome,
-    errors: &mut Vec<String>,
-) {
-    let mut held = Vec::new();
-    for path in paths {
-        if fs.is_dir(path) {
-            done.note(format!("not a file: {path}"));
-            return;
-        }
-        if !fs.exists(path) {
-            continue;
-        }
-        if !privacy_file_allowed(fs, root, path) {
-            done.note(format!("refused: {path}"));
-            return;
-        }
-        let mut pin = match fs.pin(path) {
-            Ok(pin) => pin,
-            Err(err) if err.contains("not found") || err.contains("os error 2") => continue,
-            Err(err) => {
-                done.note(format!("refused: {path}: {err}"));
-                return;
-            }
-        };
-        if pin.kind != ItemKind::File {
-            done.note(format!("not a file: {path}"));
-            return;
-        }
-        let real_root = fs
-            .pin(root)
-            .map(|pin| pin.real_path)
-            .unwrap_or_else(|_| root.to_string());
-        if !privacy_file_allowed(fs, &real_root, &pin.real_path) {
-            done.note(format!(
-                "refused: {path} (it resolves to {})",
-                pin.real_path
-            ));
-            return;
-        }
-        let bytes = pin.len;
-        if let Err(err) = fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
-            done.note(format!(
-                "{path}: {}, so its set was left alone",
-                short_reason(&err)
-            ));
-            return;
-        }
-        held.push((path.clone(), bytes, pin));
-    }
-    // All marked for deletion together, or none: a set is never left with
-    // its database but without the journal or log it still needs.
-    let count = held.len();
-    let bytes: u64 = held.iter().map(|(_, bytes, _)| bytes).sum();
-    let first = held
-        .first()
-        .map(|(path, _, _)| path.clone())
-        .unwrap_or_default();
-    match fs.pin_delete_all(held.into_iter().map(|(_, _, pin)| pin).collect()) {
-        Ok(()) => {
-            done.files += count;
-            done.bytes += bytes;
-        }
-        Err(err) => errors.push(format!("{first} and its side files: {err}")),
     }
 }
 
@@ -2698,45 +2657,15 @@ mod tests {
         );
         fs.add_dir(&format!("{home}\\Profiles\\abc.default"));
         fs.add_dir(&format!("{home}\\Profiles\\plain.default"));
-        let profiles = firefox_profiles(&fs, home);
+        let profiles = firefox_profiles(&fs, home, &mut Vec::new());
         assert_eq!(profiles.len(), 2);
     }
 
+    /// Browser categories never delete a database file: cookies are only
+    /// removed from inside the database by SQLite, and history, logins,
+    /// and form data stay.
     #[test]
-    fn exact_files_take_sidecars_and_leave_the_rest() {
-        let mut reg = seed_reg();
-        let mut fs = seed_fs();
-        let mut sys = FakeSys::default();
-        let mut backup = crate::backup::test_writer("hive-mend-privacy-sidecar-test");
-        let outcome = clean_with_progress(
-            &mut reg,
-            &mut fs,
-            &mut sys,
-            &quiet(),
-            &[builtin("chrome-data")],
-            &mut backup,
-            &mut |_, _, _| true,
-        )
-        .unwrap();
-        // History plus its -wal sidecar; -shm/-journal were absent.
-        assert_eq!(outcome.items[0].files, 2);
-        assert_eq!(outcome.items[0].bytes, 58);
-        assert!(!fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"));
-        // Saved logins and autofill survive the clean.
-        assert!(
-            fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Login Data")
-        );
-        assert!(fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Web Data"));
-        assert!(
-            fs.exists(
-                r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
-            )
-        );
-        let _ = std::fs::remove_file(backup.path());
-    }
-
-    #[test]
-    fn current_chromium_cookies_under_network_are_cleaned() {
+    fn browser_categories_delete_no_database_files() {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
@@ -2746,26 +2675,99 @@ mod tests {
             vec![0; 2],
             None,
         );
+        let before: Vec<String> = [
+            "History",
+            "History-wal",
+            "Login Data",
+            "Web Data",
+            r"Network\Cookies",
+            r"Network\Cookies-journal",
+        ]
+        .iter()
+        .map(|name| format!(r"{profile}\{name}"))
+        .filter(|path| fs.exists(path))
+        .collect();
+        assert!(before.len() >= 4);
         let mut sys = FakeSys::default();
-        let mut backup = crate::backup::test_writer("hive-mend-privacy-network-cookies");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-no-db-delete");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
-            &[builtin("chrome-data")],
+            &[
+                builtin("chrome-data"),
+                builtin("edge-data"),
+                builtin("firefox-data"),
+            ],
             &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
-        assert!(!fs.exists(&format!(r"{profile}\Network\Cookies")));
-        assert!(!fs.exists(&format!(r"{profile}\Network\Cookies-journal")));
-        assert!(!fs.exists(&format!(r"{profile}\History")));
-        assert_eq!(
-            outcome.items[0].files, 4,
-            "History + wal, Cookies + journal"
-        );
         let _ = std::fs::remove_file(backup.path());
+        for path in &before {
+            assert!(fs.exists(path), "{path} was deleted");
+        }
+        assert!(outcome.items.iter().all(|item| item.files == 0));
+        assert!(
+            builtin("chrome-data")
+                .targets
+                .iter()
+                .all(|target| matches!(target, PrivacyTarget::Cookies { .. }))
+        );
+    }
+
+    #[test]
+    fn a_custom_file_with_side_files_is_never_deleted_as_a_set() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        fs.add_file_bytes(&format!(r"{temp}\one.log"), vec![1; 3], None);
+        let mut set = builtin("user-temp");
+        set.targets = vec![PrivacyTarget::ExactFiles {
+            dir: DirSpec::Fixed(temp.into()),
+            names: vec!["one.log".into()],
+            sidecars: true,
+        }];
+        let mut single = set.clone();
+        single.id = "single".into();
+        single.targets = vec![PrivacyTarget::ExactFiles {
+            dir: DirSpec::Fixed(temp.into()),
+            names: vec!["one.log".into()],
+            sidecars: false,
+        }];
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-single");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[set],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(fs.exists(&format!(r"{temp}\one.log")), "deleted as a set");
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("not deleted"))
+        );
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[single],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(!fs.exists(&format!(r"{temp}\one.log")));
+        assert_eq!(outcome.items[0].files, 1);
     }
 
     #[test]
@@ -2817,46 +2819,6 @@ mod tests {
         .unwrap();
         assert!(outcome.items[0].skipped_running);
         assert!(fs.exists(history), "a running browser's files were cleaned");
-        let _ = std::fs::remove_file(backup.path());
-    }
-
-    #[test]
-    fn a_browser_that_starts_between_database_sets_stops_the_rest() {
-        // Closed for the plan, the check before the category, and the first
-        // set (History); running by the time the cookie set's turn comes.
-        struct StartsMidway(std::cell::Cell<u32>);
-        impl ProcessList for StartsMidway {
-            fn running(&self, _exe: &str) -> bool {
-                let calls = self.0.get() + 1;
-                self.0.set(calls);
-                calls > 3
-            }
-        }
-        let mut reg = seed_reg();
-        let mut fs = seed_fs();
-        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
-        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
-        let mut sys = FakeSys::default();
-        let mut backup = crate::backup::test_writer("hive-mend-privacy-midway");
-        let outcome = clean_with_progress(
-            &mut reg,
-            &mut fs,
-            &mut sys,
-            &StartsMidway(std::cell::Cell::new(0)),
-            &[builtin("chrome-data")],
-            &mut backup,
-            &mut |_, _, _| true,
-        )
-        .unwrap();
-        assert!(
-            !fs.exists(&format!(r"{profile}\History")),
-            "History went first"
-        );
-        assert!(
-            fs.exists(&format!(r"{profile}\Network\Cookies")),
-            "the cookie set was touched after the browser started"
-        );
-        assert!(outcome.items[0].skipped_running);
         let _ = std::fs::remove_file(backup.path());
     }
 
@@ -2915,7 +2877,7 @@ mod tests {
         );
         assert_eq!(dirs, [cache.to_string()]);
         let fox = builtin("firefox-data");
-        assert!(fox.name.contains("form history"));
+        assert!(fox.name.contains("cookies"));
         assert!(
             !fox.detail
                 .to_ascii_lowercase()
@@ -3002,81 +2964,6 @@ mod tests {
     }
 
     #[test]
-    fn a_set_member_that_cannot_be_deleted_keeps_the_whole_set() {
-        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
-        for failing in ["History", "History-wal"] {
-            let mut reg = seed_reg();
-            let mut fs = seed_fs();
-            // A read-only member: its deletion mark fails after every
-            // member was taken.
-            fs.set_fail_delete(&format!(r"{profile}\{failing}"));
-            let mut sys = FakeSys::default();
-            let mut backup = crate::backup::test_writer("hive-mend-privacy-set-fail");
-            let outcome = clean_with_progress(
-                &mut reg,
-                &mut fs,
-                &mut sys,
-                &quiet(),
-                &[builtin("chrome-data")],
-                &mut backup,
-                &mut |_, _, _| true,
-            )
-            .unwrap();
-            let _ = std::fs::remove_file(backup.path());
-            assert!(fs.exists(&format!(r"{profile}\History")), "{failing}");
-            assert!(fs.exists(&format!(r"{profile}\History-wal")), "{failing}");
-            assert!(
-                outcome.errors.iter().any(|err| err.contains("side files")),
-                "{failing}: {:?}",
-                outcome.errors
-            );
-        }
-    }
-
-    #[test]
-    fn a_browser_database_with_any_member_in_use_is_left_whole() {
-        let mut reg = seed_reg();
-        let mut fs = seed_fs();
-        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
-        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
-        fs.add_file_bytes(
-            &format!(r"{profile}\Network\Cookies-journal"),
-            vec![0; 2],
-            None,
-        );
-        // The side file is open (the browser came back): neither goes.
-        fs.set_busy(&format!(r"{profile}\Network\Cookies-journal"));
-        // History's sidecar is open: History stays too.
-        fs.set_busy(&format!(r"{profile}\History-wal"));
-        let mut sys = FakeSys::default();
-        let mut backup = crate::backup::test_writer("hive-mend-privacy-set-in-use");
-        let outcome = clean_with_progress(
-            &mut reg,
-            &mut fs,
-            &mut sys,
-            &quiet(),
-            &[builtin("chrome-data")],
-            &mut backup,
-            &mut |_, _, _| true,
-        )
-        .unwrap();
-        assert!(fs.exists(&format!(r"{profile}\Network\Cookies")));
-        assert!(fs.exists(&format!(r"{profile}\Network\Cookies-journal")));
-        assert!(fs.exists(&format!(r"{profile}\History")));
-        assert!(fs.exists(&format!(r"{profile}\History-wal")));
-        assert_eq!(outcome.items[0].files, 0);
-        assert!(
-            outcome.items[0]
-                .restricted
-                .iter()
-                .any(|note| note.contains("Cookies-journal") && note.contains("in use")),
-            "{:?}",
-            outcome.items[0].restricted
-        );
-        let _ = std::fs::remove_file(backup.path());
-    }
-
-    #[test]
     fn a_canceled_preview_stops_inside_a_large_folder_and_says_so() {
         let reg = seed_reg();
         let mut fs = seed_fs();
@@ -3107,6 +2994,99 @@ mod tests {
     }
 
     #[test]
+    fn long_folder_paths_count_against_the_walk_budget() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let long = "x".repeat(200);
+        for index in 0..200 {
+            fs.add_dir(&format!(r"{temp}\{long}{index}"));
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut budget = WalkBudget::new(false);
+        budget.bytes_left = 5_000;
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |_| true,
+            &mut || true,
+            &mut budget,
+            &mut row,
+        );
+        // No file matched, yet the queued folder paths alone ran it out.
+        assert!(!finished);
+        assert!(budget.exhausted);
+        assert!(budget.folders_left > MAX_WALK_FOLDERS - 30, "kept too many");
+        assert!(budget.shortfall(temp).unwrap().contains("too large"));
+    }
+
+    #[test]
+    fn files_too_deep_or_past_the_profile_limit_are_reported_not_skipped_silently() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let mut deep = temp.to_string();
+        for level in 0..70 {
+            deep.push_str(&format!(r"\d{level}"));
+        }
+        let day = Duration::from_secs(24 * 3600);
+        fs.add_file_bytes(&format!(r"{deep}\x.tmp"), vec![0], Some(day * 9));
+        let sys = FakeSys::default();
+        let preview = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
+        assert!(
+            preview.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("levels down")),
+            "{:?}",
+            preview.items[0].restricted
+        );
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-deep");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(fs.exists(&format!(r"{deep}\x.tmp")));
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("levels down")),
+            "{:?}",
+            outcome.items[0].restricted
+        );
+        // More profiles than are looked at: said, not silently cut.
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for index in 0..1_001 {
+            fs.add_dir(&format!(r"{users}\P{index:04}"));
+        }
+        let (_, notes) = resolve_dirs(
+            &fs,
+            &DirSpec::Chromium {
+                vendor: "Google\\Chrome".into(),
+                sub: String::new(),
+            },
+        );
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("more than 1000 profiles")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
     fn a_walk_out_of_folders_stops_and_says_so() {
         let mut fs = MemoryFs::with_windows_dirs();
         let temp = r"C:\Users\test\AppData\Local\Temp";
@@ -3114,10 +3094,8 @@ mod tests {
             fs.add_dir(&format!(r"{temp}\d{index}"));
         }
         let mut row = PreviewItem::blank("user-temp");
-        let mut budget = WalkBudget {
-            folders_left: 5,
-            exhausted: false,
-        };
+        let mut budget = WalkBudget::new(false);
+        budget.folders_left = 5;
         let finished = walk_files(
             &fs,
             temp,
@@ -3189,7 +3167,7 @@ mod tests {
                 hits.len() < 10
             },
             &mut || true,
-            &mut WalkBudget::new(),
+            &mut WalkBudget::new(false),
             &mut row,
         );
         assert!(!finished);
@@ -3248,10 +3226,7 @@ mod tests {
         )
         .unwrap();
         assert!(fs.exists(&format!(r"{profile}\Network\Cookies")));
-        assert!(
-            !fs.exists(&format!(r"{profile}\History")),
-            "history still goes"
-        );
+        assert!(fs.exists(&format!(r"{profile}\History")));
         let _ = std::fs::remove_file(backup.path());
     }
 }

@@ -32,8 +32,12 @@ pub struct BackupWriter {
     file: std::fs::File,
     path: PathBuf,
     started: bool,
-    /// Bytes written so far.
+    /// Bytes written so far, to the backup and to its signature.
     len: u64,
+    sig_len: u64,
+    /// The limits this writer keeps to: the reader's.
+    max_len: u64,
+    max_sig: u64,
     /// A write failed: nothing more is written, so the job stops.
     failed: bool,
     /// The keyed signature kept beside it, for administrator backups.
@@ -43,6 +47,14 @@ pub struct BackupWriter {
 /// The largest backup Hivemend restores, and so the largest it writes: an
 /// append that would pass it is refused before anything is written.
 pub const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest signature file Hivemend reads, and so the largest it
+/// writes: room for some 50,000 saves.
+pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The longest signature line: a 20-digit length, a space, 64 hex
+/// characters (HMAC-SHA256), and CRLF.
+const MAX_SIGNATURE_LINE: u64 = 20 + 1 + 64 + 2;
 
 /// A keyed checksum over everything fed to it so far. Sent along with its
 /// writer to the thread that does the work.
@@ -147,6 +159,9 @@ impl BackupWriter {
                         path,
                         started: false,
                         len: 0,
+                        sig_len: 0,
+                        max_len: MAX_BACKUP_BYTES,
+                        max_sig: MAX_SIGNATURE_BYTES,
                         failed: false,
                         signature: None,
                     });
@@ -192,6 +207,46 @@ impl BackupWriter {
         self.failed
     }
 
+    /// Lower limits, so tests can reach them with small files.
+    #[cfg(test)]
+    pub(crate) fn limit_for_test(&mut self, max_len: u64, max_sig: u64) {
+        self.max_len = max_len;
+        self.max_sig = max_sig;
+    }
+
+    /// Bytes `text` takes once encoded (with the byte-order mark if it is
+    /// the first thing written).
+    fn encoded_len(&self, text: &str, first: bool) -> u64 {
+        text.encode_utf16().count() as u64 * 2 + if first { 2 } else { 0 }
+    }
+
+    /// True when appending each of `texts` in turn stays within the
+    /// limits, signature lines included.
+    fn fits(&self, texts: &[&str]) -> bool {
+        let mut len = self.len;
+        let mut sig = self.sig_len;
+        for (index, text) in texts.iter().enumerate() {
+            len += self.encoded_len(text, !self.started && index == 0);
+            if self.signature.is_some() {
+                sig += MAX_SIGNATURE_LINE;
+            }
+        }
+        len <= self.max_len && sig <= self.max_sig
+    }
+
+    /// Append `text` only if `then` will fit after it as well, so a record
+    /// that must follow (an entry's confirmation) can always be written.
+    /// Refused with `FileTooLarge` before anything is written otherwise.
+    pub fn append_reserving(&mut self, text: &str, then: &str) -> std::io::Result<()> {
+        if !self.fits(&[text, then]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "the backup would be larger than Hivemend can restore",
+            ));
+        }
+        self.append(text)
+    }
+
     /// Append `text` as UTF-16 (with the byte-order mark first) and flush it
     /// to disk, then add its signature line. An append that would make the
     /// backup larger than [`MAX_BACKUP_BYTES`] is refused (`FileTooLarge`)
@@ -213,10 +268,10 @@ impl BackupWriter {
             bytes.extend(unit.to_le_bytes());
         }
         let new_len = self.len + bytes.len() as u64;
-        if new_len > MAX_BACKUP_BYTES {
+        if !self.fits(&[text]) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::FileTooLarge,
-                "the backup would be larger than Hivemend can restore (64 MB)",
+                "the backup would be larger than Hivemend can restore",
             ));
         }
         let written = (&self.file)
@@ -238,12 +293,17 @@ impl BackupWriter {
                 .update(&bytes)
                 .map_err(std::io::Error::other)
                 .and_then(|mac| {
-                    (&*file).write_all(signature_line(new_len, &mac).as_bytes())?;
-                    file.sync_data()
+                    let line = signature_line(new_len, &mac);
+                    (&*file).write_all(line.as_bytes())?;
+                    file.sync_data()?;
+                    Ok(line.len() as u64)
                 });
-            if let Err(err) = signed {
-                self.failed = true;
-                return Err(err);
+            match signed {
+                Ok(written) => self.sig_len += written,
+                Err(err) => {
+                    self.failed = true;
+                    return Err(err);
+                }
             }
         }
         Ok(())
@@ -1092,6 +1152,26 @@ mod tests {
         // The two complete appends are still signed, as they were.
         assert_eq!(generations.len(), 2);
         assert_eq!(generations[0].0, signed_len);
+    }
+
+    #[test]
+    fn a_signature_past_its_limit_is_refused_before_writing() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-limit-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer.sign_with(Box::new(Sum(0))).unwrap();
+        // Room for one signature line at its longest: the first append
+        // fits, the second would not.
+        writer.limit_for_test(MAX_BACKUP_BYTES, MAX_SIGNATURE_LINE);
+        writer.append("a\r\n").unwrap();
+        let before = std::fs::read(writer.path()).unwrap();
+        let err = writer.append("d\r\n").unwrap_err();
+        let after = std::fs::read(writer.path()).unwrap();
+        let sig = std::fs::read_to_string(signature_path(writer.path())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(after, before, "the refused append wrote data");
+        assert_eq!(signature_generations(&sig, 0).len(), 1);
+        assert!(!writer.has_failed());
     }
 
     #[test]

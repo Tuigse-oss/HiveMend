@@ -58,19 +58,17 @@ pub use host::recycle_held;
 
 #[cfg(windows)]
 mod host {
-    use crate::fs::{host_dispose as dispose, host_open_in as open_in};
+    use crate::fs::{
+        host_dispose as dispose, host_open_in as open_in, host_rename_into as rename_into,
+    };
     use std::os::windows::fs::OpenOptionsExt;
     use std::os::windows::io::AsRawHandle;
-    use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
-    };
-    use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError};
+    use windows_sys::Win32::Foundation::HANDLE;
     use windows_sys::Win32::Storage::FileSystem::{
         BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
         FILE_SHARE_WRITE, GetDriveTypeW, GetFileInformationByHandle, GetVolumePathNameW,
     };
-    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
     const SYNCHRONIZE: u32 = 0x0010_0000;
     const DELETE: u32 = 0x0001_0000;
@@ -214,44 +212,6 @@ mod host {
         crate::store::check_handle_owner_and_dacl(bin.as_raw_handle(), &shown, Some(&sid))?;
         let real = crate::fs::host_final_path(&bin)?;
         Ok((bin, real))
-    }
-
-    /// Rename the open `file` to `name` inside the held folder `dir`.
-    /// (`SetFileInformationByHandle` refuses a folder handle as the base of
-    /// the new name, so this goes to the NT call it wraps.)
-    fn rename_into(file: &std::fs::File, dir: &std::fs::File, name: &str) -> std::io::Result<()> {
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let head = std::mem::offset_of!(FILE_RENAME_INFORMATION, FileName);
-        let size = std::mem::size_of::<FILE_RENAME_INFORMATION>() + units.len() * 2;
-        let mut buffer = vec![0u64; size.div_ceil(8)];
-        let info = buffer.as_mut_ptr() as *mut FILE_RENAME_INFORMATION;
-        unsafe {
-            // Never replace: a name already taken fails.
-            (*info).Anonymous.Flags = 0;
-            (*info).RootDirectory = dir.as_raw_handle() as HANDLE;
-            (*info).FileNameLength = (units.len() * 2) as u32;
-            std::ptr::copy_nonoverlapping(
-                units.as_ptr(),
-                (buffer.as_mut_ptr() as *mut u8).add(head) as *mut u16,
-                units.len(),
-            );
-        }
-        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-        let status = unsafe {
-            NtSetInformationFile(
-                file.as_raw_handle() as _,
-                &mut status_block,
-                buffer.as_ptr() as *const _,
-                size as u32,
-                FileRenameInformation,
-            )
-        };
-        if status < 0 {
-            return Err(std::io::Error::from_raw_os_error(
-                unsafe { RtlNtStatusToDosError(status) } as i32,
-            ));
-        }
-        Ok(())
     }
 
     fn now() -> u64 {

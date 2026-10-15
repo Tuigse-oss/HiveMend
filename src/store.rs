@@ -658,7 +658,10 @@ mod signed {
             }
             Err(err) => return Err(format!("its signature: {err}")),
         };
-        if pin.kind != ItemKind::File || pin.links != 1 || pin.len > 1 << 20 {
+        if pin.kind != ItemKind::File
+            || pin.links != 1
+            || pin.len > crate::backup::MAX_SIGNATURE_BYTES
+        {
             return Err("its signature file is not one Hivemend wrote".into());
         }
         let store = root.join("backups").display().to_string();
@@ -831,6 +834,21 @@ fn check_protected_dir(dir: &Path) -> Result<(), String> {
     check_owner_and_dacl(&pin, &shown)
 }
 
+/// A well-known account's name with its SID, for messages.
+#[cfg(windows)]
+fn sid_name(sid: &str) -> String {
+    let name = match sid {
+        "S-1-1-0" => "Everyone",
+        "S-1-5-11" => "Authenticated Users",
+        "S-1-5-32-545" => "Users",
+        "S-1-5-4" => "INTERACTIVE",
+        "S-1-5-13" => "TERMINAL SERVER USER (a Windows compatibility group)",
+        "S-1-5-32-547" => "Power Users",
+        _ => return sid.to_string(),
+    };
+    format!("{name} ({sid})")
+}
+
 /// SIDs trusted to own or write protected data.
 #[cfg(windows)]
 const TRUSTED_SIDS: &[&str] = &[
@@ -912,14 +930,12 @@ pub(crate) fn check_registry_key_security(
         | 0x1000_0000 // generic all
         | 0x4000_0000; // generic write
     // LOCAL SERVICE, NETWORK SERVICE, and per-service SIDs (NT SERVICE\x)
-    // are Windows' own service identities. TERMINAL SERVER USER (S-1-5-13)
-    // is a Windows NT 4.0 Terminal Server compatibility group that Windows
-    // puts on App Paths, Uninstall, and SharedDLLs by default; no standard
-    // account's token carries it on Windows 10 or 11, so it is not an
-    // account programs running without elevation use.
-    let service = |sid: &str| {
-        sid == "S-1-5-19" || sid == "S-1-5-20" || sid == "S-1-5-13" || sid.starts_with("S-1-5-80-")
-    };
+    // are Windows' own service identities. Nothing else is trusted: not
+    // even TERMINAL SERVER USER, which Windows' default security on App
+    // Paths, Uninstall, and SharedDLLs lets write, since Hivemend cannot
+    // show that no session ever carries it.
+    let service =
+        |sid: &str| sid == "S-1-5-19" || sid == "S-1-5-20" || sid.starts_with("S-1-5-80-");
     check_security(
         key,
         windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY,
@@ -1016,7 +1032,7 @@ fn check_security(
             // token carries it, so it grants nothing on the object itself.
             let creator_owner = sid == "S-1-3-0";
             if !trusted(&sid) && !creator_owner {
-                return Err(format!("{shown} lets {sid} change it"));
+                return Err(format!("{shown} lets {} change it", sid_name(&sid)));
             }
         }
         Ok(())

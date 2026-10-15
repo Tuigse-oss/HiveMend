@@ -388,6 +388,11 @@ mod live_tests {
         let unbound = try_write(&db, &vfs);
         let refused = vfs.refused();
         drop(vfs);
+        // Read right after the refusal, before anything else runs.
+        let after_unbound = std::fs::read(&db).unwrap();
+        let journal_after_unbound = std::fs::metadata(dir.join("bound.sqlite-journal"))
+            .map(|meta| meta.len())
+            .ok();
         // The journal bound with another file's identity: refused too.
         let journal = dir.join("bound.sqlite-journal");
         std::fs::write(&journal, b"").unwrap();
@@ -407,6 +412,9 @@ mod live_tests {
         let wrong = try_write(&db, &vfs);
         let wrong_refused = vfs.refused();
         drop(vfs);
+        let after_wrong = std::fs::read(&db).unwrap();
+        let journal_after_wrong = std::fs::read(&journal).unwrap();
+        let other_after_wrong = std::fs::read(&other).unwrap();
         // Bound correctly: the write goes through.
         let vfs = BoundVfs::register(vec![
             Allowed {
@@ -421,7 +429,7 @@ mod live_tests {
         .unwrap();
         let right = try_write(&db, &vfs);
         drop(vfs);
-        let after_unbound = before.clone();
+        let after_right = std::fs::read(&db).unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         assert!(unbound.is_err(), "an unverified journal was used");
         assert!(
@@ -436,6 +444,23 @@ mod live_tests {
             "{wrong_refused:?}"
         );
         assert!(right.is_ok(), "{right:?}");
-        assert_eq!(after_unbound, before);
+        // Each refusal changed nothing: not the database, not the journal it
+        // would have used, not the file it was pointed at.
+        assert_eq!(
+            after_unbound, before,
+            "the unbound case changed the database"
+        );
+        assert_eq!(
+            journal_after_unbound, None,
+            "the unbound case made a journal"
+        );
+        assert_eq!(
+            after_wrong, before,
+            "the wrong-identity case changed the database"
+        );
+        assert!(journal_after_wrong.is_empty(), "the journal was written");
+        assert_eq!(other_after_wrong, b"x", "the other file was written");
+        // The allowed write did change it: the comparison can fail.
+        assert_ne!(after_right, before);
     }
 }

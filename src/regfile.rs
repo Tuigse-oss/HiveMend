@@ -97,8 +97,9 @@ fn parse_lines(text: &str, limit: usize) -> Result<ParsedBackup, (String, usize)
     }
     // (entry, op); entry 0 is outside any numbered entry.
     let mut ops: Vec<(usize, RegOp)> = Vec::new();
-    let mut not_removed: Vec<usize> = Vec::new();
-    let mut confirmed: Vec<usize> = Vec::new();
+    // Sets, so a backup with many entries is read in linear time.
+    let mut not_removed: std::collections::HashSet<usize> = std::collections::HashSet::new();
+    let mut confirmed: std::collections::HashSet<usize> = std::collections::HashSet::new();
     let mut format_2 = false;
     let mut entry = 0usize;
     let mut key: Option<String> = None;
@@ -123,9 +124,9 @@ fn parse_lines(text: &str, limit: usize) -> Result<ParsedBackup, (String, usize)
                 // entries after them are read on.
                 if let Some(rest) = comment.strip_prefix("entry ") {
                     if let Some(id) = rest.strip_suffix(" was not removed") {
-                        not_removed.push(id.parse().map_err(|_| bad(line_no))?);
+                        not_removed.insert(id.parse().map_err(|_| bad(line_no))?);
                     } else if let Some(id) = rest.strip_suffix(" removed") {
-                        confirmed.push(id.parse().map_err(|_| bad(line_no))?);
+                        confirmed.insert(id.parse().map_err(|_| bad(line_no))?);
                     } else {
                         entry = rest.parse().map_err(|_| bad(line_no))?;
                         key = None;
@@ -167,12 +168,9 @@ fn parse_lines(text: &str, limit: usize) -> Result<ParsedBackup, (String, usize)
     let keep = |entry: usize| {
         entry == 0 || (!not_removed.contains(&entry) && (!format_2 || confirmed.contains(&entry)))
     };
+    let mut listed = std::collections::HashSet::new();
     for (entry, op) in &ops {
-        if !keep(*entry)
-            && format_2
-            && !not_removed.contains(entry)
-            && !unconfirmed.iter().any(|(have, _)| have == entry)
-        {
+        if !keep(*entry) && format_2 && !not_removed.contains(entry) && listed.insert(*entry) {
             unconfirmed.push((*entry, op.key().to_string()));
         }
     }
@@ -320,6 +318,40 @@ const MARKER: &str = "Hivemend restore {6f1d2a5e-hm}";
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn many_entries(count: usize) -> String {
+        let mut text = format!(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n{FORMAT_2}\r\n"
+        );
+        for entry in 1..=count {
+            text.push_str(&format!(
+                "\r\n; entry {entry}\r\n[HKEY_CURRENT_USER\\Software\\HmScale\\K{entry}]\r\n\"v\"=dword:00000001\r\n; entry {entry} removed\r\n"
+            ));
+        }
+        text
+    }
+
+    #[test]
+    fn a_large_backup_is_read_in_linear_time() {
+        let time = |count: usize| {
+            let text = many_entries(count);
+            (0..3)
+                .map(|_| {
+                    let started = std::time::Instant::now();
+                    let parsed = parse_backup(&text).unwrap();
+                    assert_eq!(parsed.ops.len(), count * 2);
+                    started.elapsed()
+                })
+                .min()
+                .unwrap()
+        };
+        let small = time(20_000);
+        let large = time(80_000);
+        // Four times the entries: about four times the work, never the
+        // sixteen a quadratic reading would take.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(ratio < 10.0, "{small:?} -> {large:?} ({ratio:.1}x)");
+    }
     use crate::model::{RegValue, Repair};
     use crate::registry::MemoryRegistry;
 
