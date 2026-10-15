@@ -2,6 +2,7 @@ pub mod art;
 mod backup;
 mod demo;
 mod diskspace;
+mod duplicates;
 mod engine;
 mod exclude;
 mod fs;
@@ -43,6 +44,9 @@ pub use diskspace::HostLister;
 pub use diskspace::{
     BigFile, DirLister, DirNode, DiskEntry, DiskReport, FileKind, LARGEST_KEPT, analyze,
 };
+pub use duplicates::{ContentReader, DupGroup, DupReport, FileId, check_removal, find_duplicates};
+#[cfg(windows)]
+pub use duplicates::{HostContent, recycle};
 pub use engine::{
     Engine, RepairOutcome, ScanReport, repair, repair_with_progress, scan, scan_with_progress,
     still_reported,
@@ -55,7 +59,7 @@ pub use fs::{FileView, HostFs, ItemKind, KnownDir, MemoryFs};
 pub use hiveinfo::gather_hives;
 pub use hiveinfo::{HiveEntry, HiveInventory, device_path_to_drive, hivelist_key};
 pub use model::{Error, Finding, Repair, ScanOptions, ScannerId};
-pub use pathutil::paths_in_command;
+pub use pathutil::{paths_in_command, protected_roots};
 pub use privacy::{
     CleanOutcome, DirSpec, ItemOutcome, Preview, PreviewItem, PrivacyGroup, PrivacyItem,
     PrivacyTarget, ProcessList, SystemTargets, ValueMatch, build_items, clean_with_progress,

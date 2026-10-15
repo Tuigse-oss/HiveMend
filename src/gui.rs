@@ -115,6 +115,11 @@ const ID_PG_LIST: u16 = 2011;
 const ID_DS_UP: u16 = 1620;
 const ID_DS_OPEN: u16 = 1621;
 const ID_DS_LIST: u16 = 2012;
+const ID_DUP_EXTRAS: u16 = 1630;
+const ID_DUP_NONE: u16 = 1631;
+const ID_DUP_RECYCLE: u16 = 1632;
+const ID_DUP_OPEN: u16 = 1633;
+const ID_DUP_LIST: u16 = 2013;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -188,6 +193,7 @@ enum Page {
     Startup,
     Programs,
     DiskSpace,
+    Duplicates,
     Monitor,
     Tools,
     About,
@@ -201,6 +207,7 @@ const NAV: &[(&str, Page, Icon)] = &[
     ("Startup", Page::Startup, Icon::Startup),
     ("Programs", Page::Programs, Icon::Programs),
     ("Disk Space", Page::DiskSpace, Icon::DiskSpace),
+    ("Duplicates", Page::Duplicates, Icon::Duplicates),
     ("Services", Page::Services, Icon::Optimize),
     ("Monitor", Page::Monitor, Icon::Monitor),
     ("Tools", Page::Tools, Icon::Tools),
@@ -252,6 +259,8 @@ enum Job {
     Services,
     Cleaning,
     Analyzing,
+    Finding,
+    Recycling,
 }
 
 /// Disk Space page views.
@@ -295,6 +304,7 @@ enum Action {
     Refresh,
     SvcView(SvcView),
     DiskRoot(usize),
+    DupRoot(usize),
     DiskView(DiskView),
 }
 
@@ -336,6 +346,12 @@ enum JobResult {
     },
     Disk {
         report: Box<hive_mend::DiskReport>,
+    },
+    Dups {
+        result: Result<hive_mend::DupReport, String>,
+    },
+    Recycled {
+        results: Vec<(String, Result<(), String>)>,
     },
 }
 
@@ -430,6 +446,7 @@ enum Redo {
     Restore(usize),
     Startup(Vec<usize>, bool),
     Uninstall(usize),
+    Recycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -530,6 +547,18 @@ struct App {
     disk_list: HWND,
     btn_ds_up: HWND,
     btn_ds_open: HWND,
+    dup_report: Option<hive_mend::DupReport>,
+    dup_root: Option<usize>,
+    /// (set, file) for each list row.
+    dup_rows: Vec<(usize, usize)>,
+    dup_checked: Vec<bool>,
+    dup_filling: bool,
+    dup_note: String,
+    dup_list: HWND,
+    btn_dup_extras: HWND,
+    btn_dup_none: HWND,
+    btn_dup_recycle: HWND,
+    btn_dup_open: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -1073,6 +1102,17 @@ impl App {
             disk_list: std::ptr::null_mut(),
             btn_ds_up: std::ptr::null_mut(),
             btn_ds_open: std::ptr::null_mut(),
+            dup_report: None,
+            dup_root: None,
+            dup_rows: Vec::new(),
+            dup_checked: Vec::new(),
+            dup_filling: false,
+            dup_note: String::new(),
+            dup_list: std::ptr::null_mut(),
+            btn_dup_extras: std::ptr::null_mut(),
+            btn_dup_none: std::ptr::null_mut(),
+            btn_dup_recycle: std::ptr::null_mut(),
+            btn_dup_open: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1201,6 +1241,22 @@ impl App {
         );
         self.btn_ds_up = button(hwnd, ID_DS_UP, "Up One Level", BS_PUSHBUTTON);
         self.btn_ds_open = button(hwnd, ID_DS_OPEN, "Open in Explorer", BS_PUSHBUTTON);
+        self.dup_list = list_view(
+            hwnd,
+            ID_DUP_LIST,
+            0,
+            LVS_EX_CHECKBOXES,
+            &[("Name", 240), ("Folder", 380), ("Size", 90), ("Set", 70)],
+        );
+        self.btn_dup_extras = button(hwnd, ID_DUP_EXTRAS, "Tick Extra Copies", BS_PUSHBUTTON);
+        self.btn_dup_none = button(hwnd, ID_DUP_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_dup_recycle = button(
+            hwnd,
+            ID_DUP_RECYCLE,
+            "Move Ticked to Recycle Bin",
+            BS_PUSHBUTTON,
+        );
+        self.btn_dup_open = button(hwnd, ID_DUP_OPEN, "Open Folder", BS_PUSHBUTTON);
         self.chk_restore_point = button(
             hwnd,
             ID_RESTORE_POINT,
@@ -1313,6 +1369,11 @@ impl App {
             self.disk_list,
             self.btn_ds_up,
             self.btn_ds_open,
+            self.dup_list,
+            self.btn_dup_extras,
+            self.btn_dup_none,
+            self.btn_dup_recycle,
+            self.btn_dup_open,
         ]);
         all
     }
@@ -1401,6 +1462,7 @@ impl App {
             Action::OpenTool(index) => self.open_tool(index),
             Action::Refresh => self.invalidate(),
             Action::DiskRoot(index) => self.start_disk(index),
+            Action::DupRoot(index) => self.start_dups(index),
             Action::DiskView(view) => {
                 if self.busy() {
                     return;
@@ -1457,7 +1519,7 @@ impl App {
             // Every visit: an uninstaller may have finished since.
             self.refresh_programs();
         }
-        if page == Page::DiskSpace && self.disk_roots.is_empty() {
+        if matches!(page, Page::DiskSpace | Page::Duplicates) && self.disk_roots.is_empty() {
             self.disk_roots = disk_roots();
         }
         if page == Page::Services && !self.svc_loaded {
@@ -1538,6 +1600,22 @@ impl App {
                 self.open_disk_row();
                 return;
             }
+            ID_DUP_EXTRAS => {
+                self.dup_tick(true);
+                return;
+            }
+            ID_DUP_NONE => {
+                self.dup_tick(false);
+                return;
+            }
+            ID_DUP_RECYCLE => {
+                self.recycle_ticked();
+                return;
+            }
+            ID_DUP_OPEN => {
+                self.open_dup_row();
+                return;
+            }
             // Enter, which IsDialogMessage turns into IDOK.
             IDOK if self.page == Page::DiskSpace && unsafe { GetFocus() } == self.disk_list => {
                 self.open_disk_selection();
@@ -1575,7 +1653,7 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping after this category...");
                     self.show_progress();
-                } else if self.job == Job::Analyzing {
+                } else if self.job == Job::Analyzing || self.job == Job::Finding {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping...");
                     self.show_progress();
@@ -1694,6 +1772,34 @@ impl App {
         } else if id == ID_SVC_LIST && header.code == NM_DBLCLK {
             if let Some(row) = selected_rows(self.svc_list).first() {
                 self.show_svc_details(*row);
+            }
+        } else if id == ID_DUP_LIST {
+            match header.code {
+                LVN_ITEMCHANGING => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.dup_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old && self.busy() {
+                            return 1;
+                        }
+                    }
+                }
+                LVN_ITEMCHANGED => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.dup_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old
+                            && let Some(slot) = self.dup_checked.get_mut(change.iItem as usize)
+                        {
+                            *slot = new == 2;
+                            self.update_dup_label();
+                        }
+                    }
+                }
+                NM_DBLCLK => self.open_dup_row(),
+                _ => {}
             }
         } else if id == ID_PRIV_LIST {
             match header.code {
@@ -3453,6 +3559,296 @@ impl App {
         shell_open(self.hwnd, "explorer.exe", Some(&arg));
     }
 
+    // ---- duplicates ----------------------------------------------------
+
+    fn start_dups(&mut self, index: usize) {
+        if self.busy() {
+            return;
+        }
+        let Some((_, root)) = self.disk_roots.get(index).cloned() else {
+            return;
+        };
+        let protected = match hive_mend::protected_roots(&HostFs) {
+            Ok(protected) => protected,
+            Err(err) => {
+                self.message(
+                    &format!("The search cannot run safely: {err}."),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        };
+        self.job = Job::Finding;
+        self.dup_root = Some(index);
+        self.dup_report = None;
+        CANCEL.store(false, Ordering::SeqCst);
+        set_progress(0, 1, &format!("Reading {root}..."));
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            let report = hive_mend::find_duplicates(
+                &hive_mend::HostLister,
+                &hive_mend::HostContent,
+                &root,
+                DUP_MIN_BYTES,
+                &protected,
+                &mut |text, done, total| {
+                    if last.elapsed() >= std::time::Duration::from_millis(200) {
+                        last = std::time::Instant::now();
+                        set_progress(done, total.max(1), text);
+                        post(hwnd, WM_JOB_PROGRESS);
+                    }
+                    !CANCEL.load(Ordering::SeqCst)
+                },
+            );
+            finish_job(hwnd, JobResult::Dups { result: Ok(report) });
+        });
+    }
+
+    fn fill_dups(&mut self) {
+        self.dup_filling = true;
+        self.dup_rows.clear();
+        unsafe {
+            SendMessageW(self.dup_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.dup_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        if let Some(report) = self.dup_report.as_ref() {
+            for (set, group) in report.groups.iter().enumerate() {
+                for (file, path) in group.files.iter().enumerate() {
+                    let (folder, name) = path.rsplit_once('\\').unwrap_or(("", path));
+                    let row = self.dup_rows.len();
+                    insert_row(
+                        self.dup_list,
+                        row,
+                        &[
+                            name,
+                            folder,
+                            &format_bytes(group.bytes),
+                            &(set + 1).to_string(),
+                        ],
+                    );
+                    self.dup_rows.push((set, file));
+                }
+            }
+        }
+        self.dup_checked.resize(self.dup_rows.len(), false);
+        self.dup_checked.truncate(self.dup_rows.len());
+        for (row, on) in self.dup_checked.iter().enumerate() {
+            set_state_image(self.dup_list, row, if *on { 2 } else { 1 });
+        }
+        unsafe {
+            SendMessageW(self.dup_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.dup_list, std::ptr::null(), 1);
+        }
+        self.dup_filling = false;
+        self.update_dup_label();
+    }
+
+    /// Tick every copy but the first of each set, or untick everything.
+    fn dup_tick(&mut self, extras: bool) {
+        if self.busy() {
+            return;
+        }
+        self.dup_checked = self
+            .dup_rows
+            .iter()
+            .map(|(_, file)| extras && *file > 0)
+            .collect();
+        self.fill_dups();
+    }
+
+    fn dup_ticked_paths(&self) -> Vec<String> {
+        let Some(report) = self.dup_report.as_ref() else {
+            return Vec::new();
+        };
+        self.dup_rows
+            .iter()
+            .zip(&self.dup_checked)
+            .filter(|(_, on)| **on)
+            .filter_map(|((set, file), _)| report.groups.get(*set)?.files.get(*file).cloned())
+            .collect()
+    }
+
+    fn update_dup_label(&self) {
+        let count = self.dup_checked.iter().filter(|on| **on).count();
+        let label = if count == 0 {
+            "Move Ticked to Recycle Bin".to_string()
+        } else {
+            format!("Move {count} to Recycle Bin")
+        };
+        set_text(self.btn_dup_recycle, &label);
+    }
+
+    fn recycle_ticked(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if self.elevated {
+            self.message(
+                "Hivemend does not remove duplicates with administrator rights. Open it without administrator rights to move your own files to the Recycle Bin.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let Some(report) = self.dup_report.clone() else {
+            return;
+        };
+        let mut plan: Vec<(hive_mend::DupGroup, Vec<usize>)> = Vec::new();
+        for (set, group) in report.groups.iter().enumerate() {
+            let remove: Vec<usize> = self
+                .dup_rows
+                .iter()
+                .zip(&self.dup_checked)
+                .filter(|((row_set, _), on)| **on && *row_set == set)
+                .map(|((_, file), _)| *file)
+                .collect();
+            if remove.is_empty() {
+                continue;
+            }
+            if remove.len() >= group.files.len() {
+                self.message(
+                    &format!(
+                        "Every copy in set {} is ticked. Untick at least one copy to keep.",
+                        set + 1
+                    ),
+                    MB_ICONINFORMATION,
+                );
+                return;
+            }
+            plan.push((group.clone(), remove));
+        }
+        let count: usize = plan.iter().map(|(_, remove)| remove.len()).sum();
+        if count == 0 {
+            self.message(
+                "Tick the copies to remove first, or use Tick Extra Copies.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let bytes: u64 = plan
+            .iter()
+            .map(|(group, remove)| group.bytes * remove.len() as u64)
+            .sum();
+        let question = format!(
+            "Move {} ({}) to the Recycle Bin?\n\nOne copy of every set is kept. Each file is compared byte by byte with the kept copy first and left alone if it no longer matches. You can put files back from the Recycle Bin.",
+            count_of(count as u64, "file", "files"),
+            format_bytes(bytes)
+        );
+        if !self.confirm(&question, Redo::Recycle) {
+            return;
+        }
+        let protected = match hive_mend::protected_roots(&HostFs) {
+            Ok(protected) => protected,
+            Err(err) => {
+                self.message(&format!("Nothing was moved: {err}."), MB_ICONWARNING);
+                return;
+            }
+        };
+        self.job = Job::Recycling;
+        set_progress(0, count.max(1), "Checking and moving files...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+            unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+            let mut results = Vec::new();
+            let mut done = 0;
+            for (group, remove) in plan {
+                for (path, verdict) in
+                    hive_mend::check_removal(&hive_mend::HostContent, &group, &remove, &protected)
+                {
+                    done += 1;
+                    set_progress(done, count.max(1), &format!("Moving {path}"));
+                    post(hwnd, WM_JOB_PROGRESS);
+                    let outcome = verdict.and_then(|()| hive_mend::recycle(&path));
+                    results.push((path, outcome));
+                }
+            }
+            finish_job(hwnd, JobResult::Recycled { results });
+        });
+    }
+
+    fn finish_recycle(&mut self, results: Vec<(String, Result<(), String>)>) {
+        let moved: Vec<&String> = results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .map(|(path, _)| path)
+            .collect();
+        let kept: Vec<&String> = results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .map(|(path, _)| path)
+            .collect();
+        if let Some(report) = self.dup_report.as_mut() {
+            // A set with a file that was kept may have changed since the
+            // search; it is dropped until the next search.
+            report
+                .groups
+                .retain(|group| !group.files.iter().any(|path| kept.contains(&path)));
+            for group in &mut report.groups {
+                group.files.retain(|path| !moved.contains(&path));
+            }
+            report.groups.retain(|group| group.files.len() > 1);
+        }
+        let mut lines = vec![format!(
+            "Moved {} to the Recycle Bin.",
+            count_of(moved.len() as u64, "file", "files")
+        )];
+        for (path, outcome) in results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .take(8)
+        {
+            if let Err(why) = outcome {
+                lines.push(format!("Kept {path}: {why}"));
+            }
+        }
+        let failed = !kept.is_empty();
+        if failed {
+            lines.push("Search again to list the sets with kept files.".to_string());
+        }
+        self.dup_checked.clear();
+        self.sync_controls();
+        self.fill_dups();
+        self.message(
+            &lines.join("\n"),
+            if failed {
+                MB_ICONWARNING
+            } else {
+                MB_ICONINFORMATION
+            },
+        );
+    }
+
+    fn open_dup_row(&mut self) {
+        let Some(path) = selected_rows(self.dup_list)
+            .first()
+            .and_then(|row| self.dup_rows.get(*row))
+            .and_then(|(set, file)| {
+                self.dup_report
+                    .as_ref()?
+                    .groups
+                    .get(*set)?
+                    .files
+                    .get(*file)
+                    .cloned()
+            })
+        else {
+            self.message("Highlight a file first.", MB_ICONINFORMATION);
+            return;
+        };
+        shell_open(
+            self.hwnd,
+            "explorer.exe",
+            Some(&format!("/select,\"{path}\"")),
+        );
+    }
+
     fn fill_services(&mut self) {
         self.svc_filling = true;
         unsafe {
@@ -4139,6 +4535,40 @@ impl App {
                 self.sync_controls();
                 self.fill_disk();
             }
+            JobResult::Dups { result } => {
+                match result {
+                    Ok(report) => {
+                        let extra: u64 = report.groups.iter().map(|group| group.extra()).sum();
+                        let unread = if report.unreadable > 0 {
+                            format!(
+                                " {} could not be read.",
+                                count_of(report.unreadable, "item", "items")
+                            )
+                        } else {
+                            String::new()
+                        };
+                        self.dup_note = format!(
+                            "{}{} of identical files in {}; keeping one of each frees {}.{unread}",
+                            if report.canceled {
+                                "Stopped early: "
+                            } else {
+                                ""
+                            },
+                            count_of(report.groups.len() as u64, "set", "sets"),
+                            report.root,
+                            format_bytes(extra),
+                        );
+                        self.dup_report = Some(report);
+                    }
+                    Err(err) => {
+                        self.dup_note = "The search could not run.".to_string();
+                        self.message(&err, MB_ICONWARNING);
+                    }
+                }
+                self.sync_controls();
+                self.fill_dups();
+            }
+            JobResult::Recycled { results } => self.finish_recycle(results),
             JobResult::Privacy { result } => {
                 self.sync_controls();
                 self.finish_privacy(result);
@@ -4203,6 +4633,7 @@ impl App {
                 .filter_map(|row| self.startup_items.get(*row))
                 .map(|item| format!("{}|{}", item.approved_key, item.name))
                 .collect(),
+            Redo::Recycle => self.dup_ticked_paths(),
             Redo::Uninstall(row) => self
                 .programs
                 .get(*row)
@@ -4242,6 +4673,7 @@ impl App {
             Redo::Restore(row) => self.start_restore(row),
             Redo::Startup(rows, enable) => self.toggle_startup(&rows, enable),
             Redo::Uninstall(row) => self.uninstall_program(&[row]),
+            Redo::Recycle => self.recycle_ticked(),
         }
     }
 
@@ -4641,6 +5073,59 @@ impl App {
                     unsafe { EnableWindow(self.btn_ds_up, i32::from(can_go_up)) };
                 }
             }
+            Page::Duplicates => {
+                if matches!(self.job, Job::Finding | Job::Recycling) {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 52), width, self.s(22));
+                    if self.job == Job::Finding {
+                        visible.push(self.btn_cancel);
+                        place(
+                            self.btn_cancel,
+                            left,
+                            self.s(BODY_Y + 124),
+                            self.s(110),
+                            button_h,
+                        );
+                    }
+                } else if self.dup_report.is_some() {
+                    visible.extend([
+                        self.dup_list,
+                        self.btn_dup_extras,
+                        self.btn_dup_none,
+                        self.btn_dup_recycle,
+                        self.btn_dup_open,
+                    ]);
+                    let top = self.s(BODY_Y + 44);
+                    place(
+                        self.dup_list,
+                        left,
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
+                    );
+                    let mut x = left;
+                    for (control, w) in [
+                        (self.btn_dup_extras, 150),
+                        (self.btn_dup_none, 110),
+                        (self.btn_dup_open, 120),
+                    ] {
+                        place(control, x, button_y, self.s(w), button_h);
+                        x += self.s(w + 8);
+                    }
+                    let recycle_w = self.s(250);
+                    place(
+                        self.btn_dup_recycle,
+                        right - recycle_w,
+                        button_y,
+                        recycle_w,
+                        button_h,
+                    );
+                    let folder_w = (width - self.s(240 + 90 + 70 + 26)).max(self.s(160));
+                    unsafe {
+                        SendMessageW(self.dup_list, LVM_SETCOLUMNWIDTH, 1, folder_w as isize)
+                    };
+                }
+            }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
         }
         for control in self.all_controls() {
@@ -4761,6 +5246,7 @@ impl App {
                 Page::Startup => self.draw_startup(mem, rect),
                 Page::Programs => self.draw_programs(mem, rect),
                 Page::DiskSpace => self.draw_disk(mem, rect, previous_hover),
+                Page::Duplicates => self.draw_dups(mem, rect, previous_hover),
                 Page::Privacy => self.draw_privacy(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
@@ -4971,6 +5457,8 @@ impl App {
                 Job::Services => "Working...",
                 Job::Cleaning => "Cleaning...",
                 Job::Analyzing => "Reading sizes...",
+                Job::Finding => "Comparing files...",
+                Job::Recycling => "Recycling...",
                 Job::Idle => "",
             };
             text(
@@ -5602,6 +6090,59 @@ impl App {
         for (label, view) in views {
             let selected = self.disk_view == view;
             x = self.pill(hdc, x, label, selected, hover, Action::DiskView(view));
+        }
+    }
+
+    unsafe fn draw_dups(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        self.heading(hdc, rect, "Duplicates", None);
+        let line = match self.job {
+            Job::Finding => "Comparing file contents. Nothing is changed.".to_string(),
+            Job::Recycling => "Checking each file again, then moving it.".to_string(),
+            _ if !self.dup_note.is_empty() => self.dup_note.clone(),
+            _ => "Find identical files of 1 MB or more. Matching is by content, not name."
+                .to_string(),
+        };
+        self.subtitle(hdc, rect, &line);
+        let mut x = left;
+        let roots = self.disk_roots.clone();
+        for (index, (label, _)) in roots.iter().enumerate() {
+            let selected = self.dup_root == Some(index);
+            x = self.pill(hdc, x, label, selected, hover, Action::DupRoot(index));
+        }
+        let _ = x;
+        if matches!(self.job, Job::Finding | Job::Recycling) {
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 84),
+                    right,
+                    bottom: self.s(BODY_Y + 110),
+                },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            return;
+        }
+        if self.dup_report.is_none() {
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 140),
+                },
+                "Pick a drive or your user folder above. The Windows, Program Files, and ProgramData folders are left out, and links and cloud-only files are never read. Ticked copies go to the Recycle Bin, and one copy of every set is always kept.",
+                DT_WORDBREAK | DT_NOPREFIX,
+            );
         }
     }
 
@@ -7158,6 +7699,9 @@ fn copy_text(hwnd: HWND, value: &str) {
 
 /// Queue a shell open for after the handler returns: ShellExecuteW can pump
 /// messages (its own error dialog, a DDE or COM wait).
+/// Duplicates smaller than this are not worth the reading.
+const DUP_MIN_BYTES: u64 = 1024 * 1024;
+
 /// `1 file`, `2 files`, `1,000 files`.
 fn count_of(count: u64, one: &str, many: &str) -> String {
     format!(

@@ -86,8 +86,8 @@ That reads `Data/rmscan.xml`, `Data/keys.dat`, `Data/values.dat`, and `Data/map.
 ## Window
 
 Double-clicking the exe opens the window. The left rail lists Home, Scan,
-Restore, Privacy, Startup, Programs, Disk Space, Services, Monitor, Tools,
-Settings, and About.
+Restore, Privacy, Startup, Programs, Disk Space, Duplicates, Services,
+Monitor, Tools, Settings, and About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
@@ -143,6 +143,17 @@ Settings, and About.
   the 100 largest files, and the space by kind of file. Sizes are file
   sizes. Junctions and symbolic links are never followed, so nothing is
   counted twice. It only reads; Open in Explorer is the only action.
+- Duplicates finds identical files of 1 MB or more in a fixed drive or
+  your user folder, matching by content (size, then a hash of the first
+  64 KB, then of the whole file), never by name. The Windows, Program
+  Files, and ProgramData folders are left out; links, junctions, and
+  cloud-only files are never followed or read, and a hard link is not
+  counted as a copy. Tick Extra Copies ticks all but the first copy of
+  each set. Ticked files go to the Recycle Bin (Windows warns first if a
+  file would be deleted for good instead). One copy of every set is
+  always kept, and just before moving, each file is compared byte by
+  byte with the kept copy and left alone if it no longer matches.
+  Removing is only done without administrator rights.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.
