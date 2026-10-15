@@ -2762,6 +2762,46 @@ mod tests {
     }
 
     #[test]
+    fn an_administrator_window_leaves_browser_data_alone() {
+        let mut items: Vec<PrivacyItem> = build_items()
+            .into_iter()
+            .filter(|item| ["chrome-data", "edge-data", "user-temp"].contains(&item.id.as_str()))
+            .collect();
+        leave_browsers_alone(&mut items);
+        for item in &items {
+            let browser = item.id != "user-temp";
+            assert_eq!(item.targets.is_empty(), browser, "{}", item.id);
+            assert_eq!(!item.warnings.is_empty(), browser, "{}", item.id);
+        }
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let history = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History";
+        let chrome: Vec<PrivacyItem> = items
+            .iter()
+            .filter(|item| item.id == "chrome-data")
+            .cloned()
+            .collect();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-admin-browsers");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &chrome,
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(
+            fs.exists(history),
+            "an administrator window cleaned browser data"
+        );
+        assert_eq!(outcome.items[0].files, 0);
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
     fn firefox_cache_is_found_in_the_local_profile_folder() {
         let mut fs = MemoryFs::with_windows_dirs();
         fs.set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
