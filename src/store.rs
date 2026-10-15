@@ -324,35 +324,11 @@ fn restore_one(
         .pin_read_at(&source, 0, crate::fs::copy_len(&source)?)
         .filter(|bytes| bytes.len() as u64 == source.len)
         .ok_or("could not read the saved copy")?;
-    // Where it would really land, before anything is created: the nearest
-    // folder that exists, resolved, plus the parts still to be made. A
-    // refused restore must not have made folders somewhere else first.
-    let mut anchor = original.as_str();
-    let mut rest: Vec<&str> = Vec::new();
-    while !(fs.exists(anchor) && fs.is_dir(anchor)) {
-        let Some((parent, name)) = anchor.rsplit_once('\\') else {
-            return Err("refused: no part of its folder exists".into());
-        };
-        rest.push(name);
-        anchor = parent;
-    }
-    let real_anchor = fs
-        .pin(anchor)
-        .map_err(|err| format!("refused: {anchor}: {err}"))?
-        .real_path;
-    let projected = rest.iter().rev().fold(
-        real_anchor.trim_end_matches('\\').to_string(),
-        |path, part| format!(r"{path}\{part}"),
-    );
-    if !destination_allowed(&*fs, &projected) {
-        return Err(format!("refused: it resolves to {projected}"));
-    }
-    let target = fs.pin_create_new(&original)?;
-    if !destination_allowed(&*fs, &target.real_path) {
-        let real = target.real_path.clone();
-        let _ = fs.pin_delete(target);
-        return Err(format!("refused: it resolves to {real}"));
-    }
+    // Where it will really land is checked before anything is created,
+    // and the folders and file are then made through held handles, so a
+    // refused restore makes nothing anywhere, and a folder changed after the
+    // check cannot carry it somewhere else.
+    let target = fs.pin_create_confined(&original, &|fs, real| destination_allowed(fs, real))?;
     let written = fs
         .pin_write_at(&target, 0, &bytes)
         .and_then(|()| fs.pin_sync(&target));

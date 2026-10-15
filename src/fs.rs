@@ -177,11 +177,18 @@ pub trait FileView {
     /// Copy the pinned file's bytes to a new file at `to`, creating its
     /// folders. Never overwrites.
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String>;
-    /// Create a new, empty file at `path` (creating its folders) and pin it
-    /// with write access. Never opens an existing file or a link in its place;
-    /// callers check [`Pinned::real_path`] and delete it if it landed
-    /// somewhere it should not.
-    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String>;
+    /// Create a new, empty file at `path` and pin it with write access,
+    /// making any missing folders. The nearest folder that exists is held
+    /// from its check to the end, and each missing folder and the file are
+    /// made relative to held handles, never through a link, so the file
+    /// lands exactly where `allowed` was asked about: nothing is made unless
+    /// `allowed(fs, real path)` accepts it. On any failure, whatever this
+    /// call made is removed again through its own handles.
+    fn pin_create_confined(
+        &mut self,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<Pinned, String>;
     /// True when the file has named data streams besides the download
     /// marker (Zone.Identifier). A copy of the main stream does not hold
     /// them, so such a file cannot be backed up by copying.
@@ -452,8 +459,28 @@ impl FileView for MemoryFs {
         Ok(())
     }
 
-    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
-        let key = self.resolve(path);
+    fn pin_create_confined(
+        &mut self,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<Pinned, String> {
+        let path = norm(path);
+        let mut anchor = path.as_str();
+        let mut rest: Vec<&str> = Vec::new();
+        while !self.is_dir(anchor) {
+            let Some((parent, name)) = anchor.rsplit_once('\\') else {
+                return Err("refused: no part of its folder exists".into());
+            };
+            rest.push(name);
+            anchor = parent;
+        }
+        let key = rest
+            .iter()
+            .rev()
+            .fold(self.resolve(anchor), |path, part| format!(r"{path}\{part}"));
+        if !allowed(self, &key) {
+            return Err(format!("refused: it resolves to {key}"));
+        }
         if self.nodes.contains_key(&key) {
             return Err("target already exists".into());
         }
@@ -703,6 +730,120 @@ pub(crate) fn host_handle_streams(file: &std::fs::File) -> Result<bool, String> 
     }
 }
 
+/// Open or create the child `name` of the held folder `dir`, relative to
+/// that handle and never following a link (`NtCreateFile` with a root
+/// directory and `FILE_OPEN_REPARSE_POINT`). `sddl` gives a new object its
+/// security. Fails with the NT status.
+#[cfg(windows)]
+pub(crate) fn host_open_in(
+    dir: &std::fs::File,
+    name: &str,
+    access: u32,
+    share: u32,
+    disposition: u32,
+    options: u32,
+    sddl: Option<&str>,
+) -> Result<std::fs::File, i32> {
+    use std::os::windows::io::{AsRawHandle, FromRawHandle};
+    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use windows_sys::Wdk::Storage::FileSystem::NtCreateFile;
+    use windows_sys::Win32::Foundation::{HANDLE, LocalFree, UNICODE_STRING};
+    use windows_sys::Win32::Security::Authorization::{
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+    };
+    use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
+    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
+    const FILE_ATTRIBUTE_NORMAL: u32 = 0x80;
+    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0020;
+    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    if name.is_empty() || name.contains(['\\', '/']) {
+        return Err(-1);
+    }
+    let units: Vec<u16> = name.encode_utf16().collect();
+    let bytes = (units.len() * 2) as u16;
+    let object_name = UNICODE_STRING {
+        Length: bytes,
+        MaximumLength: bytes,
+        Buffer: units.as_ptr() as _,
+    };
+    let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
+    if let Some(sddl) = sddl {
+        let text: Vec<u16> = sddl.encode_utf16().chain(std::iter::once(0)).collect();
+        let ok = unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                text.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(-1);
+        }
+    }
+    let attributes = OBJECT_ATTRIBUTES {
+        Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
+        RootDirectory: dir.as_raw_handle() as HANDLE,
+        ObjectName: &object_name,
+        Attributes: OBJ_CASE_INSENSITIVE,
+        SecurityDescriptor: sd as _,
+        SecurityQualityOfService: std::ptr::null(),
+    };
+    let mut handle: HANDLE = std::ptr::null_mut();
+    let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
+    let status = unsafe {
+        NtCreateFile(
+            &mut handle,
+            access,
+            &attributes,
+            &mut status_block,
+            std::ptr::null(),
+            FILE_ATTRIBUTE_NORMAL,
+            share,
+            disposition,
+            options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
+            std::ptr::null(),
+            0,
+        )
+    };
+    if !sd.is_null() {
+        unsafe { LocalFree(sd as _) };
+    }
+    if status < 0 {
+        return Err(status);
+    }
+    Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
+}
+
+/// Mark an open file, or empty folder, to be deleted when its last handle
+/// closes. The handle needs delete access.
+#[cfg(windows)]
+pub(crate) fn host_dispose(file: &std::fs::File) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
+    };
+    let info = FILE_DISPOSITION_INFO { DeleteFile: true };
+    unsafe {
+        SetFileInformationByHandle(
+            file.as_raw_handle() as _,
+            FileDispositionInfo,
+            &info as *const _ as *const _,
+            std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
+        ) != 0
+    }
+}
+
+/// An NT status as the matching Windows error text.
+#[cfg(windows)]
+pub(crate) fn nt_status_text(status: i32) -> String {
+    if status == -1 {
+        return "invalid name".into();
+    }
+    let code = unsafe { windows_sys::Win32::Foundation::RtlNtStatusToDosError(status) };
+    std::io::Error::from_raw_os_error(code as i32).to_string()
+}
+
 /// Where an open file really is, from its handle, as a drive path.
 #[cfg(windows)]
 pub(crate) fn host_final_path(file: &std::fs::File) -> Result<String, String> {
@@ -852,11 +993,12 @@ impl FileView for HostFs {
         }
     }
 
-    fn pin_create_new(&mut self, path: &str) -> Result<Pinned, String> {
-        if let Some(parent) = Path::new(path).parent() {
-            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
-        }
-        host::create_new(path)
+    fn pin_create_confined(
+        &mut self,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<Pinned, String> {
+        host::create_confined(path, &|real| allowed(&HostFs, real))
     }
 
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
@@ -1047,20 +1189,151 @@ mod host {
         identify(file, path)
     }
 
-    /// `CREATE_NEW` never opens an existing file and fails on an existing
-    /// link, so the handle is always a file this call made.
-    pub fn create_new(path: &str) -> Result<Pinned, String> {
-        // `write(true)` only satisfies std's create check; `access_mode`
-        // sets the rights actually requested.
-        let file = std::fs::OpenOptions::new()
-            .write(true)
-            .access_mode(GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE)
-            .share_mode(FILE_SHARE_READ)
-            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
-            .create_new(true)
-            .open(path)
-            .map_err(|err| err.to_string())?;
-        identify(file, path)
+    /// See [`super::FileView::pin_create_confined`]. The nearest existing
+    /// folder is opened without following a link and held, without delete
+    /// sharing, to the end: it cannot be renamed or replaced, nor can any
+    /// folder above it while a handle inside is open. Its real path comes
+    /// from that handle. Every new folder and the file are created
+    /// (`FILE_CREATE`, never opening something already there) relative to
+    /// the held handle of the folder above.
+    pub fn create_confined(path: &str, allowed: &dyn Fn(&str) -> bool) -> Result<Pinned, String> {
+        use crate::fs::{host_dispose, host_open_in, nt_status_text};
+        const FILE_LIST_DIRECTORY: u32 = 0x0001;
+        const FILE_ADD_FILE: u32 = 0x0002;
+        const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
+        const FILE_TRAVERSE: u32 = 0x0020;
+        const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+        const FILE_CREATE: u32 = 2;
+        const FILE_DIRECTORY_FILE: u32 = 0x0001;
+        const FILE_NON_DIRECTORY_FILE: u32 = 0x0040;
+        const FOLDER: u32 = FILE_LIST_DIRECTORY
+            | FILE_ADD_FILE
+            | FILE_ADD_SUBDIRECTORY
+            | FILE_TRAVERSE
+            | FILE_READ_ATTRIBUTES
+            | SYNCHRONIZE;
+        let path = path.trim_end_matches('\\');
+        let mut anchor = path;
+        let mut rest: Vec<&str> = Vec::new();
+        let held = loop {
+            let opened = std::fs::OpenOptions::new()
+                .access_mode(FOLDER)
+                .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+                .custom_flags(FLAGS)
+                .open(anchor);
+            match opened {
+                Ok(file) => break file,
+                Err(err) if matches!(err.raw_os_error(), Some(2 | 3)) => {
+                    let Some((parent, name)) = anchor.rsplit_once('\\') else {
+                        return Err("refused: no part of its folder exists".into());
+                    };
+                    if name.is_empty() || parent.is_empty() {
+                        return Err("refused: no part of its folder exists".into());
+                    }
+                    rest.push(name);
+                    anchor = parent;
+                }
+                Err(err) => return Err(format!("refused: {anchor}: {err}")),
+            }
+        };
+        let Some(leaf) = rest.first().copied() else {
+            return Err("target already exists".into());
+        };
+        let anchor_pin = identify(held, anchor).map_err(|err| format!("refused: {err}"))?;
+        if anchor_pin.kind != ItemKind::Dir {
+            return Err(format!("refused: {anchor} is not a folder"));
+        }
+        let projected = rest.iter().rev().fold(
+            anchor_pin.real_path.trim_end_matches('\\').to_string(),
+            |path, part| format!(r"{path}\{part}"),
+        );
+        if !allowed(&projected) {
+            return Err(format!("refused: it resolves to {projected}"));
+        }
+        let PinHandle::Host(anchor_file) = &anchor_pin.handle else {
+            return Err("not a host handle".into());
+        };
+        // Undo in reverse, each deleted and closed before its parent.
+        let undo = |mut made: Vec<std::fs::File>| -> String {
+            let mut left = 0;
+            while let Some(item) = made.pop() {
+                if !host_dispose(&item) {
+                    left += 1;
+                }
+                drop(item);
+            }
+            if left == 0 {
+                String::new()
+            } else {
+                format!(" ({left} new item(s) could not be removed again)")
+            }
+        };
+        let mut made: Vec<std::fs::File> = Vec::new();
+        for name in rest[1..].iter().rev() {
+            let parent = made.last().unwrap_or(anchor_file);
+            match host_open_in(
+                parent,
+                name,
+                FOLDER | DELETE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                FILE_CREATE,
+                FILE_DIRECTORY_FILE,
+                None,
+            ) {
+                Ok(dir) => made.push(dir),
+                Err(status) => {
+                    let note = undo(made);
+                    return Err(format!(
+                        "could not create the folder {name}: {}{note}",
+                        nt_status_text(status)
+                    ));
+                }
+            }
+        }
+        let parent = made.last().unwrap_or(anchor_file);
+        let file = match host_open_in(
+            parent,
+            leaf,
+            GENERIC_READ | GENERIC_WRITE | DELETE | SYNCHRONIZE,
+            FILE_SHARE_READ,
+            FILE_CREATE,
+            FILE_NON_DIRECTORY_FILE,
+            None,
+        ) {
+            Ok(file) => file,
+            Err(status) => {
+                let note = undo(made);
+                return Err(format!(
+                    "could not create {path}: {}{note}",
+                    nt_status_text(status)
+                ));
+            }
+        };
+        // A second handle, so the file can still be removed if it cannot
+        // be identified.
+        let spare = file.try_clone().map_err(|err| err.to_string());
+        let pin = identify(file, path).and_then(|pin| {
+            if pin.real_path.eq_ignore_ascii_case(&projected) {
+                Ok(pin)
+            } else {
+                Err(format!("it landed at {} instead", pin.real_path))
+            }
+        });
+        match (pin, spare) {
+            (Ok(pin), _) => {
+                // The new folders stay; their handles close here.
+                drop(made);
+                drop(anchor_pin);
+                Ok(pin)
+            }
+            (Err(err), spare) => {
+                if let Ok(spare) = spare {
+                    made.push(spare);
+                }
+                let note = undo(made);
+                Err(format!("refused: {err}{note}"))
+            }
+        }
     }
 
     /// How long ago a FILETIME (100 ns ticks since 1601) was, if it is in
@@ -1263,7 +1536,13 @@ mod host {
         })
     }
 
-    pub fn create_new(path: &str) -> Result<Pinned, String> {
+    pub fn create_confined(path: &str, allowed: &dyn Fn(&str) -> bool) -> Result<Pinned, String> {
+        if !allowed(path) {
+            return Err(format!("refused: it resolves to {path}"));
+        }
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+        }
         let file = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
@@ -1396,6 +1675,98 @@ mod live_tests {
             "{fresh_age:?}"
         );
         assert!(blocked.is_err(), "a writer got in while it was held");
+    }
+
+    #[test]
+    fn live_new_folders_land_only_where_they_were_checked() {
+        let base = std::env::temp_dir().join(format!("hm-confined-{}", std::process::id()));
+        let place = base.join("place");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let target = place.join("new1").join("new2").join("x.lnk");
+        let swaps = std::cell::RefCell::new(Vec::new());
+        let asked = std::cell::RefCell::new(String::new());
+        let made = HostFs.pin_create_confined(&target.display().to_string(), &|_, real| {
+            // After the check: move the folder (or the one above it) away
+            // and put a junction to `outside` in its place.
+            let moved = std::fs::rename(&place, base.join("place-old")).is_ok();
+            let above = std::fs::rename(&base, base.with_extension("old")).is_ok();
+            if moved {
+                let _ = std::process::Command::new("cmd")
+                    .args(["/C", "mklink", "/J"])
+                    .arg(&place)
+                    .arg(&outside)
+                    .output();
+            }
+            swaps.borrow_mut().extend([moved, above]);
+            *asked.borrow_mut() = real.to_string();
+            true
+        });
+        let real = made
+            .as_ref()
+            .map(|pin| pin.real_path.clone())
+            .map_err(String::clone);
+        drop(made);
+        let outside_entries = std::fs::read_dir(&outside)
+            .map(|dir| dir.count())
+            .unwrap_or(0);
+        // Refused: nothing at all is made.
+        let refused_target = place.join("other").join("deeper").join("y.lnk");
+        let refused =
+            HostFs.pin_create_confined(&refused_target.display().to_string(), &|_, _| false);
+        let other_made = place.join("other").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(base.with_extension("old"));
+        assert_eq!(*swaps.borrow(), [false, false], "a held folder moved");
+        let real = real.expect("created");
+        assert!(
+            real.eq_ignore_ascii_case(&asked.borrow()),
+            "{real} vs {}",
+            asked.borrow()
+        );
+        assert!(real.ends_with(r"place\new1\new2\x.lnk"), "{real}");
+        assert_eq!(outside_entries, 0, "something landed outside");
+        assert!(refused.is_err());
+        assert!(!other_made, "a refused creation made a folder");
+    }
+
+    #[test]
+    fn live_a_junction_on_the_way_is_judged_by_where_it_leads() {
+        let base = std::env::temp_dir().join(format!("hm-confined-j-{}", std::process::id()));
+        let outside = base.join("outside");
+        std::fs::create_dir_all(outside.join("sub")).unwrap();
+        let link = base.join("j");
+        let linked = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&outside)
+            .output()
+            .expect("run mklink");
+        // Through the junction to a folder that exists: judged by its real
+        // path, and refused here, so nothing is made.
+        let through = link.join("sub").join("new").join("x.lnk");
+        let asked = std::cell::RefCell::new(String::new());
+        let refused = HostFs.pin_create_confined(&through.display().to_string(), &|_, real| {
+            *asked.borrow_mut() = real.to_string();
+            false
+        });
+        // The junction itself as the nearest folder: never used.
+        let at_link = link.join("missing").join("x.lnk");
+        let at_link_result =
+            HostFs.pin_create_confined(&at_link.display().to_string(), &|_, _| true);
+        let leaked = outside.join("sub").join("new").exists() || outside.join("missing").exists();
+        let _ = std::fs::remove_dir_all(&base);
+        assert!(linked.status.success());
+        assert!(refused.is_err());
+        assert!(
+            asked.borrow().contains(r"outside\sub\new\x.lnk"),
+            "{}",
+            asked.borrow()
+        );
+        let err = at_link_result.err().unwrap_or_default();
+        assert!(err.contains("link or junction"), "{err}");
+        assert!(!leaked, "something was made through the junction");
     }
 
     #[test]

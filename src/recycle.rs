@@ -58,18 +58,17 @@ pub use host::recycle_held;
 
 #[cfg(windows)]
 mod host {
+    use crate::fs::{host_dispose as dispose, host_open_in as open_in};
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::{AsRawHandle, FromRawHandle};
-    use windows_sys::Wdk::Foundation::OBJECT_ATTRIBUTES;
+    use std::os::windows::io::AsRawHandle;
     use windows_sys::Wdk::Storage::FileSystem::{
-        FILE_RENAME_INFORMATION, FileRenameInformation, NtCreateFile, NtSetInformationFile,
+        FILE_RENAME_INFORMATION, FileRenameInformation, NtSetInformationFile,
     };
-    use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError, UNICODE_STRING};
+    use windows_sys::Win32::Foundation::{HANDLE, RtlNtStatusToDosError};
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_NORMAL,
-        FILE_ATTRIBUTE_REPARSE_POINT, FILE_DISPOSITION_INFO, FILE_FLAG_BACKUP_SEMANTICS,
-        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, FileDispositionInfo,
-        GetDriveTypeW, GetFileInformationByHandle, GetVolumePathNameW, SetFileInformationByHandle,
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ,
+        FILE_SHARE_WRITE, GetDriveTypeW, GetFileInformationByHandle, GetVolumePathNameW,
     };
     use windows_sys::Win32::System::IO::IO_STATUS_BLOCK;
 
@@ -82,13 +81,10 @@ mod host {
     const FILE_TRAVERSE: u32 = 0x0020;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
     const DRIVE_FIXED: u32 = 3;
-    const OBJ_CASE_INSENSITIVE: u32 = 0x40;
     const FILE_CREATE: u32 = 2;
     const FILE_OPEN_IF: u32 = 3;
     const FILE_DIRECTORY_FILE: u32 = 0x0001;
-    const FILE_SYNCHRONOUS_IO_NONALERT: u32 = 0x0020;
     const FILE_NON_DIRECTORY_FILE: u32 = 0x0040;
-    const FILE_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
     const STATUS_OBJECT_NAME_COLLISION: i32 = 0xC000_0035_u32 as i32;
     const ERROR_ALREADY_EXISTS: i32 = 183;
 
@@ -102,77 +98,6 @@ mod host {
             return Err(std::io::Error::last_os_error().to_string());
         }
         Ok(info)
-    }
-
-    /// Open (`create` false) or open-or-create a child of `dir` by name,
-    /// relative to the held handle, never following a link.
-    fn open_in(
-        dir: &std::fs::File,
-        name: &str,
-        access: u32,
-        share: u32,
-        disposition: u32,
-        options: u32,
-        sddl: Option<&str>,
-    ) -> Result<std::fs::File, i32> {
-        use windows_sys::Win32::Foundation::LocalFree;
-        use windows_sys::Win32::Security::Authorization::{
-            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
-        };
-        let units: Vec<u16> = name.encode_utf16().collect();
-        let bytes = (units.len() * 2) as u16;
-        let object_name = UNICODE_STRING {
-            Length: bytes,
-            MaximumLength: bytes,
-            Buffer: units.as_ptr() as _,
-        };
-        let mut sd: *mut core::ffi::c_void = std::ptr::null_mut();
-        if let Some(sddl) = sddl {
-            let text = wide(sddl);
-            let ok = unsafe {
-                ConvertStringSecurityDescriptorToSecurityDescriptorW(
-                    text.as_ptr(),
-                    SDDL_REVISION_1,
-                    &mut sd,
-                    std::ptr::null_mut(),
-                )
-            };
-            if ok == 0 {
-                return Err(-1);
-            }
-        }
-        let attributes = OBJECT_ATTRIBUTES {
-            Length: std::mem::size_of::<OBJECT_ATTRIBUTES>() as u32,
-            RootDirectory: dir.as_raw_handle() as HANDLE,
-            ObjectName: &object_name,
-            Attributes: OBJ_CASE_INSENSITIVE,
-            SecurityDescriptor: sd as _,
-            SecurityQualityOfService: std::ptr::null(),
-        };
-        let mut handle: HANDLE = std::ptr::null_mut();
-        let mut status_block: IO_STATUS_BLOCK = unsafe { std::mem::zeroed() };
-        let status = unsafe {
-            NtCreateFile(
-                &mut handle,
-                access,
-                &attributes,
-                &mut status_block,
-                std::ptr::null(),
-                FILE_ATTRIBUTE_NORMAL,
-                share,
-                disposition,
-                options | FILE_SYNCHRONOUS_IO_NONALERT | FILE_OPEN_REPARSE_POINT,
-                std::ptr::null(),
-                0,
-            )
-        };
-        if !sd.is_null() {
-            unsafe { LocalFree(sd as _) };
-        }
-        if status < 0 {
-            return Err(status);
-        }
-        Ok(unsafe { std::fs::File::from_raw_handle(handle as _) })
     }
 
     fn status_text(status: i32) -> String {
@@ -289,18 +214,6 @@ mod host {
         crate::store::check_handle_owner_and_dacl(bin.as_raw_handle(), &shown, Some(&sid))?;
         let real = crate::fs::host_final_path(&bin)?;
         Ok((bin, real))
-    }
-
-    fn dispose(file: &std::fs::File) {
-        let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-        unsafe {
-            SetFileInformationByHandle(
-                file.as_raw_handle() as _,
-                FileDispositionInfo,
-                &info as *const _ as *const _,
-                std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-            )
-        };
     }
 
     /// Rename the open `file` to `name` inside the held folder `dir`.
