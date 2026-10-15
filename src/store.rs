@@ -324,6 +324,29 @@ fn restore_one(
         .pin_read_at(&source, 0, source.len as usize)
         .filter(|bytes| bytes.len() as u64 == source.len)
         .ok_or("could not read the saved copy")?;
+    // Where it would really land, before anything is created: the nearest
+    // folder that exists, resolved, plus the parts still to be made. A
+    // refused restore must not have made folders somewhere else first.
+    let mut anchor = original.as_str();
+    let mut rest: Vec<&str> = Vec::new();
+    while !(fs.exists(anchor) && fs.is_dir(anchor)) {
+        let Some((parent, name)) = anchor.rsplit_once('\\') else {
+            return Err("refused: no part of its folder exists".into());
+        };
+        rest.push(name);
+        anchor = parent;
+    }
+    let real_anchor = fs
+        .pin(anchor)
+        .map_err(|err| format!("refused: {anchor}: {err}"))?
+        .real_path;
+    let projected = rest.iter().rev().fold(
+        real_anchor.trim_end_matches('\\').to_string(),
+        |path, part| format!(r"{path}\{part}"),
+    );
+    if !destination_allowed(&*fs, &projected) {
+        return Err(format!("refused: it resolves to {projected}"));
+    }
     let target = fs.pin_create_new(&original)?;
     if !destination_allowed(&*fs, &target.real_path) {
         let real = target.real_path.clone();
@@ -711,16 +734,25 @@ mod tests {
                     &format!(r"{desktop}\present.lnk"),
                     &format!(r"{files}\0004-present.lnk"),
                 ),
-                // Spelled on the Desktop, really in System32: created, caught
-                // by its real path, and removed again.
+                // Spelled on the Desktop, really in System32: refused by its
+                // real path before anything is created.
                 (
                     &format!(r"{desktop}\sys\x.lnk"),
+                    &format!(r"{files}\0001-good.lnk"),
+                ),
+                // The same, with folders still to be made: none are made.
+                (
+                    &format!(r"{desktop}\sys\new\deeper\y.lnk"),
                     &format!(r"{files}\0001-good.lnk"),
                 ),
             ]),
         );
         assert_eq!(restored, 1, "{errors:?}");
-        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(
+            !fs.exists(r"C:\Windows\System32\new"),
+            "a folder was made outside"
+        );
         assert_eq!(
             fs.read(&format!(r"{desktop}\good.lnk")),
             Some(b"good".to_vec())
@@ -841,11 +873,15 @@ mod live_tests {
         assert!(made.status.success());
         assert_eq!(restored, 1, "{errors:?}");
         assert_eq!(good_bytes, Some(b"shortcut".to_vec()));
+        // Refused either because the folder is a junction (it is never
+        // followed) or by its real path; never created outside first.
         assert!(
-            errors.iter().any(|err| err.contains("resolves to")),
+            errors
+                .iter()
+                .any(|err| err.contains("resolves to") || err.contains("link or junction")),
             "{errors:?}"
         );
-        assert!(!landed, "the misplaced file was not removed");
+        assert!(!landed, "a file landed outside its place");
     }
 
     /// Runs only elevated (it skips otherwise): creates a scratch protected
