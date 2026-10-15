@@ -911,9 +911,15 @@ pub(crate) fn check_registry_key_security(
         | 0x0008_0000 // write owner
         | 0x1000_0000 // generic all
         | 0x4000_0000; // generic write
-    // LOCAL SERVICE, NETWORK SERVICE, and per-service SIDs (NT SERVICE\x).
-    let service =
-        |sid: &str| sid == "S-1-5-19" || sid == "S-1-5-20" || sid.starts_with("S-1-5-80-");
+    // LOCAL SERVICE, NETWORK SERVICE, and per-service SIDs (NT SERVICE\x)
+    // are Windows' own service identities. TERMINAL SERVER USER (S-1-5-13)
+    // is a Windows NT 4.0 Terminal Server compatibility group that Windows
+    // puts on App Paths, Uninstall, and SharedDLLs by default; no standard
+    // account's token carries it on Windows 10 or 11, so it is not an
+    // account programs running without elevation use.
+    let service = |sid: &str| {
+        sid == "S-1-5-19" || sid == "S-1-5-20" || sid == "S-1-5-13" || sid.starts_with("S-1-5-80-")
+    };
     check_security(
         key,
         windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY,
@@ -941,7 +947,6 @@ fn check_security(
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSID,
     };
-    const INHERIT_ONLY: u8 = 0x08;
     let trusted = |sid: &str| TRUSTED_SIDS.contains(&sid) || extra(sid);
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
@@ -1007,7 +1012,9 @@ fn check_security(
                 return Err(format!("{shown} has an access entry Hivemend cannot check"));
             }
             let sid = sid_text(unsafe { (ace as *mut u8).add(8) } as PSID);
-            let creator_owner = sid == "S-1-3-0" && header.AceFlags & INHERIT_ONLY != 0;
+            // CREATOR OWNER only stands in for whoever creates a child; no
+            // token carries it, so it grants nothing on the object itself.
+            let creator_owner = sid == "S-1-3-0";
             if !trusted(&sid) && !creator_owner {
                 return Err(format!("{shown} lets {sid} change it"));
             }

@@ -4402,6 +4402,15 @@ impl App {
                 "Left alone because they could not be backed up or are protected: {left}"
             ));
         }
+        for note in outcome.notes.iter().take(5) {
+            lines.push(format!("Left alone: {note}"));
+        }
+        if outcome.notes.len() > 5 {
+            lines.push(format!(
+                "...and {} more left alone",
+                outcome.notes.len() - 5
+            ));
+        }
         if !outcome.errors.is_empty() {
             let mut line = format!("Could not remove: {}", outcome.errors.len());
             if outcome.denied > 0 && !self.elevated {

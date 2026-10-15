@@ -472,6 +472,14 @@ mod tests {
         assert!(reg.values(&format!(r"{base}\Open\Deep")).is_ok(), "changed");
         assert!(reg.values(&format!(r"{base}\Closed")).is_err());
         assert_eq!(outcome.applied, 1);
+        // Left alone with its reason, not counted as a failure.
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.refused, 1);
+        assert!(
+            outcome.notes[0].contains("leaves it alone"),
+            "{:?}",
+            outcome.notes
+        );
         // A restore into such a key changes nothing at all.
         let ops = vec![
             crate::regfile::RegOp::CreateKey(format!(r"{base}\New")),
@@ -617,6 +625,8 @@ pub struct RepairOutcome {
     /// without "Run as administrator". Also counted in `errors`.
     pub denied: usize,
     pub errors: Vec<String>,
+    /// Why entries were left alone, where that is worth saying.
+    pub notes: Vec<String>,
     /// Findings that are no longer a problem: removed or already gone.
     pub resolved: Vec<Finding>,
 }
@@ -693,6 +703,10 @@ pub fn repair_with_progress(
                             "the backup could not be written ({why}), so the repair stopped; nothing more was changed"
                         ));
                         Applied::NotBackedUp
+                    }
+                    Ok(Deleted::Untrusted(why)) => {
+                        outcome.notes.push(why);
+                        Applied::Refused
                     }
                     Ok(Deleted::RemovedUnconfirmed(why)) => {
                         stopped = Some(format!(
@@ -773,6 +787,9 @@ pub(crate) enum Deleted {
     /// Removed, but the line confirming it could not be written, so a
     /// restore will not put it back by itself; the job stops here.
     RemovedUnconfirmed(String),
+    /// A key this window must not change (an administrator window and a key
+    /// standard accounts can change); left alone, with the reason.
+    Untrusted(String),
 }
 
 /// Remove one registry target (`DeleteKey` or `DeleteValue`) in its own
@@ -803,8 +820,12 @@ pub(crate) fn delete_in_transaction(
     }
     let mut tx = reg.begin()?;
     let mut touched = Vec::new();
-    match touch_all(&mut *tx, key, tree, 0, &mut touched) {
+    let mut untrusted = None;
+    match touch_all(&mut *tx, key, tree, 0, &mut touched, &mut untrusted) {
         Ok(()) => {}
+        Err(_) if untrusted.is_some() => {
+            return Ok(Deleted::Untrusted(untrusted.unwrap_or_default()));
+        }
         Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
         // Part of it cannot be read, so it could not be backed up anyway.
         Err(_)
@@ -879,16 +900,31 @@ fn touch_all(
     tree: bool,
     depth: usize,
     touched: &mut Vec<String>,
+    untrusted: &mut Option<String>,
 ) -> Result<(), RegError> {
     if depth > 512 {
         return Err(RegError::Message(format!("{key} is nested too deeply")));
     }
-    tx.require_trusted(key)?;
+    if let Err(err) = tx.require_trusted(key) {
+        let why = match &err {
+            RegError::Denied(why) | RegError::Message(why) => why.clone(),
+            RegError::NotFound => return Err(err),
+        };
+        *untrusted = Some(why);
+        return Err(err);
+    }
     tx.touch(key)?;
     touched.push(crate::pathutil::canonical_path(key));
     if tree {
         for child in tx.subkeys(key)? {
-            touch_all(tx, &format!("{key}\\{child}"), true, depth + 1, touched)?;
+            touch_all(
+                tx,
+                &format!("{key}\\{child}"),
+                true,
+                depth + 1,
+                touched,
+                untrusted,
+            )?;
         }
     }
     Ok(())

@@ -1379,6 +1379,18 @@ mod live_tests {
         assert!(matches!(refused, Err(RegError::Denied(_))), "{refused:?}");
         assert!(matches!(below, Err(RegError::Denied(_))), "{below:?}");
         assert!(allowed.is_ok(), "{allowed:?}");
+        // Windows' own default security on the keys repair works in is
+        // accepted (it includes the legacy TERMINAL SERVER USER entry).
+        for key in [
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs",
+            r"HKLM\SOFTWARE\Classes",
+            r"HKLM\SOFTWARE",
+        ] {
+            let trusted = require_trusted_key(key);
+            assert!(trusted.is_ok(), "{key}: {trusted:?}");
+        }
     }
 
     #[test]

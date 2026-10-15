@@ -1723,6 +1723,7 @@ fn apply_repair(
         Ok(crate::engine::Deleted::NotBackedUp) => {
             done.note(format!("not backed up, left alone: {key}"));
         }
+        Ok(crate::engine::Deleted::Untrusted(why)) => done.note(why),
         Ok(crate::engine::Deleted::TooLarge) => {
             done.note(format!(
                 "left alone, its backup would be larger than a restore accepts: {key}"

@@ -371,7 +371,7 @@ fn repair_live(
             errors: outcome.errors.clone(),
             complete: scan_complete(&report),
             warnings: report.warnings.clone(),
-            notes,
+            notes: notes.into_iter().chain(outcome.notes.clone()).collect(),
         };
         if json {
             println!("{}", result.json());
