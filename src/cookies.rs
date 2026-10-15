@@ -445,7 +445,10 @@ fn trim_with(
     // it. If any other program has it open, this fails before any write.
     // The side files are kept, never deleted: a rollback journal is cut to
     // nothing on each commit, and a write-ahead log is kept after closing.
+    // Removed rows are overwritten, not just unlinked, so a removed cookie
+    // does not linger in free pages of the database.
     conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .and_then(|()| conn.pragma_update(None, "secure_delete", "ON"))
         .and_then(|()| {
             if wal {
                 keep_wal(&conn)
@@ -775,6 +778,36 @@ mod tests {
             }
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_removed_cookie_does_not_linger_in_the_file() {
+        let dir = scratch("secure-delete");
+        let db = dir.join("Cookies");
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        conn.execute_batch("CREATE TABLE cookies (host_key TEXT NOT NULL, name TEXT, value TEXT);")
+            .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES ('.tracker.io', 'id', 'SECRETVALUE1234567890')",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO cookies VALUES ('.github.com', 'id', 'keepme')",
+            [],
+        )
+        .unwrap();
+        drop(conn);
+        trim_cookies(&db, &["github.com".to_string()]).unwrap();
+        let bytes = std::fs::read(&db).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let has = |needle: &[u8]| bytes.windows(needle.len()).any(|window| window == needle);
+        assert!(
+            !has(b"SECRETVALUE1234567890"),
+            "the removed value is still in the file"
+        );
+        assert!(!has(b".tracker.io"));
+        assert!(has(b"keepme"));
     }
 
     #[test]

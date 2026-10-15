@@ -51,11 +51,11 @@ hivemend repair --yes
 hivemend hives
 ```
 
-`scan` never changes the registry. `repair` without `--yes` prints the plan. With `--yes` each entry is removed inside its own registry transaction (Windows' Kernel Transaction Manager): the entry is read from that transaction, recorded in the UTF-16 `.reg` backup, and the backup flushed to disk before the deletion commits. Before anything is removed, the entry's section is read back with the restore's own parser, and a key removal deletes exactly the keys it recorded: a key that appears meanwhile stops it. Only after the commit is `; entry N removed` written, and a restore puts back only entries confirmed that way, so a run that stops part way never offers back something that was not removed (such entries are listed instead, and their data stays in the file). If another program changes the entry meanwhile, or any step fails, the transaction is rolled back and the entry stays. Where Windows cannot open a registry transaction, nothing is removed. If the backup cannot be written, the repair stops; an entry whose backup would pass the 64 MB a restore accepts is left alone. A shortcut is only removed when it has no named data streams at all, the download marker included, since the backup copy holds only its main data: it is held so nothing can write, rename, or delete it, copied, marked for deletion so nothing new can be opened on it, and deleted only if it is still exactly what was copied.
+`scan` never changes the registry. `repair` without `--yes` prints the plan. With `--yes` each entry is removed inside its own registry transaction (Windows' Kernel Transaction Manager): the entry is read from that transaction, recorded in the UTF-16 `.reg` backup, and the backup flushed to disk before the deletion commits. Before anything is removed, the entry's section is read back with the restore's own parser, and a key removal deletes exactly the keys it recorded: a key that appears meanwhile stops it. Only after the commit is `; entry N removed` written, and a restore puts back only entries confirmed that way, so a run that stops part way never offers back something that was not removed (such entries are listed instead, and their data stays in the file). If another program changes the entry meanwhile, or any step fails, the transaction is rolled back and the entry stays. Where Windows cannot open a registry transaction, nothing is removed. If the backup cannot be written, the repair stops; an entry whose backup would pass the 64 MB a restore accepts is left alone. A shortcut is never deleted: it is held so nothing can write, rename, or delete it, and then moved, by that same hold and with all its data, into the backup's files folder, so an interruption leaves it either where it was or in the backup. One whose backup folder is on another drive is left alone, and so is one with any named data stream (the download marker included), since a restore puts back only its main data.
 
 `--format json` prints one JSON document: `complete`, `findings`, `warnings`, and `notes` for a scan; for `repair --yes`, `complete`, `backup`, `removed`, `already_gone`, `left_alone` (asked for but not done: refused, not backed up, changed meanwhile, or left for a normal window), `per_user_left`, `report_only`, `needs_admin`, `errors`, `warnings`, and `notes`. Scan exit codes: 0 when a complete scan found nothing, 2 when there are findings, 3 when the scan could not read everything (or was stopped) and found nothing, so it cannot be called clean, and 1 on an error. Repair exit codes: 0 when everything asked for was done, 3 when the scan was incomplete or something asked for was left undone, and 1 on errors.
 
-Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, leaves alone any machine-wide key that accounts other than SYSTEM, Administrators, TrustedInstaller, or Windows' service accounts can change (Windows' legacy TERMINAL SERVER USER entry, which no standard account carries, does not count), and says which, does not read your ignore list, and `--backup-dir` is refused unless it is the protected store.
+Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, leaves alone any machine-wide key that accounts other than SYSTEM, Administrators, TrustedInstaller, or Windows' service accounts can change, and says which. That includes keys whose default security lets Windows' TERMINAL SERVER USER group write (App Paths, Uninstall, and SharedDLLs among them), so most machine-wide entries are reported but not repaired; does not read your ignore list, and `--backup-dir` is refused unless it is the protected store.
 
 ### Where data is kept
 
@@ -154,20 +154,19 @@ Monitor, Tools, Settings, and About.
   a stopped preview does not count: Clean needs a finished one), tick
   what to clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
-  for good. The built-in history and cookie cleaning waits for a closed
-  browser (checked again just before each category runs and before each
-  database) and never touches saved logins, saved addresses or cards, or
-  bookmarks. A database and its side files are taken together while no
-  other program has any of them open, and all are marked for deletion
-  before any goes; if one cannot be (a read-only file, say), the marks
-  are called off and the whole set stays. For
-  Chrome and Edge it clears browsing history and cookies; for Firefox it
-  clears cookies and saved form entries, and leaves browsing history and
-  bookmarks (they share one file). A Temp file listed for being older
+  for good. The browser categories only remove cookies, and only while
+  the browser is closed (checked again just before each category runs
+  and before each database): cookies are removed from inside the cookie
+  database by SQLite, never by deleting the database, because a database
+  and its journal cannot be deleted together all or nothing. Browsing
+  history, saved logins, form entries, addresses, cards, and bookmarks
+  are not touched. A Temp file listed for being older
   than two days is opened so that nothing else can write to it and its
   age is read again: one written to since, or held open by another
   program, is left alone. One folder walk looks through at most 100,000
-  folders and removes at most 100,000 files, and says when it left the
+  folders (and a bounded amount of path text), goes at most 64 folders
+  deep, looks at no more than 1,000 browser profiles, and removes at most
+  100,000 files, and says when any of these left something out or the
   rest for another clean. Cancel stops a clean part way through a
   category, too. Custom
   items you add can name any allowed Temp or browser-profile file, so add
@@ -237,10 +236,10 @@ rendered at the screen's own scale. Nothing is loaded from image files.
 
 Cookies to keep live in `%LOCALAPPDATA%\HiveMend\cookies-keep.txt`, one site
 per line (`github.com` keeps its subdomains too); the Cookies to Keep button
-on the Privacy page opens it in Notepad. With an empty list, cleaning a
-browser's history and cookies deletes its cookie database (for Chrome and
-Edge, `Network\Cookies`). With sites listed, Hivemend edits the database
-instead, only while the browser is closed. The database and each of its
+on the Privacy page opens it in Notepad. Cleaning a browser's cookies
+edits its cookie database (for Chrome and Edge, `Network\Cookies`), only
+while the browser is closed: with an empty list every cookie is removed,
+with sites listed every other one. The database and each of its
 SQLite side files must be a plain file with one name at its own path,
 and Hivemend holds each of them (making the journal or log SQLite will
 write, if it is missing) so none can be moved or replaced. SQLite then
@@ -250,7 +249,8 @@ anything else or any attempt to delete one; the journal is emptied
 rather than deleted, and every side file must be empty afterwards.
 SQLite takes the database alone for the whole edit, so no other program
 can read or write it meanwhile. A copy is taken in memory under that lock, every other cookie
-is removed in one transaction, and the database is checked. If anything
+is removed in one transaction (with SQLite's secure delete, so removed
+values are overwritten), and the database is checked. If anything
 fails after the edit, the copy is put back through the same locked
 connection; only if that fails is it saved beside the database, written
 through the handle that created the new file, and Hivemend says where (it then leaves that database alone until the copy

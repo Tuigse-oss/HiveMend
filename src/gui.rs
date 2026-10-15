@@ -2813,7 +2813,7 @@ impl App {
             if let Some(parent) = file.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
-            let help = "# Cookies to keep: one site per line, such as github.com.\r\n# Its subdomains are kept too. Every other cookie is removed when\r\n# you clean a browser's history and cookies. Save, then go back to\r\n# Hivemend's Privacy page.\r\n";
+            let help = "# Cookies to keep: one site per line, such as github.com.\r\n# Its subdomains are kept too. Every other cookie is removed when\r\n# you clean a browser's cookies. Save, then go back to\r\n# Hivemend's Privacy page.\r\n";
             if let Err(err) = std::fs::write(&file, help) {
                 self.message(
                     &format!("Could not create {}: {err}", file.display()),
