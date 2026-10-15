@@ -31,6 +31,25 @@ pub trait Registry {
         let _ = (path, name, data);
         Err(RegError::Message("this registry cannot be written".into()))
     }
+    /// Start a transaction. A registry that cannot offer one says so, and
+    /// callers that need one leave their work undone (scan-only).
+    fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+        Err(RegError::Message(
+            "registry transactions are not available".into(),
+        ))
+    }
+}
+
+/// A registry transaction. Its reads see its own changes; nothing it writes
+/// is visible to anything else until [`commit`](RegTransaction::commit).
+/// Once a key has been written in it ([`touch`](RegTransaction::touch)),
+/// any change to that key from outside makes the commit fail, so nothing
+/// is applied. Dropping it uncommitted rolls everything back.
+pub trait RegTransaction: Registry {
+    /// Write to `key` inside the transaction (and undo the write), so a
+    /// change to it from anywhere else before commit aborts the commit.
+    fn touch(&mut self, key: &str) -> Result<(), RegError>;
+    fn commit(self: Box<Self>) -> Result<(), RegError>;
 }
 
 #[derive(Clone, Debug, Default)]
@@ -48,6 +67,9 @@ struct NodeChild {
 #[derive(Clone, Debug, Default)]
 pub struct MemoryRegistry {
     root: Node,
+    /// Test hook: keys "another program" changes while a transaction is
+    /// open. A commit that touched any of them fails, as on Windows.
+    pub changed_elsewhere: Vec<String>,
 }
 
 impl MemoryRegistry {
@@ -172,6 +194,67 @@ impl Registry for MemoryRegistry {
         let parent_node = self.node_mut(&parent).ok_or(RegError::NotFound)?;
         let index = child_index(&parent_node.children, leaf).ok_or(RegError::NotFound)?;
         parent_node.children.remove(index);
+        Ok(())
+    }
+
+    fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+        let work = self.clone();
+        Ok(Box::new(MemoryTransaction {
+            base: self,
+            work,
+            touched: Vec::new(),
+        }))
+    }
+}
+
+/// A transaction over a [`MemoryRegistry`]: changes go to a copy that
+/// replaces the original on commit.
+struct MemoryTransaction<'a> {
+    base: &'a mut MemoryRegistry,
+    work: MemoryRegistry,
+    touched: Vec<String>,
+}
+
+impl Registry for MemoryTransaction<'_> {
+    fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+        self.work.subkeys(path)
+    }
+    fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+        self.work.values(path)
+    }
+    fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        self.work.delete_value(path, name)
+    }
+    fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+        self.work.delete_tree(path)
+    }
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        self.work.set_value(path, name, data)
+    }
+}
+
+impl RegTransaction for MemoryTransaction<'_> {
+    fn touch(&mut self, key: &str) -> Result<(), RegError> {
+        self.work.node(key).ok_or(RegError::NotFound)?;
+        self.touched.push(canonical_path(key));
+        Ok(())
+    }
+
+    fn commit(self: Box<Self>) -> Result<(), RegError> {
+        let conflict = self.touched.iter().any(|touched| {
+            self.base
+                .changed_elsewhere
+                .iter()
+                .any(|changed| canonical_path(changed).eq_ignore_ascii_case(touched))
+        });
+        if conflict {
+            return Err(RegError::Message(
+                "another program changed it during the transaction".into(),
+            ));
+        }
+        let changed = std::mem::take(&mut self.base.changed_elsewhere);
+        *self.base = self.work;
+        self.base.changed_elsewhere = changed;
         Ok(())
     }
 }

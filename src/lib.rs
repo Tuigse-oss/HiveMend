@@ -71,7 +71,7 @@ pub use privacy::{
     preview, privacy_reg_allowed, set_cookie_keep, uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
-pub use registry::{MemoryRegistry, Registry};
+pub use registry::{MemoryRegistry, RegTransaction, Registry};
 pub use rules::decode_text_owned;
 pub use services::{
     MemoryServiceStore, NEVER_TOUCH, SUGGESTED, ServiceChange, ServiceInfo, ServiceOutcome,
@@ -93,7 +93,7 @@ pub use tools::{WINDOWS_TOOLS, WindowsTool, expand_target, is_openable};
 #[cfg(windows)]
 pub use windows_privacy::{WindowsProcessList, WindowsSystemTargets};
 #[cfg(windows)]
-pub use windows_reg::WindowsRegistry;
+pub use windows_reg::{WindowsRegistry, WindowsTransaction};
 #[cfg(windows)]
 pub use windows_services::ScmServiceStore;
 

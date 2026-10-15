@@ -12,13 +12,13 @@ use windows_sys::Win32::System::Registry::{
     HKEY_USERS, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ,
     KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_CREATED_NEW_KEY, REG_DWORD, REG_EXPAND_SZ,
     REG_LINK, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey,
-    RegCreateKeyExW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW,
-    RegQueryValueExW, RegSetValueExW,
+    RegCreateKeyExW, RegCreateKeyTransactedW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW,
+    RegOpenKeyExW, RegOpenKeyTransactedW, RegQueryValueExW, RegSetValueExW,
 };
 
 use crate::model::{RegValue, ValueKind};
 use crate::pathutil::canonical_path;
-use crate::registry::{RegError, Registry};
+use crate::registry::{RegError, RegTransaction, Registry};
 
 const DELETE_ACCESS: u32 = 0x0001_0000;
 /// `KEY_FLAGS_INFORMATION.KeyFlags` bit for a symbolic-link key.
@@ -32,6 +32,148 @@ const MAX_DELETE_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsRegistry;
+
+thread_local! {
+    /// The transaction every open and create on this thread goes through
+    /// while a [`WindowsTransaction`] call runs; null otherwise.
+    static TX: std::cell::Cell<windows_sys::Win32::Foundation::HANDLE> =
+        const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+/// Sets this thread's transaction for one call and clears it after.
+struct TxScope(windows_sys::Win32::Foundation::HANDLE);
+
+impl TxScope {
+    fn enter(tx: windows_sys::Win32::Foundation::HANDLE) -> Self {
+        Self(TX.with(|cell| cell.replace(tx)))
+    }
+}
+
+impl Drop for TxScope {
+    fn drop(&mut self) {
+        TX.with(|cell| cell.set(self.0));
+    }
+}
+
+/// A Windows registry transaction (KTM). Every key it opens or creates goes
+/// through the same link-refusing walk as [`WindowsRegistry`], transacted.
+/// Windows aborts it if anything else changes a key it has written, so the
+/// commit then fails and nothing it did is applied; dropping it uncommitted
+/// rolls it back.
+pub struct WindowsTransaction {
+    tx: windows_sys::Win32::Foundation::HANDLE,
+    done: bool,
+}
+
+/// A value name no program uses, written and removed again by `touch`.
+const TOUCH_VALUE: &str = "Hivemend transaction {6f1d2a5e-hm}";
+
+impl WindowsTransaction {
+    pub fn begin() -> Result<Self, RegError> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::CreateTransaction;
+        let tx = unsafe {
+            CreateTransaction(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if tx == INVALID_HANDLE_VALUE || tx.is_null() {
+            return Err(RegError::Message(format!(
+                "registry transactions are not available ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self { tx, done: false })
+    }
+}
+
+impl Drop for WindowsTransaction {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Storage::FileSystem::RollbackTransaction;
+        unsafe {
+            if !self.done {
+                RollbackTransaction(self.tx);
+            }
+            CloseHandle(self.tx);
+        }
+    }
+}
+
+impl Registry for WindowsTransaction {
+    fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.subkeys(path)
+    }
+    fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.values(path)
+    }
+    fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.delete_value(path, name)
+    }
+    fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.delete_tree(path)
+    }
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.set_value(path, name, data)
+    }
+}
+
+impl RegTransaction for WindowsTransaction {
+    fn touch(&mut self, key: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        let opened = open(key, true)?;
+        let name = wide(TOUCH_VALUE);
+        let marker = 1u32.to_le_bytes();
+        let set = unsafe {
+            RegSetValueExW(
+                opened.key,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                marker.as_ptr(),
+                marker.len() as u32,
+            )
+        };
+        if set != ERROR_SUCCESS {
+            return Err(failure(
+                set,
+                format!("{key}: could not start its transaction ({set})"),
+            ));
+        }
+        let removed = unsafe { RegDeleteValueW(opened.key, name.as_ptr()) };
+        if removed != ERROR_SUCCESS {
+            return Err(failure(
+                removed,
+                format!("{key}: could not start its transaction ({removed})"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn commit(mut self: Box<Self>) -> Result<(), RegError> {
+        use windows_sys::Win32::Storage::FileSystem::CommitTransaction;
+        let ok = unsafe { CommitTransaction(self.tx) };
+        self.done = true;
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(RegError::Message(format!(
+                "the change was not applied: another program changed the key meanwhile, or Windows refused ({err})"
+            )));
+        }
+        Ok(())
+    }
+}
 
 struct Opened {
     key: HKEY,
@@ -148,6 +290,10 @@ impl Registry for WindowsRegistry {
             ));
         }
         Ok(())
+    }
+
+    fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+        Ok(Box::new(WindowsTransaction::begin()?))
     }
 
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
@@ -289,18 +435,35 @@ fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
     let wide = wide(&leaf);
     let mut key: HKEY = ptr::null_mut();
     let mut disposition = 0u32;
+    let tx = TX.with(|cell| cell.get());
     let rc = unsafe {
-        RegCreateKeyExW(
-            parent.key,
-            wide.as_ptr(),
-            0,
-            ptr::null(),
-            REG_OPTION_NON_VOLATILE,
-            KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
-            ptr::null(),
-            &mut key,
-            &mut disposition,
-        )
+        if tx.is_null() {
+            RegCreateKeyExW(
+                parent.key,
+                wide.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                ptr::null(),
+                &mut key,
+                &mut disposition,
+            )
+        } else {
+            RegCreateKeyTransactedW(
+                parent.key,
+                wide.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                ptr::null(),
+                &mut key,
+                &mut disposition,
+                tx,
+                ptr::null(),
+            )
+        }
     };
     if rc != ERROR_SUCCESS || key.is_null() {
         return Err(failure(rc, format!("RegCreateKeyExW {path} failed ({rc})")));
@@ -589,17 +752,30 @@ fn open_child(parent: HKEY, name: &str, access: u32) -> Result<Opened, OpenFail>
     if name.is_empty() || name.contains('\0') || name.contains('\\') {
         return Err(OpenFail::Code(ERROR_PATH_NOT_FOUND));
     }
+    let tx = TX.with(|cell| cell.get());
     let open = |access: u32| {
         let wide = wide(name);
         let mut opened = ptr::null_mut();
         let rc = unsafe {
-            RegOpenKeyExW(
-                parent,
-                wide.as_ptr(),
-                REG_OPTION_OPEN_LINK,
-                access,
-                &mut opened,
-            )
+            if tx.is_null() {
+                RegOpenKeyExW(
+                    parent,
+                    wide.as_ptr(),
+                    REG_OPTION_OPEN_LINK,
+                    access,
+                    &mut opened,
+                )
+            } else {
+                RegOpenKeyTransactedW(
+                    parent,
+                    wide.as_ptr(),
+                    REG_OPTION_OPEN_LINK,
+                    access,
+                    &mut opened,
+                    tx,
+                    ptr::null(),
+                )
+            }
         };
         if rc == ERROR_SUCCESS && !opened.is_null() {
             Ok(Opened {
@@ -967,6 +1143,76 @@ mod live_tests {
         assert!(kids.is_empty());
         reg.delete_tree(&key.root).expect("delete test tree");
         assert!(matches!(reg.subkeys(&key.root), Err(RegError::NotFound)));
+    }
+
+    #[test]
+    fn live_a_transaction_fails_when_a_touched_key_changes_elsewhere() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendTxTest{}",
+            std::process::id()
+        ));
+        let child = format!(r"{}\Child", root.0);
+        let mut reg = WindowsRegistry;
+        reg.set_value(&root.0, "keep", &ValueKind::Dword(1))
+            .unwrap();
+        reg.set_value(&root.0, "stale", &ValueKind::Dword(1))
+            .unwrap();
+        reg.set_value(&child, "x", &ValueKind::Dword(1)).unwrap();
+
+        // Changed elsewhere after the touch: the commit fails, nothing applied.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&root.0).unwrap();
+        reg.set_value(&root.0, "keep", &ValueKind::Dword(2))
+            .unwrap();
+        let _ = tx.delete_value(&root.0, "stale");
+        assert!(Box::new(tx).commit().is_err());
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+
+        // Dropped without commit: rolled back.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&root.0).unwrap();
+        tx.delete_value(&root.0, "stale").unwrap();
+        assert!(
+            !tx.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+        drop(tx);
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+
+        // Untouched by anyone else: a whole subtree goes on commit.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&child).unwrap();
+        tx.delete_tree(&child).unwrap();
+        assert!(
+            reg.subkeys(&root.0).unwrap().iter().any(|k| k == "Child"),
+            "visible before commit"
+        );
+        Box::new(tx).commit().unwrap();
+        assert!(!reg.subkeys(&root.0).unwrap().iter().any(|k| k == "Child"));
     }
 
     #[test]
