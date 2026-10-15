@@ -23,6 +23,8 @@ mod rules;
 mod scanners;
 mod services;
 mod settings;
+#[cfg(windows)]
+mod sqlite_bind;
 mod startup;
 mod store;
 mod sysinfo;

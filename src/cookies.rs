@@ -167,12 +167,10 @@ fn leftover_copies(path: &Path) -> Vec<PathBuf> {
 #[cfg(windows)]
 fn check_plain_file(path: &Path, hold: bool) -> Result<(std::fs::File, (u64, u64)), String> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Foundation::GENERIC_READ;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
         FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES, FILE_SHARE_DELETE, FILE_SHARE_READ,
-        FILE_SHARE_WRITE, GetFileInformationByHandle, SYNCHRONIZE,
+        FILE_SHARE_WRITE, SYNCHRONIZE,
     };
     let shown = path.display().to_string();
     let (access, share) = if hold {
@@ -192,6 +190,54 @@ fn check_plain_file(path: &Path, hold: bool) -> Result<(std::fs::File, (u64, u64
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
         .open(path)
         .map_err(|err| format!("{shown}: {err}"))?;
+    let id = verify_held(&file, path)?;
+    Ok((file, id))
+}
+
+/// Create `path` as a new, empty side file for SQLite to use, held like a
+/// checked one (sharing reading and writing only) and verified the same way.
+#[cfg(windows)]
+fn create_side_file(path: &Path) -> Result<(std::fs::File, (u64, u64)), String> {
+    use std::os::windows::fs::OpenOptionsExt;
+    use windows_sys::Win32::Foundation::{GENERIC_READ, GENERIC_WRITE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_READ, FILE_SHARE_WRITE, SYNCHRONIZE,
+    };
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .access_mode(GENERIC_READ | GENERIC_WRITE | SYNCHRONIZE)
+        .share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE)
+        .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+        .open(path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    let id = verify_held(&file, path)?;
+    Ok((file, id))
+}
+
+#[cfg(not(windows))]
+fn create_side_file(path: &Path) -> Result<(std::fs::File, (u64, u64)), String> {
+    use std::os::unix::fs::MetadataExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|err| format!("{}: {err}", path.display()))?;
+    let meta = file.metadata().map_err(|err| err.to_string())?;
+    Ok((file, (meta.dev(), meta.ino())))
+}
+
+/// The open file must be a plain file with one name, really at `path`
+/// (with any short names spelled out). Returns its identity.
+#[cfg(windows)]
+fn verify_held(file: &std::fs::File, path: &Path) -> Result<(u64, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_REPARSE_POINT,
+        GetFileInformationByHandle,
+    };
+    let shown = path.display().to_string();
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
         return Err(format!("{shown}: {}", std::io::Error::last_os_error()));
@@ -204,16 +250,15 @@ fn check_plain_file(path: &Path, hold: bool) -> Result<(std::fs::File, (u64, u64
     }
     // The real path from the handle must be the given one, with any short
     // (8.3) names spelled out: a link anywhere on the way makes them differ.
-    let real = crate::fs::host_final_path(&file)?;
+    let real = crate::fs::host_final_path(file)?;
     let expected = long_path(&shown).unwrap_or_else(|| shown.clone());
     if !real.eq_ignore_ascii_case(&expected) {
         return Err(format!("{shown} is really {real}"));
     }
-    let id = (
+    Ok((
         u64::from(info.dwVolumeSerialNumber),
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
-    );
-    Ok((file, id))
+    ))
 }
 
 /// `path` with any short (8.3) names spelled out (as it is when it does not
@@ -252,19 +297,65 @@ fn check_plain_file(path: &Path, _hold: bool) -> Result<(std::fs::File, (u64, u6
     Ok((file, (meta.dev(), meta.ino())))
 }
 
-/// Check every side file that exists.
-fn check_side_files(path: &Path) -> Result<(), String> {
+/// A side file held for the whole edit, and whether Hivemend made it.
+struct HeldSide {
+    path: PathBuf,
+    file: std::fs::File,
+    #[cfg_attr(not(windows), allow(dead_code))]
+    id: (u64, u64),
+}
+
+/// Hold every side file that exists, after checking it, and make (and hold)
+/// the one SQLite will write if it is missing: the rollback journal, or the
+/// write-ahead log for a WAL database. Nothing else may be opened.
+fn bind_side_files(path: &Path, wal: bool) -> Result<Vec<HeldSide>, String> {
+    let mut held = Vec::new();
     for suffix in SIDE_SUFFIXES {
         let side = side_path(path, suffix);
+        let needed = (suffix == "-journal" && !wal) || (suffix == "-wal" && wal);
         match std::fs::symlink_metadata(&side) {
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+                if needed {
+                    let (file, id) = create_side_file(&side)?;
+                    held.push(HeldSide {
+                        path: side,
+                        file,
+                        id,
+                    });
+                }
+            }
             Err(err) => return Err(format!("{}: {err}", side.display())),
             Ok(_) => {
-                check_plain_file(&side, false)?;
+                let (file, id) = check_plain_file(&side, true)?;
+                held.push(HeldSide {
+                    path: side,
+                    file,
+                    id,
+                });
             }
         }
     }
-    Ok(())
+    Ok(held)
+}
+
+/// True when the database's header says it uses a write-ahead log.
+fn uses_wal(db: &std::fs::File) -> Result<bool, String> {
+    let mut header = [0u8; 20];
+    #[cfg(windows)]
+    let read = {
+        use std::os::windows::fs::FileExt;
+        db.seek_read(&mut header, 0)
+    };
+    #[cfg(not(windows))]
+    let read = {
+        use std::os::unix::fs::FileExt;
+        db.read_at(&mut header, 0)
+    };
+    match read {
+        Ok(20) => Ok(header[18] == 2 || header[19] == 2),
+        Ok(_) => Err("not a cookie database: too short".into()),
+        Err(err) => Err(err.to_string()),
+    }
 }
 
 /// Points in a trim where a test can step in.
@@ -308,33 +399,68 @@ fn trim_with(
         ));
     }
     let (held, id) = check_plain_file(path, true).map_err(unchanged)?;
-    check_side_files(path).map_err(unchanged)?;
+    #[cfg(not(windows))]
+    let _ = id;
+    let wal = uses_wal(&held).map_err(unchanged)?;
+    let sides = bind_side_files(path, wal).map_err(unchanged)?;
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("");
     let (table, column) = cookie_schema(name);
-    let mut conn = open(
-        path,
-        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-    )
-    .map_err(unchanged)?;
+    // SQLite may open only the held, verified objects; see sqlite_bind.
+    #[cfg(windows)]
+    let vfs = {
+        let mut allowed = vec![crate::sqlite_bind::Allowed {
+            path: path.display().to_string(),
+            id,
+        }];
+        allowed.extend(sides.iter().map(|side| crate::sqlite_bind::Allowed {
+            path: side.path.display().to_string(),
+            id: side.id,
+        }));
+        crate::sqlite_bind::BoundVfs::register(allowed).map_err(unchanged)?
+    };
+    let refused = || {
+        #[cfg(windows)]
+        {
+            let refused = vfs.refused();
+            if !refused.is_empty() {
+                return format!(" (refused: {})", refused.join("; "));
+            }
+        }
+        String::new()
+    };
+    let flags =
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+    #[cfg(windows)]
+    let opened = rusqlite::Connection::open_with_flags_and_vfs(path, flags, vfs.name());
+    #[cfg(not(windows))]
+    let opened = rusqlite::Connection::open_with_flags(path, flags);
+    let mut conn = opened.map_err(|err| unchanged(format!("{err}{}", refused())))?;
+    conn.busy_timeout(std::time::Duration::ZERO)
+        .map_err(|err| unchanged(err.to_string()))?;
     // Take the database alone, and keep it until the connection closes: an
     // empty exclusive transaction takes the lock and the locking mode keeps
     // it. If any other program has it open, this fails before any write.
+    // The side files are kept, never deleted: a rollback journal is cut to
+    // nothing on each commit, and a write-ahead log is kept after closing.
     conn.pragma_update(None, "locking_mode", "EXCLUSIVE")
+        .and_then(|()| {
+            if wal {
+                keep_wal(&conn)
+            } else {
+                let mode: String =
+                    conn.query_row("PRAGMA journal_mode=TRUNCATE", [], |row| row.get(0))?;
+                if mode.eq_ignore_ascii_case("truncate") {
+                    Ok(())
+                } else {
+                    Err(rusqlite::Error::InvalidQuery)
+                }
+            }
+        })
         .and_then(|()| conn.execute_batch("BEGIN EXCLUSIVE; COMMIT;"))
-        .map_err(|err| unchanged(busy(err)))?;
-    // What SQLite opened is the held file, and its side files are still
-    // plain ones.
-    let (_, again) = check_plain_file(path, false).map_err(unchanged)?;
-    if again != id {
-        return Err(unchanged(format!(
-            "{} changed while it was being opened",
-            path.display()
-        )));
-    }
-    check_side_files(path).map_err(unchanged)?;
+        .map_err(|err| unchanged(format!("{}{}", busy(err), refused())))?;
     at(Stage::Locked).map_err(unchanged)?;
     let mut snapshot =
         rusqlite::Connection::open_in_memory().map_err(|err| unchanged(err.to_string()))?;
@@ -351,13 +477,49 @@ fn trim_with(
     match at(Stage::Committed).and_then(|()| settle(&conn)) {
         Ok(()) => {
             let closed = conn.close().map_err(|(_, err)| err.to_string());
+            // No removed cookie may linger in a side file.
+            let lingering: Vec<String> = sides
+                .iter()
+                .filter(|side| !side.path.to_string_lossy().ends_with("-shm"))
+                .filter(|side| side.file.metadata().map(|meta| meta.len()).unwrap_or(1) > 0)
+                .map(|side| side.path.display().to_string())
+                .collect();
+            drop(sides);
             drop(held);
             closed.map_err(|err| {
                 format!("the cookies were removed, but closing the database failed: {err}")
             })?;
+            if !lingering.is_empty() {
+                return Err(format!(
+                    "the cookies were removed, but {} still holds data",
+                    lingering.join(", ")
+                ));
+            }
             Ok(count)
         }
         Err(err) => Err(put_back(conn, &snapshot, path, err)),
+    }
+}
+
+/// Keep the write-ahead log file when the connection closes (SQLite would
+/// otherwise delete it, and a file of that name could be made anew).
+fn keep_wal(conn: &rusqlite::Connection) -> rusqlite::Result<()> {
+    let mut on: std::ffi::c_int = 1;
+    let rc = unsafe {
+        rusqlite::ffi::sqlite3_file_control(
+            conn.handle(),
+            c"main".as_ptr(),
+            rusqlite::ffi::SQLITE_FCNTL_PERSIST_WAL,
+            &mut on as *mut std::ffi::c_int as *mut std::ffi::c_void,
+        )
+    };
+    if rc == rusqlite::ffi::SQLITE_OK {
+        Ok(())
+    } else {
+        Err(rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error::new(rc),
+            Some("could not keep the write-ahead log".into()),
+        ))
     }
 }
 
@@ -500,10 +662,15 @@ fn save_copy(snapshot: &rusqlite::Connection, path: &Path) -> Result<PathBuf, St
             .create_new(true)
             .open(&copy)
         {
-            Ok(file) => {
-                drop(file);
-                snapshot
-                    .backup(rusqlite::MAIN_DB, &copy, None)
+            Ok(mut file) => {
+                // Written through the handle that made the file, never by
+                // opening its name again.
+                use std::io::Write;
+                let data = snapshot
+                    .serialize(rusqlite::MAIN_DB)
+                    .map_err(|err| format!("{}: {err}", copy.display()))?;
+                file.write_all(&data)
+                    .and_then(|()| file.sync_all())
                     .map_err(|err| format!("{}: {err}", copy.display()))?;
                 return Ok(copy);
             }
@@ -596,11 +763,7 @@ mod tests {
                 kept: 2
             }
         );
-        let left: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(left, ["Cookies"], "no copy is left behind");
+        assert_only_the_database(&dir, "Cookies");
         // Firefox names its table and column differently.
         let fox = dir.join("cookies.sqlite");
         make_db(&fox, "moz_cookies", "host", &[".github.com", ".tracker.io"]);
@@ -664,11 +827,7 @@ mod tests {
         let before = std::fs::read(&db).unwrap();
         assert!(trim_cookies(&db, &["github.com".to_string()]).is_err());
         assert_eq!(std::fs::read(&db).unwrap(), before);
-        let left: Vec<_> = std::fs::read_dir(&dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name())
-            .collect();
-        assert_eq!(left, ["Cookies"]);
+        assert_only_the_database(&dir, "Cookies");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -685,13 +844,27 @@ mod tests {
         hosts
     }
 
-    fn names(dir: &Path) -> Vec<String> {
-        let mut names: Vec<String> = std::fs::read_dir(dir)
-            .unwrap()
-            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
-            .collect();
-        names.sort();
-        names
+    /// Nothing but the database and empty side files: no copy of the
+    /// cookies, and nothing removed lingering in a journal or log.
+    fn assert_only_the_database(dir: &Path, db: &str) {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let entry = entry.unwrap();
+            let name = entry.file_name().to_string_lossy().into_owned();
+            if name == db {
+                continue;
+            }
+            assert!(
+                SIDE_SUFFIXES
+                    .iter()
+                    .any(|suffix| name == format!("{db}{suffix}")),
+                "{name} was left beside {db}"
+            );
+            assert_eq!(
+                entry.metadata().unwrap().len(),
+                0,
+                "{name} still holds data"
+            );
+        }
     }
 
     /// A second program's attempt to read and to write, with no waiting.
@@ -775,7 +948,7 @@ mod tests {
                 .query_row("PRAGMA integrity_check", [], |row| row.get(0))
                 .unwrap();
             assert_eq!(check, "ok");
-            assert_eq!(names(&dir), ["cookies.sqlite"], "{mode}: a copy was left");
+            assert_only_the_database(&dir, "cookies.sqlite");
             let _ = std::fs::remove_dir_all(&dir);
         }
     }
@@ -838,16 +1011,23 @@ mod tests {
         let db = dir.join("cookies.sqlite");
         make_db(&db, "moz_cookies", "host", &[".github.com", ".tracker.io"]);
         let mut moved = Vec::new();
+        let journal = side_path(&db, "-journal");
         trim_with(&db, &["github.com".to_string()], &mut |stage| {
             moved.push(std::fs::rename(&db, dir.join("swap.sqlite")).is_ok());
             moved.push(std::fs::rename(&dir, dir.with_extension("moved")).is_ok());
+            // The side file SQLite writes cannot be swapped either.
+            moved.push(std::fs::rename(&journal, dir.join("swap-journal")).is_ok());
+            moved.push(std::fs::remove_file(&journal).is_ok());
             let _ = stage;
             Ok(())
         })
         .unwrap();
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(dir.with_extension("moved"));
-        assert_eq!(moved, [false; 4], "the database or its folder moved");
+        assert_eq!(
+            moved, [false; 8],
+            "the database, its folder, or its journal moved"
+        );
     }
 
     #[cfg(windows)]
