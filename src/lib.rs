@@ -36,8 +36,8 @@ mod windows_reg;
 mod windows_services;
 
 pub use backup::{
-    BackupInfo, BackupSummary, BackupWriter, backup_name, encode_reg, is_hive_mend_backup,
-    list_backups, read_backup, reserve_backup,
+    BackupInfo, BackupSummary, BackupWriter, RunningMac, backup_name, encode_reg,
+    is_hive_mend_backup, list_backups, read_backup, reserve_backup,
 };
 pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;
@@ -99,13 +99,13 @@ pub use windows_reg::{WindowsRegistry, WindowsTransaction};
 #[cfg(windows)]
 pub use windows_services::ScmServiceStore;
 
-#[cfg(windows)]
-pub use store::restore_backup;
 pub use store::{
     LEGACY_DIR, Store, adopt_legacy_settings, backup_stores, backups_dir, backups_location,
     cookies_keep_file, custom_privacy_file, elevated, exclusions_file, protected_dir,
     restore_files, restore_scope, settings_file, user_dir,
 };
+#[cfg(windows)]
+pub use store::{restore_backup, sign_protected};
 
 /// The shipped exe must start on a clean Windows install, which has no
 /// Visual C++ runtime. This test binary is built with the same flags as the

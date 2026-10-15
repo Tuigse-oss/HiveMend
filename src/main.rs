@@ -320,6 +320,13 @@ fn repair_live(
         // Reserve a unique, already-created backup file so a second repair in
         // the same second cannot overwrite this one's recovery record.
         let mut backup = hive_mend::reserve_backup(backup_dir, SystemTime::now())?;
+        // As administrator the backup is signed, or nothing is changed.
+        if let Err(err) = hive_mend::sign_protected(&mut backup) {
+            backup.discard();
+            return Err(hive_mend::Error(format!(
+                "could not sign the backup, so nothing was changed: {err}"
+            )));
+        }
         let mut fs = HostFs;
         let outcome = repair(&mut reg, &mut fs, &report.findings, &mut backup)?;
         let report_only = report

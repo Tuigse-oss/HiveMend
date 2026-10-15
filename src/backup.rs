@@ -32,6 +32,59 @@ pub struct BackupWriter {
     file: std::fs::File,
     path: PathBuf,
     started: bool,
+    /// The keyed signature kept beside it, for administrator backups.
+    signature: Option<(std::fs::File, Box<dyn RunningMac>)>,
+}
+
+/// A keyed checksum over everything fed to it so far. Sent along with its
+/// writer to the thread that does the work.
+pub trait RunningMac: Send {
+    /// Add `bytes`; returns the checksum of everything added so far.
+    fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// Where a backup's signature is kept: `<backup>.sig`.
+pub fn signature_path(backup: &Path) -> PathBuf {
+    let mut path = backup.as_os_str().to_owned();
+    path.push(".sig");
+    PathBuf::from(path)
+}
+
+/// The signature file's text: the checksum in lowercase hex.
+pub fn signature_text(mac: &[u8]) -> String {
+    mac.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn create_reserved(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Delete access, so an unused reservation is removed through this
+        // handle; read sharing only, so nothing else can write, rename, or
+        // delete it while it is held.
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        options.access_mode(GENERIC_WRITE | DELETE | SYNCHRONIZE);
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+fn dispose(file: &std::fs::File, path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        crate::fs::host_dispose(file);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        let _ = std::fs::remove_file(path);
+    }
 }
 
 impl BackupWriter {
@@ -46,27 +99,13 @@ impl BackupWriter {
                 format!("{stem}-{}.reg", attempt + 1)
             };
             let path = dir.join(&name);
-            let mut options = std::fs::OpenOptions::new();
-            options.write(true).create_new(true);
-            #[cfg(windows)]
-            {
-                use std::os::windows::fs::OpenOptionsExt;
-                // Delete access, so an unused reservation is removed through
-                // this handle; read sharing only, so nothing else can write,
-                // rename, or delete it while it is held.
-                const DELETE: u32 = 0x0001_0000;
-                const GENERIC_WRITE: u32 = 0x4000_0000;
-                const SYNCHRONIZE: u32 = 0x0010_0000;
-                const FILE_SHARE_READ: u32 = 0x1;
-                options.access_mode(GENERIC_WRITE | DELETE | SYNCHRONIZE);
-                options.share_mode(FILE_SHARE_READ);
-            }
-            match options.open(&path) {
+            match create_reserved(&path) {
                 Ok(file) => {
                     return Ok(Self {
                         file,
                         path,
                         started: false,
+                        signature: None,
                     });
                 }
                 Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
@@ -88,6 +127,23 @@ impl BackupWriter {
         !self.started
     }
 
+    /// Keep a keyed signature of the backup beside it, in a new
+    /// `<backup>.sig`, brought up to date by every append. Only before
+    /// anything is written.
+    pub fn sign_with(&mut self, mac: Box<dyn RunningMac>) -> std::io::Result<()> {
+        if self.started || self.signature.is_some() {
+            return Err(std::io::Error::other("the backup is already being written"));
+        }
+        let file = create_reserved(&signature_path(&self.path))?;
+        self.signature = Some((file, mac));
+        Ok(())
+    }
+
+    /// True when a signature is being kept.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
     /// Append `text` as UTF-16 (with the byte-order mark first) and flush it
     /// to disk.
     pub fn append(&mut self, text: &str) -> std::io::Result<()> {
@@ -102,6 +158,25 @@ impl BackupWriter {
         self.file.write_all(&bytes)?;
         self.file.sync_data()?;
         self.started = true;
+        if let Some((file, mac)) = &mut self.signature {
+            // The signature always covers exactly the bytes on disk: it is
+            // rewritten in place (its length never changes) after each
+            // flushed append. A failure here fails the append, so nothing
+            // is removed on the strength of an unsigned record.
+            let mac = mac.update(&bytes).map_err(std::io::Error::other)?;
+            let text = signature_text(&mac);
+            #[cfg(windows)]
+            {
+                use std::os::windows::fs::FileExt;
+                file.seek_write(text.as_bytes(), 0)?;
+            }
+            #[cfg(not(windows))]
+            {
+                use std::os::unix::fs::FileExt;
+                file.write_at(text.as_bytes(), 0)?;
+            }
+            file.sync_data()?;
+        }
         Ok(())
     }
 
@@ -111,25 +186,9 @@ impl BackupWriter {
         if self.started {
             return;
         }
-        #[cfg(windows)]
-        {
-            use std::os::windows::io::AsRawHandle;
-            use windows_sys::Win32::Storage::FileSystem::{
-                FILE_DISPOSITION_INFO, FileDispositionInfo, SetFileInformationByHandle,
-            };
-            let info = FILE_DISPOSITION_INFO { DeleteFile: true };
-            unsafe {
-                SetFileInformationByHandle(
-                    self.file.as_raw_handle() as _,
-                    FileDispositionInfo,
-                    &info as *const _ as *const _,
-                    std::mem::size_of::<FILE_DISPOSITION_INFO>() as u32,
-                );
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            let _ = std::fs::remove_file(&self.path);
+        dispose(&self.file, &self.path);
+        if let Some((file, _)) = &self.signature {
+            dispose(file, &signature_path(&self.path));
         }
     }
 }
@@ -905,5 +964,51 @@ mod tests {
         assert_eq!(summary.files.len(), 2);
         assert_eq!(summary.files[0].0, one);
         assert_eq!(summary.files[0].1, first);
+    }
+
+    /// A stand-in checksum: the running sum of the bytes, as 8 bytes.
+    struct Sum(u64);
+
+    impl RunningMac for Sum {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            self.0 = bytes
+                .iter()
+                .fold(self.0, |sum, byte| sum + u64::from(*byte));
+            Ok(self.0.to_be_bytes().to_vec())
+        }
+    }
+
+    #[test]
+    fn the_signature_always_covers_exactly_what_is_on_disk() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer.sign_with(Box::new(Sum(0))).unwrap();
+        let sig = signature_path(writer.path());
+        for text in [
+            "Windows Registry Editor Version 5.00\r\n",
+            "; entry 1\r\n",
+            "[HKEY_X]\r\n",
+        ] {
+            writer.append(text).unwrap();
+            let bytes = std::fs::read(writer.path()).unwrap();
+            let sum: u64 = bytes.iter().map(|byte| u64::from(*byte)).sum();
+            assert_eq!(
+                std::fs::read_to_string(&sig).unwrap(),
+                signature_text(&sum.to_be_bytes())
+            );
+        }
+        // Too late to start signing once written.
+        assert!(writer.sign_with(Box::new(Sum(0))).is_err());
+        let path = writer.path().to_path_buf();
+        drop(writer);
+        // An unused signed reservation leaves neither file behind.
+        let mut unused = BackupWriter::reserve(&dir, "unused").unwrap();
+        unused.sign_with(Box::new(Sum(0))).unwrap();
+        let unused_path = unused.path().to_path_buf();
+        unused.discard();
+        let left = (unused_path.exists(), signature_path(&unused_path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(path.ends_with("signed.reg"));
+        assert_eq!(left, (false, false));
     }
 }

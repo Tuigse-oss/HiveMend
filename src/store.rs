@@ -339,14 +339,23 @@ fn restore_one(
     Ok(true)
 }
 
-/// Restore a backup end to end: read it through a checked handle, import an
-/// exact snapshot of the checked bytes with `reg.exe`, then put back its
+/// Restore a backup end to end: read it through a checked handle (as
+/// administrator, only a backup whose signature matches those exact
+/// bytes), apply it in one registry transaction, then put back its
 /// confined shortcut copies.
 #[cfg(windows)]
 pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>), String> {
     let elevated = elevated();
     let mut fs = crate::fs::HostFs;
     let (real, bytes) = read_restorable(&mut fs, file, elevated)?;
+    if elevated {
+        signed::verify(&mut fs, &real, &bytes).map_err(|why| {
+            format!(
+                "{} is not restored with administrator rights: {why}",
+                file.display()
+            )
+        })?;
+    }
     let text = crate::rules::decode_text_owned(bytes);
     if !is_hive_mend_backup(&text) {
         return Err(format!(
@@ -376,6 +385,301 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
     let (files, mut errors) = restore_files(&mut fs, &real, &summary);
     errors.extend(notes);
     Ok((applied, files, errors))
+}
+
+/// Start keeping a signature for a backup an administrator window is about
+/// to write in the protected store; a normal window's backups are left
+/// unsigned. Fails, so the caller writes and changes nothing, when the
+/// signature cannot be kept.
+#[cfg(windows)]
+pub fn sign_protected(writer: &mut crate::backup::BackupWriter) -> Result<(), String> {
+    if !elevated() {
+        return Ok(());
+    }
+    let fs = crate::fs::HostFs;
+    let real = fs
+        .pin(&writer.path().display().to_string())
+        .map(|pin| pin.real_path)
+        .map_err(|err| format!("{}: {err}", writer.path().display()))?;
+    if store_of(&fs, &real) != Store::Protected {
+        return Err(format!(
+            "{} is not in the protected backup store",
+            writer.path().display()
+        ));
+    }
+    let mac = signed::Hmac::new(&signed::key()?)?;
+    writer
+        .sign_with(Box::new(mac))
+        .map_err(|err| format!("could not start its signature: {err}"))
+}
+
+/// Administrator backups are signed with HMAC-SHA256 under a key that only
+/// SYSTEM and Administrators can read, kept in the protected store. The
+/// signature file sits beside the backup, where only administrators can
+/// write. An elevated restore accepts a backup only when the signature
+/// matches the exact bytes it read.
+#[cfg(windows)]
+mod signed {
+    use super::{ItemKind, Path, check_owner_and_dacl};
+    use crate::fs::{Access, FileView};
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_HASH_HANDLE, BCRYPT_HMAC_SHA256_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        BCryptCreateHash, BCryptDestroyHash, BCryptDuplicateHash, BCryptFinishHash,
+        BCryptGenRandom, BCryptHashData,
+    };
+
+    const KEY_FILE: &str = "backup.key";
+    const KEY_LEN: usize = 32;
+    /// Owner Administrators; only SYSTEM and Administrators, nothing
+    /// inherited: nobody else can read it.
+    const KEY_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+    const READ_BITS: u32 = 0x0000_0001 // read data
+        | 0x8000_0000; // generic read
+
+    pub struct Hmac(BCRYPT_HASH_HANDLE);
+
+    impl Hmac {
+        pub fn new(key: &[u8]) -> Result<Self, String> {
+            let mut hash: BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            let status = unsafe {
+                BCryptCreateHash(
+                    BCRYPT_HMAC_SHA256_ALG_HANDLE,
+                    &mut hash,
+                    std::ptr::null_mut(),
+                    0,
+                    key.as_ptr(),
+                    key.len() as u32,
+                    0,
+                )
+            };
+            if status < 0 {
+                return Err(format!("could not start a signature ({status:#x})"));
+            }
+            Ok(Self(hash))
+        }
+
+        fn add(&mut self, bytes: &[u8]) -> Result<(), String> {
+            for chunk in bytes.chunks(1 << 30) {
+                let status =
+                    unsafe { BCryptHashData(self.0, chunk.as_ptr(), chunk.len() as u32, 0) };
+                if status < 0 {
+                    return Err(format!("could not sign ({status:#x})"));
+                }
+            }
+            Ok(())
+        }
+
+        /// The checksum so far, leaving this one running.
+        fn current(&self) -> Result<Vec<u8>, String> {
+            let mut copy: BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            let status =
+                unsafe { BCryptDuplicateHash(self.0, &mut copy, std::ptr::null_mut(), 0, 0) };
+            if status < 0 {
+                return Err(format!("could not sign ({status:#x})"));
+            }
+            let mut out = vec![0u8; 32];
+            let status = unsafe { BCryptFinishHash(copy, out.as_mut_ptr(), 32, 0) };
+            unsafe { BCryptDestroyHash(copy) };
+            if status < 0 {
+                return Err(format!("could not sign ({status:#x})"));
+            }
+            Ok(out)
+        }
+    }
+
+    // The hash handle is owned by this value alone and used by one thread
+    // at a time, which BCrypt allows.
+    unsafe impl Send for Hmac {}
+
+    impl Drop for Hmac {
+        fn drop(&mut self) {
+            unsafe { BCryptDestroyHash(self.0) };
+        }
+    }
+
+    impl crate::backup::RunningMac for Hmac {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            self.add(bytes)?;
+            self.current()
+        }
+    }
+
+    /// The signing key: read from the protected store, or made there the
+    /// first time. Refused unless only SYSTEM and Administrators can read
+    /// or change it.
+    pub fn key() -> Result<Vec<u8>, String> {
+        key_in(&root()?)
+    }
+
+    fn root() -> Result<std::path::PathBuf, String> {
+        let root = super::protected_dir(&crate::fs::HostFs)
+            .ok_or("could not locate the ProgramData folder")?;
+        super::ensure_protected(&root)?;
+        Ok(root)
+    }
+
+    /// The key kept in the protected folder `root`.
+    pub fn key_in(root: &Path) -> Result<Vec<u8>, String> {
+        let path = root.join(KEY_FILE);
+        if let Err(err) = create_key(&path)
+            && err.raw_os_error() != Some(80)
+        {
+            return Err(format!("could not make the signing key: {err}"));
+        }
+        read_key(&path)
+    }
+
+    /// Make a new key file with its own security. Fails with "file exists"
+    /// (os error 80) when there already is one.
+    fn create_key(path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let mut key = vec![0u8; KEY_LEN];
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                key.as_mut_ptr(),
+                KEY_LEN as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::other(format!(
+                "no random bytes ({status:#x})"
+            )));
+        }
+        let sddl: Vec<u16> = KEY_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = path
+            .display()
+            .to_string()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attrs,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let err = std::io::Error::last_os_error();
+        unsafe { LocalFree(sd as _) };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(err);
+        }
+        let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        let written = file.write_all(&key).and_then(|()| file.sync_all());
+        if written.is_err() {
+            crate::fs::host_dispose(&file);
+        }
+        written
+    }
+
+    fn read_key(path: &Path) -> Result<Vec<u8>, String> {
+        let shown = path.display().to_string();
+        let mut fs = crate::fs::HostFs;
+        let mut pin = fs.pin(&shown).map_err(|err| format!("{shown}: {err}"))?;
+        if pin.kind != ItemKind::File || pin.links != 1 || pin.len != KEY_LEN as u64 {
+            return Err(format!("{shown} is not a Hivemend signing key"));
+        }
+        let handle = pin.raw_handle().ok_or("not a host handle")?;
+        super::check_handle_security(handle, &shown, None, READ_BITS)?;
+        fs.pin_acquire(&mut pin, Access::Read)?;
+        fs.pin_read_at(&pin, 0, KEY_LEN)
+            .filter(|bytes| bytes.len() == KEY_LEN)
+            .ok_or_else(|| format!("could not read {shown}"))
+    }
+
+    /// The signature beside `real` must be in the protected store, owned
+    /// and writable only by administrators, and match `bytes` exactly.
+    pub fn verify(fs: &mut dyn FileView, real: &str, bytes: &[u8]) -> Result<(), String> {
+        verify_in(fs, &root()?, real, bytes)
+    }
+
+    /// [`verify`] against the protected folder `root` and its key.
+    pub fn verify_in(
+        fs: &mut dyn FileView,
+        root: &Path,
+        real: &str,
+        bytes: &[u8],
+    ) -> Result<(), String> {
+        let sig_path = crate::backup::signature_path(Path::new(real))
+            .display()
+            .to_string();
+        let mut pin = match fs.pin(&sig_path) {
+            Ok(pin) => pin,
+            Err(err) if err.contains("os error 2") => {
+                return Err(
+                    "it has no Hivemend signature. Administrator backups are signed from this \
+                     version on; an older one can still be opened in Registry Editor if you \
+                     trust it"
+                        .into(),
+                );
+            }
+            Err(err) => return Err(format!("its signature: {err}")),
+        };
+        if pin.kind != ItemKind::File || pin.links != 1 || pin.len != 64 {
+            return Err("its signature file is not one Hivemend wrote".into());
+        }
+        let store = root.join("backups").display().to_string();
+        if !crate::pathutil::path_under(&pin.real_path, &store) {
+            return Err("its signature is not in the protected store".into());
+        }
+        check_owner_and_dacl(&pin, &sig_path)?;
+        fs.pin_acquire(&mut pin, Access::Read)?;
+        let stored = fs
+            .pin_read_at(&pin, 0, 64)
+            .filter(|text| text.len() == 64)
+            .ok_or("could not read its signature")?;
+        let mut mac = Hmac::new(&key_in(root)?)?;
+        mac.add(bytes)?;
+        let expected = crate::backup::signature_text(&mac.current()?);
+        // Compared in full, whatever differs first.
+        let differs = stored
+            .iter()
+            .zip(expected.as_bytes())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+        if differs != 0 {
+            return Err("its signature does not match its contents (it was changed after Hivemend wrote it, or not written by Hivemend)".into());
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub fn mac_of(key: &[u8], bytes: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::new(key).unwrap();
+        mac.add(bytes).unwrap();
+        mac.current().unwrap()
+    }
 }
 
 /// The operations this window may apply, and notes on what is left for the
@@ -519,6 +823,18 @@ pub(crate) fn check_handle_owner_and_dacl(
     shown: &str,
     also: Option<&str>,
 ) -> Result<(), String> {
+    check_handle_security(handle, shown, also, 0)
+}
+
+/// [`check_handle_owner_and_dacl`], also refusing any untrusted entry that
+/// grants one of `also_bits` (for a secret, the right to read it).
+#[cfg(windows)]
+fn check_handle_security(
+    handle: std::os::windows::io::RawHandle,
+    shown: &str,
+    also: Option<&str>,
+    also_bits: u32,
+) -> Result<(), String> {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{
         ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
@@ -598,7 +914,7 @@ pub(crate) fn check_handle_owner_and_dacl(
                 continue;
             }
             let mask = unsafe { *((ace as *const u8).add(4) as *const u32) };
-            if mask & WRITE_BITS == 0 {
+            if mask & (WRITE_BITS | also_bits) == 0 {
                 continue;
             }
             // Plain and callback allow entries carry the SID right after the
@@ -924,6 +1240,89 @@ mod live_tests {
             "{errors:?}"
         );
         assert!(!landed, "a file landed outside its place");
+    }
+
+    #[test]
+    fn live_the_signature_is_hmac_sha256() {
+        // RFC 4231, test case 2.
+        let mac = signed::mac_of(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            crate::backup::signature_text(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// Runs only elevated (it skips otherwise), in a scratch protected
+    /// folder under ProgramData made exactly as the store is.
+    #[test]
+    fn live_elevated_only_a_signed_unchanged_backup_verifies() {
+        if !elevated() {
+            eprintln!("skipped: needs an elevated test run");
+            return;
+        }
+        let data = crate::fs::host_known_dir(KnownDir::ProgramData).unwrap();
+        let root = Path::new(&data).join(format!("HiveMendSigTest{}", std::process::id()));
+        let backups = root.join("backups");
+        let result = (|| -> Result<(), String> {
+            ensure_protected(&root)?;
+            ensure_protected(&backups)?;
+            let key = signed::key_in(&root)?;
+            // The same key comes back the second time.
+            assert_eq!(signed::key_in(&root)?, key);
+            let mut writer = crate::backup::BackupWriter::reserve(&backups, "signed")
+                .map_err(|err| err.to_string())?;
+            writer
+                .sign_with(Box::new(signed::Hmac::new(&key)?))
+                .map_err(|err| err.to_string())?;
+            writer
+                .append("Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n")
+                .map_err(|err| err.to_string())?;
+            writer
+                .append("\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\HmSigTest]\r\n")
+                .map_err(|err| err.to_string())?;
+            let path = writer.path().to_path_buf();
+            drop(writer);
+            let mut fs = crate::fs::HostFs;
+            let real = fs
+                .pin(&path.display().to_string())
+                .map_err(|err| err.to_string())?
+                .real_path;
+            let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+            // Unchanged: accepted.
+            signed::verify_in(&mut fs, &root, &real, &bytes)?;
+            // One byte changed: refused.
+            let mut changed = bytes.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            let err = signed::verify_in(&mut fs, &root, &real, &changed).unwrap_err();
+            assert!(err.contains("does not match"), "{err}");
+            // A file with the marker that Hivemend did not write: refused.
+            let forged = backups.join("forged.reg");
+            std::fs::write(&forged, &bytes).map_err(|err| err.to_string())?;
+            let forged_real = fs
+                .pin(&forged.display().to_string())
+                .map_err(|err| err.to_string())?
+                .real_path;
+            let err = signed::verify_in(&mut fs, &root, &forged_real, &bytes).unwrap_err();
+            assert!(err.contains("no Hivemend signature"), "{err}");
+            // ...also with a made-up signature beside it.
+            std::fs::write(crate::backup::signature_path(&forged), "0".repeat(64))
+                .map_err(|err| err.to_string())?;
+            let err = signed::verify_in(&mut fs, &root, &forged_real, &bytes).unwrap_err();
+            assert!(err.contains("does not match"), "{err}");
+            // A key file anyone may read is refused.
+            let open_root = root.join("open");
+            ensure_protected(&open_root)?;
+            std::fs::write(open_root.join("backup.key"), [7u8; 32])
+                .map_err(|err| err.to_string())?;
+            let err = signed::key_in(&open_root).unwrap_err();
+            assert!(
+                err.contains("lets S-1-5-32-545") || err.contains("lets"),
+                "{err}"
+            );
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&root);
+        result.expect("signed backup round trip");
     }
 
     /// Runs only elevated (it skips otherwise): creates a scratch protected

@@ -7557,8 +7557,14 @@ fn next_backup_file_with(prefix: &str) -> Option<hive_mend::BackupWriter> {
         )
     };
     // Reserved by creating it, and written only through this handle. None
-    // when nothing could be reserved: the caller then changes nothing.
-    hive_mend::BackupWriter::reserve(&dir, &format!("{prefix}-{stamp}")).ok()
+    // when nothing could be reserved, or (as administrator) its signature
+    // could not be kept: the caller then changes nothing.
+    let mut writer = hive_mend::BackupWriter::reserve(&dir, &format!("{prefix}-{stamp}")).ok()?;
+    if hive_mend::sign_protected(&mut writer).is_err() {
+        writer.discard();
+        return None;
+    }
+    Some(writer)
 }
 
 // ---- Win32 helpers -----------------------------------------------------
