@@ -5848,15 +5848,22 @@ impl App {
         y += self.s(36);
         let tiles = [
             (Icon::Privacy, "Privacy", Action::Page(Page::Privacy)),
+            (Icon::Startup, "Startup", Action::Page(Page::Startup)),
+            (Icon::Programs, "Programs", Action::Page(Page::Programs)),
+            (Icon::DiskSpace, "Disk Space", Action::Page(Page::DiskSpace)),
+            (
+                Icon::Duplicates,
+                "Duplicates",
+                Action::Page(Page::Duplicates),
+            ),
             (Icon::Optimize, "Services", Action::Page(Page::Services)),
             (Icon::Scan, "Quick Scan", Action::Optimize),
             (Icon::Monitor, "Monitor", Action::Page(Page::Monitor)),
             (Icon::Restore, "Restore", Action::Page(Page::Restore)),
-            (Icon::Tools, "Windows Tools", Action::Page(Page::Tools)),
         ];
-        let gap = self.s(14);
+        let gap = self.s(12);
         let tile_w = (right - left - gap * 2) / 3;
-        let tile_h = self.s(104);
+        let tile_h = self.s(84);
         for (index, (icon, label, action)) in tiles.into_iter().enumerate() {
             let column = (index % 3) as i32;
             let row = (index / 3) as i32;
@@ -5877,12 +5884,12 @@ impl App {
                 1,
                 BG,
             );
-            let icon_px = self.s(48);
+            let icon_px = self.s(40);
             self.draw_icon(
                 hdc,
                 icon,
                 tile.left + (tile_w - icon_px) / 2,
-                tile.top + self.s(14),
+                tile.top + self.s(10),
                 icon_px,
             );
             text(
@@ -5891,7 +5898,7 @@ impl App {
                 if disabled { MUTED } else { INK },
                 RECT {
                     left: tile.left + self.s(6),
-                    top: tile.top + self.s(14) + icon_px + self.s(8),
+                    top: tile.top + self.s(10) + icon_px + self.s(6),
                     right: tile.right - self.s(6),
                     bottom: tile.bottom - self.s(6),
                 },
@@ -5900,7 +5907,7 @@ impl App {
             );
             self.spot(tile, action);
         }
-        y += tile_h * 2 + gap + self.s(18);
+        y += tile_h * 3 + gap * 2 + self.s(18);
 
         // Statistics, quietly.
         let rows = self.summary_rows();

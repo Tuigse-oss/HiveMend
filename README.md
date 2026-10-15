@@ -91,9 +91,9 @@ Monitor, Tools, Settings, and About.
 
 - Home leads with the registry's status (healthy, stale entries found, or
   not scanned yet) and a Scan now button, then tiles for Privacy,
-  Services, Quick Scan (a fast startup, uninstall, shared-DLL, and COM
-  pass), Monitor, Restore, and Windows Tools, and a line of statistics
-  with a reset link.
+  Startup, Programs, Disk Space, Duplicates, Services, Quick Scan (a fast
+  startup, uninstall, shared-DLL, and COM pass), Monitor, and Restore,
+  and a line of statistics with a reset link.
 - Repairs run as administrator first ask Windows for a System Restore
   point ("Hivemend repair"), on top of Hivemend's own `.reg` backup. It
   needs System Protection turned on for the system drive, and Windows
