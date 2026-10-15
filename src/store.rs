@@ -385,6 +385,7 @@ pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>)
         files: summary.files.clone(),
         machine_wide: elevated && keys > 0,
         per_user: !elevated && keys > 0,
+        unconfirmed: summary.unconfirmed.clone(),
     };
     let (files, mut errors) = restore_files(&mut fs, &real, &summary);
     errors.extend(notes);

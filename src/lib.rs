@@ -74,7 +74,7 @@ pub use privacy::{
     uninstall_present,
 };
 pub use programs::{InstalledProgram, Launch, ProgramScope, list_programs, uninstall_launch};
-pub use regfile::{ParsedBackup, RegOp, apply_ops, parse_backup};
+pub use regfile::{FORMAT_2, ParsedBackup, RegOp, apply_ops, parse_backup};
 pub use registry::{MemoryRegistry, RegTransaction, Registry};
 pub use rules::decode_text_owned;
 pub use services::{

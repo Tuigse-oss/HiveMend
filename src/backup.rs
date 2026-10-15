@@ -738,6 +738,10 @@ pub struct BackupSummary {
     pub machine_wide: bool,
     /// Restoring writes to HKEY_CURRENT_USER.
     pub per_user: bool,
+    /// Entries saved but never confirmed as removed (a repair that stopped
+    /// part way), by number and first key: never restored automatically,
+    /// their data stays in the file for manual recovery.
+    pub unconfirmed: Vec<(usize, String)>,
 }
 
 impl BackupSummary {
@@ -748,6 +752,7 @@ impl BackupSummary {
         use crate::regfile::RegOp;
         let mut summary = Self::default();
         if let Ok(parsed) = crate::regfile::parse_backup(text) {
+            summary.unconfirmed = parsed.unconfirmed.clone();
             for op in &parsed.ops {
                 match op {
                     RegOp::CreateKey(_) | RegOp::DeleteKey(_) => summary.keys += 1,
@@ -804,9 +809,17 @@ pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
             continue;
         }
         let meta = entry.metadata().ok();
-        let summary = read_backup(&path)
-            .map(|text| BackupSummary::parse(&text))
-            .unwrap_or_default();
+        // A file larger than any restore accepts is not even read.
+        let summary = if meta
+            .as_ref()
+            .is_some_and(|meta| meta.len() <= MAX_BACKUP_BYTES)
+        {
+            read_backup(&path)
+                .map(|text| BackupSummary::parse(&text))
+                .unwrap_or_default()
+        } else {
+            BackupSummary::default()
+        };
         found.push(BackupInfo {
             store,
             modified: meta.as_ref().and_then(|meta| meta.modified().ok()),

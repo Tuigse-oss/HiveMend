@@ -12,7 +12,7 @@
 #![allow(unsafe_op_in_unsafe_fn)]
 
 use std::collections::{HashMap, VecDeque};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -88,6 +88,8 @@ const WM_RELAYOUT: u32 = WM_APP + 3;
 const WM_REDO: u32 = WM_APP + 4;
 /// Apply a popup-menu choice made after its handler returned.
 const WM_MENU_PICKED: u32 = WM_APP + 5;
+/// The backup list was read in the background.
+const WM_BACKUPS_READY: u32 = WM_APP + 6;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -371,6 +373,9 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
     text: String::new(),
 });
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
+/// The newest backup listing and the refresh it answers.
+static BACKUPS: Mutex<Option<(u64, Vec<BackupInfo>)>> = Mutex::new(None);
+static BACKUP_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 // Reentrancy guard for the window procedure. Synchronous dispatches
@@ -394,6 +399,7 @@ const DEFER_DONE: u32 = 2;
 const DEFER_CLOSE: u32 = 4;
 const DEFER_LAYOUT: u32 = 8;
 const DEFER_PAINT: u32 = 16;
+const DEFER_BACKUPS: u32 = 32;
 
 // Native modal UI (message boxes, confirmations, popup menus, the UAC
 // relaunch) never runs inside a handler. A handler queues it here and
@@ -667,6 +673,7 @@ unsafe extern "system" fn wnd_proc(
         }
         let app = &mut *window_app(hwnd);
         app.sync_controls();
+        app.refresh_backups();
         drop(_guard);
         flush_deferred(hwnd);
         return 0;
@@ -790,6 +797,16 @@ unsafe extern "system" fn wnd_proc(
                 app.show_progress();
                 0
             }
+            WM_BACKUPS_READY => {
+                let newest = BACKUP_REFRESH.load(Ordering::SeqCst);
+                if let Some((refresh, list)) = BACKUPS.lock().ok().and_then(|mut slot| slot.take())
+                    && refresh == newest
+                {
+                    app.backups = list;
+                    app.fill_backups();
+                }
+                0
+            }
             WM_JOB_DONE => {
                 if let Some(result) = RESULT.lock().ok().and_then(|mut slot| slot.take()) {
                     app.finish(result);
@@ -870,6 +887,7 @@ fn app_handles(msg: u32) -> bool {
             | WM_CTLCOLORBTN
             | WM_JOB_PROGRESS
             | WM_JOB_DONE
+            | WM_BACKUPS_READY
             | WM_REDO
             | WM_MENU_PICKED
             | WM_CLOSE
@@ -893,6 +911,7 @@ fn nested_reply(msg: u32) -> (u32, NestedReply) {
     match msg {
         WM_JOB_PROGRESS => (DEFER_PROGRESS, NestedReply::Handled),
         WM_JOB_DONE => (DEFER_DONE, NestedReply::Handled),
+        WM_BACKUPS_READY => (DEFER_BACKUPS, NestedReply::Handled),
         WM_CLOSE => (DEFER_CLOSE, NestedReply::Handled),
         WM_SIZE | WM_DPICHANGED | WM_RELAYOUT => (DEFER_LAYOUT, NestedReply::Default),
         WM_PAINT => (DEFER_PAINT, NestedReply::Default),
@@ -912,6 +931,9 @@ fn deferred_messages(bits: u32) -> Vec<u32> {
     }
     if bits & DEFER_DONE != 0 {
         out.push(WM_JOB_DONE);
+    }
+    if bits & DEFER_BACKUPS != 0 {
+        out.push(WM_BACKUPS_READY);
     }
     if bits & DEFER_CLOSE != 0 {
         out.push(WM_CLOSE);
@@ -1107,7 +1129,8 @@ impl App {
             } else {
                 Exclusions::load(&exclusions_file())
             },
-            backups: all_backups(),
+            // Read in the background once the window exists.
+            backups: Vec::new(),
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -4460,9 +4483,22 @@ impl App {
 
     // ---- restore -------------------------------------------------------
 
+    /// Read the backup list off the window's thread (each file is read and
+    /// parsed), and show it when it arrives; a later refresh supersedes an
+    /// earlier one still running.
     fn refresh_backups(&mut self) {
-        self.backups = all_backups();
-        self.fill_backups();
+        let refresh = BACKUP_REFRESH.fetch_add(1, Ordering::SeqCst) + 1;
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let list = all_backups();
+            if BACKUP_REFRESH.load(Ordering::SeqCst) != refresh {
+                return;
+            }
+            if let Ok(mut slot) = BACKUPS.lock() {
+                *slot = Some((refresh, list));
+            }
+            post(hwnd, WM_BACKUPS_READY);
+        });
     }
 
     fn fill_backups(&self) {
@@ -4496,15 +4532,8 @@ impl App {
         let Some(backup) = self.backups.get(row).cloned() else {
             return;
         };
-        // Only the protected store is trusted by an elevated instance. Other
-        // folders can be changed by other accounts or by this account's
-        // non-elevated programs, so their backups restore only without
-        // elevation, which can change only this account's own entries.
-        if self.elevated && !backup.summary.machine_wide {
-            self.message(
-                "This backup only holds entries for your own account. Restore it from Hivemend started without administrator rights.",
-                MB_ICONINFORMATION,
-            );
+        if let Some(text) = restore_block(&backup.summary, &backup.path, self.elevated) {
+            self.message(&text, MB_ICONINFORMATION);
             return;
         }
         if self.elevated && !backup.store.elevated_may_restore() {
@@ -7402,6 +7431,43 @@ fn find_path(text: &str) -> Option<usize> {
     })
 }
 
+/// Why the Restore button does nothing for this backup in this window, if
+/// it does nothing. A backup holding only entries a repair never confirmed
+/// explains how to recover them by hand instead of offering a restore, in
+/// either window. An elevated window restores only machine-wide entries
+/// (from the protected store, as checked later); one holding only entries
+/// for the account points to a normal window.
+fn restore_block(summary: &BackupSummary, path: &Path, elevated: bool) -> Option<String> {
+    let restorable = summary.keys + summary.values + summary.files.len();
+    if restorable == 0 && !summary.unconfirmed.is_empty() {
+        let mut lines: Vec<String> = summary
+            .unconfirmed
+            .iter()
+            .take(10)
+            .map(|(entry, key)| format!("entry {entry}: {key}"))
+            .collect();
+        if summary.unconfirmed.len() > 10 {
+            lines.push(format!("...and {} more", summary.unconfirmed.len() - 10));
+        }
+        return Some(format!(
+            "This backup holds only entries the repair never confirmed as removed (it stopped while saving them), so Hivemend does not put them back by itself:\n\n{}\n\nTheir saved data is still in {}. If one is missing from the registry, you can open that file in Notepad, check the entry, and add it back with Registry Editor.",
+            lines.join("\n"),
+            path.display()
+        ));
+    }
+    // Only the protected store is trusted by an elevated instance. Other
+    // folders can be changed by other accounts or by this account's
+    // non-elevated programs, so their backups restore only without
+    // elevation, which can change only this account's own entries.
+    if elevated && !summary.machine_wide {
+        return Some(
+            "This backup only holds entries for your own account. Restore it from Hivemend started without administrator rights."
+                .into(),
+        );
+    }
+    None
+}
+
 fn contents(summary: &BackupSummary) -> String {
     let mut parts = Vec::new();
     if summary.keys > 0 {
@@ -7412,6 +7478,12 @@ fn contents(summary: &BackupSummary) -> String {
     }
     if !summary.files.is_empty() {
         parts.push(plural(summary.files.len(), "shortcut"));
+    }
+    if !summary.unconfirmed.is_empty() {
+        parts.push(match summary.unconfirmed.len() {
+            1 => "1 entry needing manual recovery".to_string(),
+            count => format!("{count} entries needing manual recovery"),
+        });
     }
     if parts.is_empty() {
         "nothing that can be restored".into()
@@ -8135,6 +8207,38 @@ mod tests {
             self.looks += 1;
             Some(std::time::SystemTime::now())
         }
+    }
+
+    #[test]
+    fn a_backup_of_only_unconfirmed_entries_explains_manual_recovery() {
+        let text = format!(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n{}\r\n\r\n; entry 1\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\HmStale]\r\n\"x\"=\"1\"\r\n",
+            hive_mend::FORMAT_2
+        );
+        let summary = BackupSummary::parse(&text);
+        assert_eq!(summary.unconfirmed.len(), 1);
+        let path = Path::new(r"C:\ProgramData\HiveMend\backups\hive-mend-1.reg");
+        for elevated in [true, false] {
+            let text = restore_block(&summary, path, elevated).expect("explained");
+            assert!(text.contains("never confirmed"), "{text}");
+            assert!(
+                text.contains(r"HKEY_LOCAL_MACHINE\SOFTWARE\HmStale"),
+                "{text}"
+            );
+            assert!(text.contains("hive-mend-1.reg"), "{text}");
+            assert!(!text.contains("your own account"), "wrong scope: {text}");
+        }
+        assert!(contents(&summary).contains("manual recovery"));
+        // A per-user backup in an elevated window still points elsewhere.
+        let user = BackupSummary::parse(
+            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\X]\r\n\"x\"=\"1\"\r\n",
+        );
+        assert!(
+            restore_block(&user, path, true)
+                .unwrap()
+                .contains("your own account")
+        );
+        assert!(restore_block(&user, path, false).is_none());
     }
 
     #[test]
