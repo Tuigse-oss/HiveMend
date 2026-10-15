@@ -523,6 +523,12 @@ fn on_local_fixed_drive(path: &str) -> bool {
     !path.starts_with("\\\\")
 }
 
+/// Where an open file really is, from its handle, as a drive path.
+#[cfg(windows)]
+pub(crate) fn host_final_path(file: &std::fs::File) -> Result<String, String> {
+    host::final_path(file)
+}
+
 /// A system folder from the Windows APIs: the Windows and System32 folders
 /// from `GetSystemWindowsDirectoryW`/`GetSystemDirectoryW`, the rest from
 /// `SHGetKnownFolderPath`. None of them read the environment. `None` unless
@@ -895,7 +901,7 @@ mod host {
 
     /// The handle's own path as Windows resolves it, as a plain `X:\...`
     /// path. A network or volume-GUID answer is refused.
-    fn final_path(file: &std::fs::File) -> Result<String, String> {
+    pub(crate) fn final_path(file: &std::fs::File) -> Result<String, String> {
         let mut buf = vec![0u16; 1024];
         loop {
             let len = unsafe {

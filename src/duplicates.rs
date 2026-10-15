@@ -21,6 +21,31 @@ pub trait ContentReader {
     fn fingerprint(&self, path: &str, limit: Option<u64>) -> Result<(FileId, u64, u128), String>;
     /// True when both files hold exactly the same bytes.
     fn same_content(&self, a: &str, b: &str) -> Result<bool, String>;
+    /// Hold the file open: while the result lives, other programs cannot
+    /// write to it, and when `keep` is set (the copy being kept) cannot
+    /// delete or rename it either.
+    fn hold(&self, path: &str, keep: bool) -> Result<Held, String>;
+}
+
+/// A file held open by [`ContentReader::hold`], with what was learned
+/// through its handle.
+pub struct Held {
+    /// Where the file really is, from the open handle.
+    pub real_path: String,
+    /// It has named data streams besides the download marker
+    /// (Zone.Identifier), which a byte compare does not cover.
+    pub extra_streams: bool,
+    _guard: Box<dyn std::any::Any>,
+}
+
+impl Held {
+    pub fn new(real_path: String, extra_streams: bool, guard: Box<dyn std::any::Any>) -> Self {
+        Self {
+            real_path,
+            extra_streams,
+            _guard: guard,
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -185,14 +210,19 @@ pub fn find_duplicates(
     report
 }
 
-/// Check, just before removing, which of `remove` (indexes into the set's
-/// files) may go. Every removal needs a kept copy whose bytes it still
-/// matches. Returns each path with the reason it must stay, if any.
-pub fn check_removal(
+/// Remove `remove` (indexes into the set's files) with `recycle`, checking
+/// each file just before: a copy of the set is kept and held open (so it
+/// cannot change or go away meanwhile), each file to remove is held open
+/// against writes from its check until it is moved, its real location must
+/// be outside the protected folders, it must not be the kept copy under
+/// another name, it must have no extra data streams, and its bytes must
+/// still match the kept copy. Returns each path with what happened.
+pub fn remove_checked(
     reader: &dyn ContentReader,
     group: &DupGroup,
     remove: &[usize],
     protected: &[String],
+    recycle: &mut dyn FnMut(&str) -> Result<(), String>,
 ) -> Vec<(String, Result<(), String>)> {
     let kept: Vec<&String> = group
         .files
@@ -201,12 +231,11 @@ pub fn check_removal(
         .filter(|(index, _)| !remove.contains(index))
         .map(|(_, path)| path)
         .collect();
+    // The first kept copy that can be held and still has the set's size.
     let keeper = kept.iter().find_map(|path| {
-        reader
-            .fingerprint(path, Some(0))
-            .ok()
-            .filter(|(_, len, _)| *len == group.bytes)
-            .map(|(id, _, _)| (*path, id))
+        let held = reader.hold(path, true).ok()?;
+        let (id, len, _) = reader.fingerprint(path, Some(0)).ok()?;
+        (len == group.bytes).then_some((*path, id, held))
     });
     let mut out = Vec::new();
     for index in remove {
@@ -214,8 +243,9 @@ pub fn check_removal(
             continue;
         };
         let verdict = (|| {
-            let (keep_path, keep_id) =
-                keeper.ok_or("no copy of this set is being kept, or the kept copy changed")?;
+            let (keep_path, keep_id, _) = keeper
+                .as_ref()
+                .ok_or("no copy of this set is being kept, or the kept copy changed")?;
             let bytes = path.as_bytes();
             let plain = bytes.len() > 3
                 && bytes[0].is_ascii_alphabetic()
@@ -229,8 +259,23 @@ pub fn check_removal(
             if protected.iter().any(|root| path_under(path, root)) {
                 return Err("inside a protected Windows or program folder".to_string());
             }
+            let held = reader.hold(path, false)?;
+            // The spelling can hide where it is (a SUBST drive, a junction
+            // in a parent folder): check the real location too.
+            if protected
+                .iter()
+                .any(|root| path_under(&held.real_path, root))
+            {
+                return Err(format!(
+                    "it is really in a protected folder ({})",
+                    held.real_path
+                ));
+            }
+            if held.extra_streams {
+                return Err("it has extra data streams a byte compare does not cover".to_string());
+            }
             let (id, len, _) = reader.fingerprint(path, Some(0))?;
-            if id == keep_id {
+            if id == *keep_id {
                 return Err("it is the kept copy under another name (a hard link)".to_string());
             }
             if len != group.bytes {
@@ -239,7 +284,10 @@ pub fn check_removal(
             if !reader.same_content(keep_path, path)? {
                 return Err("its contents no longer match the kept copy".to_string());
             }
-            Ok(())
+            // Still held against writes: what was compared is what goes.
+            let moved = recycle(path);
+            drop(held);
+            moved
         })();
         out.push((path.clone(), verdict));
     }
@@ -254,12 +302,9 @@ pub struct HostContent;
 #[cfg(windows)]
 fn open_plain(path: &str) -> Result<(std::fs::File, FileId, u64), String> {
     use std::os::windows::fs::OpenOptionsExt;
-    use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
-        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
-        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_OPEN_REPARSE_POINT,
-        FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE,
-        GetFileInformationByHandle,
+        FILE_FLAG_OPEN_REPARSE_POINT, FILE_FLAG_SEQUENTIAL_SCAN, FILE_SHARE_DELETE,
+        FILE_SHARE_READ, FILE_SHARE_WRITE,
     };
     let file = std::fs::OpenOptions::new()
         .read(true)
@@ -267,6 +312,19 @@ fn open_plain(path: &str) -> Result<(std::fs::File, FileId, u64), String> {
         .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN)
         .open(path)
         .map_err(|err| err.to_string())?;
+    let (id, len) = check_plain(&file)?;
+    Ok((file, id, len))
+}
+
+/// Identity and length of an open file, refusing links, folders, and cloud
+/// placeholders.
+#[cfg(windows)]
+fn check_plain(file: &std::fs::File) -> Result<(FileId, u64), String> {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        BY_HANDLE_FILE_INFORMATION, FILE_ATTRIBUTE_DIRECTORY, FILE_ATTRIBUTE_RECALL_ON_DATA_ACCESS,
+        FILE_ATTRIBUTE_RECALL_ON_OPEN, FILE_ATTRIBUTE_REPARSE_POINT, GetFileInformationByHandle,
+    };
     let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
     if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
         return Err(std::io::Error::last_os_error().to_string());
@@ -283,11 +341,84 @@ fn open_plain(path: &str) -> Result<(std::fs::File, FileId, u64), String> {
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     );
     let len = (u64::from(info.nFileSizeHigh) << 32) | u64::from(info.nFileSizeLow);
-    Ok((file, id, len))
+    Ok((id, len))
+}
+
+/// Named data streams besides the main one and the download marker.
+#[cfg(windows)]
+fn has_extra_streams(path: &str) -> Result<bool, String> {
+    use windows_sys::Win32::Foundation::{ERROR_HANDLE_EOF, GetLastError, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::Storage::FileSystem::{
+        FindClose, FindFirstStreamW, FindNextStreamW, FindStreamInfoStandard,
+        WIN32_FIND_STREAM_DATA,
+    };
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut data: WIN32_FIND_STREAM_DATA = unsafe { std::mem::zeroed() };
+    let handle = unsafe {
+        FindFirstStreamW(
+            wide.as_ptr(),
+            FindStreamInfoStandard,
+            &mut data as *mut _ as *mut _,
+            0,
+        )
+    };
+    if handle == INVALID_HANDLE_VALUE {
+        return if unsafe { GetLastError() } == ERROR_HANDLE_EOF {
+            Ok(false)
+        } else {
+            Err(std::io::Error::last_os_error().to_string())
+        };
+    }
+    let mut extra = false;
+    loop {
+        let len = data
+            .cStreamName
+            .iter()
+            .position(|unit| *unit == 0)
+            .unwrap_or(data.cStreamName.len());
+        let name = String::from_utf16_lossy(&data.cStreamName[..len]).to_ascii_lowercase();
+        if name != "::$data" && name != ":zone.identifier:$data" {
+            extra = true;
+            break;
+        }
+        if unsafe { FindNextStreamW(handle, &mut data as *mut _ as *mut _) } == 0 {
+            if unsafe { GetLastError() } != ERROR_HANDLE_EOF {
+                unsafe { FindClose(handle) };
+                return Err(std::io::Error::last_os_error().to_string());
+            }
+            break;
+        }
+    }
+    unsafe { FindClose(handle) };
+    Ok(extra)
 }
 
 #[cfg(windows)]
 impl ContentReader for HostContent {
+    fn hold(&self, path: &str, keep: bool) -> Result<Held, String> {
+        use std::os::windows::fs::OpenOptionsExt;
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_FLAG_OPEN_REPARSE_POINT, FILE_SHARE_DELETE, FILE_SHARE_READ,
+        };
+        // No FILE_SHARE_WRITE: nothing can change it while held. The kept
+        // copy also withholds FILE_SHARE_DELETE, so it cannot go away.
+        let share = if keep {
+            FILE_SHARE_READ
+        } else {
+            FILE_SHARE_READ | FILE_SHARE_DELETE
+        };
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(share)
+            .custom_flags(FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)
+            .map_err(|err| err.to_string())?;
+        check_plain(&file)?;
+        let real_path = crate::fs::host_final_path(&file)?;
+        let extra_streams = has_extra_streams(path)?;
+        Ok(Held::new(real_path, extra_streams, Box::new(file)))
+    }
+
     fn fingerprint(&self, path: &str, limit: Option<u64>) -> Result<(FileId, u64, u128), String> {
         use std::hash::Hasher;
         use std::io::Read;
@@ -372,6 +503,10 @@ mod tests {
         dirs: BTreeMap<String, Vec<DiskEntry>>,
         /// path -> (id, content)
         files: RefCell<HashMap<String, (FileId, Vec<u8>)>>,
+        /// alias prefix -> real prefix (a SUBST drive, a junction).
+        aliases: Vec<(String, String)>,
+        /// Files with extra data streams.
+        streams: Vec<String>,
     }
 
     impl World {
@@ -428,6 +563,37 @@ mod tests {
             let files = self.files.borrow();
             Ok(files.get(a).ok_or("missing")?.1 == files.get(b).ok_or("missing")?.1)
         }
+        fn hold(&self, path: &str, _keep: bool) -> Result<Held, String> {
+            if !self.files.borrow().contains_key(path) {
+                return Err("missing".into());
+            }
+            let real = self
+                .aliases
+                .iter()
+                .find_map(|(alias, real)| {
+                    path.strip_prefix(alias.as_str())
+                        .map(|rest| format!("{real}{rest}"))
+                })
+                .unwrap_or_else(|| path.to_string());
+            Ok(Held::new(
+                real,
+                self.streams.contains(&path.to_string()),
+                Box::new(()),
+            ))
+        }
+    }
+
+    /// Each path with what happened to it.
+    type Results = Vec<(String, Result<(), String>)>;
+
+    /// Remove with a recorder in place of the Recycle Bin.
+    fn remove(world: &World, group: &DupGroup, remove: &[usize]) -> (Results, Vec<String>) {
+        let mut moved = Vec::new();
+        let results = remove_checked(world, group, remove, &protected(), &mut |path| {
+            moved.push(path.to_string());
+            Ok(())
+        });
+        (results, moved)
     }
 
     fn world() -> World {
@@ -474,11 +640,13 @@ mod tests {
             bytes: 9,
             files: vec![r"C:\Users\a.jpg".into(), r"C:\Users\b.jpg".into()],
         };
-        let ok = check_removal(&world, &group, &[1], &protected());
+        let (ok, moved) = remove(&world, &group, &[1]);
         assert!(ok[0].1.is_ok());
-        // Removing every copy is refused: nothing is kept.
-        let all = check_removal(&world, &group, &[0, 1], &protected());
+        assert_eq!(moved, [r"C:\Users\b.jpg"]);
+        // Removing every copy is refused: nothing is kept, nothing moves.
+        let (all, moved) = remove(&world, &group, &[0, 1]);
         assert!(all.iter().all(|(_, verdict)| verdict.is_err()));
+        assert!(moved.is_empty());
         // A copy that changed since the search stays.
         world
             .files
@@ -486,27 +654,59 @@ mod tests {
             .get_mut(r"C:\Users\b.jpg")
             .unwrap()
             .1 = b"photo-new".to_vec();
-        let changed = check_removal(&world, &group, &[1], &protected());
+        let (changed, moved) = remove(&world, &group, &[1]);
         assert!(changed[0].1.is_err());
+        assert!(moved.is_empty());
         // A hard link to the kept file is not a copy.
         let linked = DupGroup {
             bytes: 9,
             files: vec![r"C:\Users\a.jpg".into(), r"C:\Users\link.jpg".into()],
         };
-        assert!(
-            check_removal(&world, &linked, &[1], &protected())[0]
-                .1
-                .is_err()
-        );
+        assert!(remove(&world, &linked, &[1]).0[0].1.is_err());
         // Protected folders are refused even if offered.
         let inside = DupGroup {
             bytes: 9,
             files: vec![r"C:\Users\a.jpg".into(), r"C:\Windows\a.jpg".into()],
         };
+        assert!(remove(&world, &inside, &[1]).0[0].1.is_err());
+    }
+
+    #[test]
+    fn a_protected_folder_reached_another_way_is_refused() {
+        let mut world = world();
+        // X: is a SUBST drive for the Windows folder.
+        world.aliases.push((r"X:".into(), r"C:\Windows".into()));
+        world.file("X:", "a.jpg", 9, b"photo-one");
+        let group = DupGroup {
+            bytes: 9,
+            files: vec![r"C:\Users\a.jpg".into(), r"X:\a.jpg".into()],
+        };
+        let (results, moved) = remove(&world, &group, &[1]);
         assert!(
-            check_removal(&world, &inside, &[1], &protected())[0]
+            results[0]
                 .1
-                .is_err()
+                .as_ref()
+                .is_err_and(|why| why.contains("really")),
+            "{results:?}"
         );
+        assert!(moved.is_empty());
+    }
+
+    #[test]
+    fn a_file_with_extra_data_streams_is_not_a_plain_copy() {
+        let mut world = world();
+        world.streams.push(r"C:\Users\b.jpg".into());
+        let group = DupGroup {
+            bytes: 9,
+            files: vec![r"C:\Users\a.jpg".into(), r"C:\Users\b.jpg".into()],
+        };
+        let (results, moved) = remove(&world, &group, &[1]);
+        assert!(
+            results[0]
+                .1
+                .as_ref()
+                .is_err_and(|why| why.contains("streams"))
+        );
+        assert!(moved.is_empty());
     }
 }

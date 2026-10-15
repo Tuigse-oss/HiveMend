@@ -3917,15 +3917,19 @@ impl App {
             let mut results = Vec::new();
             let mut done = 0;
             for (group, remove) in plan {
-                for (path, verdict) in
-                    hive_mend::check_removal(&hive_mend::HostContent, &group, &remove, &protected)
-                {
-                    done += 1;
-                    set_progress(done, count.max(1), &format!("Moving {path}"));
-                    post(hwnd, WM_JOB_PROGRESS);
-                    let outcome = verdict.and_then(|()| hive_mend::recycle(&path));
-                    results.push((path, outcome));
-                }
+                let outcomes = hive_mend::remove_checked(
+                    &hive_mend::HostContent,
+                    &group,
+                    &remove,
+                    &protected,
+                    &mut |path| {
+                        done += 1;
+                        set_progress(done, count.max(1), &format!("Moving {path}"));
+                        post(hwnd, WM_JOB_PROGRESS);
+                        hive_mend::recycle(path)
+                    },
+                );
+                results.extend(outcomes);
             }
             finish_job(hwnd, JobResult::Recycled { results });
         });
@@ -7952,7 +7956,7 @@ fn disk_roots() -> Vec<(String, String)> {
             continue;
         }
         let root = format!("{}:\\", (b'A' + letter) as char);
-        if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } == DRIVE_FIXED {
+        if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } == DRIVE_FIXED && !is_subst(&root[..2]) {
             roots.push((root[..2].to_string(), root));
         }
     }
@@ -7962,6 +7966,22 @@ fn disk_roots() -> Vec<(String, String)> {
         roots.push(("Your user folder".to_string(), profile));
     }
     roots
+}
+
+/// A SUBST drive: another name for a folder on a real drive, so it is not
+/// offered as a drive of its own (it would bypass protected-folder checks
+/// spelled for the real drive).
+fn is_subst(drive: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut target = vec![0u16; 1024];
+    let len = unsafe {
+        QueryDosDeviceW(
+            wide(drive).as_ptr(),
+            target.as_mut_ptr(),
+            target.len() as u32,
+        )
+    } as usize;
+    len > 0 && String::from_utf16_lossy(&target[..len.min(target.len())]).starts_with(r"\??\")
 }
 
 /// Bytes in use on the drive holding `path`, for the progress bar.

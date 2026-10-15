@@ -46,7 +46,9 @@ pub use diskspace::HostLister;
 pub use diskspace::{
     BigFile, DirLister, DirNode, DiskEntry, DiskReport, FileKind, LARGEST_KEPT, analyze,
 };
-pub use duplicates::{ContentReader, DupGroup, DupReport, FileId, check_removal, find_duplicates};
+pub use duplicates::{
+    ContentReader, DupGroup, DupReport, FileId, Held, find_duplicates, remove_checked,
+};
 #[cfg(windows)]
 pub use duplicates::{HostContent, recycle};
 pub use engine::{
