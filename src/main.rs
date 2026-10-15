@@ -114,10 +114,34 @@ fn main() -> ExitCode {
     }
 }
 
+/// Write to the console Hivemend was started from. Output the launcher
+/// redirected to a file or pipe (`hivemend scan > out.txt` in cmd) stays
+/// redirected: attaching would otherwise replace those handles and the
+/// output would be lost.
 #[cfg(windows)]
 fn attach_parent_console() {
-    unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(0xFFFFFFFF);
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let kinds = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    let redirected = kinds.map(|kind| {
+        let handle = unsafe { GetStdHandle(kind) };
+        let real = !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && matches!(
+                unsafe { GetFileType(handle) },
+                FILE_TYPE_DISK | FILE_TYPE_PIPE
+            );
+        real.then_some(handle)
+    });
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    for (kind, handle) in kinds.into_iter().zip(redirected) {
+        if let Some(handle) = handle {
+            unsafe { SetStdHandle(kind, handle) };
+        }
     }
 }
 
