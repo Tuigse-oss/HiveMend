@@ -61,6 +61,21 @@ pub struct DirItem {
     pub age: Option<Duration>,
 }
 
+/// The largest file a backup copies or a restore reads back in one piece.
+/// Backed-up files are shortcuts, a few kilobytes each.
+pub const MAX_COPY_BYTES: u64 = 16 * 1024 * 1024;
+
+/// The length to read for a copy, or why it is too large to copy.
+pub fn copy_len(pin: &Pinned) -> Result<usize, String> {
+    if pin.len > MAX_COPY_BYTES {
+        return Err(format!(
+            "{} is {} bytes, too large to back up here",
+            pin.real_path, pin.len
+        ));
+    }
+    Ok(pin.len as usize)
+}
+
 /// What [`FileView::pin_acquire`] grants on a pinned object.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Access {
@@ -633,7 +648,7 @@ impl FileView for HostFs {
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
         use std::io::Write;
         let bytes = self
-            .pin_read_at(pin, 0, pin.len as usize)
+            .pin_read_at(pin, 0, copy_len(pin)?)
             .filter(|bytes| bytes.len() as u64 == pin.len)
             .ok_or("could not read the file to copy")?;
         if let Some(parent) = Path::new(to).parent() {

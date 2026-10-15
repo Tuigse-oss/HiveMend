@@ -321,7 +321,7 @@ fn restore_one(
     }
     fs.pin_acquire(&mut source, Access::Read)?;
     let bytes = fs
-        .pin_read_at(&source, 0, source.len as usize)
+        .pin_read_at(&source, 0, crate::fs::copy_len(&source)?)
         .filter(|bytes| bytes.len() as u64 == source.len)
         .ok_or("could not read the saved copy")?;
     // Where it would really land, before anything is created: the nearest
@@ -644,6 +644,16 @@ mod tests {
                 .collect(),
             ..BackupSummary::default()
         }
+    }
+
+    #[test]
+    fn a_file_too_large_to_copy_is_refused_before_reading() {
+        use crate::fs::{MAX_COPY_BYTES, copy_len};
+        let mut fs = MemoryFs::new();
+        fs.add_file_bytes(r"C:\big.lnk", vec![0; MAX_COPY_BYTES as usize + 1], None);
+        fs.add_file_bytes(r"C:\small.lnk", vec![0; 64], None);
+        assert!(copy_len(&fs.pin(r"C:\big.lnk").unwrap()).is_err());
+        assert_eq!(copy_len(&fs.pin(r"C:\small.lnk").unwrap()), Ok(64));
     }
 
     #[test]

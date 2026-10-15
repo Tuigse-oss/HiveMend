@@ -261,6 +261,7 @@ enum Job {
     Analyzing,
     Finding,
     Recycling,
+    Previewing,
 }
 
 /// Disk Space page views.
@@ -352,6 +353,9 @@ enum JobResult {
     },
     Recycled {
         results: Vec<(String, Result<(), String>)>,
+    },
+    PrivacyPreview {
+        report: Preview,
     },
 }
 
@@ -2863,13 +2867,27 @@ impl App {
         if self.priv_items.is_empty() {
             self.rebuild_privacy();
         }
-        let report = preview(
-            &WindowsRegistry,
-            &HostFs,
-            &WindowsSystemTargets,
-            &WindowsProcessList,
-            &self.priv_items,
-        );
+        // Counting can walk large folders: do it off the window's thread so
+        // the window stays responsive.
+        self.job = Job::Previewing;
+        self.priv_note = "Counting what each category holds...".to_string();
+        self.sync_controls();
+        self.invalidate();
+        let items = self.priv_items.clone();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let report = preview(
+                &WindowsRegistry,
+                &HostFs,
+                &WindowsSystemTargets,
+                &WindowsProcessList,
+                &items,
+            );
+            finish_job(hwnd, JobResult::PrivacyPreview { report });
+        });
+    }
+
+    fn finish_priv_preview(&mut self, report: Preview) {
         self.priv_note = format!(
             "Preview: {} files, {} registry values, {} in scope.",
             report.files(),
@@ -4751,6 +4769,7 @@ impl App {
                 self.fill_dups();
             }
             JobResult::Recycled { results } => self.finish_recycle(results),
+            JobResult::PrivacyPreview { report } => self.finish_priv_preview(report),
             JobResult::Privacy { result } => {
                 self.sync_controls();
                 self.finish_privacy(result);
@@ -5647,6 +5666,7 @@ impl App {
                 Job::Analyzing => "Reading sizes...",
                 Job::Finding => "Comparing files...",
                 Job::Recycling => "Recycling...",
+                Job::Previewing => "Counting...",
                 Job::Idle => "",
             };
             text(
