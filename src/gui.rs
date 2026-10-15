@@ -6699,7 +6699,7 @@ impl App {
             hdc,
             rect,
             if self.elevated {
-                "As administrator, changes last until Hivemend closes and the ignore list is read-only. Start Hivemend normally to save them."
+                "As administrator, Hivemend starts from the defaults, leaves your ignore list out, and forgets changes when it closes. Start Hivemend normally to save them."
             } else {
                 "Changes are saved as you make them."
             },
@@ -7253,7 +7253,7 @@ impl App {
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
-            "Before repairing, the ticked entries are checked again. Registry entries and shortcuts are saved to a backup first; old temporary files are deleted for good and are not backed up.",
+            "Before repairing, the ticked entries are checked again. Each registry entry is saved to the backup and removed in one registry transaction, so one that changes meanwhile stays; shortcuts are saved first too. Old temporary files are deleted for good and are not backed up.",
             "It never touches Winlogon, default-app choices, the services Windows needs to boot or stay secure, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",

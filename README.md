@@ -51,11 +51,11 @@ hivemend repair --yes
 hivemend hives
 ```
 
-`scan` never changes the registry. `repair` without `--yes` prints the plan. With `--yes` it writes a UTF-16 `.reg` backup first, then deletes only the entries that backup describes, and only while each still reads exactly as the backup recorded it: anything added or changed since is left alone.
+`scan` never changes the registry. `repair` without `--yes` prints the plan. With `--yes` each entry is removed inside its own registry transaction (Windows' Kernel Transaction Manager): the entry is read from that transaction, recorded in the UTF-16 `.reg` backup, and the backup flushed to disk before the deletion commits. If another program changes the entry meanwhile, or any step fails, the transaction is rolled back and the entry stays, with a note in the backup that it was not removed. Where Windows cannot open a registry transaction, nothing is removed. A shortcut is only removed when it has no named data streams at all, the download marker included, since the backup copy holds only its main data.
 
-`--format json` prints one JSON document: `complete`, `findings`, `warnings`, and `notes` for a scan, or the outcome of `repair --yes`. Exit codes: 0 when a complete scan found nothing, 2 when there are findings, 3 when the scan could not read everything (or was stopped) and found nothing, so it cannot be called clean, and 1 on an error.
+`--format json` prints one JSON document: `complete`, `findings`, `warnings`, and `notes` for a scan; for `repair --yes`, `complete`, `backup`, `removed`, `already_gone`, `left_alone` (asked for but not done: refused, not backed up, changed meanwhile, or left for a normal window), `per_user_left`, `report_only`, `needs_admin`, `errors`, `warnings`, and `notes`. Scan exit codes: 0 when a complete scan found nothing, 2 when there are findings, 3 when the scan could not read everything (or was stopped) and found nothing, so it cannot be called clean, and 1 on an error. Repair exit codes: 0 when everything asked for was done, 3 when the scan was incomplete or something asked for was left undone, and 1 on errors.
 
-Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, and `--backup-dir` is refused unless it is the protected store.
+Run as administrator, `repair` leaves entries in your own part of the registry (HKCU, HKEY_USERS, and HKCR) for a normal window, does not read your ignore list, and `--backup-dir` is refused unless it is the protected store.
 
 ### Where data is kept
 
@@ -69,10 +69,23 @@ refuses to use it rather than repair it. Running as administrator,
 Hivemend restores only from that protected folder.
 
 Restore accepts only `.reg` files carrying Hivemend's backup marker
-line. The marker only guards against restoring the wrong file by
-accident; anyone can write it, so it does not prove where a file came
-from. What protects a restore run as administrator is where the file
-is: the protected folder, which only administrators can write.
+line, reads them with Hivemend's own parser (anything it does not
+recognise refuses the whole file), and writes them in one registry
+transaction through the same link-refusing layer repair uses: all of it,
+or nothing. A normal window restores only the `HKEY_CURRENT_USER` part
+of a backup and an administrator window only the machine-wide part;
+each says what it left for the other.
+
+In a normal window the marker only guards against restoring the wrong
+file by accident: anyone can write it. Backups made as administrator are
+also signed: `<backup>.reg.sig` beside each one holds an HMAC-SHA256 of
+its exact bytes under a key in `%ProgramData%\HiveMend\backup.key`,
+which only SYSTEM and Administrators can read. Hivemend running as
+administrator restores a backup only from the protected folder and only
+when that signature matches, so a file it did not write, or one changed
+since, is refused. Administrator backups made by versions before this
+had no signature and are refused too; open one in Registry Editor if
+you trust it.
 
 Older versions kept everything in `C:\HiveMend`, which every account on
 the PC can change. Hivemend never moves or deletes that folder. Its
@@ -113,12 +126,13 @@ Monitor, Tools, Settings, and About.
 - A window run as administrator acts only on what programs running
   without elevation cannot redirect. It leaves registry entries in your
   own part of the registry (HKCU, HKEY_USERS, HKCR) to a normal window,
-  restores only the machine-wide part of a backup, starts no
-  uninstallers, changes no startup items for your account, removes no
-  duplicates, edits no cookie database, and does not read or save your
-  settings: it starts from the built-in defaults (restore points on) and
-  forgets changes when it closes. The ignore list is read but not
-  changed.
+  restores only the machine-wide part of a backup (and only a signed
+  one), starts no uninstallers, changes no startup items for your
+  account, removes no duplicates, leaves browser history and cookies
+  alone, and reads neither the ignore list nor the cookies-to-keep list.
+  It does not read or save your settings either: it starts from the
+  built-in defaults (restore points on) and forgets changes when it
+  closes.
 - Services has a Suggested tab (safe Automatic services you may tick to
   set to Manual) and an All services tab (start, stop, or change the
   startup type of a highlighted row). Changing a startup type writes a
@@ -131,16 +145,23 @@ Monitor, Tools, Settings, and About.
   absent, and if a change's second step fails, the first is put back.
 - Privacy lists cleanable categories (history lists, temp files,
   clipboard, Recycle Bin, browser caches, application histories, and
-  custom items). Preview counts what each holds, tick what to
-  clean, then Clean. Registry entries are saved to a `privacy-*.reg`
+  custom items). Preview counts what each holds (Cancel stops it, and
+  a stopped preview does not count: Clean needs a finished one), tick
+  what to clean, then Clean. Registry entries are saved to a `privacy-*.reg`
   backup first and can be undone on the Restore page; files are deleted
   for good. The built-in history and cookie cleaning waits for a closed
-  browser (checked again just before each category runs) and never
-  touches saved logins, saved addresses or cards, or bookmarks. For
+  browser (checked again just before each category runs and before each
+  database) and never touches saved logins, saved addresses or cards, or
+  bookmarks. A database and its side files are taken together while no
+  other program has any of them open, or left alone together, so a set
+  is never half removed. For
   Chrome and Edge it clears browsing history and cookies; for Firefox it
   clears cookies and saved form entries, and leaves browsing history and
   bookmarks (they share one file). A Temp file listed for being older
-  than two days is left alone if it was written to since. Custom
+  than two days is opened so that nothing else can write to it and its
+  age is read again: one written to since, or held open by another
+  program, is left alone. One folder walk removes at most 100,000 files
+  and says when it left the rest for another clean. Custom
   items you add can name any allowed Temp or browser-profile file, so add
   only paths you understand. The built-in categories are user-scope, and
   no administrator rights are needed. There is no free-space wipe:
@@ -170,21 +191,28 @@ Monitor, Tools, Settings, and About.
   biggest folders (double-click or Enter to go in, Backspace to go up),
   the 100 largest files, and the space by kind of file. Sizes are file
   sizes. Junctions and symbolic links are never followed, so nothing is
-  counted twice. It only reads; Open in Explorer is the only action.
+  counted twice. Cancel works even inside one huge folder, and a walk
+  stops at a million folders and says its totals are partial. It only
+  reads; Open in Explorer is the only action.
 - Duplicates finds identical files of 1 MB or more in a fixed drive or
   your user folder, matching by content (size, then a hash of the first
   64 KB, then of the whole file), never by name. The Windows, Program
   Files, and ProgramData folders are left out; links, junctions, and
   cloud-only files are never followed or read, and a hard link is not
   counted as a copy. Tick Extra Copies ticks all but the first copy of
-  each set. Ticked files go to the Recycle Bin (Windows warns first if a
-  file would be deleted for good instead). One copy of every set is
-  always kept and held open so it cannot change or go away meanwhile.
-  Each file to move is held open against writes from its checks until
-  it is moved: its real location must be outside the protected folders
+  each set. One copy of every set is always kept and held open so it
+  cannot change, move, or go away meanwhile. Each file to remove is held
+  open from its checks until it is moved, so nothing can write, rename,
+  or delete it: its real location must be outside the protected folders
   (a SUBST drive or junction cannot hide it), it must have no extra data
-  streams besides the download marker, and its bytes must still match
-  the kept copy. Removing is only done without administrator rights.
+  streams besides the download marker, and its bytes, read through both
+  held files, must still match the kept copy. Hivemend then moves that
+  same open file into your Recycle Bin folder on its drive itself, with
+  the record Explorer uses to list it and put it back, so the file that
+  goes is exactly the one compared. A drive without a Recycle Bin is
+  refused: nothing is ever deleted for good. A search keeps at most a
+  million candidate files and says when it compared only part of the
+  drive. Removing is only done without administrator rights.
 - Monitor shows live memory, system-drive, and uptime readings with
   usage bars, plus the Hivemend health summary and a read-only
   registry-hive inventory with sizes. It only reads.
@@ -203,11 +231,17 @@ per line (`github.com` keeps its subdomains too); the Cookies to Keep button
 on the Privacy page opens it in Notepad. With an empty list, cleaning a
 browser's history and cookies deletes its cookie database (for Chrome and
 Edge, `Network\Cookies`). With sites listed, Hivemend edits the database
-instead, only while the browser is closed: it copies the database, removes
-every other cookie in one SQLite transaction, checks the database, and puts
-the copy back if anything fails. The copy is deleted after a good edit, so
-no spare set of cookies is left behind. A window running as administrator
-leaves cookies alone when the list has sites.
+instead, only while the browser is closed. The database and each of its
+SQLite side files must be a plain file with one name at its own path;
+the database is held so it cannot be moved or replaced, and SQLite takes
+it alone for the whole edit, so no other program can read or write it
+meanwhile. A copy is taken in memory under that lock, every other cookie
+is removed in one transaction, and the database is checked. If anything
+fails after the edit, the copy is put back through the same locked
+connection; only if that fails is it saved beside the database, and
+Hivemend says where (it then leaves that database alone until the copy
+is gone). No other copy of the cookies is ever written to disk. A window
+running as administrator leaves browser cookies alone.
 
 Custom privacy items live in `%LOCALAPPDATA%\HiveMend\privacy-custom.ini`, one
 per line (`#` starts a comment). Only Temp folders, browser profiles,
