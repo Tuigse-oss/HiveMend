@@ -101,6 +101,7 @@ fn rows(
 
 /// Count what trimming would remove, without changing anything.
 pub fn count_cookies(path: &Path, sites: &[String]) -> Result<CookieCount, String> {
+    let path = &spelled_out(path);
     let name = path
         .file_name()
         .and_then(|name| name.to_str())
@@ -201,8 +202,11 @@ fn check_plain_file(path: &Path, hold: bool) -> Result<(std::fs::File, (u64, u64
     if info.nNumberOfLinks != 1 {
         return Err(format!("{shown} has more than one name (a hard link)"));
     }
+    // The real path from the handle must be the given one, with any short
+    // (8.3) names spelled out: a link anywhere on the way makes them differ.
     let real = crate::fs::host_final_path(&file)?;
-    if !real.eq_ignore_ascii_case(&shown) {
+    let expected = long_path(&shown).unwrap_or_else(|| shown.clone());
+    if !real.eq_ignore_ascii_case(&expected) {
         return Err(format!("{shown} is really {real}"));
     }
     let id = (
@@ -210,6 +214,27 @@ fn check_plain_file(path: &Path, hold: bool) -> Result<(std::fs::File, (u64, u64
         (u64::from(info.nFileIndexHigh) << 32) | u64::from(info.nFileIndexLow),
     );
     Ok((file, id))
+}
+
+/// `path` with any short (8.3) names spelled out (as it is when it does not
+/// exist or cannot be read).
+fn spelled_out(path: &Path) -> PathBuf {
+    #[cfg(windows)]
+    if let Some(long) = path.to_str().and_then(long_path) {
+        return PathBuf::from(long);
+    }
+    path.to_path_buf()
+}
+
+/// `path` with its short (8.3) names spelled out; links are not resolved.
+#[cfg(windows)]
+fn long_path(path: &str) -> Option<String> {
+    use windows_sys::Win32::Storage::FileSystem::GetLongPathNameW;
+    let wide: Vec<u16> = path.encode_utf16().chain(std::iter::once(0)).collect();
+    let mut buf = vec![0u16; 1024];
+    let len =
+        unsafe { GetLongPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } as usize;
+    (len > 0 && len < buf.len()).then(|| String::from_utf16_lossy(&buf[..len]))
 }
 
 #[cfg(not(windows))]
@@ -272,6 +297,9 @@ fn trim_with(
     at: &mut dyn FnMut(Stage) -> Result<(), String>,
 ) -> Result<CookieCount, String> {
     let unchanged = |message: String| format!("{message}. Nothing was changed");
+    // SQLite names the side files after the spelling it is given, so a
+    // short (8.3) spelling would miss the real ones: use the long form.
+    let path = &spelled_out(path);
     let earlier = leftover_copies(path);
     if !earlier.is_empty() {
         return Err(format!(
@@ -820,5 +848,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(dir.with_extension("moved"));
         assert_eq!(moved, [false; 4], "the database or its folder moved");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn live_a_short_name_spelling_is_still_the_same_database() {
+        use windows_sys::Win32::Storage::FileSystem::GetShortPathNameW;
+        let dir = scratch("short-name-spelling");
+        let db = dir.join("cookies.sqlite");
+        make_db(&db, "moz_cookies", "host", &[".github.com", ".tracker.io"]);
+        let long = db.display().to_string();
+        let wide: Vec<u16> = long.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut buf = vec![0u16; 1024];
+        let len = unsafe { GetShortPathNameW(wide.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) }
+            as usize;
+        let short = String::from_utf16_lossy(&buf[..len]);
+        let trimmed = trim_cookies(Path::new(&short), &["github.com".to_string()]);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(len > 0);
+        assert_eq!(
+            trimmed,
+            Ok(CookieCount {
+                removed: 1,
+                kept: 1
+            }),
+            "{short}"
+        );
     }
 }
