@@ -510,6 +510,8 @@ struct App {
     settings: Settings,
     exclusions: Exclusions,
     backups: Vec<BackupInfo>,
+    /// The refresh the shown list answers.
+    backups_shown: u64,
 
     job: Job,
     findings: Vec<Finding>,
@@ -803,7 +805,9 @@ unsafe extern "system" fn wnd_proc(
                     && refresh == newest
                 {
                     app.backups = list;
+                    app.backups_shown = refresh;
                     app.fill_backups();
+                    app.invalidate();
                 }
                 0
             }
@@ -1131,6 +1135,7 @@ impl App {
             },
             // Read in the background once the window exists.
             backups: Vec::new(),
+            backups_shown: 0,
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -6645,7 +6650,11 @@ impl App {
 
     unsafe fn draw_restore(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "Restore", None);
-        let line = if self.backups.is_empty() {
+        // A refresh still reading in the background is not an empty list.
+        let reading = BACKUP_REFRESH.load(Ordering::SeqCst) != self.backups_shown;
+        let line = if reading {
+            "Reading the backups...".to_string()
+        } else if self.backups.is_empty() {
             "No backups yet. Each repair saves one here before it changes anything.".to_string()
         } else {
             "Each repair saved what it removed. Pick a backup to put those entries back."
