@@ -1541,31 +1541,51 @@ mod host {
         // because Windows 10 refuses a rename into a folder that someone
         // holds with delete access (a sharing violation). They stay pinned
         // all the same: no handle shares delete, so nothing else can rename
-        // or remove them. To undo, each is opened again by name under its
-        // held parent, checked to be the same folder, and removed.
+        // or remove them. Each also gets a second, attributes-only handle
+        // (which takes part in no sharing check) that keeps the folder object
+        // alive, so its identity cannot pass to another folder. To undo,
+        // each is opened again by name under its held parent, without
+        // sharing delete, and removed only if it is that same live object.
+        const FILE_OPEN: u32 = 1;
         let folder_access = if moving.is_some() {
             FOLDER
         } else {
             FOLDER | DELETE
         };
-        let undo_moving = |mut made: Vec<std::fs::File>, names: &[&str]| -> String {
-            const FILE_OPEN: u32 = 1;
+        let keep_alive = |parent: &std::fs::File, name: &str| {
+            host_open_in(
+                parent,
+                name,
+                FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                FILE_OPEN,
+                FILE_DIRECTORY_FILE,
+                None,
+            )
+            .ok()
+        };
+        let undo_moving = |mut made: Vec<std::fs::File>,
+                           mut kept: Vec<Option<std::fs::File>>,
+                           names: &[&str]|
+         -> String {
             let mut left = 0;
             while let Some(item) = made.pop() {
-                let id = file_id(&item).ok();
                 drop(item);
+                let keep = kept.pop().flatten();
                 let parent = made.last().unwrap_or(anchor_file);
-                let removed = id.is_some()
-                    && host_open_in(
+                let removed = keep.as_ref().is_some_and(|keep| {
+                    host_open_in(
                         parent,
                         names[made.len()],
                         DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
-                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE,
                         FILE_OPEN,
                         FILE_DIRECTORY_FILE,
                         None,
                     )
-                    .is_ok_and(|again| file_id(&again).ok() == id && host_dispose(&again));
+                    .is_ok_and(|again| same_object(keep, &again) && host_dispose(&again))
+                });
+                drop(keep);
                 if !removed {
                     left += 1;
                 }
@@ -1577,6 +1597,7 @@ mod host {
             }
         };
         let mut made: Vec<std::fs::File> = Vec::new();
+        let mut kept: Vec<Option<std::fs::File>> = Vec::new();
         let mut made_names: Vec<&str> = Vec::new();
         for name in rest[1..].iter().rev() {
             let parent = made.last().unwrap_or(anchor_file);
@@ -1590,12 +1611,16 @@ mod host {
                 None,
             ) {
                 Ok(dir) => {
+                    if moving.is_some() {
+                        // Opened by name while `dir` pins it: the same folder.
+                        kept.push(keep_alive(parent, name).filter(|keep| same_object(keep, &dir)));
+                    }
                     made.push(dir);
                     made_names.push(name);
                 }
                 Err(status) => {
                     let note = if moving.is_some() {
-                        undo_moving(made, &made_names)
+                        undo_moving(made, kept, &made_names)
                     } else {
                         undo(made)
                     };
@@ -1609,7 +1634,7 @@ mod host {
         let parent = made.last().unwrap_or(anchor_file);
         if let Some(moving) = moving {
             if let Err(err) = host_rename_into(moving, parent, leaf) {
-                let note = undo_moving(made, &made_names);
+                let note = undo_moving(made, kept, &made_names);
                 return Err(format!("could not move it to {path}: {err}{note}"));
             }
             // Moved: the folders made for it stay. It landed relative to
@@ -1619,6 +1644,7 @@ mod host {
                 return Err(format!("it landed at {real} instead of {projected}"));
             }
             drop(made);
+            drop(kept);
             return identify(moving.try_clone().map_err(|err| err.to_string())?, path);
         }
         let file = match host_open_in(
@@ -1808,6 +1834,32 @@ mod host {
             return Err(last_error());
         }
         Ok(Some((final_path(file)?, info.nNumberOfLinks)))
+    }
+
+    /// Whether two open handles are the same object: by the full 128-bit
+    /// file ID where the file system has one, else by volume serial and
+    /// file index. Both handles are open, so neither ID can have passed to
+    /// another object.
+    fn same_object(a: &std::fs::File, b: &std::fs::File) -> bool {
+        use windows_sys::Win32::Storage::FileSystem::{
+            FILE_ID_INFO, FileIdInfo, GetFileInformationByHandleEx,
+        };
+        let full = |file: &std::fs::File| {
+            let mut info: FILE_ID_INFO = unsafe { std::mem::zeroed() };
+            let ok = unsafe {
+                GetFileInformationByHandleEx(
+                    file.as_raw_handle() as _,
+                    FileIdInfo,
+                    &mut info as *mut _ as *mut _,
+                    std::mem::size_of::<FILE_ID_INFO>() as u32,
+                )
+            } != 0;
+            ok.then_some((info.VolumeSerialNumber, info.FileId.Identifier))
+        };
+        match (full(a), full(b)) {
+            (Some(x), Some(y)) => x == y,
+            _ => matches!((file_id(a), file_id(b)), (Ok(x), Ok(y)) if x == y),
+        }
     }
 
     /// Volume serial and file index: the identity of an open object.
