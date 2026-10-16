@@ -3,6 +3,9 @@ name: release
 on:
   push:
     tags: ["v*"]
+  # A manual run builds the zip and installer as workflow artifacts to try
+  # out, without creating a release.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,7 +26,7 @@ jobs:
       - run: cargo +1.99.0 audit --deny warnings
 
   build:
-    name: build and draft release
+    name: build and package
     needs: audit
     runs-on: windows-latest
     permissions:
@@ -34,16 +37,19 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
-      - name: Check the tag matches Cargo.toml
+      - name: Read the version and check the tag matches Cargo.toml
         shell: bash
         env:
-          TAG: ${{ github.ref_name }}
+          REF_TYPE: ${{ github.ref_type }}
+          REF_NAME: ${{ github.ref_name }}
         run: |
           version=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -n 1)
-          if [ "$TAG" != "v$version" ]; then
-            echo "::error::Tag $TAG does not match Cargo.toml version $version"
+          if [ "$REF_TYPE" = tag ] && [ "$REF_NAME" != "v$version" ]; then
+            echo "::error::Tag $REF_NAME does not match Cargo.toml version $version"
             exit 1
           fi
+          echo "VERSION=$version" >> "$GITHUB_ENV"
+          echo "TAG=v$version" >> "$GITHUB_ENV"
       - run: rustup toolchain install 1.99.0 --profile minimal --component clippy
       - run: cargo +1.99.0 clippy --locked --all-targets -- -D warnings
       - run: cargo +1.99.0 test --locked --all-targets
@@ -53,8 +59,6 @@ jobs:
       - run: cargo +1.99.0 auditable build --locked --release --target x86_64-pc-windows-msvc
       - name: Package
         shell: bash
-        env:
-          TAG: ${{ github.ref_name }}
         # The program ships with its licenses and the third-party notices the
         # linked crates' licenses require, never as a bare exe.
         run: |
@@ -62,19 +66,35 @@ jobs:
           cp target/x86_64-pc-windows-msvc/release/Hivemend.exe package/
           cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt README.md package/
           (cd package && 7z a -tzip "../dist/Hivemend-$TAG-x86_64-windows.zip" ./*)
+      - name: Build the installer
+        # Installs from package\ into dist\, the script's default paths.
+        shell: pwsh
+        run: |
+          choco install innosetup --version=6.7.1 --no-progress -y
+          & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" installer\hivemend.iss
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Checksums
+        shell: bash
+        run: |
           cd dist
-          sha256sum Hivemend-*.zip > SHA256SUMS.txt
+          sha256sum Hivemend-* > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Attest build provenance
         # Artifact attestations are free for public repositories.
-        if: github.event.repository.visibility == 'public'
+        if: github.ref_type == 'tag' && github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/Hivemend-*.zip
+          subject-path: dist/Hivemend-*
+      - name: Upload the test build
+        if: github.ref_type != 'tag'
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: Hivemend-${{ env.TAG }}-test-build
+          path: dist/*
       - name: Create a draft release
         # A draft stays unpublished until it is reviewed and released by hand.
+        if: github.ref_type == 'tag'
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          TAG: ${{ github.ref_name }}
         run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hivemend $TAG" --generate-notes

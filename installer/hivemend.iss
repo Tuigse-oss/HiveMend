@@ -1,0 +1,66 @@
+; Inno Setup script for the Hivemend installer, built by the release workflow:
+;   iscc /DAppVersion=0.1.0 installer\hivemend.iss
+; SourceDir (default ..\package) holds the same files as the release zip.
+
+#ifndef AppVersion
+  #error Pass the version with /DAppVersion=x.y.z
+#endif
+#ifndef SourceDir
+  #define SourceDir "..\package"
+#endif
+#ifndef OutputDir
+  #define OutputDir "..\dist"
+#endif
+
+[Setup]
+; The AppId identifies the install across upgrades; never change it.
+AppId={{6F1C2A4E-8B3D-4E7A-9C51-2D8E0B7F4A93}
+AppName=Hivemend
+AppVersion={#AppVersion}
+AppVerName=Hivemend {#AppVersion}
+AppPublisher=TUIGSE LLC
+AppPublisherURL=https://github.com/Tuigse-oss/HiveMend
+AppSupportURL=https://github.com/Tuigse-oss/HiveMend/issues
+AppUpdatesURL=https://github.com/Tuigse-oss/HiveMend/releases
+DefaultDirName={autopf}\Hivemend
+DefaultGroupName=Hivemend
+DisableProgramGroupPage=yes
+; The exe runs asInvoker, so a per-user install needs no administrator
+; rights; the dialog lets the user install for all users instead.
+PrivilegesRequired=lowest
+PrivilegesRequiredOverridesAllowed=dialog
+ArchitecturesAllowed=x64compatible
+ArchitecturesInstallIn64BitMode=x64compatible
+MinVersion=10.0
+UninstallDisplayIcon={app}\Hivemend.exe
+UninstallDisplayName=Hivemend
+VersionInfoVersion={#AppVersion}
+LicenseFile={#SourceDir}\LICENSE-MIT
+OutputDir={#OutputDir}
+OutputBaseFilename=Hivemend-v{#AppVersion}-x86_64-setup
+Compression=lzma2
+SolidCompression=yes
+WizardStyle=modern
+
+[Languages]
+Name: "english"; MessagesFile: "compiler:Default.isl"
+
+[Tasks]
+Name: "desktopicon"; Description: "{cm:CreateDesktopIcon}"; GroupDescription: "{cm:AdditionalIcons}"; Flags: unchecked
+
+[Files]
+Source: "{#SourceDir}\Hivemend.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE-MIT"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\LICENSE-APACHE"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\THIRD-PARTY-NOTICES.txt"; DestDir: "{app}"; Flags: ignoreversion
+Source: "{#SourceDir}\README.md"; DestDir: "{app}"; Flags: ignoreversion
+
+[Icons]
+Name: "{autoprograms}\Hivemend"; Filename: "{app}\Hivemend.exe"
+Name: "{autodesktop}\Hivemend"; Filename: "{app}\Hivemend.exe"; Tasks: desktopicon
+
+[Run]
+Filename: "{app}\Hivemend.exe"; Description: "{cm:LaunchProgram,Hivemend}"; Flags: nowait postinstall skipifsilent
+
+; Uninstalling leaves %LOCALAPPDATA%\HiveMend and the administrator backup
+; store alone: they hold the registry backups a restore needs.
