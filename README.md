@@ -165,10 +165,12 @@ Monitor, Tools, Settings, and About.
   age is read again: one written to since, or held open by another
   program, is left alone. One folder walk looks through at most 100,000
   folders (and a bounded amount of path text), goes at most 64 folders
-  deep, looks at no more than 1,000 browser profiles, and removes at most
-  100,000 files, and says when any of these left something out or the
-  rest for another clean. Cancel stops a clean part way through a
-  category, too. Custom
+  deep, looks at no more than 1,000 profiles of one browser (for Firefox,
+  those in `profiles.ini` and its Profiles folder together; a
+  `profiles.ini` over 1 MB is not read), and removes at most 100,000
+  files, and says when any of these left something out or the rest for
+  another clean. Cancel stops a clean part way through a category, too,
+  even while it is still finding browser profiles. Custom
   items you add can name any allowed Temp or browser-profile file, so add
   only paths you understand. The built-in categories are user-scope, and
   no administrator rights are needed. There is no free-space wipe:
