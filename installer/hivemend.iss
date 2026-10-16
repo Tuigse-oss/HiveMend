@@ -30,6 +30,18 @@ DisableProgramGroupPage=yes
 ; Chocolatey), installs for all users instead.
 PrivilegesRequired=lowest
 PrivilegesRequiredOverridesAllowed=commandline dialog
+; An upgrade without /ALLUSERS or /CURRENTUSER keeps the previous install's
+; mode, so it replaces that install instead of adding a second one.
+UsePreviousPrivileges=yes
+UsePreviousAppDir=yes
+; Upgrades ask a running Hivemend to close (it refuses while a repair,
+; restore, or cleanup is running, and Setup then stops without changing
+; anything). It is not restarted: Setup may run as administrator (Chocolatey,
+; winget machine scope), and Hivemend must not come back elevated.
+CloseApplications=yes
+RestartApplications=no
+; One Setup at a time, so two package managers cannot upgrade at once.
+SetupMutex=HivemendSetup,Global\HivemendSetup
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0

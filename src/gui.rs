@@ -79,6 +79,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
+use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_QUERYENDSESSION};
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
@@ -856,15 +857,19 @@ unsafe extern "system" fn wnd_proc(
                 }
                 0
             }
+            // Sign-out, shutdown, and an installer closing Hivemend to
+            // update it (Restart Manager): agree unless a job must finish,
+            // then close as WM_CLOSE would.
+            WM_QUERYENDSESSION => (!app.must_finish()) as LRESULT,
+            WM_ENDSESSION => {
+                if wparam != 0 && !app.must_finish() {
+                    drop(_guard);
+                    DestroyWindow(hwnd);
+                }
+                0
+            }
             WM_CLOSE => {
-                if matches!(
-                    app.job,
-                    Job::Repairing
-                        | Job::Restoring
-                        | Job::Services
-                        | Job::Cleaning
-                        | Job::Recycling
-                ) {
+                if app.must_finish() {
                     app.message(
                         "Hivemend is still working. Please wait for it to finish before closing.",
                         MB_ICONWARNING,
@@ -920,6 +925,8 @@ fn app_handles(msg: u32) -> bool {
             | WM_REDO
             | WM_MENU_PICKED
             | WM_CLOSE
+            | WM_QUERYENDSESSION
+            | WM_ENDSESSION
             | WM_DESTROY
     )
 }
@@ -1537,6 +1544,15 @@ impl App {
 
     fn busy(&self) -> bool {
         self.job != Job::Idle
+    }
+
+    /// A job that changes the system and must not be cut off: closing,
+    /// signing out, and an installer's upgrade all wait for it.
+    fn must_finish(&self) -> bool {
+        matches!(
+            self.job,
+            Job::Repairing | Job::Restoring | Job::Services | Job::Cleaning | Job::Recycling
+        )
     }
 
     fn client(&self) -> RECT {
