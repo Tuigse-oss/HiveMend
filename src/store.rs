@@ -1355,7 +1355,11 @@ mod live_tests {
         // a folder pre-created in ProgramData by another user would be.
         let dir = std::env::temp_dir().join(format!("hivemend-untrusted-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let result = check_protected_dir(&dir);
+        // By its long name: TEMP can be an 8.3 spelling (a profile folder
+        // such as `name.COMPUTER`), which is refused before ownership is
+        // looked at.
+        let long = HostFs.pin(&dir.display().to_string()).unwrap().real_path;
+        let result = check_protected_dir(Path::new(&long));
         let _ = std::fs::remove_dir_all(&dir);
         if elevated() {
             // An elevated token may own it as Administrators; the Users
