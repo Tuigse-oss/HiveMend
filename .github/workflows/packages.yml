@@ -1,9 +1,10 @@
 name: packages
 
-# Publishes a release to Scoop, winget, and Chocolatey once it is published on
-# GitHub (drafts have no public download URLs). Each channel is switched on by
-# a repository variable, so one can be turned off without touching the rest:
-#   PUBLISH_SCOOP=true       needs secret SCOOP_BUCKET_TOKEN
+# Publishes a release to winget and Chocolatey once it is published on GitHub
+# (drafts have no public download URLs). Scoop needs nothing here: the
+# Tuigse-oss/scoop-hivemend bucket picks up new releases by itself. Each
+# channel is switched on by a repository variable, so one can be turned off
+# without touching the other:
 #   PUBLISH_WINGET=true      needs secret WINGET_TOKEN
 #   PUBLISH_CHOCOLATEY=true  needs secret CHOCOLATEY_API_KEY
 on:
@@ -23,40 +24,6 @@ env:
   TAG: ${{ github.event.release.tag_name || inputs.tag }}
 
 jobs:
-  scoop:
-    if: vars.PUBLISH_SCOOP == 'true' && !github.event.release.prerelease
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          ref: ${{ env.TAG }}
-          persist-credentials: false
-      - name: Render the manifest
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt
-          python3 packaging/render.py "${TAG#v}" SHA256SUMS.txt out
-      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: Tuigse-oss/scoop-hivemend
-          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
-          path: bucket-repo
-      - name: Commit to the bucket
-        working-directory: bucket-repo
-        run: |
-          mkdir -p bucket
-          cp ../out/scoop/hivemend.json bucket/hivemend.json
-          git add bucket/hivemend.json
-          if git diff --cached --quiet; then
-            echo "Bucket already has $TAG"
-            exit 0
-          fi
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git commit -m "hivemend: update to ${TAG#v}"
-          git push
-
   winget:
     if: vars.PUBLISH_WINGET == 'true' && !github.event.release.prerelease
     runs-on: windows-latest
