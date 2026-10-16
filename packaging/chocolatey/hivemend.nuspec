@@ -1,0 +1,30 @@
+<?xml version="1.0" encoding="utf-8"?>
+<package xmlns="http://schemas.microsoft.com/packaging/2015/06/nuspec.xsd">
+  <metadata>
+    <id>hivemend</id>
+    <version>{{VERSION}}</version>
+    <title>Hivemend</title>
+    <authors>TUIGSE LLC</authors>
+    <owners>TUIGSE LLC</owners>
+    <projectUrl>https://github.com/Tuigse-oss/HiveMend</projectUrl>
+    <packageSourceUrl>https://github.com/Tuigse-oss/HiveMend/tree/main/packaging/chocolatey</packageSourceUrl>
+    <projectSourceUrl>https://github.com/Tuigse-oss/HiveMend</projectSourceUrl>
+    <docsUrl>https://github.com/Tuigse-oss/HiveMend#readme</docsUrl>
+    <bugTrackerUrl>https://github.com/Tuigse-oss/HiveMend/issues</bugTrackerUrl>
+    <licenseUrl>https://github.com/Tuigse-oss/HiveMend/blob/main/LICENSE-MIT</licenseUrl>
+    <requireLicenseAcceptance>false</requireLicenseAcceptance>
+    <releaseNotes>https://github.com/Tuigse-oss/HiveMend/releases/tag/v{{VERSION}}</releaseNotes>
+    <tags>hivemend registry registry-cleaner cleaner privacy startup uninstaller foss</tags>
+    <summary>Free, open-source registry cleaner for Windows 10/11 with backed-up, transactional repairs.</summary>
+    <description><![CDATA[Hivemend scans the Windows registry for stale entries left behind by removed programs and removes the ones you choose, each inside its own registry transaction after writing a backup that Restore can put back.
+
+It also manages startup items, installed programs, privacy cleanup, disk space, duplicate files, and services.
+
+No subscriptions, upsells, ads, account, or telemetry: Hivemend contains no networking code.
+
+This package installs Hivemend for all users. Backups in `%LOCALAPPDATA%\HiveMend` are kept when it is uninstalled.]]></description>
+  </metadata>
+  <files>
+    <file src="tools\**" target="tools" />
+  </files>
+</package>

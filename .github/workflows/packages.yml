@@ -1,0 +1,117 @@
+name: packages
+
+# Publishes a release to Scoop, winget, and Chocolatey once it is published on
+# GitHub (drafts have no public download URLs). Each channel is switched on by
+# a repository variable, so one can be turned off without touching the rest:
+#   PUBLISH_SCOOP=true       needs secret SCOOP_BUCKET_TOKEN
+#   PUBLISH_WINGET=true      needs secret WINGET_TOKEN
+#   PUBLISH_CHOCOLATEY=true  needs secret CHOCOLATEY_API_KEY
+on:
+  release:
+    types: [published]
+  # Re-runs one release's packages, for example after a channel failed.
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag, such as v0.1.0
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  TAG: ${{ github.event.release.tag_name || inputs.tag }}
+
+jobs:
+  scoop:
+    if: vars.PUBLISH_SCOOP == 'true' && !github.event.release.prerelease
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Render the manifest
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt
+          python3 packaging/render.py "${TAG#v}" SHA256SUMS.txt out
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: Tuigse-oss/scoop-hivemend
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
+          path: bucket-repo
+      - name: Commit to the bucket
+        working-directory: bucket-repo
+        run: |
+          mkdir -p bucket
+          cp ../out/scoop/hivemend.json bucket/hivemend.json
+          git add bucket/hivemend.json
+          if git diff --cached --quiet; then
+            echo "Bucket already has $TAG"
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "hivemend: update to ${TAG#v}"
+          git push
+
+  winget:
+    if: vars.PUBLISH_WINGET == 'true' && !github.event.release.prerelease
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Render the manifests
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt
+          python packaging/render.py "${TAG#v}" SHA256SUMS.txt out
+      - name: Submit to winget-pkgs
+        # Opens a pull request from the token owner's fork of
+        # microsoft/winget-pkgs; winget's bots validate and merge it.
+        shell: pwsh
+        env:
+          WINGET_TOKEN: ${{ secrets.WINGET_TOKEN }}
+        run: |
+          $url = 'https://github.com/microsoft/winget-create/releases/download/v1.12.13.0/wingetcreate.exe'
+          Invoke-WebRequest $url -OutFile wingetcreate.exe
+          $hash = (Get-FileHash wingetcreate.exe -Algorithm SHA256).Hash
+          if ($hash -ne '24042BD37915805615E6CF969AC57C6439124C3FE85823327F5F3FB24BD9FFEA') {
+            throw "wingetcreate.exe has an unexpected hash: $hash"
+          }
+          .\wingetcreate.exe submit out\winget --token $env:WINGET_TOKEN
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  chocolatey:
+    if: vars.PUBLISH_CHOCOLATEY == 'true' && !github.event.release.prerelease
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ env.TAG }}
+          persist-credentials: false
+      - name: Render the package
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release download "$TAG" --repo "$GITHUB_REPOSITORY" --pattern SHA256SUMS.txt
+          python packaging/render.py "${TAG#v}" SHA256SUMS.txt out
+      - name: Pack and push
+        # Every version goes through Chocolatey's moderation queue before it
+        # is listed.
+        shell: pwsh
+        env:
+          CHOCOLATEY_API_KEY: ${{ secrets.CHOCOLATEY_API_KEY }}
+        run: |
+          choco pack out\chocolatey\hivemend.nuspec --outputdirectory out
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $version = $env:TAG.TrimStart('v')
+          choco push "out\hivemend.$version.nupkg" --source https://push.chocolatey.org/ --api-key $env:CHOCOLATEY_API_KEY
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
