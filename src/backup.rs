@@ -849,7 +849,9 @@ pub fn list_backups_until(
 /// made while the worker runs does not start another: the worker sees it,
 /// stops its current pass early, and starts again for the newest one. Only a
 /// result for the newest request is published, and nothing older can replace
-/// it.
+/// it. Every request gets an answer: a pass that fails (panics) publishes
+/// `None` instead of a value, unless a newer request is already waiting, which
+/// is then answered as usual.
 pub struct Refresher<T> {
     state: std::sync::Mutex<RefreshState<T>>,
 }
@@ -857,7 +859,7 @@ pub struct Refresher<T> {
 struct RefreshState<T> {
     wanted: u64,
     running: bool,
-    ready: Option<(u64, T)>,
+    ready: Option<(u64, Option<T>)>,
 }
 
 impl<T> Default for Refresher<T> {
@@ -900,9 +902,20 @@ impl<T> Refresher<T> {
         self.lock().wanted
     }
 
-    /// The published answer and the request it answers, taken once.
-    pub fn take(&self) -> Option<(u64, T)> {
+    /// The published answer (`None` if it failed) and the request it
+    /// answers, taken once.
+    pub fn take(&self) -> Option<(u64, Option<T>)> {
         self.lock().ready.take()
+    }
+
+    /// The worker for request `number` could not be started: that request
+    /// is answered as failed, and the next request starts a worker.
+    pub fn not_started(&self, number: u64) {
+        let mut state = self.lock();
+        state.running = false;
+        if state.wanted == number {
+            state.ready = Some((number, None));
+        }
     }
 
     /// The worker's loop for request `number` (from [`request`]): compute,
@@ -917,20 +930,11 @@ impl<T> Refresher<T> {
         compute: impl Fn(&dyn Fn() -> bool) -> T,
         published: impl Fn(),
     ) {
-        // Should `compute` panic, a later request still starts a worker.
-        struct Running<'a, T>(&'a Refresher<T>);
-        impl<T> Drop for Running<'_, T> {
-            fn drop(&mut self) {
-                // Only when unwinding: after a publish another worker may
-                // already be running.
-                if std::thread::panicking() {
-                    self.0.lock().running = false;
-                }
-            }
-        }
-        let _running = Running(self);
         loop {
-            let value = compute(&|| self.wanted() != number);
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compute(&|| self.wanted() != number)
+            }))
+            .ok();
             let mut state = self.lock();
             if state.wanted == number {
                 state.ready = Some((number, value));
@@ -1020,7 +1024,7 @@ mod tests {
         assert_eq!(most.load(Ordering::SeqCst), 1, "two readers at once");
         assert_eq!(published.load(Ordering::SeqCst), 1);
         // Only the answer to the newest request, from the second pass.
-        assert_eq!(refresher.take(), Some((6, 1)));
+        assert_eq!(refresher.take(), Some((6, Some(1))));
         assert_eq!(refresher.wanted(), 6);
         assert_eq!(refresher.take(), None);
         // Idle again: the next request starts a reader.
@@ -1028,17 +1032,41 @@ mod tests {
     }
 
     #[test]
-    fn a_reader_that_fails_does_not_block_later_refreshes() {
-        let refresher = std::sync::Arc::new(Refresher::<u8>::new());
+    fn a_reader_that_fails_still_answers_and_does_not_block_later_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Failing alone: its request is answered as failed.
+        let refresher = Refresher::<u8>::new();
         let first = refresher.request().unwrap();
-        let worker = refresher.clone();
-        let outcome = std::thread::spawn(move || {
-            worker.work(first, |_: &dyn Fn() -> bool| panic!("read failed"), || {})
-        })
-        .join();
-        assert!(outcome.is_err());
-        assert_eq!(refresher.take(), None);
-        assert_eq!(refresher.request(), Some(2));
+        let published = AtomicUsize::new(0);
+        refresher.work(
+            first,
+            |_: &dyn Fn() -> bool| panic!("read failed"),
+            || {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(refresher.take(), Some((1, None)));
+        // Failing with a newer request already waiting: that one is read.
+        let second = refresher.request().unwrap();
+        let passes = AtomicUsize::new(0);
+        refresher.work(
+            second,
+            |_: &dyn Fn() -> bool| {
+                if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(refresher.request(), None);
+                    panic!("read failed");
+                }
+                7
+            },
+            || {},
+        );
+        assert_eq!(refresher.take(), Some((3, Some(7))));
+        assert_eq!(refresher.request(), Some(4));
+        // A worker that could not be started: answered, and not running.
+        refresher.not_started(4);
+        assert_eq!(refresher.take(), Some((4, None)));
+        assert_eq!(refresher.request(), Some(5));
     }
 
     #[test]

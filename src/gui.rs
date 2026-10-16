@@ -511,6 +511,8 @@ struct App {
     backups: Vec<BackupInfo>,
     /// The refresh the shown list answers.
     backups_shown: u64,
+    /// The newest backup listing could not be read.
+    backups_failed: bool,
 
     job: Job,
     findings: Vec<Finding>,
@@ -802,7 +804,11 @@ unsafe extern "system" fn wnd_proc(
                 if let Some((refresh, list)) = BACKUPS.take()
                     && refresh == BACKUPS.wanted()
                 {
-                    app.backups = list;
+                    // A failed read keeps the list shown before, and says so.
+                    app.backups_failed = list.is_none();
+                    if let Some(list) = list {
+                        app.backups = list;
+                    }
                     app.backups_shown = refresh;
                     app.fill_backups();
                     app.invalidate();
@@ -1134,6 +1140,7 @@ impl App {
             // Read in the background once the window exists.
             backups: Vec::new(),
             backups_shown: 0,
+            backups_failed: false,
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -4494,9 +4501,13 @@ impl App {
             return;
         };
         let hwnd = self.hwnd as isize;
-        std::thread::spawn(move || {
+        let started = std::thread::Builder::new().spawn(move || {
             BACKUPS.work(refresh, all_backups, || post(hwnd, WM_BACKUPS_READY));
         });
+        if started.is_err() {
+            BACKUPS.not_started(refresh);
+            post(hwnd, WM_BACKUPS_READY);
+        }
     }
 
     fn fill_backups(&self) {
@@ -6647,6 +6658,9 @@ impl App {
         let reading = BACKUPS.wanted() != self.backups_shown;
         let line = if reading {
             "Reading the backups...".to_string()
+        } else if self.backups_failed {
+            "The backup folder could not be read. Open this page again to try once more."
+                .to_string()
         } else if self.backups.is_empty() {
             "No backups yet. Each repair saves one here before it changes anything.".to_string()
         } else {
