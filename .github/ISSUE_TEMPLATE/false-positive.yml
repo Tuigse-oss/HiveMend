@@ -1,0 +1,41 @@
+name: False positive
+description: Hivemend flagged something that is not stale
+labels: ["false positive"]
+body:
+  - type: markdown
+    attributes:
+      value: Thanks! False positives are the most useful reports we get. Please leave out anything personal in paths (you can replace your user name with `<user>`).
+  - type: input
+    id: version
+    attributes:
+      label: Hivemend version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: input
+    id: scanner
+    attributes:
+      label: Scanner id
+      description: The job that reported it (SL, SUP, ARP, CC, DEEP, ...)
+  - type: textarea
+    id: finding
+    attributes:
+      label: The finding
+      description: The key, value, or file Hivemend reported, as shown.
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: why
+    attributes:
+      label: Why it is not stale
+      description: What uses it, and what broke if you removed it.
+    validations:
+      required: true

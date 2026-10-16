@@ -1,10 +1,42 @@
 # Hivemend
 
-Hivemend scans a Windows 10 or 11 registry for stale entries and can remove them after writing a backup.
+**A free, open-source registry cleaner and cleanup toolkit for Windows 10 and 11 that shows you exactly what it does.**
+
+No subscriptions. No upsells. No telemetry. No ads. No account. Hivemend never connects to the internet: it contains no networking code at all, and every line of it is here to read.
+
+[**Download the latest release**](https://github.com/Tuigse-oss/HiveMend/releases/latest) · [Screenshots](#a-tour-of-the-window) · [How repairs stay safe](#use) · [Contributing](CONTRIBUTING.md)
+
+![Hivemend scan results](docs/screenshots/wiki-scan.png)
+
+## Why Hivemend
+
+Most registry cleaners are closed boxes that report hundreds of scary "errors" and then ask for money to fix them. Hivemend takes the opposite approach:
+
+- **Transparent.** Every finding says which key or file it is and why it is stale. Scanning never changes anything. You choose what goes.
+- **Backed up first, every time.** Each registry entry is written to a `.reg` backup on disk *before* it is removed, inside its own Windows registry transaction. If anything goes wrong, the change rolls back. **Restore** puts back any registry repair.
+- **Conservative by design.** Hivemend leaves alone what it cannot prove is stale: Winlogon, services, file associations you chose, Windows' own files, and built-in protocols are never deleted.
+- **Honest numbers.** No inflated counts and no "your PC is at risk" banners. A clean machine shows as clean.
+- **Free for good.** MIT or Apache-2.0 licensed. No trial, no pro tier, no license key, no self-updater, nothing phoning home.
+- **Built in the open.** Releases are built by public CI from tagged source, after a security audit of every dependency, and they come with checksums.
+
+Beyond the registry, the window also manages startup items, installed programs, privacy cleanup, disk space, duplicate files, and services, and opens the Windows tools you reach for alongside them. See the [tour](#a-tour-of-the-window).
+
+### Community welcome
+
+Hivemend gets better through people using it on real machines. Bug reports, false positives ("this shouldn't have been flagged"), scanner ideas, docs fixes, and pull requests are all welcome. See [CONTRIBUTING.md](CONTRIBUTING.md) to get started.
+
+## Install
+
+1. Download `Hivemend-vX.Y.Z-x86_64-setup.exe` (installer) or `Hivemend-vX.Y.Z-x86_64-windows.zip` (portable) from [Releases](https://github.com/Tuigse-oss/HiveMend/releases/latest).
+2. Run it. It needs no administrator rights to install or use; it offers to restart as administrator when machine-wide entries need it.
+
+Builds are not code-signed yet, so Windows may show a SmartScreen warning; see [Releases](#releases) for how to check a download first.
 
 > **Use at your own risk.** Hivemend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
-It covers twelve scanner jobs:
+## What it scans
+
+Twelve scanner jobs, each of which looks for one kind of leftover:
 
 | Id | Job |
 | --- | --- |

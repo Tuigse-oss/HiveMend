@@ -1,0 +1,30 @@
+name: Bug report
+description: Something does not work as described
+labels: ["bug"]
+body:
+  - type: input
+    id: version
+    attributes:
+      label: Hivemend version
+      placeholder: v0.1.0
+    validations:
+      required: true
+  - type: input
+    id: windows
+    attributes:
+      label: Windows version
+      placeholder: Windows 11 24H2
+    validations:
+      required: true
+  - type: dropdown
+    id: admin
+    attributes:
+      label: Running as administrator?
+      options: ["No", "Yes", "Not sure"]
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: Steps, what you expected, and what you saw instead. Error text or a screenshot helps.
+    validations:
+      required: true
