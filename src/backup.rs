@@ -795,11 +795,24 @@ pub struct BackupInfo {
 
 /// `.reg` files in one backup folder, newest first.
 pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
+    list_backups_until(dir, store, &|| false)
+}
+
+/// [`list_backups`], giving up between files once `stop` says the answer is
+/// no longer wanted (what it found by then is returned).
+pub fn list_backups_until(
+    dir: &Path,
+    store: crate::store::Store,
+    stop: &dyn Fn() -> bool,
+) -> Vec<BackupInfo> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
     let mut found = Vec::new();
     for entry in entries.flatten() {
+        if stop() {
+            break;
+        }
         let path = entry.path();
         let is_reg = path
             .extension()
@@ -832,6 +845,105 @@ pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
     found
 }
 
+/// One background worker answering refresh requests, newest first. A request
+/// made while the worker runs does not start another: the worker sees it,
+/// stops its current pass early, and starts again for the newest one. Only a
+/// result for the newest request is published, and nothing older can replace
+/// it.
+pub struct Refresher<T> {
+    state: std::sync::Mutex<RefreshState<T>>,
+}
+
+struct RefreshState<T> {
+    wanted: u64,
+    running: bool,
+    ready: Option<(u64, T)>,
+}
+
+impl<T> Default for Refresher<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Refresher<T> {
+    pub const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(RefreshState {
+                wanted: 0,
+                running: false,
+                ready: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RefreshState<T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ask for a fresh answer. Returns the request's number, or `None` when
+    /// the worker already running will take it up instead.
+    pub fn request(&self) -> Option<u64> {
+        let mut state = self.lock();
+        state.wanted += 1;
+        if state.running {
+            return None;
+        }
+        state.running = true;
+        Some(state.wanted)
+    }
+
+    /// The newest request's number.
+    pub fn wanted(&self) -> u64 {
+        self.lock().wanted
+    }
+
+    /// The published answer and the request it answers, taken once.
+    pub fn take(&self) -> Option<(u64, T)> {
+        self.lock().ready.take()
+    }
+
+    /// The worker's loop for request `number` (from [`request`]): compute,
+    /// passing a check that turns true once a newer request is made, and
+    /// publish if no newer one came meanwhile; otherwise compute again for
+    /// the newest. `published` is called after each publish.
+    ///
+    /// [`request`]: Refresher::request
+    pub fn work(
+        &self,
+        mut number: u64,
+        compute: impl Fn(&dyn Fn() -> bool) -> T,
+        published: impl Fn(),
+    ) {
+        // Should `compute` panic, a later request still starts a worker.
+        struct Running<'a, T>(&'a Refresher<T>);
+        impl<T> Drop for Running<'_, T> {
+            fn drop(&mut self) {
+                // Only when unwinding: after a publish another worker may
+                // already be running.
+                if std::thread::panicking() {
+                    self.0.lock().running = false;
+                }
+            }
+        }
+        let _running = Running(self);
+        loop {
+            let value = compute(&|| self.wanted() != number);
+            let mut state = self.lock();
+            if state.wanted == number {
+                state.ready = Some((number, value));
+                state.running = false;
+                drop(state);
+                published();
+                return;
+            }
+            number = state.wanted;
+        }
+    }
+}
+
 /// True when the text carries a Hivemend marker line: the unified marker, or
 /// the older services-only marker so a services backup can still be restored.
 pub fn is_hive_mend_backup(text: &str) -> bool {
@@ -846,6 +958,106 @@ mod tests {
     use super::*;
     use crate::model::{Repair, ScannerId};
     use crate::registry::MemoryRegistry;
+
+    #[test]
+    fn one_backup_reader_runs_and_only_the_newest_answer_is_published() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let refresher = Arc::new(Refresher::<usize>::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let stopped_early = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicUsize::new(0));
+        let (started, wait_started) = mpsc::channel::<()>();
+        let started = std::sync::Mutex::new(started);
+        let first = refresher
+            .request()
+            .expect("the first request starts the reader");
+        let worker = {
+            let (refresher, active, most, passes, stopped_early, published) = (
+                refresher.clone(),
+                active.clone(),
+                most.clone(),
+                passes.clone(),
+                stopped_early.clone(),
+                published.clone(),
+            );
+            std::thread::spawn(move || {
+                refresher.work(
+                    first,
+                    |stale: &dyn Fn() -> bool| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        let pass = passes.fetch_add(1, Ordering::SeqCst);
+                        if pass == 0 {
+                            // A slow first pass: it waits to be superseded.
+                            started.lock().unwrap().send(()).unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(20);
+                            while !stale() && Instant::now() < deadline {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            stopped_early.store(stale(), Ordering::SeqCst);
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        pass
+                    },
+                    || {
+                        published.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            })
+        };
+        wait_started.recv().unwrap();
+        // Requests while it reads start no second reader.
+        for _ in 0..5 {
+            assert_eq!(refresher.request(), None);
+        }
+        worker.join().unwrap();
+        assert!(stopped_early.load(Ordering::SeqCst), "the old pass ran on");
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert_eq!(most.load(Ordering::SeqCst), 1, "two readers at once");
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        // Only the answer to the newest request, from the second pass.
+        assert_eq!(refresher.take(), Some((6, 1)));
+        assert_eq!(refresher.wanted(), 6);
+        assert_eq!(refresher.take(), None);
+        // Idle again: the next request starts a reader.
+        assert_eq!(refresher.request(), Some(7));
+    }
+
+    #[test]
+    fn a_reader_that_fails_does_not_block_later_refreshes() {
+        let refresher = std::sync::Arc::new(Refresher::<u8>::new());
+        let first = refresher.request().unwrap();
+        let worker = refresher.clone();
+        let outcome = std::thread::spawn(move || {
+            worker.work(first, |_: &dyn Fn() -> bool| panic!("read failed"), || {})
+        })
+        .join();
+        assert!(outcome.is_err());
+        assert_eq!(refresher.take(), None);
+        assert_eq!(refresher.request(), Some(2));
+    }
+
+    #[test]
+    fn a_backup_listing_stops_between_files_when_no_longer_wanted() {
+        let dir = std::env::temp_dir().join(format!("hm-list-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..5 {
+            std::fs::write(dir.join(format!("b{n}.reg")), b"x").unwrap();
+        }
+        let all = list_backups(&dir, crate::store::Store::User);
+        let looked = std::cell::Cell::new(0);
+        let some = list_backups_until(&dir, crate::store::Store::User, &|| {
+            looked.set(looked.get() + 1);
+            looked.get() > 2
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(all.len(), 5);
+        assert_eq!(some.len(), 2);
+    }
 
     fn finding(key: &str, repair: Repair) -> Finding {
         Finding {

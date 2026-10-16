@@ -26,9 +26,9 @@ use hive_mend::{
     WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
     backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
     exclusions_file, expand_target, format_bytes, format_uptime, gather_hives, gather_snapshot,
-    group_digits, list_backups, parse_custom, plan_profile, preview_with, repair_with_progress,
-    restore_backup, scan_with_progress, settings_file, sort_services, start_services,
-    still_reported, stop_services, user_dir,
+    group_digits, list_backups_until, parse_custom, plan_profile, preview_with,
+    repair_with_progress, restore_backup, scan_with_progress, settings_file, sort_services,
+    start_services, still_reported, stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -373,9 +373,8 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
     text: String::new(),
 });
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
-/// The newest backup listing and the refresh it answers.
-static BACKUPS: Mutex<Option<(u64, Vec<BackupInfo>)>> = Mutex::new(None);
-static BACKUP_REFRESH: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// The backup listing: one reader at a time, newest request wins.
+static BACKUPS: hive_mend::Refresher<Vec<BackupInfo>> = hive_mend::Refresher::new();
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 // Reentrancy guard for the window procedure. Synchronous dispatches
@@ -800,9 +799,8 @@ unsafe extern "system" fn wnd_proc(
                 0
             }
             WM_BACKUPS_READY => {
-                let newest = BACKUP_REFRESH.load(Ordering::SeqCst);
-                if let Some((refresh, list)) = BACKUPS.lock().ok().and_then(|mut slot| slot.take())
-                    && refresh == newest
+                if let Some((refresh, list)) = BACKUPS.take()
+                    && refresh == BACKUPS.wanted()
                 {
                     app.backups = list;
                     app.backups_shown = refresh;
@@ -4489,20 +4487,15 @@ impl App {
     // ---- restore -------------------------------------------------------
 
     /// Read the backup list off the window's thread (each file is read and
-    /// parsed), and show it when it arrives; a later refresh supersedes an
-    /// earlier one still running.
+    /// parsed), and show it when it arrives. One reader runs at a time: a
+    /// refresh while it reads makes it stop early and read again.
     fn refresh_backups(&mut self) {
-        let refresh = BACKUP_REFRESH.fetch_add(1, Ordering::SeqCst) + 1;
+        let Some(refresh) = BACKUPS.request() else {
+            return;
+        };
         let hwnd = self.hwnd as isize;
         std::thread::spawn(move || {
-            let list = all_backups();
-            if BACKUP_REFRESH.load(Ordering::SeqCst) != refresh {
-                return;
-            }
-            if let Ok(mut slot) = BACKUPS.lock() {
-                *slot = Some((refresh, list));
-            }
-            post(hwnd, WM_BACKUPS_READY);
+            BACKUPS.work(refresh, all_backups, || post(hwnd, WM_BACKUPS_READY));
         });
     }
 
@@ -6651,7 +6644,7 @@ impl App {
     unsafe fn draw_restore(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "Restore", None);
         // A refresh still reading in the background is not an empty list.
-        let reading = BACKUP_REFRESH.load(Ordering::SeqCst) != self.backups_shown;
+        let reading = BACKUPS.wanted() != self.backups_shown;
         let line = if reading {
             "Reading the backups...".to_string()
         } else if self.backups.is_empty() {
@@ -7555,10 +7548,10 @@ fn next_services_backup_file() -> Option<hive_mend::BackupWriter> {
 }
 
 /// Backups from every store, newest first, each tagged with its store.
-fn all_backups() -> Vec<BackupInfo> {
+fn all_backups(stop: &dyn Fn() -> bool) -> Vec<BackupInfo> {
     let mut all: Vec<BackupInfo> = backup_stores()
         .into_iter()
-        .flat_map(|(store, dir)| list_backups(&dir, store))
+        .flat_map(|(store, dir)| list_backups_until(&dir, store, stop))
         .collect();
     all.sort_by_key(|info| std::cmp::Reverse(info.modified));
     all
