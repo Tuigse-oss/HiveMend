@@ -1124,6 +1124,9 @@ fn preview_target(
                     continue;
                 }
                 for name in names {
+                    if !keep_going() {
+                        return false;
+                    }
                     if *sidecars {
                         row.note(format!("{dir}\\{name}: database files are not deleted"));
                         continue;
@@ -1156,6 +1159,9 @@ fn preview_target(
                 let Some(db) = cookie_db(fs, &dir, names) else {
                     continue;
                 };
+                if !keep_going() {
+                    return false;
+                }
                 match keep {
                     CookieKeep::Sites(sites) => {
                         match crate::cookies::count_cookies(std::path::Path::new(&db), sites) {
@@ -1729,6 +1735,10 @@ fn execute_item(
                         continue;
                     }
                     for name in names {
+                        if !keep_going() {
+                            done.canceled = true;
+                            return done;
+                        }
                         if started(&mut done).is_some() {
                             return done;
                         }
@@ -1774,6 +1784,12 @@ fn execute_item(
                     let Some(db) = cookie_db(fs, &dir, names) else {
                         continue;
                     };
+                    // Asked again before every database, so a Cancel made
+                    // after the profiles were found still edits nothing more.
+                    if !keep_going() {
+                        done.canceled = true;
+                        return done;
+                    }
                     if started(&mut done).is_some() {
                         return done;
                     }
@@ -2896,6 +2912,53 @@ mod tests {
             let db = format!(r"{users}\P{n:03}\Network\Cookies");
             assert_eq!(fs.read(&db), Some(vec![7; 64]), "{db}");
         }
+    }
+
+    /// Cancel after the few profiles were found (too few for discovery to
+    /// ask): it is still seen before the first cookie database.
+    #[test]
+    fn cancel_after_discovery_stops_before_the_first_database() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for n in 0..3 {
+            fs.add_file_bytes(&format!(r"{users}\P{n}\Network\Cookies"), vec![7; 64], None);
+        }
+        let items = vec![builtin("chrome-data")];
+        let mut calls = 0;
+        let preview = preview_with(&reg, &fs, &sys, &quiet(), &items, &mut || {
+            calls += 1;
+            calls < 2
+        });
+        assert!(preview.canceled);
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-db");
+        let mut calls = 0;
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &items,
+            &mut backup,
+            &mut |_, _, _| {
+                calls += 1;
+                calls < 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .all(|note| !note.contains("Cookies")),
+            "a database was looked at: {:?}",
+            outcome.items[0].restricted
+        );
     }
 
     #[test]
