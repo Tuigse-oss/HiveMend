@@ -1,0 +1,28 @@
+# yaml-language-server: $schema=https://aka.ms/winget-manifest.defaultLocale.1.10.0.schema.json
+PackageIdentifier: TUIGSE.Hivemend
+PackageVersion: {{VERSION}}
+PackageLocale: en-US
+Publisher: TUIGSE LLC
+PublisherUrl: https://github.com/Tuigse-oss
+PublisherSupportUrl: https://github.com/Tuigse-oss/HiveMend/issues
+PackageName: Hivemend
+PackageUrl: https://github.com/Tuigse-oss/HiveMend
+License: MIT OR Apache-2.0
+LicenseUrl: https://github.com/Tuigse-oss/HiveMend/blob/main/LICENSE-MIT
+ShortDescription: Free, open-source registry cleaner for Windows 10/11 with backed-up, transactional repairs.
+Description: |-
+  Hivemend scans the Windows registry for stale entries left behind by removed programs and removes the ones you choose,
+  each inside its own registry transaction after writing a backup that Restore can put back. It also manages startup items,
+  installed programs, privacy cleanup, disk space, duplicate files, and services.
+  No subscriptions, upsells, ads, account, or telemetry: Hivemend contains no networking code.
+Tags:
+  - registry
+  - registry-cleaner
+  - cleaner
+  - privacy
+  - startup
+  - uninstaller
+  - open-source
+ReleaseNotesUrl: https://github.com/Tuigse-oss/HiveMend/releases/tag/v{{VERSION}}
+ManifestType: defaultLocale
+ManifestVersion: 1.10.0

@@ -26,9 +26,10 @@ DefaultDirName={autopf}\Hivemend
 DefaultGroupName=Hivemend
 DisableProgramGroupPage=yes
 ; The exe runs asInvoker, so a per-user install needs no administrator
-; rights; the dialog lets the user install for all users instead.
+; rights; the dialog, or /ALLUSERS for a silent install (winget,
+; Chocolatey), installs for all users instead.
 PrivilegesRequired=lowest
-PrivilegesRequiredOverridesAllowed=dialog
+PrivilegesRequiredOverridesAllowed=commandline dialog
 ArchitecturesAllowed=x64compatible
 ArchitecturesInstallIn64BitMode=x64compatible
 MinVersion=10.0
