@@ -1119,11 +1119,16 @@ impl FileView for HostFs {
             pin.age = host::handle_age(&file);
         }
         if access == Access::ReadDeleteExclusive {
-            // And its length.
+            // And its length, its place and its names: held without delete
+            // sharing, it can no longer be renamed, nor can its folders.
             pin.len = file
                 .metadata()
                 .map(|meta| meta.len())
                 .map_err(|err| err.to_string())?;
+            if let Some((real_path, links)) = host::held_place(&file)? {
+                pin.real_path = real_path;
+                pin.links = links;
+            }
         }
         pin.handle = PinHandle::Host(file);
         Ok(())
@@ -1749,6 +1754,15 @@ mod host {
         )
     }
 
+    /// The held object's real path and name count, read through its handle.
+    pub fn held_place(file: &std::fs::File) -> Result<Option<(String, u32)>, String> {
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        if unsafe { GetFileInformationByHandle(file.as_raw_handle() as _, &mut info) } == 0 {
+            return Err(last_error());
+        }
+        Ok(Some((final_path(file)?, info.nNumberOfLinks)))
+    }
+
     /// Volume serial and file index: the identity of an open object.
     fn file_id(file: &std::fs::File) -> Result<(u32, u32, u32), String> {
         let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
@@ -1889,6 +1903,11 @@ mod host {
         _real_path: &str,
     ) -> Result<std::fs::File, String> {
         file.try_clone().map_err(|err| err.to_string())
+    }
+
+    /// Paths are not read back from handles here.
+    pub fn held_place(_file: &std::fs::File) -> Result<Option<(String, u32)>, String> {
+        Ok(None)
     }
 
     pub fn handle_age(file: &std::fs::File) -> Option<std::time::Duration> {
@@ -2139,6 +2158,34 @@ mod live_tests {
         assert!(refused.is_err());
         assert_eq!(blocked_kept.as_deref(), Some(&b"other"[..]));
         assert_eq!(backup_kept.as_deref(), Some(&b"already here"[..]));
+    }
+
+    #[test]
+    fn live_a_held_file_reports_where_it_is_now() {
+        // Pinned (shared), moved elsewhere by someone else, then held: the
+        // hold reads its place again, so checks see where it really is.
+        let base = std::env::temp_dir().join(format!("hm-held-place-{}", std::process::id()));
+        let inside = base.join("inside");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = inside.join("a.lnk");
+        std::fs::write(&file, b"x").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&file.display().to_string()).unwrap();
+        let moved = std::fs::rename(&file, outside.join("a.lnk"));
+        let held = fs.pin_acquire(&mut pin, Access::ReadDeleteExclusive);
+        let renamed_again = std::fs::rename(outside.join("a.lnk"), inside.join("b.lnk"));
+        let real = pin.real_path.clone();
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&base);
+        moved.expect("a pin shares delete, so it can be moved");
+        held.expect("held");
+        assert!(
+            real.to_ascii_lowercase().ends_with(r"\outside\a.lnk"),
+            "{real}"
+        );
+        assert!(renamed_again.is_err(), "a held file was renamed");
     }
 
     #[test]

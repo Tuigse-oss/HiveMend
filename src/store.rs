@@ -313,14 +313,24 @@ fn restore_one(
         Err(_) if fs.exists(&original) && !fs.exists(&copy_text) => return Ok(false),
         Err(err) => return Err(format!("the saved copy {copy_text}: {err}")),
     };
-    let inside = files_real.is_some_and(|dir| {
-        path_under(&source.real_path, dir) && !source.real_path.eq_ignore_ascii_case(dir)
-    });
-    if !inside || source.kind != ItemKind::File || source.links != 1 {
-        return Err(format!(
-            "refused: the saved copy {copy_text} is not inside this backup's own files folder"
-        ));
-    }
+    let confined = |source: &Pinned| {
+        let inside = files_real.is_some_and(|dir| {
+            path_under(&source.real_path, dir) && !source.real_path.eq_ignore_ascii_case(dir)
+        });
+        if !inside || source.kind != ItemKind::File || source.links != 1 {
+            return Err(format!(
+                "refused: the saved copy {copy_text} is not inside this backup's own files folder"
+            ));
+        }
+        Ok(())
+    };
+    confined(&source)?;
+    // Then held, so nothing can write, rename or delete it (or rename its
+    // folders) any more; its place and names are read again through the
+    // hold and checked again.
+    fs.pin_acquire(&mut source, Access::ReadDeleteExclusive)
+        .map_err(|err| format!("the saved copy {copy_text}: {err}"))?;
+    confined(&source)?;
     if fs.exists(&original) {
         // Something else is there now: never overwritten, never taken for
         // a finished restore.
@@ -333,7 +343,6 @@ fn restore_one(
     // matter, and an interruption leaves it either here or there, whole.
     // Where it lands is checked first and its folders are made through held
     // handles, so a folder changed after the check cannot carry it elsewhere.
-    fs.pin_acquire(&mut source, Access::ReadDeleteExclusive)?;
     fs.pin_move_confined(source, &original, &|fs, real| destination_allowed(fs, real))
         .map_err(|err| {
             if err.contains("os error 183") || err.contains("already exists") {
