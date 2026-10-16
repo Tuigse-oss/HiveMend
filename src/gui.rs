@@ -2086,7 +2086,7 @@ impl App {
             Repair::DeleteKey { .. } => "Delete key".to_string(),
             Repair::DeleteFile {
                 keep_copy: true, ..
-            } => "Delete shortcut (copy kept)".to_string(),
+            } => "Move shortcut into backup".to_string(),
             Repair::DeleteFile {
                 keep_copy: false, ..
             } => "Delete file (no undo)".to_string(),
@@ -7238,7 +7238,7 @@ impl App {
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
-            "Before repairing, the ticked entries are checked again. Each registry entry is saved to the backup and removed in one registry transaction, so one that changes meanwhile stays; shortcuts are saved first too. Old temporary files are deleted for good and are not backed up.",
+            "Before repairing, the ticked entries are checked again. Each registry entry is saved to the backup and removed in one registry transaction, so one that changes meanwhile stays; shortcuts are moved into the backup, and Restore moves them back. Old temporary files are deleted for good and are not backed up.",
             "It never touches Winlogon, default-app choices, the services Windows needs to boot or stay secure, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",

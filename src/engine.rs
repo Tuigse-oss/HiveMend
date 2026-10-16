@@ -1061,9 +1061,9 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
             message: err,
         };
     }
-    // The copy holds the main data stream only; a file with any named
-    // stream (the download marker included) could not be put back whole,
-    // so it is left alone. Checked through the held handle.
+    // A file with any named stream (the download marker included) is left
+    // alone, checked through the held handle. One added after this check
+    // still travels with it, into the backup and back on restore.
     if copy.is_some() && fs.pin_named_streams(&pin) != Ok(false) {
         return Applied::NotBackedUp;
     }

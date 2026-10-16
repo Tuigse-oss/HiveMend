@@ -33,7 +33,7 @@ enum Command {
     Scan(ScanArgs),
     /// Back up matching entries, then remove them.
     Repair(RepairArgs),
-    /// Merge a backup written by repair and put back its shortcut copies.
+    /// Merge a backup written by repair and move its saved shortcuts back.
     Restore {
         /// The .reg file in the backup folder.
         file: PathBuf,

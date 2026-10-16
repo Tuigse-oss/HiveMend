@@ -211,6 +211,18 @@ pub trait FileView {
         path: &str,
         allowed: &dyn Fn(&dyn FileView, &str) -> bool,
     ) -> Result<Pinned, String>;
+    /// Move the pinned file (held with delete access) to `path` the same
+    /// confined way [`pin_create_confined`](FileView::pin_create_confined)
+    /// creates one: missing folders made through held handles, `allowed`
+    /// asked about the real destination first, and then one rename by the
+    /// file's own handle that never replaces anything. All its data streams
+    /// go with it, and an interruption leaves it in one place or the other.
+    fn pin_move_confined(
+        &mut self,
+        pin: Pinned,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<(), String>;
     /// True when the file has named data streams besides the download
     /// marker (Zone.Identifier). A copy of the main stream does not hold
     /// them, so such a file cannot be backed up by copying.
@@ -524,6 +536,58 @@ impl FileView for MemoryFs {
             _ => return Err("file not found (os error 2)".into()),
         }
         self.nodes.remove(&key);
+        Ok(())
+    }
+
+    fn pin_move_confined(
+        &mut self,
+        pin: Pinned,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<(), String> {
+        let from = self.pinned_key(&pin)?.to_string();
+        let path = norm(path);
+        let mut anchor = path.as_str();
+        let mut rest: Vec<&str> = Vec::new();
+        while !self.is_dir(anchor) {
+            let Some((parent, name)) = anchor.rsplit_once('\\') else {
+                return Err("refused: no part of its folder exists".into());
+            };
+            rest.push(name);
+            anchor = parent;
+        }
+        let key = rest
+            .iter()
+            .rev()
+            .fold(self.resolve(anchor), |path, part| format!(r"{path}\{part}"));
+        if !allowed(self, &key) {
+            return Err(format!("refused: it resolves to {key}"));
+        }
+        if self
+            .other_volume
+            .iter()
+            .any(|root| from.starts_with(root.as_str()) != key.starts_with(root.as_str()))
+        {
+            return Err(
+                "the system cannot move the file to a different disk drive (os error 17)".into(),
+            );
+        }
+        if self.nodes.contains_key(&key) {
+            return Err("cannot create a file when that file already exists (os error 183)".into());
+        }
+        let node = self
+            .nodes
+            .remove(&from)
+            .ok_or("file not found (os error 2)")?;
+        self.ensure_parents(&key);
+        self.nodes.insert(key.clone(), node);
+        for list in [&mut self.streams, &mut self.markers] {
+            for item in list.iter_mut() {
+                if *item == from {
+                    *item = key.clone();
+                }
+            }
+        }
         Ok(())
     }
 
@@ -1151,6 +1215,18 @@ impl FileView for HostFs {
         host::create_confined(path, &|real| allowed(&HostFs, real))
     }
 
+    fn pin_move_confined(
+        &mut self,
+        pin: Pinned,
+        path: &str,
+        allowed: &dyn Fn(&dyn FileView, &str) -> bool,
+    ) -> Result<(), String> {
+        let PinHandle::Host(file) = pin.handle else {
+            return Err("not a host handle".into());
+        };
+        host::place_confined(path, &|real| allowed(&HostFs, real), Some(&file)).map(|_| ())
+    }
+
     fn pin_copy_to(&mut self, pin: &Pinned, to: &str) -> Result<(), String> {
         use std::io::Write;
         let bytes = self
@@ -1357,7 +1433,18 @@ mod host {
     /// (`FILE_CREATE`, never opening something already there) relative to
     /// the held handle of the folder above.
     pub fn create_confined(path: &str, allowed: &dyn Fn(&str) -> bool) -> Result<Pinned, String> {
-        use crate::fs::{host_dispose, host_open_in, nt_status_text};
+        place_confined(path, allowed, None)
+    }
+
+    /// [`create_confined`], or, with `moving`, the same folder handling
+    /// ending in one rename of that held file (with delete access) into the
+    /// last folder, never replacing anything.
+    pub fn place_confined(
+        path: &str,
+        allowed: &dyn Fn(&str) -> bool,
+        moving: Option<&std::fs::File>,
+    ) -> Result<Pinned, String> {
+        use crate::fs::{host_dispose, host_open_in, host_rename_into, nt_status_text};
         const FILE_LIST_DIRECTORY: u32 = 0x0001;
         const FILE_ADD_FILE: u32 = 0x0002;
         const FILE_ADD_SUBDIRECTORY: u32 = 0x0004;
@@ -1451,6 +1538,20 @@ mod host {
             }
         }
         let parent = made.last().unwrap_or(anchor_file);
+        if let Some(moving) = moving {
+            if let Err(err) = host_rename_into(moving, parent, leaf) {
+                let note = undo(made);
+                return Err(format!("could not move it to {path}: {err}{note}"));
+            }
+            // Moved: the folders made for it stay. It landed relative to
+            // held handles, so its real path is the one allowed above.
+            let real = final_path(moving)?;
+            if !real.eq_ignore_ascii_case(&projected) {
+                return Err(format!("it landed at {real} instead of {projected}"));
+            }
+            drop(made);
+            return identify(moving.try_clone().map_err(|err| err.to_string())?, path);
+        }
         let file = match host_open_in(
             parent,
             leaf,
@@ -1727,6 +1828,17 @@ mod host {
             age: meta.modified().ok().and_then(|when| when.elapsed().ok()),
             handle: PinHandle::Host(file),
         })
+    }
+
+    pub fn place_confined(
+        path: &str,
+        allowed: &dyn Fn(&str) -> bool,
+        moving: Option<&std::fs::File>,
+    ) -> Result<Pinned, String> {
+        if moving.is_some() {
+            return Err("moving by handle is only done on Windows".into());
+        }
+        create_confined(path, allowed)
     }
 
     pub fn create_confined(path: &str, allowed: &dyn Fn(&str) -> bool) -> Result<Pinned, String> {

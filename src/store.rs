@@ -265,12 +265,14 @@ pub fn read_restorable(
     Ok((real, bytes))
 }
 
-/// Put back shortcut copies whose original is still missing, confined at both
-/// ends: the saved copy must really be inside this backup's own `-files`
-/// folder, and the destination must pass the same rule repair used to remove
-/// it (Start Menu, Desktop, or temp; never the Windows folder). The new file
-/// is created without following links, checked by its real path, and removed
-/// again if it landed anywhere else. Nothing existing is overwritten.
+/// Move saved shortcuts back to their places, confined at both ends: the
+/// saved shortcut must really be inside this backup's own `-files` folder,
+/// and the destination must pass the same rule repair used to remove it
+/// (Start Menu, Desktop, or temp; never the Windows folder), checked by its
+/// real path before anything is made. It goes back by one rename of its own
+/// handle, with all its data, and nothing existing is overwritten. One that
+/// is already back (gone from the backup, present at its place) counts as
+/// done.
 pub fn restore_files(
     fs: &mut dyn FileView,
     backup_real: &str,
@@ -304,13 +306,13 @@ fn restore_one(
     if !destination_allowed(&*fs, &original) {
         return Err("refused: not a place repair removes shortcuts from".into());
     }
-    if fs.exists(&original) {
-        return Ok(false);
-    }
     let copy_text = copy.display().to_string();
-    let mut source = fs
-        .pin(&copy_text)
-        .map_err(|err| format!("the saved copy {copy_text}: {err}"))?;
+    let mut source = match fs.pin(&copy_text) {
+        Ok(source) => source,
+        // Put back by an earlier restore: the saved shortcut went back.
+        Err(_) if fs.exists(&original) && !fs.exists(&copy_text) => return Ok(false),
+        Err(err) => return Err(format!("the saved copy {copy_text}: {err}")),
+    };
     let inside = files_real.is_some_and(|dir| {
         path_under(&source.real_path, dir) && !source.real_path.eq_ignore_ascii_case(dir)
     });
@@ -319,23 +321,33 @@ fn restore_one(
             "refused: the saved copy {copy_text} is not inside this backup's own files folder"
         ));
     }
-    fs.pin_acquire(&mut source, Access::Read)?;
-    let bytes = fs
-        .pin_read_at(&source, 0, crate::fs::copy_len(&source)?)
-        .filter(|bytes| bytes.len() as u64 == source.len)
-        .ok_or("could not read the saved copy")?;
-    // Where it will really land is checked before anything is created,
-    // and the folders and file are then made through held handles, so a
-    // refused restore makes nothing anywhere, and a folder changed after the
-    // check cannot carry it somewhere else.
-    let target = fs.pin_create_confined(&original, &|fs, real| destination_allowed(fs, real))?;
-    let written = fs
-        .pin_write_at(&target, 0, &bytes)
-        .and_then(|()| fs.pin_sync(&target));
-    if let Err(err) = written {
-        let _ = fs.pin_delete(target);
-        return Err(err);
+    if fs.exists(&original) {
+        // Something else is there now: never overwritten, never taken for
+        // a finished restore.
+        return Err(format!(
+            "something is already at that place, so it was left as it is; the saved shortcut stays at {copy_text}"
+        ));
     }
+    // The saved shortcut itself goes back: moved by its own handle in one
+    // rename, so all its data streams return with it, its size does not
+    // matter, and an interruption leaves it either here or there, whole.
+    // Where it lands is checked first and its folders are made through held
+    // handles, so a folder changed after the check cannot carry it elsewhere.
+    fs.pin_acquire(&mut source, Access::ReadDeleteExclusive)?;
+    fs.pin_move_confined(source, &original, &|fs, real| destination_allowed(fs, real))
+        .map_err(|err| {
+            if err.contains("os error 183") || err.contains("already exists") {
+                format!(
+                    "something is already at that place, so it was left as it is; the saved shortcut stays at {copy_text}"
+                )
+            } else if err.contains("os error 17") {
+                format!(
+                    "the saved shortcut is on another drive, so it stays at {copy_text}; move it back yourself"
+                )
+            } else {
+                err
+            }
+        })?;
     Ok(true)
 }
 
@@ -1172,7 +1184,9 @@ mod tests {
         let files = r"C:\ProgramData\HiveMend\backups\hive-mend-1-files";
         let desktop = r"C:\Users\me\Desktop";
         fs.add_file_bytes(backup, vec![1], None);
-        fs.add_file_bytes(&format!(r"{files}\0001-good.lnk"), b"good".to_vec(), None);
+        for name in ["0001-good", "0003-evil", "0005-x", "0006-y"] {
+            fs.add_file_bytes(&format!(r"{files}\{name}.lnk"), b"good".to_vec(), None);
+        }
         fs.add_file_bytes(r"C:\Users\me\secret.txt", b"secret".to_vec(), None);
         fs.add_file_bytes(&format!(r"{desktop}\present.lnk"), b"mine".to_vec(), None);
         fs.add_file_bytes(&format!(r"{files}\0004-present.lnk"), b"old".to_vec(), None);
@@ -1193,7 +1207,7 @@ mod tests {
                 // Destination where repair never removes shortcuts: refused.
                 (
                     r"C:\Windows\System32\evil.dll",
-                    &format!(r"{files}\0001-good.lnk"),
+                    &format!(r"{files}\0003-evil.lnk"),
                 ),
                 // Already present: left alone, never overwritten.
                 (
@@ -1204,17 +1218,17 @@ mod tests {
                 // real path before anything is created.
                 (
                     &format!(r"{desktop}\sys\x.lnk"),
-                    &format!(r"{files}\0001-good.lnk"),
+                    &format!(r"{files}\0005-x.lnk"),
                 ),
                 // The same, with folders still to be made: none are made.
                 (
                     &format!(r"{desktop}\sys\new\deeper\y.lnk"),
-                    &format!(r"{files}\0001-good.lnk"),
+                    &format!(r"{files}\0006-y.lnk"),
                 ),
             ]),
         );
         assert_eq!(restored, 1, "{errors:?}");
-        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert_eq!(errors.len(), 5, "{errors:?}");
         assert!(
             !fs.exists(r"C:\Windows\System32\new"),
             "a folder was made outside"
@@ -1224,12 +1238,81 @@ mod tests {
             Some(b"good".to_vec())
         );
         assert!(!fs.exists(&format!(r"{desktop}\stolen.lnk")));
+        assert!(fs.exists(r"C:\Users\me\secret.txt"));
         assert!(!fs.exists(r"C:\Windows\System32\evil.dll"));
         assert!(!fs.exists(r"C:\Windows\System32\x.lnk"));
         assert_eq!(
             fs.read(&format!(r"{desktop}\present.lnk")),
             Some(b"mine".to_vec())
         );
+        // Every refused saved shortcut stays where it was.
+        for name in ["0003-evil", "0004-present", "0005-x", "0006-y"] {
+            assert!(fs.exists(&format!(r"{files}\{name}.lnk")), "{name}");
+        }
+        assert!(
+            errors[2].contains("stays at") && errors[2].contains("0004-present"),
+            "{errors:?}"
+        );
+    }
+
+    #[test]
+    fn a_restored_shortcut_is_moved_back_whole_and_once() {
+        use crate::fs::MAX_COPY_BYTES;
+        let mut fs = fs();
+        let backup = r"C:\ProgramData\HiveMend\backups\hive-mend-2.reg";
+        let files = r"C:\ProgramData\HiveMend\backups\hive-mend-2-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        // Larger than a copy may be, with a named data stream.
+        let big = vec![7u8; MAX_COPY_BYTES as usize + 10];
+        fs.add_file_bytes(&format!(r"{files}\0001-big.lnk"), big.clone(), None);
+        fs.add_stream(&format!(r"{files}\0001-big.lnk"));
+        // Its folder went away too: it is made again.
+        let deep = format!(r"{desktop}\Games\big.lnk");
+        // Nothing saved and nothing back: an error, not "already back".
+        let lost = format!(r"{desktop}\lost.lnk");
+        let list = summary(&[
+            (&deep, &format!(r"{files}\0001-big.lnk")),
+            (&lost, &format!(r"{files}\0002-lost.lnk")),
+        ]);
+        let (restored, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(restored, 1, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("0002-lost"), "{errors:?}");
+        assert_eq!(fs.read(&deep), Some(big));
+        assert_eq!(fs.named_streams(&deep), Ok(true));
+        // Moved, not copied: the backup no longer holds it.
+        assert!(!fs.exists(&format!(r"{files}\0001-big.lnk")));
+        // Running the restore again finds it already back.
+        let (again, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(again, 0);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(fs.exists(&deep));
+    }
+
+    #[test]
+    fn a_saved_shortcut_on_another_drive_stays_and_says_so() {
+        let mut fs = fs();
+        let backup = r"D:\HiveMend\backups\hive-mend-3.reg";
+        let files = r"D:\HiveMend\backups\hive-mend-3-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        fs.add_file_bytes(&format!(r"{files}\0001-a.lnk"), b"a".to_vec(), None);
+        fs.set_other_volume(r"D:\");
+        let (restored, errors) = restore_files(
+            &mut fs,
+            backup,
+            &summary(&[(
+                &format!(r"{desktop}\a.lnk"),
+                &format!(r"{files}\0001-a.lnk"),
+            )]),
+        );
+        assert_eq!(restored, 0);
+        assert!(errors[0].contains("another drive"), "{errors:?}");
+        assert!(fs.exists(&format!(r"{files}\0001-a.lnk")));
+        assert!(!fs.exists(&format!(r"{desktop}\a.lnk")));
     }
 
     #[test]
@@ -1313,6 +1396,7 @@ mod live_tests {
         std::fs::create_dir_all(base.join("hm-files")).unwrap();
         std::fs::write(base.join("hm.reg"), b"x").unwrap();
         std::fs::write(base.join("hm-files").join("0001-a.lnk"), b"shortcut").unwrap();
+        std::fs::write(base.join("hm-files").join("0002-x.lnk"), b"shortcut").unwrap();
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(base.join("j"))
@@ -1327,12 +1411,14 @@ mod live_tests {
         let good = base.join("restored.lnk").display().to_string();
         let bad = base.join("j").join("x.lnk").display().to_string();
         let copy = base.join("hm-files").join("0001-a.lnk");
+        let other = base.join("hm-files").join("0002-x.lnk");
         let summary = BackupSummary {
-            files: vec![(good.clone(), copy.clone()), (bad, copy)],
+            files: vec![(good.clone(), copy), (bad, other.clone())],
             ..BackupSummary::default()
         };
         let (restored, errors) = restore_files(&mut fs, &backup_real, &summary);
         let landed = elsewhere.join("x.lnk").exists();
+        let kept = other.exists();
         let good_bytes = std::fs::read(&good).ok();
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&elsewhere);
@@ -1348,6 +1434,71 @@ mod live_tests {
             "{errors:?}"
         );
         assert!(!landed, "a file landed outside its place");
+        assert!(kept, "a refused saved shortcut left the backup");
+    }
+
+    #[test]
+    fn live_a_shortcut_goes_back_whole_with_its_streams_and_any_size() {
+        // As repair leaves it: moved by handle into the backup's files
+        // folder. Larger than a copy may be, with a named stream, and its
+        // folder gone too.
+        let base = std::env::temp_dir().join(format!("hivemend-back-{}", std::process::id()));
+        let files = base.join("hm-files");
+        let place = base.join("Games");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::write(base.join("hm.reg"), b"x").unwrap();
+        let lnk = place.join("big.lnk");
+        let body: Vec<u8> = (0..crate::fs::MAX_COPY_BYTES as usize + 4096)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&lnk, &body).unwrap();
+        std::fs::write(format!("{}:notes", lnk.display()), b"hidden").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&lnk.display().to_string()).unwrap();
+        fs.pin_acquire(&mut pin, Access::ReadDeleteExclusive)
+            .unwrap();
+        fs.pin_move_into(pin, &files.display().to_string(), "0001-big.lnk")
+            .unwrap();
+        std::fs::remove_dir(&place).unwrap();
+        // A second one whose place is taken again by something else.
+        let taken = base.join("taken.lnk");
+        std::fs::write(files.join("0002-taken.lnk"), b"saved").unwrap();
+        std::fs::write(&taken, b"new owner").unwrap();
+        let backup_real = fs
+            .pin(&base.join("hm.reg").display().to_string())
+            .unwrap()
+            .real_path;
+        let summary = BackupSummary {
+            files: vec![
+                (lnk.display().to_string(), files.join("0001-big.lnk")),
+                (taken.display().to_string(), files.join("0002-taken.lnk")),
+            ],
+            ..BackupSummary::default()
+        };
+        let (restored, errors) = restore_files(&mut fs, &backup_real, &summary);
+        let (again, errors_again) = restore_files(&mut fs, &backup_real, &summary);
+        let back = std::fs::read(&lnk).ok();
+        let stream = std::fs::read(format!("{}:notes", lnk.display())).ok();
+        let left_in_backup = files.join("0001-big.lnk").exists();
+        let taken_kept = std::fs::read(&taken).ok();
+        let saved_kept = std::fs::read(files.join("0002-taken.lnk")).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(restored, 1, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("already at that place"), "{errors:?}");
+        assert!(back.as_deref() == Some(&body[..]), "its data changed");
+        assert_eq!(
+            stream.as_deref(),
+            Some(&b"hidden"[..]),
+            "its stream was lost"
+        );
+        assert!(!left_in_backup, "moved back, not copied");
+        assert_eq!(taken_kept.as_deref(), Some(&b"new owner"[..]));
+        assert_eq!(saved_kept.as_deref(), Some(&b"saved"[..]));
+        // Again: the first is already back, the second still in conflict.
+        assert_eq!(again, 0);
+        assert_eq!(errors_again.len(), 1, "{errors_again:?}");
     }
 
     #[test]
