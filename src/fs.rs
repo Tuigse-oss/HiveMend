@@ -143,6 +143,12 @@ pub trait FileView {
         None
     }
     fn read(&self, path: &str) -> Option<Vec<u8>>;
+    /// At most the first `max` bytes of the file, never reading further.
+    fn read_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        let mut bytes = self.read(path)?;
+        bytes.truncate(max);
+        Some(bytes)
+    }
     fn list(&self, dir: &str) -> Vec<DirItem>;
     /// List `dir` one entry at a time without holding the whole listing;
     /// `visit` returns false to stop. The default lists it whole first.
@@ -1286,6 +1292,17 @@ impl FileView for HostFs {
 
     fn read(&self, path: &str) -> Option<Vec<u8>> {
         std::fs::read(path).ok()
+    }
+
+    fn read_head(&self, path: &str, max: usize) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut bytes = Vec::new();
+        std::fs::File::open(path)
+            .ok()?
+            .take(max as u64)
+            .read_to_end(&mut bytes)
+            .ok()?;
+        Some(bytes)
     }
 
     fn list(&self, dir: &str) -> Vec<DirItem> {

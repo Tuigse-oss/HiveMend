@@ -725,46 +725,73 @@ fn child_dirs(fs: &dyn FileView, dir: &str, notes: &mut Vec<String>) -> Vec<Stri
     dirs
 }
 
+/// The largest `profiles.ini` read. Firefox writes a few hundred bytes per
+/// profile, so this holds far more than [`MAX_PROFILES`] of them.
+const MAX_PROFILES_INI: usize = 1 << 20;
+
 /// Firefox profiles from `profiles.ini` plus the `Profiles` folder, so a
-/// missing ini still finds default locations.
+/// missing ini still finds default locations. Together they are capped at
+/// [`MAX_PROFILES`], with a note when there were more; an oversized ini is
+/// not read.
 fn firefox_profiles(fs: &dyn FileView, home: &str, notes: &mut Vec<String>) -> Vec<String> {
     let mut profiles = Vec::new();
-    let mut push = |dir: String| {
-        if !profiles
-            .iter()
-            .any(|have: &String| have.eq_ignore_ascii_case(&dir))
-        {
-            profiles.push(dir);
+    let mut seen = std::collections::HashSet::new();
+    let mut more = false;
+    // False once full: the caller stops looking.
+    let mut push = |dir: String| -> bool {
+        if seen.contains(&dir.to_ascii_lowercase()) {
+            return true;
         }
+        if profiles.len() == MAX_PROFILES {
+            more = true;
+            return false;
+        }
+        seen.insert(dir.to_ascii_lowercase());
+        profiles.push(dir);
+        true
     };
     let ini = format!("{home}\\profiles.ini");
-    if let Some(bytes) = fs.read(&ini) {
-        let text = String::from_utf8_lossy(&bytes);
-        let mut relative = true;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.eq_ignore_ascii_case("IsRelative=0") {
-                relative = false;
-            } else if line.eq_ignore_ascii_case("IsRelative=1") {
-                relative = true;
-            } else if let Some(path) = line.strip_prefix("Path=") {
-                let path = path.trim();
-                if path.is_empty() {
-                    continue;
-                }
-                let dir = normalize_fs(&if relative || !looks_absolute(path) {
-                    format!("{home}\\{path}")
-                } else {
-                    path.to_string()
-                });
-                if fs.is_dir(&dir) {
-                    push(dir);
+    match fs.read_head(&ini, MAX_PROFILES_INI + 1) {
+        Some(bytes) if bytes.len() > MAX_PROFILES_INI => notes.push(format!(
+            "{ini} is larger than {} KB, so it was not read; only the Profiles folder was looked at",
+            MAX_PROFILES_INI / 1024
+        )),
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let mut relative = true;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.eq_ignore_ascii_case("IsRelative=0") {
+                    relative = false;
+                } else if line.eq_ignore_ascii_case("IsRelative=1") {
+                    relative = true;
+                } else if let Some(path) = line.strip_prefix("Path=") {
+                    let path = path.trim();
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let dir = normalize_fs(&if relative || !looks_absolute(path) {
+                        format!("{home}\\{path}")
+                    } else {
+                        path.to_string()
+                    });
+                    if fs.is_dir(&dir) && !push(dir) {
+                        break;
+                    }
                 }
             }
         }
+        None => {}
     }
     for profile in child_dirs(fs, &format!("{home}\\Profiles"), notes) {
-        push(profile);
+        if !push(profile) {
+            break;
+        }
+    }
+    if more {
+        notes.push(format!(
+            "{home}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
+        ));
     }
     profiles
 }
@@ -2659,6 +2686,69 @@ mod tests {
         fs.add_dir(&format!("{home}\\Profiles\\plain.default"));
         let profiles = firefox_profiles(&fs, home, &mut Vec::new());
         assert_eq!(profiles.len(), 2);
+    }
+
+    #[test]
+    fn firefox_profiles_stay_within_the_limit_from_both_sources() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
+        // The ini names MAX_PROFILES profiles, the folder holds as many
+        // others (and repeats of the ini's ones in other letter case).
+        let mut ini = String::new();
+        for n in 0..MAX_PROFILES {
+            ini.push_str(&format!(
+                "[Profile{n}]\nIsRelative=1\nPath=Profiles/ini{n}\n"
+            ));
+            fs.add_dir(&format!(r"{home}\Profiles\ini{n}"));
+        }
+        for n in 0..MAX_PROFILES / 2 {
+            fs.add_dir(&format!(r"{home}\Profiles\dir{n}"));
+        }
+        fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini.into_bytes(), None);
+        let mut notes = Vec::new();
+        let profiles = firefox_profiles(&fs, home, &mut notes);
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        let unique: std::collections::HashSet<String> = profiles
+            .iter()
+            .map(|dir| dir.to_ascii_lowercase())
+            .collect();
+        assert_eq!(unique.len(), MAX_PROFILES);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("more than") && note.contains(home)),
+            "{notes:?}"
+        );
+
+        // Within the limit, repeats count once and nothing is noted.
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.add_file_bytes(
+            &format!(r"{home}\profiles.ini"),
+            b"[Profile0]\nIsRelative=1\nPath=Profiles/A\n[Profile1]\nIsRelative=0\nPath=C:\\Users\\test\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\a\n".to_vec(),
+            None,
+        );
+        fs.add_dir(&format!(r"{home}\Profiles\a"));
+        let mut notes = Vec::new();
+        assert_eq!(firefox_profiles(&fs, home, &mut notes).len(), 1);
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn an_oversized_profiles_ini_is_not_read() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
+        let mut ini = b"[Profile0]\nIsRelative=1\nPath=Profiles/listed\n".to_vec();
+        ini.resize(MAX_PROFILES_INI + 1, b';');
+        fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini, None);
+        fs.add_dir(&format!(r"{home}\elsewhere"));
+        fs.add_dir(&format!(r"{home}\Profiles\plain"));
+        let mut notes = Vec::new();
+        let profiles = firefox_profiles(&fs, home, &mut notes);
+        assert_eq!(profiles, vec![format!(r"{home}\Profiles\plain")]);
+        assert!(
+            notes.iter().any(|note| note.contains("not read")),
+            "{notes:?}"
+        );
     }
 
     /// Browser categories never delete a database file: cookies are only
