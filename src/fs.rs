@@ -1537,21 +1537,68 @@ mod host {
                 format!(" ({left} new item(s) could not be removed again)")
             }
         };
+        // Moving: folders made for it are held without delete access,
+        // because Windows 10 refuses a rename into a folder that someone
+        // holds with delete access (a sharing violation). They stay pinned
+        // all the same: no handle shares delete, so nothing else can rename
+        // or remove them. To undo, each is opened again by name under its
+        // held parent, checked to be the same folder, and removed.
+        let folder_access = if moving.is_some() {
+            FOLDER
+        } else {
+            FOLDER | DELETE
+        };
+        let undo_moving = |mut made: Vec<std::fs::File>, names: &[&str]| -> String {
+            const FILE_OPEN: u32 = 1;
+            let mut left = 0;
+            while let Some(item) = made.pop() {
+                let id = file_id(&item).ok();
+                drop(item);
+                let parent = made.last().unwrap_or(anchor_file);
+                let removed = id.is_some()
+                    && host_open_in(
+                        parent,
+                        names[made.len()],
+                        DELETE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                        FILE_OPEN,
+                        FILE_DIRECTORY_FILE,
+                        None,
+                    )
+                    .is_ok_and(|again| file_id(&again).ok() == id && host_dispose(&again));
+                if !removed {
+                    left += 1;
+                }
+            }
+            if left == 0 {
+                String::new()
+            } else {
+                format!(" ({left} new folder(s) could not be removed again)")
+            }
+        };
         let mut made: Vec<std::fs::File> = Vec::new();
+        let mut made_names: Vec<&str> = Vec::new();
         for name in rest[1..].iter().rev() {
             let parent = made.last().unwrap_or(anchor_file);
             match host_open_in(
                 parent,
                 name,
-                FOLDER | DELETE,
+                folder_access,
                 FILE_SHARE_READ | FILE_SHARE_WRITE,
                 FILE_CREATE,
                 FILE_DIRECTORY_FILE,
                 None,
             ) {
-                Ok(dir) => made.push(dir),
+                Ok(dir) => {
+                    made.push(dir);
+                    made_names.push(name);
+                }
                 Err(status) => {
-                    let note = undo(made);
+                    let note = if moving.is_some() {
+                        undo_moving(made, &made_names)
+                    } else {
+                        undo(made)
+                    };
                     return Err(format!(
                         "could not create the folder {name}: {}{note}",
                         nt_status_text(status)
@@ -1562,7 +1609,7 @@ mod host {
         let parent = made.last().unwrap_or(anchor_file);
         if let Some(moving) = moving {
             if let Err(err) = host_rename_into(moving, parent, leaf) {
-                let note = undo(made);
+                let note = undo_moving(made, &made_names);
                 return Err(format!("could not move it to {path}: {err}{note}"));
             }
             // Moved: the folders made for it stay. It landed relative to
@@ -2158,6 +2205,47 @@ mod live_tests {
         assert!(refused.is_err());
         assert_eq!(blocked_kept.as_deref(), Some(&b"other"[..]));
         assert_eq!(backup_kept.as_deref(), Some(&b"already here"[..]));
+    }
+
+    #[test]
+    fn live_folders_made_for_a_move_that_fails_are_removed_again() {
+        // A move across drives fails only at the rename, after the missing
+        // folders were made: they are removed again, and the file stays.
+        // Needs a second fixed drive (the CI runner and the host have one).
+        let temp = std::env::temp_dir();
+        let temp_drive = temp.display().to_string()[..1].to_ascii_uppercase();
+        let Some(other) = ["D", "E", "C"]
+            .into_iter()
+            .find(|drive| *drive != temp_drive && on_local_fixed_drive(&format!(r"{drive}:\")))
+        else {
+            eprintln!("no second fixed drive; skipped");
+            return;
+        };
+        let source_dir =
+            std::path::PathBuf::from(format!(r"{other}:\hm-xvol-{}", std::process::id()));
+        if std::fs::create_dir_all(&source_dir).is_err() {
+            eprintln!("{other}: is not writable; skipped");
+            return;
+        }
+        let source = source_dir.join("a.lnk");
+        std::fs::write(&source, b"x").unwrap();
+        let base = temp.join(format!("hm-xvol-{}", std::process::id()));
+        std::fs::create_dir_all(&base).unwrap();
+        let target = base.join("new").join("deeper").join("a.lnk");
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&source.display().to_string()).unwrap();
+        fs.pin_acquire(&mut pin, Access::ReadDeleteExclusive)
+            .unwrap();
+        let moved = fs.pin_move_confined(pin, &target.display().to_string(), &|_, _| true);
+        let made_left = base.join("new").exists();
+        let source_kept = source.exists();
+        let _ = std::fs::remove_dir_all(&base);
+        let _ = std::fs::remove_dir_all(&source_dir);
+        let err = moved.expect_err("a move across drives");
+        assert!(err.contains("os error 17"), "{err}");
+        assert!(!err.contains("could not be removed"), "{err}");
+        assert!(!made_left, "a folder made for the move was left behind");
+        assert!(source_kept);
     }
 
     #[test]
