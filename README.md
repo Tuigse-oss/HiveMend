@@ -363,7 +363,11 @@ value=HKCU\Software\MyApp\Settings|RecentFile1
 
 ## Releases
 
-Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one is a zip holding `Hivemend.exe`, the MIT and Apache-2.0 license files, `THIRD-PARTY-NOTICES.txt` (the license and copyright notices of the crates built into the program and of the Rust standard library), and this README, and an installer, `Hivemend-v<version>-x86_64-setup.exe`, with `SHA256SUMS.txt` beside them. The installer puts the same files in Program Files (or, by default and without administrator rights, in your own profile), adds a Start menu entry, and uninstalls from Settings > Apps; uninstalling leaves your backups in place. The exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
+Releases are built by CI from a version tag after a RustSec audit, Clippy, and the tests pass. Each one is a zip holding `Hivemend.exe`, the MIT and Apache-2.0 license files, `THIRD-PARTY-NOTICES.txt` (the license and copyright notices of the crates built into the program and of the Rust standard library), and this README, and an installer, `Hivemend-v<version>-x86_64-setup.exe`, with `SHA256SUMS.txt` beside them. The installer puts the same files in Program Files (or, by default and without administrator rights, in your own profile), adds a Start menu entry, and uninstalls from Settings > Apps; uninstalling leaves your backups in place.
+
+The exe and installer are not code-signed yet, so Windows SmartScreen may show "Windows protected your PC" when you run them. Check the download against `SHA256SUMS.txt` (`Get-FileHash <file>` in PowerShell) and, once attestations are on, with `gh attestation verify` below; then choose **More info** and **Run anyway**. Signed builds are planned.
+
+The exe embeds its dependency list so it can be audited after download, and once the repository is public each build also carries a GitHub build provenance attestation:
 
 ```bash
 gh attestation verify Hivemend-v0.1.0-x86_64-windows.zip --repo Tuigse-oss/HiveMend
