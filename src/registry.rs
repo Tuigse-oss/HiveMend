@@ -38,6 +38,13 @@ pub trait Registry {
             "registry transactions are not available".into(),
         ))
     }
+    /// Read-only forecast of [`RegTransaction::require_trusted`], so a window
+    /// can show what a repair would refuse before trying it. The repair still
+    /// checks inside its transaction.
+    fn check_trusted(&self, key: &str) -> Result<(), RegError> {
+        let _ = key;
+        Ok(())
+    }
 }
 
 /// A registry transaction. Its reads see its own changes; nothing it writes
@@ -254,6 +261,10 @@ impl Registry for MemoryRegistry {
             touched: Vec::new(),
         }))
     }
+
+    fn check_trusted(&self, key: &str) -> Result<(), RegError> {
+        memory_trusted(&self.untrusted, key)
+    }
 }
 
 /// A transaction over a [`MemoryRegistry`]: changes go to a copy that
@@ -282,21 +293,27 @@ impl Registry for MemoryTransaction<'_> {
     }
 }
 
+/// The test hook behind `require_trusted` and `check_trusted`: refuse `key`
+/// when it is at or below one of the `untrusted` roots.
+fn memory_trusted(untrusted: &[String], key: &str) -> Result<(), RegError> {
+    let key = canonical_path(key);
+    if untrusted.iter().any(|root| {
+        let root = canonical_path(root);
+        key.eq_ignore_ascii_case(&root)
+            || key
+                .to_ascii_lowercase()
+                .starts_with(&format!("{}\\", root.to_ascii_lowercase()))
+    }) {
+        return Err(RegError::Denied(format!(
+            "{key} can be changed without administrator rights; an administrator window leaves it alone"
+        )));
+    }
+    Ok(())
+}
+
 impl RegTransaction for MemoryTransaction<'_> {
     fn require_trusted(&self, key: &str) -> Result<(), RegError> {
-        let key = canonical_path(key);
-        if self.work.untrusted.iter().any(|root| {
-            let root = canonical_path(root);
-            key.eq_ignore_ascii_case(&root)
-                || key
-                    .to_ascii_lowercase()
-                    .starts_with(&format!("{}\\", root.to_ascii_lowercase()))
-        }) {
-            return Err(RegError::Denied(format!(
-                "{key} can be changed without administrator rights; an administrator window leaves it alone"
-            )));
-        }
-        Ok(())
+        memory_trusted(&self.work.untrusted, key)
     }
 
     fn touch(&mut self, key: &str) -> Result<(), RegError> {

@@ -54,8 +54,8 @@ pub use duplicates::{
 #[cfg(windows)]
 pub use duplicates::{HostContent, recycle};
 pub use engine::{
-    Engine, RepairOutcome, ScanReport, repair, repair_with_progress, scan, scan_with_progress,
-    still_reported,
+    Engine, LeftAlone, RepairOutcome, ScanReport, left_alone_here, repair, repair_with_progress,
+    scan, scan_with_progress, still_reported,
 };
 pub use exclude::{Exclusion, Exclusions};
 #[cfg(windows)]

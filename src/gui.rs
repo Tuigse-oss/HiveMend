@@ -20,15 +20,15 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use hive_mend::art::Icon;
 use hive_mend::{
     BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
-    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, Repair, RepairOutcome,
-    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
-    ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, WINDOWS_TOOLS,
-    WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores,
-    backups_dir, backups_location, build_items, clean_with_progress, custom_privacy_file,
-    decode_text_owned, exclusions_file, expand_target, format_bytes, format_uptime, gather_hives,
-    gather_snapshot, group_digits, list_backups_until, parse_custom, plan_profile, preview_with,
-    repair_with_progress, restore_backup, scan_with_progress, settings_file, sort_services,
-    start_services, still_reported, stop_services, user_dir,
+    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
+    RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store,
+    WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes,
+    backup_stores, backups_dir, backups_location, build_items, clean_with_progress,
+    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
+    format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until, parse_custom,
+    plan_profile, preview_with, repair_with_progress, restore_backup, scan_with_progress,
+    settings_file, sort_services, start_services, still_reported, stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
@@ -548,6 +548,12 @@ struct App {
     programs: Vec<hive_mend::InstalledProgram>,
     programs_loaded: bool,
     programs_note: String,
+    /// Findings this window leaves alone without offering them, and why:
+    /// forecast after each scan, and added to when a repair refuses one.
+    left_alone: Vec<(Finding, LeftAlone)>,
+    /// Report-only and protected findings of the last scan in this window,
+    /// shown on Home when nothing is left to fix.
+    last_info: usize,
     programs_list: HWND,
     btn_pg_uninstall: HWND,
     btn_pg_open: HWND,
@@ -608,7 +614,15 @@ struct App {
     btn_priv_clean: HWND,
 }
 
-pub fn run() -> std::process::ExitCode {
+/// Set by [`run`] when Hivemend was started to open on the Programs page.
+static OPEN_PROGRAMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// The command-line flag [`start_unelevated`] passes so the new window opens
+/// on Programs.
+pub const PROGRAMS_FLAG: &str = "--programs";
+
+pub fn run(open_programs: bool) -> std::process::ExitCode {
+    OPEN_PROGRAMS.store(open_programs, std::sync::atomic::Ordering::Relaxed);
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -679,6 +693,9 @@ unsafe extern "system" fn wnd_proc(
         let app = &mut *window_app(hwnd);
         app.sync_controls();
         app.refresh_backups();
+        if OPEN_PROGRAMS.load(std::sync::atomic::Ordering::Relaxed) {
+            app.go(Page::Programs);
+        }
         drop(_guard);
         flush_deferred(hwnd);
         return 0;
@@ -1177,6 +1194,8 @@ impl App {
             programs: Vec::new(),
             programs_loaded: false,
             programs_note: String::new(),
+            left_alone: Vec::new(),
+            last_info: 0,
             programs_list: std::ptr::null_mut(),
             btn_pg_uninstall: std::ptr::null_mut(),
             btn_pg_open: std::ptr::null_mut(),
@@ -1795,8 +1814,9 @@ impl App {
                         let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
                         let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
                         let row = change.iItem as usize;
-                        let fixed = self.findings.get(row).is_some_and(|f| !f.repairable());
-                        // Report-only rows have no check box and stay that way.
+                        let fixed = self.findings.get(row).is_some_and(|f| !self.offered(f));
+                        // Report-only and left-alone rows have no check box
+                        // and stay that way.
                         if new != old && fixed && new != 0 {
                             return 1;
                         }
@@ -2015,21 +2035,41 @@ impl App {
             return;
         }
         let ignored = self.exclusions.filter(&mut report.findings);
+        self.left_alone = report
+            .findings
+            .iter()
+            .filter_map(|finding| {
+                hive_mend::left_alone_here(&WindowsRegistry, finding, self.elevated)
+                    .map(|why| (finding.clone(), why))
+            })
+            .collect();
+        report
+            .findings
+            .sort_by_key(|finding| self.row_rank(finding));
         self.findings = report.findings;
         self.scanned = true;
         self.scope = scope;
         self.fill_findings();
         self.settings.last_scan = local_now();
-        self.settings.last_problems = Some(self.findings.len());
+        let (problems, info) = self.finding_counts();
+        self.settings.last_problems = Some(problems);
+        self.last_info = info;
         self.save_settings();
-        let mut note = if self.findings.is_empty() {
-            format!("No problems found ({seconds:.1} s).")
+        let mut note = if problems == 0 {
+            format!("Nothing to fix ({seconds:.1} s).")
         } else {
-            format!("{} problems found ({seconds:.1} s).", self.findings.len())
+            format!("{problems} problems found ({seconds:.1} s).")
         };
-        let report_only = self.findings.iter().filter(|f| !f.repairable()).count();
-        if report_only > 0 {
-            note.push_str(&format!(" {report_only} are for information only."));
+        if info > 0 {
+            note.push_str(&format!(
+                " {info} more are listed at the end for information only."
+            ));
+        }
+        let normal = self.normal_window_count();
+        if normal > 0 {
+            note.push_str(&format!(
+                " {normal} are in your own part of the registry: fix them from Hivemend started without administrator rights."
+            ));
         }
         if !self.elevated {
             let admin = self.findings.iter().filter(|f| f.needs_admin()).count();
@@ -2068,7 +2108,7 @@ impl App {
                         &self.fix_label(finding),
                     ],
                 );
-                let image = if !finding.repairable() {
+                let image = if !self.offered(finding) {
                     0
                 } else if self.checked[row] {
                     2
@@ -2086,12 +2126,69 @@ impl App {
 
     /// Ticked unless it cannot be undone, or cannot succeed without rights.
     fn default_tick(&self, finding: &Finding) -> bool {
-        finding.repairable() && !finding.permanent() && (self.elevated || !finding.needs_admin())
+        self.offered(finding) && !finding.permanent() && (self.elevated || !finding.needs_admin())
+    }
+
+    /// Why this window leaves `finding` alone, if it does.
+    fn left_alone_why(&self, finding: &Finding) -> Option<&LeftAlone> {
+        self.left_alone
+            .iter()
+            .find(|(held, _)| held == finding)
+            .map(|(_, why)| why)
+    }
+
+    /// Offered for repair here: it has a check box.
+    fn offered(&self, finding: &Finding) -> bool {
+        finding.repairable() && self.left_alone_why(finding).is_none()
+    }
+
+    /// Rows that can be fixed come first, then those to fix from a normal
+    /// window, then the ones listed for information only.
+    fn row_rank(&self, finding: &Finding) -> u8 {
+        match self.left_alone_why(finding) {
+            _ if !finding.repairable() => 3,
+            None => 0,
+            Some(LeftAlone::NormalWindow) => 1,
+            Some(LeftAlone::Protected(_)) => 2,
+        }
+    }
+
+    /// (problems, information only). A protected or report-only finding is
+    /// not a problem anyone can fix, so it is never counted as one; an entry
+    /// left to a normal window still is.
+    fn finding_counts(&self) -> (usize, usize) {
+        let info = self
+            .findings
+            .iter()
+            .filter(|finding| {
+                !finding.repairable()
+                    || matches!(self.left_alone_why(finding), Some(LeftAlone::Protected(_)))
+            })
+            .count();
+        (self.findings.len() - info, info)
+    }
+
+    fn normal_window_count(&self) -> usize {
+        self.findings
+            .iter()
+            .filter(|finding| {
+                finding.repairable()
+                    && matches!(self.left_alone_why(finding), Some(LeftAlone::NormalWindow))
+            })
+            .count()
     }
 
     fn fix_label(&self, finding: &Finding) -> String {
+        match self.left_alone_why(finding) {
+            _ if !finding.repairable() => {}
+            Some(LeftAlone::NormalWindow) => {
+                return "Fix from Hivemend without administrator rights".into();
+            }
+            Some(LeftAlone::Protected(_)) => return "Protected, left alone (information)".into(),
+            None => {}
+        }
         let mut label = match &finding.repair {
-            Repair::None => return "Report only".into(),
+            Repair::None => return "Report only (information)".into(),
             Repair::DeleteValue { .. } => "Delete value".to_string(),
             Repair::DeleteKey { .. } => "Delete key".to_string(),
             Repair::DeleteFile {
@@ -2110,7 +2207,7 @@ impl App {
     fn tick_all(&mut self, on: bool) {
         self.filling_list = true;
         for (row, finding) in self.findings.iter().enumerate() {
-            if !finding.repairable() {
+            if !self.offered(finding) {
                 continue;
             }
             self.checked[row] = on;
@@ -2124,7 +2221,7 @@ impl App {
         self.findings
             .iter()
             .zip(&self.checked)
-            .filter(|(finding, on)| **on && finding.repairable())
+            .filter(|(finding, on)| **on && self.offered(finding))
             .map(|(finding, _)| finding.clone())
             .collect()
     }
@@ -2193,19 +2290,24 @@ impl App {
                 keep_ticks.push(tick);
             }
         }
-        self.findings = keep_findings;
-        let ticks = keep_ticks;
+        // Rows a repair just refused move down with the information rows.
+        let mut kept: Vec<(Finding, bool)> = keep_findings.into_iter().zip(keep_ticks).collect();
+        kept.sort_by_key(|(finding, _)| self.row_rank(finding));
+        let (findings, ticks): (Vec<Finding>, Vec<bool>) = kept.into_iter().unzip();
+        self.findings = findings;
         self.fill_findings();
         self.filling_list = true;
         for (row, tick) in ticks.into_iter().enumerate() {
-            if self.findings[row].repairable() {
+            if self.offered(&self.findings[row]) {
                 self.checked[row] = tick;
                 set_state_image(self.list, row, if tick { 2 } else { 1 });
             }
         }
         self.filling_list = false;
         self.update_repair_label();
-        self.settings.last_problems = Some(self.findings.len());
+        let (problems, info) = self.finding_counts();
+        self.settings.last_problems = Some(problems);
+        self.last_info = info;
         self.save_settings();
         self.invalidate();
     }
@@ -3501,15 +3603,27 @@ impl App {
         };
         // An administrator window never starts uninstallers: one started
         // from here would run with administrator rights, whatever wrote it.
-        // From a normal window, the uninstaller asks for rights itself.
+        // Instead it opens Hivemend without administrator rights on this
+        // page; from there the uninstaller asks for rights itself.
         if self.elevated {
-            self.message(
-                &format!(
-                    "Uninstall {} from Hivemend started without administrator rights. Its uninstaller will ask for administrator rights itself if it needs them.",
-                    program.name
-                ),
-                MB_ICONINFORMATION,
+            let question = format!(
+                "Uninstallers are started from Hivemend without administrator rights, so a program's uninstaller never gets them unless it asks Windows itself.\n\nOpen Hivemend without administrator rights on the Programs page to uninstall {}? This window closes.",
+                program.name
             );
+            if !self.confirm(&question, Redo::Uninstall(row)) {
+                return;
+            }
+            match start_unelevated(&exe_path(), PROGRAMS_FLAG) {
+                Ok(()) => unsafe {
+                    PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
+                },
+                Err(err) => self.message(
+                    &format!(
+                        "Hivemend could not open a window without administrator rights: {err}.\n\nClose this window and start Hivemend normally, or use Settings > Apps > Installed apps."
+                    ),
+                    MB_ICONWARNING,
+                ),
+            }
             return;
         }
         let launch = match hive_mend::uninstall_launch(&HostFs, &program.uninstall, self.elevated) {
@@ -4415,6 +4529,14 @@ impl App {
                 return;
             }
         };
+        for finding in &outcome.refused_findings {
+            if self.left_alone_why(finding).is_none() {
+                self.left_alone.push((
+                    finding.clone(),
+                    LeftAlone::Protected("a safety rule left it alone in the last repair".into()),
+                ));
+            }
+        }
         let resolved: Vec<&Finding> = outcome.resolved.iter().chain(&fixed_meanwhile).collect();
         let rows: Vec<usize> = self
             .findings
@@ -6179,7 +6301,15 @@ impl App {
             Some(0) => (
                 Icon::StatusOk,
                 "Your registry looks healthy".to_string(),
-                format!("The last scan{when} found no stale entries."),
+                if self.last_info > 0 {
+                    format!(
+                        "The last scan{when} found nothing to fix. {} {} listed on the Scan page for information only.",
+                        self.last_info,
+                        if self.last_info == 1 { "entry is" } else { "entries are" }
+                    )
+                } else {
+                    format!("The last scan{when} found no stale entries.")
+                },
             ),
             Some(count) => (
                 Icon::StatusWarn,
@@ -8208,6 +8338,149 @@ fn open_in_regedit(hwnd: HWND, key: &str, elevated: bool) {
         );
     }
     shell_open(hwnd, "regedit.exe", Some("-m"));
+}
+
+/// Start `exe` with `args` without administrator rights, from an
+/// administrator window: with a copy of the desktop shell's token, the one
+/// every normal window of this account runs with. Refused when the shell
+/// belongs to another account or itself runs with administrator rights (User
+/// Account Control off), where no such token exists.
+fn start_unelevated(exe: &Path, args: &str) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+    use windows_sys::Win32::Security::{
+        DuplicateTokenEx, EqualSid, GetTokenInformation, SecurityImpersonation,
+        TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
+        TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenPrimary, TokenUser,
+    };
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken,
+        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+    };
+    use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
+
+    struct Owned(HANDLE);
+    impl Drop for Owned {
+        fn drop(&mut self) {
+            if !self.0.is_null() {
+                unsafe { CloseHandle(self.0) };
+            }
+        }
+    }
+    let failed = |what: &str| format!("{what} failed ({})", std::io::Error::last_os_error());
+    // TOKEN_USER is followed by its SID; 256 bytes hold any SID.
+    let user_of = |token: HANDLE| -> Result<Vec<u64>, String> {
+        let mut buffer = vec![0u64; 32];
+        let mut got = 0u32;
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr().cast(),
+                (buffer.len() * 8) as u32,
+                &mut got,
+            )
+        };
+        if ok == 0 {
+            return Err(failed("GetTokenInformation"));
+        }
+        Ok(buffer)
+    };
+
+    let shell = unsafe { GetShellWindow() };
+    let mut pid = 0u32;
+    if !shell.is_null() {
+        unsafe { GetWindowThreadProcessId(shell, &mut pid) };
+    }
+    if pid == 0 {
+        return Err("the Windows desktop (Explorer) is not running".into());
+    }
+    let process = Owned(unsafe { OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid) });
+    if process.0.is_null() {
+        return Err(failed("OpenProcess"));
+    }
+    let mut shell_token = Owned(std::ptr::null_mut());
+    if unsafe { OpenProcessToken(process.0, TOKEN_DUPLICATE | TOKEN_QUERY, &mut shell_token.0) }
+        == 0
+    {
+        return Err(failed("OpenProcessToken"));
+    }
+    let mut own_token = Owned(std::ptr::null_mut());
+    if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut own_token.0) } == 0 {
+        return Err(failed("OpenProcessToken"));
+    }
+    let shell_user = user_of(shell_token.0)?;
+    let own_user = user_of(own_token.0)?;
+    let same = unsafe {
+        let shell_sid = (*shell_user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+        let own_sid = (*own_user.as_ptr().cast::<TOKEN_USER>()).User.Sid;
+        EqualSid(shell_sid, own_sid) != 0
+    };
+    if !same {
+        return Err("the Windows desktop belongs to another account".into());
+    }
+    let mut elevation = TOKEN_ELEVATION { TokenIsElevated: 0 };
+    let mut got = 0u32;
+    if unsafe {
+        GetTokenInformation(
+            shell_token.0,
+            TokenElevation,
+            (&mut elevation as *mut TOKEN_ELEVATION).cast(),
+            std::mem::size_of::<TOKEN_ELEVATION>() as u32,
+            &mut got,
+        )
+    } == 0
+    {
+        return Err(failed("GetTokenInformation"));
+    }
+    if elevation.TokenIsElevated != 0 {
+        return Err("Windows runs this account's desktop with administrator rights (User Account Control is off), so there is no way to start a program without them".into());
+    }
+    let mut token = Owned(std::ptr::null_mut());
+    if unsafe {
+        DuplicateTokenEx(
+            shell_token.0,
+            TOKEN_QUERY
+                | TOKEN_DUPLICATE
+                | TOKEN_ASSIGN_PRIMARY
+                | TOKEN_ADJUST_DEFAULT
+                | TOKEN_ADJUST_SESSIONID,
+            std::ptr::null(),
+            SecurityImpersonation,
+            TokenPrimary,
+            &mut token.0,
+        )
+    } == 0
+    {
+        return Err(failed("DuplicateTokenEx"));
+    }
+    let application = wide(&exe.display().to_string());
+    let mut command_line = wide(&format!("\"{}\" {args}", exe.display()));
+    let startup = STARTUPINFOW {
+        cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        ..unsafe { std::mem::zeroed() }
+    };
+    let mut started: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
+    if unsafe {
+        CreateProcessWithTokenW(
+            token.0,
+            0,
+            application.as_ptr(),
+            command_line.as_mut_ptr(),
+            0,
+            std::ptr::null(),
+            std::ptr::null(),
+            &startup,
+            &mut started,
+        )
+    } == 0
+    {
+        return Err(failed("CreateProcessWithTokenW"));
+    }
+    unsafe {
+        CloseHandle(started.hThread);
+        CloseHandle(started.hProcess);
+    }
+    Ok(())
 }
 
 fn exe_path() -> PathBuf {

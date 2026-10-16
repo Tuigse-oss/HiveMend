@@ -608,6 +608,58 @@ mod tests {
     }
 
     #[test]
+    fn what_a_window_leaves_alone_is_forecast_before_repair() {
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Open"), "DisplayName", "Open");
+        reg.set_sz(&format!(r"{base}\Closed"), "DisplayName", "Closed");
+        reg.untrusted.push(format!(r"{base}\Open"));
+        let per_user = Finding {
+            key: r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\Gone"
+                .into(),
+            repair: Repair::DeleteKey {
+                key: r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\Gone"
+                    .into(),
+            },
+            ..uninstall_finding("Gone")
+        };
+        let report_only = Finding {
+            repair: Repair::None,
+            ..uninstall_finding("Report")
+        };
+        let file = temp_file_finding(r"C:\Users\me\AppData\Local\Temp\old.tmp");
+
+        // An administrator window: a key others can change is protected, and
+        // the user's own hive is left to a normal window.
+        assert!(matches!(
+            left_alone_here(&reg, &uninstall_finding("Open"), true),
+            Some(LeftAlone::Protected(why)) if why.contains("leaves it alone")
+        ));
+        assert_eq!(
+            left_alone_here(&reg, &per_user, true),
+            Some(LeftAlone::NormalWindow)
+        );
+        assert_eq!(
+            left_alone_here(&reg, &uninstall_finding("Closed"), true),
+            None
+        );
+        // Already gone is not protected: the repair reports it as gone.
+        assert_eq!(
+            left_alone_here(&reg, &uninstall_finding("Missing"), true),
+            None
+        );
+        // A normal window refuses neither; it can only do what its account can.
+        assert_eq!(
+            left_alone_here(&reg, &uninstall_finding("Open"), false),
+            None
+        );
+        assert_eq!(left_alone_here(&reg, &per_user, false), None);
+        // Report-only findings and files are not forecast here.
+        assert_eq!(left_alone_here(&reg, &report_only, true), None);
+        assert_eq!(left_alone_here(&reg, &file, true), None);
+    }
+
+    #[test]
     fn an_administrator_leaves_keys_others_can_change_alone() {
         let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
         let mut reg = MemoryRegistry::new();
@@ -630,6 +682,8 @@ mod tests {
         // Left alone with its reason, not counted as a failure.
         assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
         assert_eq!(outcome.refused, 1);
+        // Named, so a window can stop offering it.
+        assert_eq!(outcome.refused_findings, vec![uninstall_finding("Open")]);
         assert!(
             outcome.notes[0].contains("leaves it alone"),
             "{:?}",
@@ -784,11 +838,51 @@ pub struct RepairOutcome {
     pub notes: Vec<String>,
     /// Findings that are no longer a problem: removed or already gone.
     pub resolved: Vec<Finding>,
+    /// Findings a safety rule refused (report-only ones aside), so a window
+    /// can stop offering them.
+    pub refused_findings: Vec<Finding>,
 }
 
 impl RepairOutcome {
     pub fn skipped(&self) -> usize {
         self.already_gone + self.refused + self.not_backed_up
+    }
+}
+
+/// Why a window leaves a finding alone without trying to repair it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum LeftAlone {
+    /// In the signed-in user's own part of the registry, which an
+    /// administrator window leaves to Hivemend started without
+    /// administrator rights.
+    NormalWindow,
+    /// A safety rule refuses it in this window; the text says why.
+    Protected(String),
+}
+
+/// Forecast of what a repair from this window would leave alone, so the
+/// window can show it as such instead of offering it. Read-only: the repair
+/// applies the same rules again when it runs.
+pub fn left_alone_here(reg: &dyn Registry, finding: &Finding, elevated: bool) -> Option<LeftAlone> {
+    let key = match &finding.repair {
+        Repair::DeleteValue { key, .. } if is_protected_key(key) => {
+            return Some(LeftAlone::Protected(format!("{key} is a protected key")));
+        }
+        Repair::DeleteKey { key } if !key_delete_allowed(key) => {
+            return Some(LeftAlone::Protected(format!("{key} is a protected key")));
+        }
+        Repair::DeleteValue { key, .. } | Repair::DeleteKey { key } => key,
+        Repair::DeleteFile { .. } | Repair::None => return None,
+    };
+    if !elevated {
+        return None;
+    }
+    if finding.per_user() {
+        return Some(LeftAlone::NormalWindow);
+    }
+    match reg.check_trusted(key) {
+        Ok(()) | Err(RegError::NotFound) => None,
+        Err(RegError::Denied(why) | RegError::Message(why)) => Some(LeftAlone::Protected(why)),
     }
 }
 
@@ -885,7 +979,12 @@ pub fn repair_with_progress(
                 outcome.already_gone += 1;
                 outcome.resolved.push(finding.clone());
             }
-            Applied::Refused => outcome.refused += 1,
+            Applied::Refused => {
+                outcome.refused += 1;
+                if finding.repairable() {
+                    outcome.refused_findings.push(finding.clone());
+                }
+            }
             Applied::NotBackedUp => outcome.not_backed_up += 1,
             Applied::Failed { message, denied } => {
                 if denied {
