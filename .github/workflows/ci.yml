@@ -91,3 +91,30 @@ jobs:
           installer\test-installer.ps1
           -Old installer-test\Hivemend-v0.0.1-x86_64-setup.exe -OldVersion 0.0.1
           -New installer-test\Hivemend-v0.0.2-x86_64-setup.exe -NewVersion 0.0.2
+
+  ui:
+    name: ui (keyboard, screen reader, scan, repair, restore)
+    # Drives the window through Windows UI Automation, as a screen reader or
+    # keyboard user would, against stale entries seeded for the test.
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: rustup toolchain install 1.99.0 --profile minimal
+      - run: cargo +1.99.0 build --locked
+      - run: python -m pip install pywinauto==0.6.9 pillow==11.3.0
+      - name: Seed stale entries
+        shell: pwsh
+        run: tests\ui\seed.ps1
+      - name: Run the UI tests
+        run: python -I tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
+      - name: Remove the seeded entries
+        if: always()
+        shell: pwsh
+        run: tests\ui\seed.ps1 -Remove
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        if: always()
+        with:
+          name: ui-test-screenshots
+          path: ui-test-output
