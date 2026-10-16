@@ -523,11 +523,11 @@ struct App {
     /// Stand-in buttons for `hotspots`, in the same order, and what each
     /// was last set to (name, place, enabled) or `None` when hidden.
     access: Vec<HWND>,
-    access_shown: Vec<Option<(String, RECT, bool)>>,
+    access_shown: Vec<Option<(String, Edges, bool)>>,
     /// Status lines drawn in the last paint, and their stand-in statics.
     texts: std::cell::RefCell<Vec<(RECT, String)>>,
     text_ctls: Vec<HWND>,
-    text_shown: Vec<Option<(String, RECT)>>,
+    text_shown: Vec<Option<(String, Edges)>>,
     hover: Option<usize>,
     tracking: bool,
     elevated: bool,
@@ -5774,14 +5774,14 @@ impl App {
             SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, SetWindowTextW,
             ShowWindow,
         };
-        let place = |control: HWND, rect: RECT| unsafe {
+        let place = |control: HWND, (left, top, right, bottom): Edges| unsafe {
             SetWindowPos(
                 control,
                 std::ptr::null_mut(),
-                rect.left,
-                rect.top,
-                rect.right - rect.left,
-                rect.bottom - rect.top,
+                left,
+                top,
+                right - left,
+                bottom - top,
                 SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
             );
         };
@@ -5793,7 +5793,7 @@ impl App {
                 if matches!(spot.action, Action::Page(page) if page == self.page) {
                     name.push_str(", current page");
                 }
-                (name, spot.rect, self.spot_enabled(index))
+                (name, edges(spot.rect), self.spot_enabled(index))
             });
             if want == self.access_shown[index] {
                 continue;
@@ -5816,7 +5816,9 @@ impl App {
         }
         let texts = self.texts.borrow().clone();
         for (index, &control) in self.text_ctls.iter().enumerate() {
-            let want = texts.get(index).map(|(rect, line)| (line.clone(), *rect));
+            let want = texts
+                .get(index)
+                .map(|(rect, line)| (line.clone(), edges(*rect)));
             if want == self.text_shown[index] {
                 continue;
             }
@@ -8050,6 +8052,13 @@ fn delete_fonts(fonts: &Fonts) {
     ] {
         unsafe { DeleteObject(font) };
     }
+}
+
+/// A rectangle as comparable numbers: left, top, right, bottom.
+type Edges = (i32, i32, i32, i32);
+
+fn edges(rect: RECT) -> Edges {
+    (rect.left, rect.top, rect.right, rect.bottom)
 }
 
 /// A stand-in control (see [`ID_ACCESS_BASE`]): hidden until placed, and
