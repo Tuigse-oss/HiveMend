@@ -352,6 +352,10 @@ impl Registry for WindowsRegistry {
         Ok(Box::new(WindowsTransaction::begin()?))
     }
 
+    fn check_trusted(&self, key: &str) -> Result<(), RegError> {
+        require_trusted_key(key)
+    }
+
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
         delete_tree_checked(path, None)
     }

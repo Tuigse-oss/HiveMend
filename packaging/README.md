@@ -13,6 +13,32 @@ gh release download v0.1.0 --pattern SHA256SUMS.txt
 python3 packaging/render.py 0.1.0 SHA256SUMS.txt out
 ```
 
+## Upgrades
+
+Every channel upgrades by installing the new version over the old one:
+
+- **winget and Chocolatey** run the new Inno Setup installer silently. Its
+  fixed `AppId` makes it replace the existing install in place, in the same
+  folder and the same mode (per user or all users). winget finds the install
+  through `ProductCode`, the Add/Remove Programs key that `AppId` produces.
+- A running Hivemend is asked to close first. It refuses while a repair,
+  restore, or cleanup is running, and Setup then stops without changing
+  anything; it is never restarted afterwards, so it cannot come back with
+  the installer's administrator rights.
+- **Scoop** unpacks each version into its own folder and switches `current`
+  over to it.
+- Backups, settings, and the ignore list live in `%LOCALAPPDATA%\HiveMend`
+  (and the administrator backup store), never in the install folder, so
+  upgrades and uninstalls keep them.
+
+CI checks this on every pull request (`installer\test-installer.ps1`): a
+per-user and an all-users install, an upgrade with Hivemend running, a
+reinstall, and an uninstall. A release build also upgrades from the last
+published release's installer.
+
+Never change the `AppId` in `installer/hivemend.iss`: a new one would install
+next to the old version instead of replacing it.
+
 ## Scoop
 
 The bucket is its own repository, `Tuigse-oss/scoop-hivemend`, so `main` here

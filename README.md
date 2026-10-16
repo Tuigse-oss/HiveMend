@@ -226,8 +226,11 @@ Monitor, Tools, Settings, and About.
   registered command is resolved to one existing `.exe` (a bare tool name
   such as `MsiExec.exe` only from System32, an app alias such as
   `winget.exe` only from your WindowsApps folder) or refused. A window
-  run as administrator starts no uninstallers: from a normal window, the
-  uninstaller asks for administrator rights itself if it needs them.
+  run as administrator starts no uninstallers, so an uninstall command
+  never gets administrator rights it did not ask Windows for: Uninstall
+  there offers to reopen Hivemend without administrator rights on the
+  Programs page, and from there the uninstaller asks for rights itself if
+  it needs them.
 - Disk Space adds up a fixed drive or your user folder and lists the
   biggest folders (double-click or Enter to go in, Backspace to go up),
   the 100 largest files, and the space by kind of file. Sizes are file
@@ -276,7 +279,11 @@ scanners. The footer shows repair, backup, and ignore-list state.
 
 **Scan & Repair** — press **Start Scan**, tick what you want gone, press
 **Repair**. Each entry is checked again, backed up, then removed in its
-own registry transaction. Scanning never changes anything.
+own registry transaction. Scanning never changes anything. Only entries
+Hivemend can fix count as problems: report-only entries and ones a safety
+rule protects are listed last, without a check box, for information. In a
+window run as administrator, entries in your own part of the registry are
+marked to fix from Hivemend started without administrator rights.
 
 ![Scan & Repair](docs/screenshots/wiki-scan.png)
 

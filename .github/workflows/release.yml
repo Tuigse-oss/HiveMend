@@ -73,6 +73,27 @@ jobs:
           choco install innosetup --version=6.7.1 --no-progress -y
           & "${env:ProgramFiles(x86)}\Inno Setup 6\ISCC.exe" "/DAppVersion=$env:VERSION" installer\hivemend.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Test install, upgrade from the last release, and uninstall
+        # Upgrades from the latest published release's installer, the way
+        # winget and Chocolatey will; before the first release, reinstalls
+        # this one over itself.
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $new = "dist\Hivemend-$env:TAG-x86_64-setup.exe"
+          $old = $new
+          $oldVersion = $env:VERSION
+          $last = gh release list --repo $env:GITHUB_REPOSITORY --exclude-drafts --exclude-pre-releases --limit 1 --json tagName --jq '.[0].tagName // ""'
+          if ($last) {
+            gh release download $last --repo $env:GITHUB_REPOSITORY --pattern '*-setup.exe' --dir previous
+            $found = Get-ChildItem previous -Filter '*-setup.exe' | Select-Object -First 1
+            if ($found) {
+              $old = $found.FullName
+              $oldVersion = $last.TrimStart('v')
+            }
+          }
+          installer\test-installer.ps1 -Old $old -OldVersion $oldVersion -New $new -NewVersion $env:VERSION
       - name: Checksums
         shell: bash
         run: |

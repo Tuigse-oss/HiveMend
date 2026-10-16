@@ -2,6 +2,9 @@
 PackageIdentifier: TUIGSE.Hivemend
 PackageVersion: {{VERSION}}
 InstallerType: inno
+# The Add/Remove Programs key Inno Setup writes for the installer's AppId, so
+# winget recognizes an existing install and upgrades it in place.
+ProductCode: '{6F1C2A4E-8B3D-4E7A-9C51-2D8E0B7F4A93}_is1'
 MinimumOSVersion: 10.0.0.0
 UpgradeBehavior: install
 Installers:
@@ -13,6 +16,7 @@ Installers:
       Custom: /CURRENTUSER
   - Architecture: x64
     Scope: machine
+    ElevationRequirement: elevatesSelf
     InstallerUrl: {{SETUP_URL}}
     InstallerSha256: {{SETUP_SHA256}}
     InstallerSwitches:
