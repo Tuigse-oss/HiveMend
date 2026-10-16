@@ -231,6 +231,92 @@ Monitor, Tools, Settings, and About.
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
+### A tour of the window
+
+Every screenshot below is the real app on Windows 11 at 1040x720.
+
+**Home** — the banner reports the last result (no scan yet, healthy, or
+stale entries found). **Scan now** starts a full scan; the tiles jump to
+each tool, and **Quick Scan** runs a short pass over four safe cleanup
+scanners. The footer shows repair, backup, and ignore-list state.
+
+![Home](docs/screenshots/wiki-home.png)
+
+**Scan & Repair** — press **Start Scan**, tick what you want gone, press
+**Repair**. Each entry is checked again, backed up, then removed in its
+own registry transaction. Scanning never changes anything.
+
+![Scan & Repair](docs/screenshots/wiki-scan.png)
+
+**Restore** — pick a backup to put entries back. Shortcuts move back to
+their old places without overwriting anything; moving one back consumes
+its archived copy, and repeating a restore reports an unresolved
+recovery instead of success.
+
+![Restore](docs/screenshots/wiki-restore.png)
+
+**Privacy** — tick categories, **Preview** the counts (double-click a
+row for details), then **Clean Ticked**. **Cookies to Keep** lists sites
+whose cookies survive. Registry entries are backed up first; files are
+deleted for good.
+
+![Privacy](docs/screenshots/wiki-privacy.png)
+
+**Startup** — programs that start at sign-in. **Enable** and **Disable**
+flip the same switch Task Manager uses, so nothing is deleted and the
+two always agree.
+
+![Startup](docs/screenshots/wiki-startup.png)
+
+**Programs** — installed programs with publisher, date, size, and
+version. **Uninstall** starts the program's own uninstaller; Hivemend
+never removes program files itself.
+
+![Programs](docs/screenshots/wiki-programs.png)
+
+**Disk Space** — pick a drive pill to see the biggest folders, the 100
+largest files, and space by kind of file. Reading sizes never changes
+anything; Open in Explorer is the only action.
+
+![Disk Space](docs/screenshots/wiki-diskspace.png)
+
+**Duplicates** — find identical files of 1 MB or more by content, never
+by name. Tick the spares and move them to the Recycle Bin; one copy of
+every set is always kept, and anything that no longer matches byte for
+byte is left alone.
+
+![Duplicates](docs/screenshots/wiki-duplicates.png)
+
+**Services** — the **Suggested** pill lists safe Automatic services with
+the reason for each; **Apply Ticked** sets them to Manual with the old
+start types backed up first. **All services** shows everything.
+Boot-critical and security services are never suggested.
+
+![Services](docs/screenshots/wiki-services.png)
+
+**Monitor** — a read-only snapshot of the system with live memory,
+system-drive, and uptime readings plus a registry-hive inventory. Read
+when the page paints; nothing here changes your PC.
+
+![Monitor](docs/screenshots/wiki-monitor.png)
+
+**Windows Tools** — screens that ship with Windows (Device Manager,
+Services, System Restore, Windows Update, and the rest). Hivemend only
+opens them.
+
+![Windows Tools](docs/screenshots/wiki-tools.png)
+
+**Settings** — tick which scanner groups a scan covers, ask for a
+Windows restore point before repairs, and manage the ignore list
+(right-click a scan result to ignore it; **Stop Ignoring Highlighted**
+to undo). Changes save as you make them.
+
+![Settings](docs/screenshots/wiki-settings.png)
+
+**About** — version, the safety rules in short, and support details.
+
+![About](docs/screenshots/wiki-about.png)
+
 The artwork is original and drawn in code (`src/art.rs`): Celtic and
 Scottish symbols for each tool, in the same green and gold as the window,
 rendered at the screen's own scale. Nothing is loaded from image files.
