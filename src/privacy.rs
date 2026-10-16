@@ -607,13 +607,13 @@ pub fn uninstall_present(reg: &dyn Registry, needle: &str) -> bool {
 
 /// Resolve a directory spec to existing directories, plus notes for roots
 /// that could not be resolved (unknown `%VAR%`). Profile discovery asks
-/// `keep_going` as it goes and stops early when told; the walk that follows
-/// asks it again first, so a stopped discovery removes nothing.
+/// `keep_going` as it goes; `None` means it was told to stop, and the caller
+/// stops too, using nothing it found.
 fn resolve_dirs(
     fs: &dyn FileView,
     spec: &DirSpec,
     keep_going: &mut dyn FnMut() -> bool,
-) -> (Vec<String>, Vec<String>) {
+) -> Option<(Vec<String>, Vec<String>)> {
     let mut dirs = Vec::new();
     let mut notes = Vec::new();
     let mut push = |dir: String| {
@@ -650,10 +650,10 @@ fn resolve_dirs(
             let base = expand_env(fs, "%LOCALAPPDATA%");
             if base.contains('%') {
                 notes.push("%LOCALAPPDATA% is not set".to_string());
-                return (dirs, notes);
+                return Some((dirs, notes));
             }
             let users = format!("{base}\\{vendor}\\User Data");
-            for profile in child_dirs(fs, &users, &mut notes, keep_going) {
+            for profile in child_dirs(fs, &users, &mut notes, keep_going)? {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -668,10 +668,10 @@ fn resolve_dirs(
             let base = expand_env(fs, "%LOCALAPPDATA%");
             if base.contains('%') {
                 notes.push("%LOCALAPPDATA% is not set".to_string());
-                return (dirs, notes);
+                return Some((dirs, notes));
             }
             let profiles = format!("{base}\\Mozilla\\Firefox\\Profiles");
-            for profile in child_dirs(fs, &profiles, &mut notes, keep_going) {
+            for profile in child_dirs(fs, &profiles, &mut notes, keep_going)? {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -686,10 +686,10 @@ fn resolve_dirs(
             let base = expand_env(fs, "%APPDATA%");
             if base.contains('%') {
                 notes.push("%APPDATA% is not set".to_string());
-                return (dirs, notes);
+                return Some((dirs, notes));
             }
             let home = format!("{base}\\Mozilla\\Firefox");
-            for profile in firefox_profiles(fs, &home, &mut notes, keep_going) {
+            for profile in firefox_profiles(fs, &home, &mut notes, keep_going)? {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -701,7 +701,7 @@ fn resolve_dirs(
             }
         }
     }
-    (dirs, notes)
+    Some((dirs, notes))
 }
 
 /// The most profile folders looked at under one folder.
@@ -711,19 +711,22 @@ const MAX_PROFILES: usize = 1_000;
 const DISCOVERY_CHECK_EVERY: usize = 64;
 
 /// Folders in `dir`, at most [`MAX_PROFILES`]; a note says when there
-/// were more, so the rest is never taken as looked at.
+/// were more, so the rest is never taken as looked at. `None` when
+/// `keep_going` said stop.
 fn child_dirs(
     fs: &dyn FileView,
     dir: &str,
     notes: &mut Vec<String>,
     keep_going: &mut dyn FnMut() -> bool,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let mut dirs = Vec::new();
     let mut more = false;
     let mut seen = 0usize;
+    let mut stopped = false;
     fs.list_each(dir, &mut |item| {
         seen += 1;
         if seen.is_multiple_of(DISCOVERY_CHECK_EVERY) && !keep_going() {
+            stopped = true;
             return false;
         }
         if item.kind != ItemKind::Dir {
@@ -741,7 +744,10 @@ fn child_dirs(
             "{dir}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
         ));
     }
-    dirs
+    if stopped {
+        return None;
+    }
+    Some(dirs)
 }
 
 /// The largest `profiles.ini` read. Firefox writes a few hundred bytes per
@@ -751,13 +757,13 @@ const MAX_PROFILES_INI: usize = 1 << 20;
 /// Firefox profiles from `profiles.ini` plus the `Profiles` folder, so a
 /// missing ini still finds default locations. Together they are capped at
 /// [`MAX_PROFILES`], with a note when there were more; an oversized ini is
-/// not read.
+/// not read. `None` when `keep_going` said stop.
 fn firefox_profiles(
     fs: &dyn FileView,
     home: &str,
     notes: &mut Vec<String>,
     keep_going: &mut dyn FnMut() -> bool,
-) -> Vec<String> {
+) -> Option<Vec<String>> {
     let mut profiles = Vec::new();
     let mut seen = std::collections::HashSet::new();
     let mut more = false;
@@ -823,11 +829,12 @@ fn firefox_profiles(
         }
         None => {}
     }
-    if !stopped {
-        for profile in child_dirs(fs, &format!("{home}\\Profiles"), notes, keep_going) {
-            if !push(profile) {
-                break;
-            }
+    if stopped {
+        return None;
+    }
+    for profile in child_dirs(fs, &format!("{home}\\Profiles"), notes, keep_going)? {
+        if !push(profile) {
+            break;
         }
     }
     if more || ini_more {
@@ -835,7 +842,7 @@ fn firefox_profiles(
             "{home}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
         ));
     }
-    profiles
+    Some(profiles)
 }
 
 fn looks_absolute(path: &str) -> bool {
@@ -1050,7 +1057,9 @@ fn preview_target(
             recursive,
             min_age,
         } => {
-            let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
             for note in notes {
                 row.note(note);
             }
@@ -1098,7 +1107,9 @@ fn preview_target(
             names,
             sidecars,
         } => {
-            let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
             for note in notes {
                 row.note(note);
             }
@@ -1132,7 +1143,9 @@ fn preview_target(
                 row.note(reason.clone());
                 return true;
             }
-            let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
             for note in notes {
                 row.note(note);
             }
@@ -1631,7 +1644,10 @@ fn execute_item(
                 recursive,
                 min_age,
             } => {
-                let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
                 for note in notes {
                     done.note(note);
                 }
@@ -1695,7 +1711,10 @@ fn execute_item(
                 names,
                 sidecars,
             } => {
-                let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
                 for note in notes {
                     done.note(note);
                 }
@@ -1741,7 +1760,10 @@ fn execute_item(
                     done.note(reason.clone());
                     continue;
                 }
-                let (dirs, notes) = resolve_dirs(fs, dir, keep_going);
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
                 for note in notes {
                     done.note(note);
                 }
@@ -2726,7 +2748,7 @@ mod tests {
         );
         fs.add_dir(&format!("{home}\\Profiles\\abc.default"));
         fs.add_dir(&format!("{home}\\Profiles\\plain.default"));
-        let profiles = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true);
+        let profiles = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true).unwrap();
         assert_eq!(profiles.len(), 2);
     }
 
@@ -2748,7 +2770,7 @@ mod tests {
         }
         fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini.into_bytes(), None);
         let mut notes = Vec::new();
-        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true);
+        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true).unwrap();
         assert_eq!(profiles.len(), MAX_PROFILES);
         let unique: std::collections::HashSet<String> = profiles
             .iter()
@@ -2772,7 +2794,9 @@ mod tests {
         fs.add_dir(&format!(r"{home}\Profiles\a"));
         let mut notes = Vec::new();
         assert_eq!(
-            firefox_profiles(&fs, home, &mut notes, &mut || true).len(),
+            firefox_profiles(&fs, home, &mut notes, &mut || true)
+                .unwrap()
+                .len(),
             1
         );
         assert!(notes.is_empty(), "{notes:?}");
@@ -2794,23 +2818,84 @@ mod tests {
         for n in 0..900 {
             fs.add_dir(&format!(r"{users}\P{n:04}"));
         }
-        let all = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true);
+        let all = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true).unwrap();
         assert_eq!(all.len(), 900);
+        // Told to stop: nothing found is handed back, and it asks only once.
         let mut asked = 0;
-        let some = firefox_profiles(&fs, home, &mut Vec::new(), &mut || {
+        let stopped = firefox_profiles(&fs, home, &mut Vec::new(), &mut || {
             asked += 1;
             false
         });
+        assert_eq!(stopped, None);
         assert_eq!(asked, 1);
-        assert!(some.len() < DISCOVERY_CHECK_EVERY, "{}", some.len());
         let mut asked = 0;
-        let mut notes = Vec::new();
-        let some = child_dirs(&fs, users, &mut notes, &mut || {
+        let stopped = child_dirs(&fs, users, &mut Vec::new(), &mut || {
             asked += 1;
             false
         });
+        assert_eq!(stopped, None);
         assert_eq!(asked, 1);
-        assert!(some.len() < DISCOVERY_CHECK_EVERY, "{}", some.len());
+    }
+
+    /// Cancel while browser profiles are still being found: Clean edits no
+    /// cookie database and says it was cancelled, and Preview says so too.
+    #[test]
+    fn cancel_during_profile_discovery_stops_preview_and_clean() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for n in 0..300 {
+            fs.add_file_bytes(
+                &format!(r"{users}\P{n:03}\Network\Cookies"),
+                vec![7; 64],
+                None,
+            );
+        }
+        let items = vec![builtin("chrome-data")];
+        // The first question (before the category) says go on; every one
+        // after it, which discovery asks, says stop.
+        let mut calls = 0;
+        let preview = preview_with(&reg, &fs, &sys, &quiet(), &items, &mut || {
+            calls += 1;
+            calls < 2
+        });
+        assert!(calls >= 2, "discovery never asked");
+        assert!(preview.canceled);
+        assert!(preview.items.is_empty());
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-discovery-cancel");
+        let mut calls = 0;
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &items,
+            &mut backup,
+            &mut |_, _, _| {
+                calls += 1;
+                calls < 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(calls >= 2, "discovery never asked");
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert_eq!(outcome.items[0].cookies, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .all(|note| !note.contains("Cookies")),
+            "a database was looked at: {:?}",
+            outcome.items[0].restricted
+        );
+        for n in 0..300 {
+            let db = format!(r"{users}\P{n:03}\Network\Cookies");
+            assert_eq!(fs.read(&db), Some(vec![7; 64]), "{db}");
+        }
     }
 
     #[test]
@@ -2823,7 +2908,7 @@ mod tests {
         fs.add_dir(&format!(r"{home}\elsewhere"));
         fs.add_dir(&format!(r"{home}\Profiles\plain"));
         let mut notes = Vec::new();
-        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true);
+        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true).unwrap();
         assert_eq!(profiles, vec![format!(r"{home}\Profiles\plain")]);
         assert!(
             notes.iter().any(|note| note.contains("not read")),
@@ -3045,7 +3130,8 @@ mod tests {
                 sub: "cache2".into(),
             },
             &mut || true,
-        );
+        )
+        .unwrap();
         assert_eq!(dirs, [cache.to_string()]);
         let fox = builtin("firefox-data");
         assert!(fox.name.contains("cookies"));
@@ -3249,7 +3335,8 @@ mod tests {
                 sub: String::new(),
             },
             &mut || true,
-        );
+        )
+        .unwrap();
         assert!(
             notes
                 .iter()
