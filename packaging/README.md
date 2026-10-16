@@ -1,9 +1,10 @@
 # Packaging
 
-Templates for the Scoop, winget, and Chocolatey packages. When a GitHub
-release is published, `.github/workflows/packages.yml` fills them in with
-`render.py` (version, download URLs, and checksums from the release's
-`SHA256SUMS.txt`) and publishes each channel that is switched on.
+Templates for the Scoop, winget, and Chocolatey packages. `render.py` fills
+them in with the version, download URLs, and checksums from a release's
+`SHA256SUMS.txt`. When a GitHub release is published,
+`.github/workflows/packages.yml` publishes to winget and Chocolatey, and the
+Scoop bucket updates itself.
 
 To render them by hand, for a first submission or to check a change:
 
@@ -12,22 +13,17 @@ gh release download v0.1.0 --pattern SHA256SUMS.txt
 python3 packaging/render.py 0.1.0 SHA256SUMS.txt out
 ```
 
-## Switching a channel on
-
-Each channel needs a repository variable (Settings > Secrets and variables >
-Actions > Variables) and a secret. Without the variable, its job is skipped.
-
-### Scoop: `PUBLISH_SCOOP=true`, secret `SCOOP_BUCKET_TOKEN`
+## Scoop
 
 The bucket is its own repository, `Tuigse-oss/scoop-hivemend`, so `main` here
-never needs a bot commit. The organization does not allow deploy keys, so the
-workflow pushes with a fine-grained token limited to that one repository.
+never needs a bot commit. Its `update` workflow runs every six hours (or on
+demand from its Actions tab), finds the latest published Hivemend release,
+renders `scoop/hivemend.json` with this folder's `render.py` at that tag, and
+commits it. It uses that repository's own token, so no secret is needed.
 
-1. At GitHub > Settings > Developer settings > Fine-grained tokens, create a
-   token with resource owner **Tuigse-oss**, repository access **Only select
-   repositories: scoop-hivemend**, and permission **Contents: Read and write**.
-2. Add it to this repository as the secret `SCOOP_BUCKET_TOKEN`. When it
-   expires, make a new one the same way.
+GitHub pauses scheduled workflows in a public repository after 60 days without
+activity; if a release is not picked up, re-enable or run the `update`
+workflow there.
 
 Users install with:
 
@@ -35,6 +31,11 @@ Users install with:
 scoop bucket add hivemend https://github.com/Tuigse-oss/scoop-hivemend
 scoop install hivemend
 ```
+
+## Switching on winget and Chocolatey
+
+Each needs a repository variable (Settings > Secrets and variables > Actions >
+Variables) and a secret. Without the variable, its job is skipped.
 
 ### winget: `PUBLISH_WINGET=true`, secret `WINGET_TOKEN`
 
