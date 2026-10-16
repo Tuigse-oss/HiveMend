@@ -38,8 +38,8 @@ mod windows_reg;
 mod windows_services;
 
 pub use backup::{
-    BackupInfo, BackupSummary, BackupWriter, Refresher, RunningMac, backup_name, encode_reg,
-    is_hive_mend_backup, list_backups, list_backups_until, read_backup, reserve_backup,
+    BackupInfo, BackupInventory, BackupSummary, BackupWriter, Refresher, RunningMac, backup_name,
+    encode_reg, is_hive_mend_backup, list_backups, list_backups_until, read_backup, reserve_backup,
 };
 pub use cookies::{CookieCount, count_cookies, keeps, parse_keep_list, trim_cookies};
 pub use demo::sample_world;

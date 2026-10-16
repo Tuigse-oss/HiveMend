@@ -6,7 +6,7 @@ description = "Scan and repair stale Windows registry entries on Windows 10 and 
 readme = "README.md"
 license = "MIT OR Apache-2.0"
 authors = ["Brad Williamson"]
-repository = "https://github.com/bradwilliamson/HiveMend"
+repository = "https://github.com/Tuigse-oss/HiveMend"
 
 # The program is Hivemend.exe; the crate and library keep the name hive-mend.
 [[bin]]

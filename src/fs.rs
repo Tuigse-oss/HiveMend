@@ -90,7 +90,9 @@ pub enum Access {
     Delete,
     /// Delete, with only reading shared: refused while another program
     /// has the file open to write or delete it, and no other program can
-    /// write to it while held. The pin's age is read again through it.
+    /// write to it while held. The pin's age is read again through it, and
+    /// so is its place: held without delete sharing, it can no longer be
+    /// renamed, so the refreshed path is where it is for the final decision.
     DeleteExclusive,
 }
 
@@ -289,6 +291,14 @@ pub struct MemoryFs {
     written_since: Vec<String>,
     /// Folders on another volume: a move into them fails.
     other_volume: Vec<String>,
+    /// A rename that lands between the pin and the exclusive hold, standing
+    /// in for another program moving the file: `pin_acquire` with exclusive
+    /// access moves the node and reports the new place through the hold, the
+    /// way a held Windows handle reports where its object is now.
+    relocate_on_hold: HashMap<String, String>,
+    /// A link-count change that lands between the pin and the exclusive
+    /// hold: `pin_acquire` with exclusive access reports the new count.
+    relink_on_hold: HashMap<String, u32>,
 }
 
 impl MemoryFs {
@@ -340,6 +350,19 @@ impl MemoryFs {
     /// Give a file `count` hard links.
     pub fn set_links(&mut self, path: &str, count: u32) {
         self.links.insert(norm(path), count);
+    }
+
+    /// Move `from` to `to` when it is next held exclusively, standing in for
+    /// another program renaming the file after it was pinned but before the
+    /// mutation hold is acquired. The hold then reports the new place.
+    pub fn relocate_on_acquire(&mut self, from: &str, to: &str) {
+        self.relocate_on_hold.insert(norm(from), norm(to));
+    }
+
+    /// Report `count` hard links when `path` is next held exclusively,
+    /// standing in for a link added after the file was pinned.
+    pub fn relink_on_acquire(&mut self, path: &str, count: u32) {
+        self.relink_on_hold.insert(norm(path), count);
     }
 
     fn resolve(&self, path: &str) -> String {
@@ -441,12 +464,58 @@ impl FileView for MemoryFs {
     }
 
     fn pin_acquire(&mut self, pin: &mut Pinned, access: Access) -> Result<(), String> {
-        let key = self.pinned_key(pin)?.to_string();
-        if !self.nodes.contains_key(&key) {
+        let old = self.pinned_key(pin)?.to_string();
+        if !self.nodes.contains_key(&old) {
             return Err("file not found (os error 2)".into());
         }
+        let exclusive = matches!(
+            access,
+            Access::ReadDeleteExclusive | Access::DeleteExclusive
+        );
+        // A rename that landed after the pin: the exclusive hold follows the
+        // object and reports where it is now. Shared access keeps the pinned
+        // place, as it cannot stop a further rename anyway.
+        let key = if exclusive {
+            if let Some(next) = self.relocate_on_hold.remove(&old) {
+                let node = self
+                    .nodes
+                    .remove(&old)
+                    .ok_or("file not found (os error 2)")?;
+                self.ensure_parents(&next);
+                self.nodes.insert(next.clone(), node);
+                for list in [&mut self.streams, &mut self.markers] {
+                    for item in list.iter_mut() {
+                        if *item == old {
+                            *item = next.clone();
+                        }
+                    }
+                }
+                if let Some(count) = self.links.remove(&old) {
+                    self.links.insert(next.clone(), count);
+                }
+                pin.real_path = next.clone();
+                pin.handle = PinHandle::Memory(next.clone());
+                next
+            } else {
+                old.clone()
+            }
+        } else {
+            old.clone()
+        };
+        if exclusive {
+            // A link-count change that landed after the pin is visible
+            // through the hold, as is the count recorded at pin time.
+            if let Some(count) = self
+                .relink_on_hold
+                .remove(&old)
+                .or_else(|| self.relink_on_hold.remove(&key))
+            {
+                self.links.insert(key.clone(), count);
+            }
+            pin.links = self.links.get(&key).copied().unwrap_or(1);
+        }
         if access == Access::ReadDeleteExclusive {
-            if self.busy.contains(&key) {
+            if self.busy.contains(&old) || self.busy.contains(&key) {
                 return Err("the file is being used by another process (os error 32)".into());
             }
             if let Some(FsNode::File { bytes, .. }) = self.nodes.get(&key) {
@@ -454,10 +523,10 @@ impl FileView for MemoryFs {
             }
         }
         if access == Access::DeleteExclusive {
-            if self.busy.contains(&key) {
+            if self.busy.contains(&old) || self.busy.contains(&key) {
                 return Err("the file is being used by another process (os error 32)".into());
             }
-            if self.written_since.contains(&key) {
+            if self.written_since.contains(&old) || self.written_since.contains(&key) {
                 pin.age = Some(Duration::ZERO);
             }
         }
@@ -1115,8 +1184,14 @@ impl FileView for HostFs {
         };
         let file = host::reopen(file, pin.kind, access, &pin.real_path)?;
         if access == Access::DeleteExclusive {
-            // Now that nothing else can write it, its age is final.
+            // Now that nothing else can write it, its age is final. Held
+            // without delete sharing, it can no longer be renamed either,
+            // so its place is final too: the last decision runs on it.
             pin.age = host::handle_age(&file);
+            if let Some((real_path, links)) = host::held_place(&file)? {
+                pin.real_path = real_path;
+                pin.links = links;
+            }
         }
         if access == Access::ReadDeleteExclusive {
             // And its length, its place and its names: held without delete
@@ -2323,6 +2398,36 @@ mod live_tests {
         held.expect("held");
         assert!(
             real.to_ascii_lowercase().ends_with(r"\outside\a.lnk"),
+            "{real}"
+        );
+        assert!(renamed_again.is_err(), "a held file was renamed");
+    }
+
+    #[test]
+    fn live_a_delete_hold_reports_where_it_is_now() {
+        // DeleteExclusive (the Privacy delete path) refreshes the held place
+        // like ReadDeleteExclusive does: renamed after pinning, then held,
+        // the pin says where the file is now, and a further rename is
+        // refused, so the final scope decision runs on current ground.
+        let base = std::env::temp_dir().join(format!("hm-del-place-{}", std::process::id()));
+        let inside = base.join("inside");
+        let outside = base.join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let file = inside.join("a.tmp");
+        std::fs::write(&file, b"x").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&file.display().to_string()).unwrap();
+        let moved = std::fs::rename(&file, outside.join("a.tmp"));
+        let held = fs.pin_acquire(&mut pin, Access::DeleteExclusive);
+        let renamed_again = std::fs::rename(outside.join("a.tmp"), inside.join("b.tmp"));
+        let real = pin.real_path.clone();
+        drop(pin);
+        let _ = std::fs::remove_dir_all(&base);
+        moved.expect("a pin shares delete, so it can be moved");
+        held.expect("held");
+        assert!(
+            real.to_ascii_lowercase().ends_with(r"\outside\a.tmp"),
             "{real}"
         );
         assert!(renamed_again.is_err(), "a held file was renamed");

@@ -270,9 +270,10 @@ pub fn read_restorable(
 /// and the destination must pass the same rule repair used to remove it
 /// (Start Menu, Desktop, or temp; never the Windows folder), checked by its
 /// real path before anything is made. It goes back by one rename of its own
-/// handle, with all its data, and nothing existing is overwritten. One that
-/// is already back (gone from the backup, present at its place) counts as
-/// done.
+/// handle, with all its data, and nothing existing is overwritten. A saved
+/// shortcut that cannot be opened is an unresolved recovery even when
+/// something is at its place: a file there never identifies a missing
+/// archive's contents, so it is reported, never counted as done.
 pub fn restore_files(
     fs: &mut dyn FileView,
     backup_real: &str,
@@ -309,8 +310,15 @@ fn restore_one(
     let copy_text = copy.display().to_string();
     let mut source = match fs.pin(&copy_text) {
         Ok(source) => source,
-        // Put back by an earlier restore: the saved shortcut went back.
-        Err(_) if fs.exists(&original) && !fs.exists(&copy_text) => return Ok(false),
+        // The saved shortcut cannot be opened, and nothing here proves it
+        // went back: a file at the destination never identifies a missing
+        // archive's contents. Report it as an unresolved recovery, never as
+        // a restore already done. Nothing is overwritten or retried.
+        Err(_) if fs.exists(&original) && !fs.exists(&copy_text) => {
+            return Err(format!(
+                "the saved copy {copy_text} is missing, so it cannot be verified whether it was already put back; the file at {original} was left as it is"
+            ));
+        }
         Err(err) => return Err(format!("the saved copy {copy_text}: {err}")),
     };
     let confined = |source: &Pinned| {
@@ -1293,11 +1301,119 @@ mod tests {
         assert_eq!(fs.named_streams(&deep), Ok(true));
         // Moved, not copied: the backup no longer holds it.
         assert!(!fs.exists(&format!(r"{files}\0001-big.lnk")));
-        // Running the restore again finds it already back.
+        // Running the restore again cannot verify the consumed archive from
+        // the destination alone, so it reports an unresolved recovery
+        // instead of a quiet success, and changes nothing.
+        let (again, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(again, 0);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0001-big") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0002-lost")),
+            "{errors:?}"
+        );
+        assert!(fs.exists(&deep));
+    }
+
+    #[test]
+    fn a_missing_archive_is_never_reported_as_restored() {
+        // PV-03: a missing or unreadable saved copy plus anything at the
+        // destination is an unresolved recovery with a visible warning, never
+        // a completed restore. Nothing is overwritten, whatever is there.
+        let mut fs = fs();
+        let backup = r"C:\ProgramData\HiveMend\backups\hive-mend-9.reg";
+        let files = r"C:\ProgramData\HiveMend\backups\hive-mend-9-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        fs.add_dir(files);
+        // An unrelated file at the destination proves nothing about the
+        // missing archive.
+        fs.add_file_bytes(&format!(r"{desktop}\other.lnk"), b"mine".to_vec(), None);
+        // A directory at the destination is left alone too.
+        fs.add_dir(&format!(r"{desktop}\folder"));
+        // An unreadable saved copy: pinned as a reparse point, never as data.
+        fs.add_file_bytes(&format!(r"{desktop}\broken.lnk"), b"mine".to_vec(), None);
+        fs.add_other(&format!(r"{files}\0004-broken.lnk"));
+        let (restored, errors) = restore_files(
+            &mut fs,
+            backup,
+            &summary(&[
+                (
+                    &format!(r"{desktop}\other.lnk"),
+                    &format!(r"{files}\0001-other.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\folder"),
+                    &format!(r"{files}\0002-folder.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\gone.lnk"),
+                    &format!(r"{files}\0003-gone.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\broken.lnk"),
+                    &format!(r"{files}\0004-broken.lnk"),
+                ),
+            ]),
+        );
+        assert_eq!(restored, 0, "nothing verified, nothing claimed: {errors:?}");
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0001-other") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0002-folder") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0003-gone")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0004-broken")),
+            "{errors:?}"
+        );
+        // Nothing overwritten, nothing created, nothing consumed.
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\other.lnk")),
+            Some(b"mine".to_vec())
+        );
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\broken.lnk")),
+            Some(b"mine".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{desktop}\gone.lnk")));
+        assert!(fs.is_dir(&format!(r"{desktop}\folder")));
+        // A genuine restore still works, and repeating it reports the now
+        // missing archive instead of silently claiming it again: the file
+        // put back keeps its data, with no duplicate.
+        fs.add_file_bytes(&format!(r"{files}\0005-real.lnk"), b"real".to_vec(), None);
+        let list = summary(&[(
+            &format!(r"{desktop}\real.lnk"),
+            &format!(r"{files}\0005-real.lnk"),
+        )]);
+        let (restored, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!((restored, errors.len()), (1, 0), "{errors:?}");
         let (again, errors) = restore_files(&mut fs, backup, &list);
         assert_eq!(again, 0);
         assert_eq!(errors.len(), 1, "{errors:?}");
-        assert!(fs.exists(&deep));
+        assert!(errors[0].contains("0005-real") && errors[0].contains("left as it is"));
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\real.lnk")),
+            Some(b"real".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{files}\0005-real.lnk")));
     }
 
     #[test]
@@ -1509,9 +1625,24 @@ mod live_tests {
         assert!(!left_in_backup, "moved back, not copied");
         assert_eq!(taken_kept.as_deref(), Some(&b"new owner"[..]));
         assert_eq!(saved_kept.as_deref(), Some(&b"saved"[..]));
-        // Again: the first is already back, the second still in conflict.
+        // Again: neither is claimed. The consumed archive cannot be verified
+        // from the destination alone, so it is reported as an unresolved
+        // recovery; the conflict still reports, and nothing is overwritten
+        // or duplicated.
         assert_eq!(again, 0);
-        assert_eq!(errors_again.len(), 1, "{errors_again:?}");
+        assert_eq!(errors_again.len(), 2, "{errors_again:?}");
+        assert!(
+            errors_again
+                .iter()
+                .any(|err| err.contains("0001-big") && err.contains("left as it is")),
+            "{errors_again:?}"
+        );
+        assert!(
+            errors_again
+                .iter()
+                .any(|err| err.contains("already at that place")),
+            "{errors_again:?}"
+        );
     }
 
     #[test]

@@ -268,6 +268,93 @@ mod tests {
         );
     }
 
+    #[test]
+    fn a_shortcut_renamed_after_pinning_is_left_alone_by_repair() {
+        // PV-01 through the production repair: the shortcut moves to another
+        // allowed place between the pin and the exclusive hold. The hold
+        // reports where it is now, which was never approved, so repair
+        // refuses it instead of archiving it from there.
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        let temp = r"C:\Users\me\AppData\Local\Temp";
+        fs.add_dir(temp);
+        fs.add_file_bytes(&format!(r"{desktop}\moved.lnk"), b"lnk".to_vec(), None);
+        fs.relocate_on_acquire(
+            &format!(r"{desktop}\moved.lnk"),
+            &format!(r"{temp}\moved.lnk"),
+        );
+        let mut reg = MemoryRegistry::new();
+        let mut backup = crate::backup::test_writer("hive-mend-relocated");
+        let finding = Finding {
+            scanner: ScannerId::TempShortcuts,
+            scanner_name: "Temp files".into(),
+            key: format!(r"{desktop}\moved.lnk"),
+            value: None,
+            detail: "temporary file".into(),
+            repair: Repair::DeleteFile {
+                path: format!(r"{desktop}\moved.lnk"),
+                keep_copy: true,
+            },
+        };
+        let outcome = repair(&mut reg, &mut fs, &[finding], &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(outcome.refused, 1, "{outcome:?}");
+        // Left alone where it is now, with its data; nothing was archived.
+        assert_eq!(
+            fs.read(&format!(r"{temp}\moved.lnk")),
+            Some(b"lnk".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{desktop}\moved.lnk")));
+    }
+
+    #[test]
+    fn a_shortcut_with_two_names_is_not_archived_by_repair() {
+        // PV-02 through the production repair: restore refuses a saved
+        // shortcut with more than one name, so repair refuses to archive
+        // one, whether the second name was there at the pin or appeared
+        // before the hold.
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        for name in ["plain.lnk", "linked.lnk", "late.lnk"] {
+            fs.add_file_bytes(&format!(r"{desktop}\{name}"), b"lnk".to_vec(), None);
+        }
+        fs.set_links(&format!(r"{desktop}\linked.lnk"), 2);
+        fs.relink_on_acquire(&format!(r"{desktop}\late.lnk"), 2);
+        let mut reg = MemoryRegistry::new();
+        let mut backup = crate::backup::test_writer("hive-mend-links");
+        let findings: Vec<Finding> = ["plain.lnk", "linked.lnk", "late.lnk"]
+            .iter()
+            .map(|name| {
+                let path = format!(r"{desktop}\{name}");
+                Finding {
+                    scanner: ScannerId::TempShortcuts,
+                    scanner_name: "Temp files".into(),
+                    key: path.clone(),
+                    value: None,
+                    detail: "temporary file".into(),
+                    repair: Repair::DeleteFile {
+                        path,
+                        keep_copy: true,
+                    },
+                }
+            })
+            .collect();
+        let outcome = repair(&mut reg, &mut fs, &findings, &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        assert_eq!(outcome.refused, 2, "{outcome:?}");
+        // Both names and their data remain; only the single-named file moved.
+        for name in ["linked.lnk", "late.lnk"] {
+            assert_eq!(
+                fs.read(&format!(r"{desktop}\{name}")),
+                Some(b"lnk".to_vec()),
+                "{name} was archived"
+            );
+        }
+        assert!(!fs.exists(&format!(r"{desktop}\plain.lnk")));
+    }
+
     fn uninstall_finding(name: &str) -> Finding {
         let key = format!(
             r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
@@ -1034,8 +1121,11 @@ fn apply(
 /// Delete a stale shortcut or temp file through one checked handle. The
 /// object is pinned first, the same rules are applied to the real path
 /// Windows reports for it (so a junction, link, or 8.3 name cannot carry the
-/// delete somewhere the spelling would never be allowed), and the copy and
-/// the delete both go through that handle.
+/// delete somewhere the spelling would never be allowed), then it is held
+/// exclusively and the rules run again on where the hold says it is now (so
+/// a rename after the first check, even to another allowed place, is left
+/// alone). The copy and the delete both go through that handle, and only a
+/// single-named shortcut is archived, as restore refuses any other.
 fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> Applied {
     let mut pin = match fs.pin(path) {
         Ok(pin) => pin,
@@ -1048,18 +1138,35 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
     if pin.kind != ItemKind::File || !file_delete_allowed(&real) || under_windows_dir(&*fs, &real) {
         return Applied::Refused;
     }
-    // A shortcut kept as a copy is taken so nothing else can write, rename,
-    // or delete it, and its length is read again through that hold.
+    // Everything taken exclusively, so nothing else can write, rename, or
+    // delete it while held, and its length, place, and names are read again
+    // through that hold.
     let access = if copy.is_some() {
         Access::ReadDeleteExclusive
     } else {
-        Access::Delete
+        Access::DeleteExclusive
     };
     if let Err(err) = fs.pin_acquire(&mut pin, access) {
         return Applied::Failed {
             denied: err.contains("os error 5") || err.contains("os error 32"),
             message: err,
         };
+    }
+    // The hold reports where the file is now: a move after the first check,
+    // even to another place repair may touch, was never approved, so the
+    // file is left alone. The location decision stays valid until mutation.
+    if !pin.real_path.eq_ignore_ascii_case(&real)
+        || pin.kind != ItemKind::File
+        || !file_delete_allowed(&pin.real_path)
+        || under_windows_dir(&*fs, &pin.real_path)
+    {
+        return Applied::Refused;
+    }
+    // Restore only puts back a saved shortcut with a single name: a shortcut
+    // that gained another name before the hold is refused here, so a repair
+    // cannot archive what restore would not bring back.
+    if copy.is_some() && pin.links != 1 {
+        return Applied::Refused;
     }
     // A file with any named stream (the download marker included) is left
     // alone, checked through the held handle. One added after this check
@@ -1147,5 +1254,33 @@ mod live_tests {
         let after = std::fs::metadata(&victim).unwrap();
         assert_eq!(before.len(), after.len());
         assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    fn live_a_shortcut_with_two_names_is_not_archived() {
+        // PV-02 on NTFS through the production repair path: a stale
+        // shortcut with a second hard-link name is refused, never archived,
+        // since restore would not bring it back. Both names keep their data.
+        let dir = std::env::temp_dir().join(format!("hivemend-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lnk = dir.join("old.lnk");
+        let alias = dir.join("alias.lnk");
+        let copy = dir.join("backup").join("0001-old.lnk");
+        std::fs::write(&lnk, b"lnk").unwrap();
+        std::fs::hard_link(&lnk, &alias).expect("a second hard-link name");
+        let mut fs = HostFs;
+        let outcome = delete_file_pinned(
+            &mut fs,
+            &lnk.display().to_string(),
+            Some(&copy.display().to_string()),
+        );
+        let kept = std::fs::read(&lnk).ok();
+        let alias_kept = std::fs::read(&alias).ok();
+        let archived = copy.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(outcome, Applied::Refused));
+        assert_eq!(kept.as_deref(), Some(&b"lnk"[..]));
+        assert_eq!(alias_kept.as_deref(), Some(&b"lnk"[..]));
+        assert!(!archived, "a refused shortcut reached the backup");
     }
 }

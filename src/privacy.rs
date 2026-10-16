@@ -1932,6 +1932,25 @@ fn trim_cookie_db(
         done.note(format!("refused: {db} (it resolves to {real})"));
         return;
     }
+    // Read where the database is once more, immediately before editing it:
+    // the edit opens the path, not a held handle, so a move after the
+    // checks above leaves it alone instead of trimming a file that was
+    // never approved.
+    let real_again = match fs.pin(db) {
+        Ok(pin) if pin.kind == ItemKind::File => pin.real_path,
+        Ok(_) => {
+            done.note(format!("not a file: {db}"));
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {db}: {err}"));
+            return;
+        }
+    };
+    if !real_again.eq_ignore_ascii_case(&real) {
+        done.note(format!("changed since it was listed, left alone: {db}"));
+        return;
+    }
     match crate::cookies::trim_cookies(std::path::Path::new(&real), sites) {
         Ok(count) => done.cookies += count.removed,
         Err(err) => errors.push(format!("cookies in {db}: {err}")),
@@ -1978,24 +1997,43 @@ fn delete_file(
         ));
         return;
     }
-    // A file listed for being old is taken so nothing else can write it,
-    // then its age is read again: written to, or replaced, since it was
-    // listed, or busy now, and it stays.
-    let result = if let Some(min) = hit.min_age {
-        match fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
-            Ok(()) if !pin.age.is_some_and(|age| age >= min) => {
+    // Every delete is taken exclusively, so nothing else can write, rename,
+    // or delete the file while held; a shared hold could not stop a rename
+    // after the decision. The hold reports where the file is now, and the
+    // scope check runs again on it: a file that moved after it was listed,
+    // even to another place under this root, was never approved at its new
+    // place, so it stays. A file listed for being old then has its age read
+    // again: written to, or replaced, since it was listed, or busy now, and
+    // it stays.
+    let confirmed = pin.real_path.clone();
+    let result = match fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
+        Ok(()) => {
+            let real_root = fs
+                .pin(root)
+                .map(|pin| pin.real_path)
+                .unwrap_or_else(|_| root.to_string());
+            if !pin.real_path.eq_ignore_ascii_case(&confirmed)
+                || !privacy_file_allowed(fs, &real_root, &pin.real_path)
+            {
                 done.note(format!(
                     "changed since it was listed, left alone: {}",
                     hit.path
                 ));
                 return;
             }
-            Ok(()) => fs.pin_delete(pin),
-            Err(err) => Err(err),
+            if hit
+                .min_age
+                .is_some_and(|min| !pin.age.is_some_and(|age| age >= min))
+            {
+                done.note(format!(
+                    "changed since it was listed, left alone: {}",
+                    hit.path
+                ));
+                return;
+            }
+            fs.pin_delete(pin)
         }
-    } else {
-        fs.pin_acquire(&mut pin, Access::Delete)
-            .and_then(|()| fs.pin_delete(pin))
+        Err(err) => Err(err),
     };
     match result {
         Ok(()) => {
@@ -2590,6 +2628,66 @@ mod tests {
                 .any(|note| note.contains("resolves to"))
         );
         assert_eq!(fs.read(r"C:\Users\me\Documents\keep.txt"), Some(vec![2; 8]));
+    }
+
+    #[test]
+    fn a_file_moved_after_listing_is_not_deleted() {
+        // PV-01 through the production Privacy delete, ordinary and
+        // age-filtered: the file moves between the scope check and the
+        // exclusive hold, and the hold reports where it is now. A move to
+        // another place under the same root is still refused, as is a move
+        // out of it; the file stays where it is now, with its data.
+        let day = Duration::from_secs(24 * 3600);
+        for min_age in [None, Some(day * 2)] {
+            let mut fs = MemoryFs::with_windows_dirs();
+            let root = r"C:\Users\me\AppData\Local\Temp";
+            let sub = format!(r"{root}\Sub");
+            fs.add_dir(&sub);
+            for name in ["near.tmp", "far.tmp", "stays.tmp"] {
+                fs.add_file_bytes(&format!(r"{root}\{name}"), vec![7; 8], Some(day * 3));
+            }
+            fs.add_file_bytes(r"C:\Users\me\Documents\keep.txt", vec![2; 8], None);
+            fs.relocate_on_acquire(&format!(r"{root}\near.tmp"), &format!(r"{sub}\near.tmp"));
+            fs.relocate_on_acquire(
+                &format!(r"{root}\far.tmp"),
+                r"C:\Users\me\Documents\far.tmp",
+            );
+            let mut done = ItemOutcome::blank("user-temp");
+            let mut errors = Vec::new();
+            for name in ["near.tmp", "far.tmp", "stays.tmp"] {
+                let hit = FileHit {
+                    path: format!(r"{root}\{name}"),
+                    bytes: 8,
+                    min_age,
+                };
+                delete_file(&mut fs, root, &hit, &mut done, &mut errors);
+            }
+            assert!(errors.is_empty(), "{errors:?} (age {min_age:?})");
+            assert_eq!(done.files, 1, "(age {min_age:?}): {done:?}");
+            assert_eq!(
+                fs.read(&format!(r"{sub}\near.tmp")),
+                Some(vec![7; 8]),
+                "(age {min_age:?})"
+            );
+            assert_eq!(
+                fs.read(r"C:\Users\me\Documents\far.tmp"),
+                Some(vec![7; 8]),
+                "(age {min_age:?})"
+            );
+            assert!(
+                !fs.exists(&format!(r"{root}\stays.tmp")),
+                "(age {min_age:?}): the control was not deleted"
+            );
+            assert!(
+                done.restricted
+                    .iter()
+                    .filter(|note| note.contains("left alone"))
+                    .count()
+                    == 2,
+                "(age {min_age:?}): {:?}",
+                done.restricted
+            );
+        }
     }
 
     #[test]

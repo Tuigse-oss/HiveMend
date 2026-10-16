@@ -793,8 +793,20 @@ pub struct BackupInfo {
     pub summary: BackupSummary,
 }
 
-/// `.reg` files in one backup folder, newest first.
-pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
+/// What one backup folder contributed to the inventory: the backups that
+/// could be listed and read, newest first, plus one line per failure. A
+/// folder that does not exist yet contributes nothing and no error: its
+/// store is optional until the first repair writes to it. Anything else
+/// that goes wrong is reported here, never shown as an empty or partial
+/// list with no warning.
+#[derive(Clone, Debug, Default)]
+pub struct BackupInventory {
+    pub items: Vec<BackupInfo>,
+    pub errors: Vec<String>,
+}
+
+/// `.reg` files in one backup folder, newest first, with read failures.
+pub fn list_backups(dir: &Path, store: crate::store::Store) -> BackupInventory {
     list_backups_until(dir, store, &|| false)
 }
 
@@ -804,45 +816,122 @@ pub fn list_backups_until(
     dir: &Path,
     store: crate::store::Store,
     stop: &dyn Fn() -> bool,
-) -> Vec<BackupInfo> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+) -> BackupInventory {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Not created yet: an optional store, not a failure.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return BackupInventory::default();
+        }
+        Err(err) => {
+            return BackupInventory {
+                items: Vec::new(),
+                errors: vec![format!("could not list {}: {err}", dir.display())],
+            };
+        }
     };
-    let mut found = Vec::new();
-    for entry in entries.flatten() {
+    inventory_from_entries(dir, store, entries, stop, &dir_entry_stat, &read_backup)
+}
+
+/// What the inventory knows about one enumerated entry, from a single
+/// fallible query: whether it is a regular file, and for a file its size
+/// and timestamp. One query keeps type and metadata from disagreeing, and a
+/// failed query is an error, never a guess.
+struct EntryStat {
+    is_file: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// [`EntryStat`] through the platform: follows links like the listing
+/// always has, and reports any failure instead of defaulting.
+fn dir_entry_stat(entry: &std::fs::DirEntry) -> Result<EntryStat, String> {
+    entry
+        .metadata()
+        .map(|meta| EntryStat {
+            is_file: meta.is_file(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+        .map_err(|err| err.to_string())
+}
+
+/// [`list_backups_until`] over an entry stream, checking entries through
+/// `stat` and reading through `read`: the seam fault-injection tests use
+/// for unreadable entries, uncheckable entries, and files.
+fn inventory_from_entries(
+    dir: &Path,
+    store: crate::store::Store,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    stop: &dyn Fn() -> bool,
+    stat: &dyn Fn(&std::fs::DirEntry) -> Result<EntryStat, String>,
+    read: &dyn Fn(&Path) -> Result<String, std::io::Error>,
+) -> BackupInventory {
+    let mut inventory = BackupInventory::default();
+    for entry in entries {
         if stop() {
             break;
         }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                inventory.errors.push(format!(
+                    "an entry in {} could not be read ({err}); the list may be incomplete",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         let is_reg = path
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("reg"));
-        if !is_reg || !path.is_file() {
+        if !is_reg {
             continue;
         }
-        let meta = entry.metadata().ok();
+        // An entry whose type cannot be checked is unknown, not a known
+        // non-file: it is reported and left out, never silently skipped.
+        let stat = match stat(&entry) {
+            Ok(stat) => stat,
+            Err(err) => {
+                inventory.errors.push(format!(
+                    "could not check {} ({err}); it is not listed",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if !stat.is_file {
+            continue;
+        }
         // A file larger than any restore accepts is not even read.
-        let summary = if meta
-            .as_ref()
-            .is_some_and(|meta| meta.len() <= MAX_BACKUP_BYTES)
-        {
-            read_backup(&path)
-                .map(|text| BackupSummary::parse(&text))
-                .unwrap_or_default()
+        let summary = if stat.len <= MAX_BACKUP_BYTES {
+            match read(&path) {
+                Ok(text) => BackupSummary::parse(&text),
+                Err(err) => {
+                    inventory.errors.push(format!(
+                        "could not read {} ({err}); it is not listed",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
         } else {
             BackupSummary::default()
         };
-        found.push(BackupInfo {
+        inventory.items.push(BackupInfo {
             store,
-            modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
-            size: meta.map(|meta| meta.len()).unwrap_or(0),
+            modified: stat.modified,
+            size: stat.len,
             path,
             summary,
         });
     }
-    found.sort_by_key(|info| std::cmp::Reverse(info.modified));
-    found
+    inventory
+        .items
+        .sort_by_key(|info| std::cmp::Reverse(info.modified));
+    inventory
 }
 
 /// One background worker answering refresh requests, newest first. A request
@@ -1083,8 +1172,176 @@ mod tests {
             looked.get() > 2
         });
         let _ = std::fs::remove_dir_all(&dir);
-        assert_eq!(all.len(), 5);
-        assert_eq!(some.len(), 2);
+        assert_eq!(all.items.len(), 5);
+        assert!(all.errors.is_empty());
+        assert_eq!(some.items.len(), 2);
+        assert!(some.errors.is_empty());
+    }
+
+    #[test]
+    fn a_missing_backup_folder_is_empty_not_failed() {
+        // PV-04: a store that was never created is the normal empty state,
+        // not a read failure.
+        let dir = std::env::temp_dir().join(format!(
+            "hm-list-missing-{}-{}",
+            std::process::id(),
+            "no-such-folder"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        assert!(inventory.items.is_empty());
+        assert!(inventory.errors.is_empty());
+    }
+
+    #[test]
+    fn an_unlistable_backup_folder_is_reported_not_empty() {
+        // PV-04: an existing store that cannot be enumerated is a failure
+        // with a message, never a quiet "no backups".
+        let dir = std::env::temp_dir().join(format!("hm-list-file-{}", std::process::id()));
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        let _ = std::fs::remove_file(&dir);
+        assert!(inventory.items.is_empty());
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.errors[0].contains("could not list"),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_read_is_reported_and_not_listed() {
+        // PV-04: a listed backup that fails to read is skipped with a
+        // message; the readable ones still list.
+        let dir = std::env::temp_dir().join(format!("hm-list-unread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.reg"), b"unreadable").unwrap();
+        let entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &dir_entry_stat,
+            &|path| {
+                if path.file_name().and_then(|name| name.to_str()) == Some("bad.reg") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "denied",
+                    ))
+                } else {
+                    read_backup(path)
+                }
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("good.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("bad.reg"), "{inventory:?}");
+        assert!(inventory.errors[0].contains("not listed"), "{inventory:?}");
+    }
+
+    #[test]
+    fn an_unreadable_entry_is_reported_and_the_rest_listed() {
+        // PV-04: a failure midway through enumeration leaves a labeled
+        // partial list, not a quiet short one.
+        let dir = std::env::temp_dir().join(format!("hm-list-entry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kept.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        let mut entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        entries.push(Err(std::io::Error::other("boom")));
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &dir_entry_stat,
+            &read_backup,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("incomplete"), "{inventory:?}");
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_checked_is_reported_and_not_listed() {
+        // PV-04 residual: a .reg entry whose file-type/metadata query fails
+        // is unknown, not a known non-file. It is reported and left out,
+        // never silently skipped or listed as an empty backup.
+        let dir = std::env::temp_dir().join(format!("hm-list-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.reg"), b"uncheckable").unwrap();
+        let entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &|entry| {
+                if entry.file_name().to_str() == Some("bad.reg") {
+                    Err("denied".to_string())
+                } else {
+                    dir_entry_stat(entry)
+                }
+            },
+            &read_backup,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("good.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("bad.reg"), "{inventory:?}");
+        assert!(
+            inventory.errors[0].contains("could not check"),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn folders_stay_silent_and_oversized_files_stay_listed() {
+        // Controls for the residual fix: a known directory (even named
+        // *.reg) is silently skipped, and a backup larger than any restore
+        // accepts is listed without being read, with no error either way.
+        let dir = std::env::temp_dir().join(format!("hm-list-kinds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub.reg")).unwrap();
+        let big = vec![0u8; MAX_BACKUP_BYTES as usize + 1];
+        std::fs::write(dir.join("huge.reg"), &big).unwrap();
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("huge.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.items[0].size, big.len() as u64);
+        assert_eq!(inventory.items[0].summary, BackupSummary::default());
+        assert!(inventory.errors.is_empty(), "{inventory:?}");
     }
 
     fn finding(key: &str, repair: Repair) -> Finding {

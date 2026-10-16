@@ -19,14 +19,14 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::art::Icon;
 use hive_mend::{
-    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, Finding, HiveEntry, HostFs,
-    ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, Repair, RepairOutcome, SUGGESTED, ScanOptions,
-    ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo, ServiceOutcome,
-    ServiceState, ServiceStore, Settings, StartType, Store, WINDOWS_TOOLS, WindowsProcessList,
-    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
-    backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
-    exclusions_file, expand_target, format_bytes, format_uptime, gather_hives, gather_snapshot,
-    group_digits, list_backups_until, parse_custom, plan_profile, preview_with,
+    BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
+    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, Repair, RepairOutcome,
+    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
+    ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, WINDOWS_TOOLS,
+    WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores,
+    backups_dir, backups_location, build_items, clean_with_progress, custom_privacy_file,
+    decode_text_owned, exclusions_file, expand_target, format_bytes, format_uptime, gather_hives,
+    gather_snapshot, group_digits, list_backups_until, parse_custom, plan_profile, preview_with,
     repair_with_progress, restore_backup, scan_with_progress, settings_file, sort_services,
     start_services, still_reported, stop_services, user_dir,
 };
@@ -374,7 +374,7 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
 });
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
 /// The backup listing: one reader at a time, newest request wins.
-static BACKUPS: hive_mend::Refresher<Vec<BackupInfo>> = hive_mend::Refresher::new();
+static BACKUPS: hive_mend::Refresher<BackupInventory> = hive_mend::Refresher::new();
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 // Reentrancy guard for the window procedure. Synchronous dispatches
@@ -513,6 +513,8 @@ struct App {
     backups_shown: u64,
     /// The newest backup listing could not be read.
     backups_failed: bool,
+    /// What the shown listing failed to read: stores, entries, or files.
+    backup_errors: Vec<String>,
 
     job: Job,
     findings: Vec<Finding>,
@@ -801,13 +803,15 @@ unsafe extern "system" fn wnd_proc(
                 0
             }
             WM_BACKUPS_READY => {
-                if let Some((refresh, list)) = BACKUPS.take()
+                if let Some((refresh, inventory)) = BACKUPS.take()
                     && refresh == BACKUPS.wanted()
                 {
                     // A failed read keeps the list shown before, and says so.
-                    app.backups_failed = list.is_none();
-                    if let Some(list) = list {
-                        app.backups = list;
+                    // A partial read replaces the list but labels what failed.
+                    app.backups_failed = inventory.is_none();
+                    if let Some(inventory) = inventory {
+                        app.backups = inventory.items;
+                        app.backup_errors = inventory.errors;
                     }
                     app.backups_shown = refresh;
                     app.fill_backups();
@@ -1141,6 +1145,7 @@ impl App {
             backups: Vec::new(),
             backups_shown: 0,
             backups_failed: false,
+            backup_errors: Vec::new(),
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -4605,10 +4610,19 @@ impl App {
     ) {
         match result {
             Ok((summary, files, errors)) => {
-                let mut text = format!("Restored {} from\n{}", contents(&summary), file.display());
-                if files > 0 {
-                    text.push_str(&format!("\n\n{files} shortcuts were put back."));
-                }
+                // The headline counts only what was verified: shortcuts put
+                // back by this restore, not every shortcut the backup names.
+                // A missing archive is never claimed as restored.
+                let expected = summary.files.len();
+                let mut text = if errors.is_empty() && files == expected {
+                    format!("Restored {} from\n{}", contents(&summary), file.display())
+                } else {
+                    format!(
+                        "Restore from\n{} put back {files} of {expected} shortcuts ({}).",
+                        file.display(),
+                        contents(&summary)
+                    )
+                };
                 if !errors.is_empty() {
                     text.push_str("\n\nSome files could not be put back:\n");
                     text.push_str(
@@ -6661,6 +6675,11 @@ impl App {
         } else if self.backups_failed {
             "The backup folder could not be read. Open this page again to try once more."
                 .to_string()
+        } else if !self.backup_errors.is_empty() {
+            format!(
+                "Some backups could not be read and are not listed: {}. Open this page again to try once more.",
+                self.backup_errors.first().cloned().unwrap_or_default()
+            )
         } else if self.backups.is_empty() {
             "No backups yet. Each repair saves one here before it changes anything.".to_string()
         } else {
@@ -7561,13 +7580,17 @@ fn next_services_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("services")
 }
 
-/// Backups from every store, newest first, each tagged with its store.
-fn all_backups(stop: &dyn Fn() -> bool) -> Vec<BackupInfo> {
-    let mut all: Vec<BackupInfo> = backup_stores()
-        .into_iter()
-        .flat_map(|(store, dir)| list_backups_until(&dir, store, stop))
-        .collect();
-    all.sort_by_key(|info| std::cmp::Reverse(info.modified));
+/// Backups from every store, newest first, each tagged with its store,
+/// with one line per store, entry, or file that could not be read.
+fn all_backups(stop: &dyn Fn() -> bool) -> BackupInventory {
+    let mut all = BackupInventory::default();
+    for (store, dir) in backup_stores() {
+        let inventory = list_backups_until(&dir, store, stop);
+        all.items.extend(inventory.items);
+        all.errors.extend(inventory.errors);
+    }
+    all.items
+        .sort_by_key(|info| std::cmp::Reverse(info.modified));
     all
 }
 
