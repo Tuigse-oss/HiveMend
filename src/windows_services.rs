@@ -180,6 +180,123 @@ fn enumerate(manager: &ScHandle) -> Result<Vec<ServiceInfo>, StoreError> {
     Err(scm_error(ERROR_MORE_DATA, "listing services"))
 }
 
+/// The Start value a start type is written as, for the types Hivemend sets.
+fn start_dword(to: StartType) -> Option<u32> {
+    match to {
+        StartType::Automatic | StartType::AutomaticDelayed => Some(2),
+        StartType::Manual => Some(3),
+        StartType::Disabled => Some(4),
+        StartType::Boot | StartType::System => None,
+    }
+}
+
+/// The three service-manager steps a start type change uses, so the
+/// decision logic can be tested without a real service.
+trait StartOps {
+    /// The current start type, or `None` when it cannot be read.
+    fn prior(&mut self) -> Option<StartType>;
+    fn set_start(&mut self, dword: u32) -> Result<(), StoreError>;
+    fn set_delayed(&mut self, delayed: i32) -> Result<(), StoreError>;
+}
+
+/// Change a service's start type. The state to go back to must be read
+/// before anything changes, or nothing is changed; if the second step
+/// (the delay flag) fails, the first is put back.
+fn change_start(name: &str, to: StartType, ops: &mut dyn StartOps) -> Result<(), StoreError> {
+    // Defense in depth: the apply layer refuses these first.
+    let (start, delayed) = match to {
+        StartType::Automatic => (2u32, Some(0)),
+        StartType::AutomaticDelayed => (2u32, Some(1)),
+        StartType::Manual => (3u32, None),
+        StartType::Disabled => (4u32, None),
+        StartType::Boot | StartType::System => {
+            return Err(StoreError::new(format!(
+                "{name}: refusing a Boot or System start"
+            )));
+        }
+    };
+    let Some(prior) = ops.prior() else {
+        return Err(StoreError::new(format!(
+            "{name}: its current start type could not be read, so it was left as it is"
+        )));
+    };
+    ops.set_start(start)?;
+    // A stale delay flag is meaningless unless Start is Automatic, so only
+    // Automatic targets rewrite it; Manual and Disabled leave it exactly as
+    // `sc.exe` would.
+    if let Some(delayed) = delayed
+        && let Err(failed) = ops.set_delayed(delayed)
+    {
+        // Start already changed: put it back, so a failed request never
+        // leaves a different mode behind.
+        let restored = start_dword(prior).is_some_and(|dword| ops.set_start(dword).is_ok());
+        return Err(StoreError {
+            message: format!(
+                "{}; {}",
+                failed.message,
+                if restored {
+                    "the start type was put back as it was"
+                } else {
+                    "the start type could not be put back, so restore this change's backup"
+                }
+            ),
+            denied: failed.denied,
+        });
+    }
+    Ok(())
+}
+
+struct ScmStart<'a> {
+    manager: &'a ScHandle,
+    service: &'a ScHandle,
+    name: &'a str,
+}
+
+impl StartOps for ScmStart<'_> {
+    fn prior(&mut self) -> Option<StartType> {
+        query_start(self.manager, self.name)
+    }
+
+    fn set_start(&mut self, dword: u32) -> Result<(), StoreError> {
+        let ok = unsafe {
+            ChangeServiceConfigW(
+                self.service.handle,
+                SERVICE_NO_CHANGE,
+                dword,
+                SERVICE_NO_CHANGE,
+                ptr::null(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+                ptr::null(),
+            )
+        };
+        if ok == 0 {
+            return Err(scm_error(last_error(), self.name));
+        }
+        Ok(())
+    }
+
+    fn set_delayed(&mut self, delayed: i32) -> Result<(), StoreError> {
+        let info = SERVICE_DELAYED_AUTO_START_INFO {
+            fDelayedAutostart: delayed,
+        };
+        let ok = unsafe {
+            ChangeServiceConfig2W(
+                self.service.handle,
+                SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
+                &info as *const _ as *const _,
+            )
+        };
+        if ok == 0 {
+            return Err(scm_error(last_error(), self.name));
+        }
+        Ok(())
+    }
+}
+
 fn query_start(manager: &ScHandle, name: &str) -> Option<StartType> {
     let service = open_service(manager, name, SERVICE_QUERY_CONFIG).ok()?;
     let mut needed = 0u32;
@@ -271,57 +388,17 @@ impl ServiceStore for ScmServiceStore {
     }
 
     fn set_start(&mut self, name: &str, to: StartType) -> Result<(), StoreError> {
-        // Defense in depth: the apply layer refuses these first.
-        let (start, delayed) = match to {
-            StartType::Automatic => (2u32, Some(0)),
-            StartType::AutomaticDelayed => (2u32, Some(1)),
-            StartType::Manual => (3u32, None),
-            StartType::Disabled => (4u32, None),
-            StartType::Boot | StartType::System => {
-                return Err(StoreError::new(format!(
-                    "{name}: refusing a Boot or System start"
-                )));
-            }
-        };
         let manager = open_manager(SC_MANAGER_CONNECT)?;
         let service = open_service(&manager, name, SERVICE_CHANGE_CONFIG)?;
-        let ok = unsafe {
-            ChangeServiceConfigW(
-                service.handle,
-                SERVICE_NO_CHANGE,
-                start,
-                SERVICE_NO_CHANGE,
-                ptr::null(),
-                ptr::null(),
-                ptr::null_mut(),
-                ptr::null(),
-                ptr::null(),
-                ptr::null(),
-                ptr::null(),
-            )
-        };
-        if ok == 0 {
-            return Err(scm_error(last_error(), name));
-        }
-        // A stale delay flag is meaningless unless Start is Automatic, so
-        // only Automatic targets rewrite it; Manual and Disabled leave it
-        // exactly as `sc.exe` would.
-        if let Some(delayed) = delayed {
-            let info = SERVICE_DELAYED_AUTO_START_INFO {
-                fDelayedAutostart: delayed,
-            };
-            let ok = unsafe {
-                ChangeServiceConfig2W(
-                    service.handle,
-                    SERVICE_CONFIG_DELAYED_AUTO_START_INFO,
-                    &info as *const _ as *const _,
-                )
-            };
-            if ok == 0 {
-                return Err(scm_error(last_error(), name));
-            }
-        }
-        Ok(())
+        change_start(
+            name,
+            to,
+            &mut ScmStart {
+                manager: &manager,
+                service: &service,
+                name,
+            },
+        )
     }
 
     fn start(&mut self, name: &str) -> Result<Transition, StoreError> {
@@ -378,5 +455,58 @@ mod live_tests {
             err.message.contains("no such service"),
             "unexpected: {err:?}"
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Records each step; `prior` and `delay_fails` set what it answers.
+    struct Fake {
+        prior: Option<StartType>,
+        delay_fails: bool,
+        starts: Vec<u32>,
+    }
+
+    impl StartOps for Fake {
+        fn prior(&mut self) -> Option<StartType> {
+            self.prior
+        }
+        fn set_start(&mut self, dword: u32) -> Result<(), StoreError> {
+            self.starts.push(dword);
+            Ok(())
+        }
+        fn set_delayed(&mut self, _delayed: i32) -> Result<(), StoreError> {
+            if self.delay_fails {
+                Err(StoreError::new("injected".to_string()))
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    #[test]
+    fn an_unreadable_start_type_changes_nothing() {
+        let mut fake = Fake {
+            prior: None,
+            delay_fails: false,
+            starts: Vec::new(),
+        };
+        let err = change_start("Svc", StartType::Manual, &mut fake).unwrap_err();
+        assert!(err.message.contains("could not be read"), "{}", err.message);
+        assert!(fake.starts.is_empty(), "the start type was changed");
+    }
+
+    #[test]
+    fn a_failed_delay_flag_puts_the_start_type_back() {
+        let mut fake = Fake {
+            prior: Some(StartType::Manual),
+            delay_fails: true,
+            starts: Vec::new(),
+        };
+        let err = change_start("Svc", StartType::AutomaticDelayed, &mut fake).unwrap_err();
+        assert_eq!(fake.starts, [2, 3], "set to Automatic, then back to Manual");
+        assert!(err.message.contains("put back"), "{}", err.message);
     }
 }

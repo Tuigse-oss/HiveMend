@@ -9,10 +9,10 @@
 //! Windows directory, no thumbnail or Prefetch cleaning.
 
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::time::Duration;
 
-use crate::backup::{export_repairs, write_backup};
+use crate::backup::{BackupWriter, export_repairs};
 use crate::fs::{Access, FileView, ItemKind};
 use crate::model::{Error, Repair};
 use crate::pathutil::{
@@ -35,11 +35,6 @@ pub trait SystemTargets {
     /// Recycle Bin (items, bytes) across all fixed drives.
     fn bin_items(&self) -> (usize, u64);
     fn empty_bin(&mut self) -> Result<(), String>;
-    /// Fixed drives as roots (`C:\`), for free-space rows.
-    fn fixed_drives(&self) -> Vec<String>;
-    fn free_bytes(&self, drive: &str) -> u64;
-    /// Launch a detached free-space wipe. Returns once it is running.
-    fn wipe_free_space(&mut self, drive: &str) -> Result<(), String>;
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -48,7 +43,6 @@ pub enum PrivacyGroup {
     Browsers,
     Plugins,
     Custom,
-    Maintenance,
 }
 
 impl PrivacyGroup {
@@ -58,7 +52,6 @@ impl PrivacyGroup {
             Self::Browsers => "Browsers",
             Self::Plugins => "Applications",
             Self::Custom => "Custom",
-            Self::Maintenance => "Maintenance",
         }
     }
 }
@@ -98,6 +91,9 @@ pub enum DirSpec {
     Chromium { vendor: String, sub: String },
     /// Every Firefox profile dir plus `sub`.
     Firefox { sub: String },
+    /// Every Firefox local profile dir (`%LOCALAPPDATA%\Mozilla\Firefox\
+    /// Profiles\<profile>`) plus `sub`, where Firefox keeps its cache.
+    FirefoxLocal { sub: String },
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -124,11 +120,26 @@ pub enum PrivacyTarget {
         names: Vec<String>,
         sidecars: bool,
     },
+    /// A browser's cookie database in each profile (`names` relative to the
+    /// profile, first match used), with its SQLite side files.
+    Cookies {
+        dir: DirSpec,
+        names: Vec<String>,
+        keep: CookieKeep,
+    },
     Clipboard,
     RecycleBin,
-    FreeSpace {
-        drive: String,
-    },
+}
+
+/// What a clean does with cookie databases.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum CookieKeep {
+    /// Delete the database files.
+    All,
+    /// Remove every cookie except those for these sites.
+    Sites(Vec<String>),
+    /// Leave cookies alone, for this reason.
+    LeaveAlone(String),
 }
 
 #[derive(Clone, Debug)]
@@ -308,7 +319,7 @@ fn builtin_items() -> Vec<PrivacyItem> {
         PrivacyGroup::Browsers,
         "Cached web files. Locked files are skipped.",
         vec![PrivacyTarget::DirFiles {
-            dir: DirSpec::Firefox {
+            dir: DirSpec::FirefoxLocal {
                 sub: "cache2".into(),
             },
             mask: "*.*".into(),
@@ -316,20 +327,21 @@ fn builtin_items() -> Vec<PrivacyItem> {
             min_age: None,
         }],
     ));
-    // Closed-browser lists stay clear of saved logins, autofill, and
-    // bookmarks: Login Data, Web Data, and places.sqlite hold passwords
-    // and bookmarks, which no confirm can give back.
+    // Browser databases are only ever edited, never deleted: a database and
+    // its journal or log cannot be removed together all-or-nothing across a
+    // crash, so cookies are removed from inside the database by SQLite.
+    // Saved logins, autofill, bookmarks, and history are not touched.
     for (vendor, id, name, exe) in [
         (
             "Google\\Chrome",
             "chrome-data",
-            "Chrome history + cookies (closed)",
+            "Chrome cookies (closed)",
             "chrome.exe",
         ),
         (
             "Microsoft\\Edge",
             "edge-data",
-            "Edge history + cookies (closed)",
+            "Edge cookies (closed)",
             "msedge.exe",
         ),
     ] {
@@ -337,34 +349,31 @@ fn builtin_items() -> Vec<PrivacyItem> {
             id,
             name,
             PrivacyGroup::Browsers,
-            "Browsing history and cookies, only while the browser is closed.",
-            vec![PrivacyTarget::ExactFiles {
-                dir: DirSpec::Chromium {
-                    vendor: vendor.into(),
-                    sub: String::new(),
+            "Cookies, only while the browser is closed.",
+            vec![
+                // Version 96 and later keep cookies under Network.
+                PrivacyTarget::Cookies {
+                    dir: DirSpec::Chromium {
+                        vendor: vendor.into(),
+                        sub: String::new(),
+                    },
+                    names: vec![r"Network\Cookies".to_string(), "Cookies".to_string()],
+                    keep: CookieKeep::All,
                 },
-                names: ["History", "Cookies"]
-                    .into_iter()
-                    .map(str::to_string)
-                    .collect(),
-                sidecars: true,
-            }],
+            ],
         );
         closed.veto_exes.push(exe.to_string());
         items.push(closed);
     }
     let mut fox = item(
         "firefox-data",
-        "Firefox history + cookies (closed)",
+        "Firefox cookies (closed)",
         PrivacyGroup::Browsers,
-        "Browsing history and cookies, only while the browser is closed.",
-        vec![PrivacyTarget::ExactFiles {
+        "Cookies, only while the browser is closed.",
+        vec![PrivacyTarget::Cookies {
             dir: DirSpec::Firefox { sub: String::new() },
-            names: ["cookies.sqlite", "formhistory.sqlite"]
-                .into_iter()
-                .map(str::to_string)
-                .collect(),
-            sidecars: true,
+            names: vec!["cookies.sqlite".to_string()],
+            keep: CookieKeep::All,
         }],
     );
     fox.veto_exes.push("firefox.exe".to_string());
@@ -407,27 +416,125 @@ fn builtin_items() -> Vec<PrivacyItem> {
     items
 }
 
-/// Built-ins plus one free-space row per fixed drive.
-pub fn build_items(sys: &dyn SystemTargets) -> Vec<PrivacyItem> {
-    let mut items = builtin_items();
-    for drive in sys.fixed_drives() {
-        let short = drive.trim_end_matches(['\\', '/']);
-        let mut wipe = item(
-            &format!("freespace-{short}"),
-            &format!("Free-space wipe ({short})"),
-            PrivacyGroup::Maintenance,
-            "Overwrites empty space with cipher. Very slow.",
-            vec![PrivacyTarget::FreeSpace {
-                drive: drive.clone(),
-            }],
-        );
-        wipe.confirm_note = Some(
-            "This takes tens of minutes and runs on its own after it starts. On SSDs the benefit is partial."
+/// The privacy categories offered on this PC.
+pub fn build_items() -> Vec<PrivacyItem> {
+    builtin_items()
+}
+
+/// What to do with cookies, from reading the keep list. Anything uncertain
+/// (an unreadable list, a line that is not a site, an elevated window with
+/// sites listed) leaves cookies alone: it must never widen what is removed.
+/// Returns the choice and the list's warnings.
+pub fn cookie_keep_choice(
+    read: std::io::Result<String>,
+    elevated: bool,
+) -> (CookieKeep, Vec<String>) {
+    let text = match read {
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return (CookieKeep::All, Vec::new());
+        }
+        Err(err) => {
+            return (
+                CookieKeep::LeaveAlone(format!(
+                    "Cookies are left alone: your cookies-to-keep list could not be read ({err})."
+                )),
+                Vec::new(),
+            );
+        }
+        Ok(text) => text,
+    };
+    let (sites, warnings) = crate::cookies::parse_keep_list(&text);
+    let keep = if !warnings.is_empty() {
+        CookieKeep::LeaveAlone(
+            "Cookies are left alone until every line of your cookies-to-keep list is a site name."
                 .to_string(),
-        );
-        items.push(wipe);
+        )
+    } else if sites.is_empty() {
+        CookieKeep::All
+    } else if elevated {
+        CookieKeep::LeaveAlone(
+            "You keep some cookies, so an administrator window leaves cookies alone. Start Hivemend without administrator rights to clean them."
+                .to_string(),
+        )
+    } else {
+        CookieKeep::Sites(sites)
+    };
+    (keep, warnings)
+}
+
+/// For an administrator window: drop per-user registry targets, which a
+/// program running without elevation can redirect, and say so on the row.
+/// Their history is cleaned from a normal window.
+pub fn leave_per_user_registry(items: &mut [PrivacyItem]) {
+    for item in items {
+        let before = item.targets.len();
+        item.targets.retain(|target| match target {
+            PrivacyTarget::RegTree { key } | PrivacyTarget::RegValues { key, .. } => {
+                !crate::pathutil::per_user_key(key)
+            }
+            _ => true,
+        });
+        if item.targets.len() != before {
+            item.warnings.push(
+                "Its registry entries are cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            );
+        }
     }
-    items
+}
+
+/// For an administrator window: browser history and cookie items do
+/// nothing, and say so. Their files sit in folders programs running without
+/// elevation can change, and the keep list that governs them is per-user.
+pub fn leave_browsers_alone(items: &mut [PrivacyItem]) {
+    for item in items {
+        let browser = item
+            .targets
+            .iter()
+            .any(|target| matches!(target, PrivacyTarget::Cookies { .. }));
+        if browser {
+            item.targets.clear();
+            item.warnings.push(
+                "Browser data is cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            );
+        }
+    }
+}
+
+/// Apply the cookies-to-keep choice to every item that holds cookies.
+pub fn set_cookie_keep(items: &mut [PrivacyItem], keep: &CookieKeep) {
+    for item in items {
+        let mut holds = false;
+        for target in &mut item.targets {
+            if let PrivacyTarget::Cookies { keep: have, .. } = target {
+                *have = keep.clone();
+                holds = true;
+            }
+        }
+        if holds {
+            item.detail = match keep {
+                CookieKeep::All => "Cookies, only while the browser is closed.".to_string(),
+                CookieKeep::Sites(sites) => format!(
+                    "Cookies, only while the browser is closed. Cookies for {} on your keep list stay.",
+                    if sites.len() == 1 {
+                        "the 1 site".to_string()
+                    } else {
+                        format!("the {} sites", sites.len())
+                    }
+                ),
+                CookieKeep::LeaveAlone(_) => "Cookies are left alone.".to_string(),
+            };
+        }
+    }
+}
+
+/// The first cookie database present in a profile, of `names`.
+fn cookie_db(fs: &dyn FileView, dir: &str, names: &[String]) -> Option<String> {
+    names
+        .iter()
+        .map(|name| format!("{dir}\\{name}"))
+        .find(|path| fs.exists(path) && !fs.is_dir(path))
 }
 
 /// Case-insensitive `*`/`?` mask over a file name. `*.*` matches everything.
@@ -472,6 +579,8 @@ pub fn uninstall_present(reg: &dyn Registry, needle: &str) -> bool {
     for root in [
         r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
         r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall",
+        // Programs installed just for this account.
+        r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall",
     ] {
         let Ok(entries) = reg.subkeys(root) else {
             continue;
@@ -497,8 +606,14 @@ pub fn uninstall_present(reg: &dyn Registry, needle: &str) -> bool {
 }
 
 /// Resolve a directory spec to existing directories, plus notes for roots
-/// that could not be resolved (unknown `%VAR%`).
-fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>) {
+/// that could not be resolved (unknown `%VAR%`). Profile discovery asks
+/// `keep_going` as it goes; `None` means it was told to stop, and the caller
+/// stops too, using nothing it found.
+fn resolve_dirs(
+    fs: &dyn FileView,
+    spec: &DirSpec,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Option<(Vec<String>, Vec<String>)> {
     let mut dirs = Vec::new();
     let mut notes = Vec::new();
     let mut push = |dir: String| {
@@ -535,10 +650,28 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             let base = expand_env(fs, "%LOCALAPPDATA%");
             if base.contains('%') {
                 notes.push("%LOCALAPPDATA% is not set".to_string());
-                return (dirs, notes);
+                return Some((dirs, notes));
             }
             let users = format!("{base}\\{vendor}\\User Data");
-            for profile in child_dirs(fs, &users) {
+            for profile in child_dirs(fs, &users, &mut notes, keep_going)? {
+                let dir = if sub.is_empty() {
+                    profile
+                } else {
+                    format!("{profile}\\{sub}")
+                };
+                if fs.is_dir(&dir) {
+                    push(dir);
+                }
+            }
+        }
+        DirSpec::FirefoxLocal { sub } => {
+            let base = expand_env(fs, "%LOCALAPPDATA%");
+            if base.contains('%') {
+                notes.push("%LOCALAPPDATA% is not set".to_string());
+                return Some((dirs, notes));
+            }
+            let profiles = format!("{base}\\Mozilla\\Firefox\\Profiles");
+            for profile in child_dirs(fs, &profiles, &mut notes, keep_going)? {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -553,10 +686,10 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             let base = expand_env(fs, "%APPDATA%");
             if base.contains('%') {
                 notes.push("%APPDATA% is not set".to_string());
-                return (dirs, notes);
+                return Some((dirs, notes));
             }
             let home = format!("{base}\\Mozilla\\Firefox");
-            for profile in firefox_profiles(fs, &home) {
+            for profile in firefox_profiles(fs, &home, &mut notes, keep_going)? {
                 let dir = if sub.is_empty() {
                     profile
                 } else {
@@ -568,59 +701,148 @@ fn resolve_dirs(fs: &dyn FileView, spec: &DirSpec) -> (Vec<String>, Vec<String>)
             }
         }
     }
-    (dirs, notes)
+    Some((dirs, notes))
 }
 
-fn child_dirs(fs: &dyn FileView, dir: &str) -> Vec<String> {
-    fs.list(dir)
-        .into_iter()
-        .filter(|item| item.kind == ItemKind::Dir)
-        .map(|item| format!("{dir}\\{}", item.name))
-        .collect()
+/// The most profile folders looked at under one folder.
+const MAX_PROFILES: usize = 1_000;
+
+/// How many listed entries or profile paths between `keep_going` checks.
+const DISCOVERY_CHECK_EVERY: usize = 64;
+
+/// Folders in `dir`, at most [`MAX_PROFILES`]; a note says when there
+/// were more, so the rest is never taken as looked at. `None` when
+/// `keep_going` said stop.
+fn child_dirs(
+    fs: &dyn FileView,
+    dir: &str,
+    notes: &mut Vec<String>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Option<Vec<String>> {
+    let mut dirs = Vec::new();
+    let mut more = false;
+    let mut seen = 0usize;
+    let mut stopped = false;
+    fs.list_each(dir, &mut |item| {
+        seen += 1;
+        if seen.is_multiple_of(DISCOVERY_CHECK_EVERY) && !keep_going() {
+            stopped = true;
+            return false;
+        }
+        if item.kind != ItemKind::Dir {
+            return true;
+        }
+        if dirs.len() == MAX_PROFILES {
+            more = true;
+            return false;
+        }
+        dirs.push(format!("{dir}\\{}", item.name));
+        true
+    });
+    if more {
+        notes.push(format!(
+            "{dir}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
+        ));
+    }
+    if stopped {
+        return None;
+    }
+    Some(dirs)
 }
+
+/// The largest `profiles.ini` read. Firefox writes a few hundred bytes per
+/// profile, so this holds far more than [`MAX_PROFILES`] of them.
+const MAX_PROFILES_INI: usize = 1 << 20;
 
 /// Firefox profiles from `profiles.ini` plus the `Profiles` folder, so a
-/// missing ini still finds default locations.
-fn firefox_profiles(fs: &dyn FileView, home: &str) -> Vec<String> {
+/// missing ini still finds default locations. Together they are capped at
+/// [`MAX_PROFILES`], with a note when there were more; an oversized ini is
+/// not read. `None` when `keep_going` said stop.
+fn firefox_profiles(
+    fs: &dyn FileView,
+    home: &str,
+    notes: &mut Vec<String>,
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Option<Vec<String>> {
     let mut profiles = Vec::new();
-    let mut push = |dir: String| {
-        if !profiles
-            .iter()
-            .any(|have: &String| have.eq_ignore_ascii_case(&dir))
-        {
-            profiles.push(dir);
+    let mut seen = std::collections::HashSet::new();
+    let mut more = false;
+    // False once full: the caller stops looking.
+    let mut push = |dir: String| -> bool {
+        if seen.contains(&dir.to_ascii_lowercase()) {
+            return true;
         }
+        if profiles.len() == MAX_PROFILES {
+            more = true;
+            return false;
+        }
+        seen.insert(dir.to_ascii_lowercase());
+        profiles.push(dir);
+        true
     };
+    // Paths the ini names, each looked up at most once; at most
+    // MAX_PROFILES of them are looked up at all.
+    let mut named = std::collections::HashSet::new();
+    let mut stopped = false;
+    let mut ini_more = false;
     let ini = format!("{home}\\profiles.ini");
-    if let Some(bytes) = fs.read(&ini) {
-        let text = String::from_utf8_lossy(&bytes);
-        let mut relative = true;
-        for line in text.lines() {
-            let line = line.trim();
-            if line.eq_ignore_ascii_case("IsRelative=0") {
-                relative = false;
-            } else if line.eq_ignore_ascii_case("IsRelative=1") {
-                relative = true;
-            } else if let Some(path) = line.strip_prefix("Path=") {
-                let path = path.trim();
-                if path.is_empty() {
-                    continue;
-                }
-                let dir = normalize_fs(&if relative || !looks_absolute(path) {
-                    format!("{home}\\{path}")
-                } else {
-                    path.to_string()
-                });
-                if fs.is_dir(&dir) {
-                    push(dir);
+    match fs.read_head(&ini, MAX_PROFILES_INI + 1) {
+        Some(bytes) if bytes.len() > MAX_PROFILES_INI => notes.push(format!(
+            "{ini} is larger than {} KB, so it was not read; only the Profiles folder was looked at",
+            MAX_PROFILES_INI / 1024
+        )),
+        Some(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            let mut relative = true;
+            for line in text.lines() {
+                let line = line.trim();
+                if line.eq_ignore_ascii_case("IsRelative=0") {
+                    relative = false;
+                } else if line.eq_ignore_ascii_case("IsRelative=1") {
+                    relative = true;
+                } else if let Some(path) = line.strip_prefix("Path=") {
+                    let path = path.trim();
+                    if path.is_empty() {
+                        continue;
+                    }
+                    let dir = normalize_fs(&if relative || !looks_absolute(path) {
+                        format!("{home}\\{path}")
+                    } else {
+                        path.to_string()
+                    });
+                    if !named.insert(dir.to_ascii_lowercase()) {
+                        continue;
+                    }
+                    if named.len() > MAX_PROFILES {
+                        ini_more = true;
+                        break;
+                    }
+                    if named.len().is_multiple_of(DISCOVERY_CHECK_EVERY) && !keep_going() {
+                        stopped = true;
+                        break;
+                    }
+                    if fs.is_dir(&dir) && !push(dir) {
+                        break;
+                    }
                 }
             }
         }
+        None => {}
     }
-    for profile in child_dirs(fs, &format!("{home}\\Profiles")) {
-        push(profile);
+    if stopped {
+        return None;
     }
-    profiles
+    for profile in child_dirs(fs, &format!("{home}\\Profiles"), notes, keep_going)? {
+        if !push(profile) {
+            break;
+        }
+    }
+    if more || ini_more {
+        notes.push(format!(
+            "{home}: more than {MAX_PROFILES} profiles; only the first {MAX_PROFILES} were looked at"
+        ));
+    }
+    Some(profiles)
 }
 
 fn looks_absolute(path: &str) -> bool {
@@ -692,6 +914,8 @@ pub struct PreviewItem {
     pub values: usize,
     /// Non-file, non-value payloads (clipboard).
     pub other: usize,
+    /// Cookies removed from a database that is kept.
+    pub cookies: usize,
     pub bytes: u64,
     pub restricted: Vec<String>,
     pub restricted_extra: usize,
@@ -715,6 +939,8 @@ impl PreviewItem {
 #[derive(Clone, Debug, Default)]
 pub struct Preview {
     pub items: Vec<PreviewItem>,
+    /// Stopped before every category was counted: not a complete preview.
+    pub canceled: bool,
 }
 
 impl Preview {
@@ -739,8 +965,26 @@ pub fn preview(
     procs: &dyn ProcessList,
     items: &[PrivacyItem],
 ) -> Preview {
+    preview_with(reg, fs, sys, procs, items, &mut || true)
+}
+
+/// [`preview`] that asks `keep_going` between categories, between folders,
+/// and every few thousand files inside a large folder, and stops as soon as
+/// it says no; the result is then marked canceled.
+pub fn preview_with(
+    reg: &dyn Registry,
+    fs: &dyn FileView,
+    sys: &dyn SystemTargets,
+    procs: &dyn ProcessList,
+    items: &[PrivacyItem],
+    keep_going: &mut dyn FnMut() -> bool,
+) -> Preview {
     let mut out = Preview::default();
     for item in items {
+        if !keep_going() {
+            out.canceled = true;
+            return out;
+        }
         let mut row = PreviewItem::blank(&item.id);
         for warning in &item.warnings {
             row.note(warning.clone());
@@ -763,13 +1007,17 @@ pub fn preview(
         // is walked once per item no matter how many targets name it.
         let mut walked = HashSet::new();
         for target in &item.targets {
-            preview_target(reg, fs, sys, target, &mut row, &mut walked);
+            if !preview_target(reg, fs, sys, target, &mut row, &mut walked, keep_going) {
+                out.canceled = true;
+                return out;
+            }
         }
         out.items.push(row);
     }
     out
 }
 
+/// False when `keep_going` stopped it.
 fn preview_target(
     reg: &dyn Registry,
     fs: &dyn FileView,
@@ -777,19 +1025,20 @@ fn preview_target(
     target: &PrivacyTarget,
     row: &mut PreviewItem,
     walked: &mut HashSet<String>,
-) {
+    keep_going: &mut dyn FnMut() -> bool,
+) -> bool {
     match target {
         PrivacyTarget::RegTree { key } => {
             if !privacy_reg_allowed(key) {
                 row.note(format!("refused: {key}"));
-                return;
+                return true;
             }
             row.values += count_tree(reg, key, 0, row);
         }
         PrivacyTarget::RegValues { key, values } => {
             if !privacy_reg_allowed(key) {
                 row.note(format!("refused: {key}"));
-                return;
+                return true;
             }
             match reg.values(key) {
                 Ok(present) => {
@@ -808,7 +1057,9 @@ fn preview_target(
             recursive,
             min_age,
         } => {
-            let (dirs, notes) = resolve_dirs(fs, dir);
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
             for note in notes {
                 row.note(note);
             }
@@ -823,11 +1074,31 @@ fn preview_target(
                 if !walked.insert(gate) {
                     continue;
                 }
-                let mut hits = Vec::new();
-                walk_files(fs, &dir, mask, *recursive, *min_age, 0, &mut hits, row);
-                for hit in hits {
-                    row.files += 1;
-                    row.bytes += hit.bytes;
+                let mut counted = (0usize, 0u64);
+                let mut budget = WalkBudget::new(false);
+                let finished = walk_files(
+                    fs,
+                    &dir,
+                    mask,
+                    *recursive,
+                    *min_age,
+                    0,
+                    &mut |hit| {
+                        counted.0 += 1;
+                        counted.1 += hit.bytes;
+                        true
+                    },
+                    keep_going,
+                    &mut budget,
+                    row,
+                );
+                row.files += counted.0;
+                row.bytes += counted.1;
+                if let Some(note) = budget.shortfall(&dir) {
+                    row.note(note);
+                }
+                if !finished && !budget.exhausted {
+                    return false;
                 }
             }
         }
@@ -836,7 +1107,9 @@ fn preview_target(
             names,
             sidecars,
         } => {
-            let (dirs, notes) = resolve_dirs(fs, dir);
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
             for note in notes {
                 row.note(note);
             }
@@ -851,14 +1124,55 @@ fn preview_target(
                     continue;
                 }
                 for name in names {
-                    for path in with_sidecars(&dir, name, *sidecars) {
-                        if fs.is_dir(&path) {
-                            row.note(format!("not a file: {path}"));
-                        } else if fs.exists(&path) {
-                            row.files += 1;
-                            row.bytes += fs.len(&path).unwrap_or(0);
+                    if !keep_going() {
+                        return false;
+                    }
+                    if *sidecars {
+                        row.note(format!("{dir}\\{name}: database files are not deleted"));
+                        continue;
+                    }
+                    let path = format!("{dir}\\{name}");
+                    if fs.is_dir(&path) {
+                        row.note(format!("not a file: {path}"));
+                    } else if fs.exists(&path) {
+                        row.files += 1;
+                        row.bytes += fs.len(&path).unwrap_or(0);
+                    }
+                }
+            }
+        }
+        PrivacyTarget::Cookies { dir, names, keep } => {
+            if let CookieKeep::LeaveAlone(reason) = keep {
+                row.note(reason.clone());
+                return true;
+            }
+            let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                return false;
+            };
+            for note in notes {
+                row.note(note);
+            }
+            for dir in dirs {
+                if !walked.insert(format!("cookies\0{}", dir.to_ascii_lowercase())) {
+                    continue;
+                }
+                let Some(db) = cookie_db(fs, &dir, names) else {
+                    continue;
+                };
+                if !keep_going() {
+                    return false;
+                }
+                match keep {
+                    CookieKeep::Sites(sites) => {
+                        match crate::cookies::count_cookies(std::path::Path::new(&db), sites) {
+                            Ok(count) => row.cookies += count.removed,
+                            Err(err) => row.note(format!("cannot read {db}: {err}")),
                         }
                     }
+                    _ => match crate::cookies::count_cookies(std::path::Path::new(&db), &[]) {
+                        Ok(count) => row.cookies += count.removed,
+                        Err(err) => row.note(format!("cannot read {db}: {err}")),
+                    },
                 }
             }
         }
@@ -870,10 +1184,8 @@ fn preview_target(
             row.files += count;
             row.bytes += bytes;
         }
-        PrivacyTarget::FreeSpace { drive } => {
-            row.bytes += sys.free_bytes(drive);
-        }
     }
+    true
 }
 
 /// Registry values under a tree, for preview counts and delete credit.
@@ -908,8 +1220,80 @@ fn count_tree(reg: &dyn Registry, key: &str, depth: usize, row: &mut PreviewItem
 struct FileHit {
     path: String,
     bytes: u64,
+    /// The age the file had to have to be listed; checked again on the
+    /// object about to be deleted.
+    min_age: Option<Duration>,
 }
 
+/// The most files one clean takes from one folder walk, and the most bytes
+/// of their paths; past either the rest are left for another run, and the
+/// clean says so.
+const MAX_WALK_HITS: usize = 100_000;
+const MAX_WALK_HIT_BYTES: usize = 64 * 1024 * 1024;
+
+/// The most folders one walk visits or queues; past it the walk stops and
+/// says it covered only part.
+const MAX_WALK_FOLDERS: usize = 100_000;
+
+/// Folders a walk may still queue, and whether it ran out.
+/// What a walk may still keep, and why it stopped short, if it did.
+struct WalkBudget {
+    folders_left: usize,
+    /// Bytes of path text it may still keep: queued folders always, and
+    /// the files it hands on when `charge_hits` (a clean keeps them).
+    bytes_left: usize,
+    charge_hits: bool,
+    /// A folder or byte limit was reached.
+    exhausted: bool,
+    /// Folders deeper than the walk goes were not looked at.
+    too_deep: bool,
+}
+
+impl WalkBudget {
+    fn new(charge_hits: bool) -> Self {
+        Self {
+            folders_left: MAX_WALK_FOLDERS,
+            bytes_left: MAX_WALK_HIT_BYTES,
+            charge_hits,
+            exhausted: false,
+            too_deep: false,
+        }
+    }
+
+    /// Take `bytes` of path text from the budget, or say it ran out.
+    fn charge(&mut self, bytes: usize) -> bool {
+        if bytes > self.bytes_left {
+            self.exhausted = true;
+            return false;
+        }
+        self.bytes_left -= bytes;
+        true
+    }
+
+    /// The note saying how a walk of `dir` fell short, if it did.
+    fn shortfall(&self, dir: &str) -> Option<String> {
+        if self.exhausted {
+            Some(format!(
+                "{dir}: too large to go through at once (more than {MAX_WALK_FOLDERS} folders or {} MB of paths); the rest was not looked at",
+                MAX_WALK_HIT_BYTES / (1024 * 1024)
+            ))
+        } else if self.too_deep {
+            Some(format!(
+                "{dir}: folders more than {MAX_WALK_DEPTH} levels down were not looked at"
+            ))
+        } else {
+            None
+        }
+    }
+}
+
+/// How deep a walk goes.
+const MAX_WALK_DEPTH: usize = 64;
+
+/// Walk `dir` for files matching `mask`, one entry at a time, handing each
+/// to `on_hit` (false stops the walk). `keep_going` is asked for every
+/// folder and every [`crate::diskspace::CHECK_EVERY`] entries. Returns false
+/// when the walk was stopped.
 #[allow(clippy::too_many_arguments)]
 fn walk_files(
     fs: &dyn FileView,
@@ -918,50 +1302,93 @@ fn walk_files(
     recursive: bool,
     min_age: Option<Duration>,
     depth: usize,
-    hits: &mut Vec<FileHit>,
+    on_hit: &mut dyn FnMut(FileHit) -> bool,
+    keep_going: &mut dyn FnMut() -> bool,
+    budget: &mut WalkBudget,
     row: &mut PreviewItem,
-) {
-    if depth > 64 {
-        return;
+) -> bool {
+    if depth > MAX_WALK_DEPTH {
+        // Not looked at, and said so: never reported as covered.
+        budget.too_deep = true;
+        return true;
     }
-    for entry in fs.list(dir) {
+    if !keep_going() {
+        return false;
+    }
+    let mut subdirs = Vec::new();
+    let mut listed = 0u64;
+    let mut going = true;
+    fs.list_each(dir, &mut |entry| {
+        listed += 1;
+        if listed.is_multiple_of(crate::diskspace::CHECK_EVERY) && !keep_going() {
+            going = false;
+            return false;
+        }
         let path = format!("{dir}\\{}", entry.name);
         match entry.kind {
             ItemKind::File => {
                 if !mask_matches(&entry.name, mask) {
-                    continue;
+                    return true;
                 }
                 if let Some(min) = min_age {
                     match entry.age {
                         Some(age) if age >= min => {}
-                        Some(_) => continue,
+                        Some(_) => return true,
                         None => {
                             row.note(format!("age unknown: {path}"));
-                            continue;
+                            return true;
                         }
                     }
                 }
+                if budget.charge_hits && !budget.charge(path.len()) {
+                    going = false;
+                    return false;
+                }
                 let bytes = fs.len(&path).unwrap_or(0);
-                hits.push(FileHit { path, bytes });
+                if !on_hit(FileHit {
+                    path,
+                    bytes,
+                    min_age,
+                }) {
+                    going = false;
+                    return false;
+                }
             }
             ItemKind::Dir => {
                 if recursive {
-                    walk_files(fs, &path, mask, recursive, min_age, depth + 1, hits, row);
+                    if budget.folders_left == 0 || !budget.charge(path.len()) {
+                        budget.exhausted = true;
+                        going = false;
+                        return false;
+                    }
+                    budget.folders_left -= 1;
+                    subdirs.push(path);
                 }
             }
             ItemKind::Other => row.note(format!("not a plain file: {path}")),
         }
+        true
+    });
+    if !going {
+        return false;
     }
-}
-
-fn with_sidecars(dir: &str, name: &str, sidecars: bool) -> Vec<String> {
-    let mut paths = vec![format!("{dir}\\{name}")];
-    if sidecars {
-        for suffix in ["-wal", "-shm", "-journal"] {
-            paths.push(format!("{dir}\\{name}{suffix}"));
+    for path in subdirs {
+        if !walk_files(
+            fs,
+            &path,
+            mask,
+            recursive,
+            min_age,
+            depth + 1,
+            on_hit,
+            keep_going,
+            budget,
+            row,
+        ) {
+            return false;
         }
     }
-    paths
+    true
 }
 
 // ---- clean ----
@@ -972,6 +1399,8 @@ pub struct ItemOutcome {
     pub files: usize,
     pub values: usize,
     pub other: usize,
+    /// Cookies removed from a database that is kept.
+    pub cookies: usize,
     pub bytes: u64,
     pub already_gone: usize,
     pub restricted: Vec<String>,
@@ -979,6 +1408,8 @@ pub struct ItemOutcome {
     pub skipped_running: bool,
     pub gated_out: bool,
     pub note: String,
+    /// Cancel stopped this category part way; the rest of it was left.
+    pub canceled: bool,
 }
 
 impl ItemOutcome {
@@ -1027,7 +1458,7 @@ pub fn clean_with_progress(
     sys: &mut dyn SystemTargets,
     procs: &dyn ProcessList,
     items: &[PrivacyItem],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
     progress: &mut dyn FnMut(usize, usize, &str) -> bool,
 ) -> Result<CleanOutcome, Error> {
     enum Planned {
@@ -1063,26 +1494,19 @@ pub fn clean_with_progress(
         planned.push(Planned::Run { repairs, pre });
     }
 
-    let all: Vec<Repair> = planned
-        .iter()
-        .flat_map(|step| match step {
-            Planned::Run { repairs, .. } => {
-                repairs.iter().map(|(repair, _)| repair.clone()).collect()
-            }
-            Planned::Skip(_) => Vec::new(),
-        })
-        .collect();
-    let plan = export_repairs(reg, &all, backup_file);
-    write_backup(backup_file, &plan.body)?;
+    // The header now; each registry entry is appended as it is removed.
+    let header = export_repairs(reg, &[], backup.path());
+    backup.append(&header.body)?;
 
     let total = planned
         .iter()
         .filter(|step| matches!(step, Planned::Run { .. }))
         .count();
     let mut outcome = CleanOutcome {
-        backup_file: backup_file.to_path_buf(),
+        backup_file: backup.path().to_path_buf(),
         ..CleanOutcome::default()
     };
+    let mut entry = 0usize;
     let mut done = 0usize;
     for (item, step) in items.iter().zip(planned) {
         match step {
@@ -1092,17 +1516,36 @@ pub fn clean_with_progress(
                     outcome.canceled = true;
                     return Ok(outcome);
                 }
-                outcome.items.push(execute_item(
+                // Check again right before acting: the program may have
+                // started since the plan was made (earlier items take time).
+                if let Some(exe) = item.veto_exes.iter().find(|exe| procs.running(exe)) {
+                    let mut skip = ItemOutcome::blank(&item.id);
+                    skip.skipped_running = true;
+                    skip.note(format!("close {exe} first"));
+                    outcome.items.push(skip);
+                    done += 1;
+                    continue;
+                }
+                let step = execute_item(
                     reg,
                     fs,
                     sys,
+                    procs,
+                    &mut || progress(done, total, &item.name),
                     item,
                     &repairs,
                     pre,
-                    &plan,
+                    backup,
+                    &mut entry,
                     &mut outcome.errors,
-                ));
+                );
+                let canceled = step.canceled;
+                outcome.items.push(step);
                 done += 1;
+                if canceled {
+                    outcome.canceled = true;
+                    return Ok(outcome);
+                }
             }
         }
     }
@@ -1155,9 +1598,9 @@ fn collect_repairs(
             }
             PrivacyTarget::DirFiles { .. }
             | PrivacyTarget::ExactFiles { .. }
+            | PrivacyTarget::Cookies { .. }
             | PrivacyTarget::Clipboard
-            | PrivacyTarget::RecycleBin
-            | PrivacyTarget::FreeSpace { .. } => {}
+            | PrivacyTarget::RecycleBin => {}
         }
     }
 }
@@ -1167,13 +1610,26 @@ fn execute_item(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     sys: &mut dyn SystemTargets,
+    procs: &dyn ProcessList,
+    keep_going: &mut dyn FnMut() -> bool,
     item: &PrivacyItem,
     repairs: &[PlannedRepair],
     pre: Vec<String>,
-    plan: &crate::backup::BackupPlan,
+    backup: &mut BackupWriter,
+    entry: &mut usize,
     errors: &mut Vec<String>,
 ) -> ItemOutcome {
     let mut done = ItemOutcome::blank(&item.id);
+    // Checked again right before each database set is taken: a program
+    // that starts part way through stops the rest of its category.
+    let started = |done: &mut ItemOutcome| {
+        let exe = item.veto_exes.iter().find(|exe| procs.running(exe))?;
+        done.skipped_running = true;
+        done.note(format!(
+            "{exe} started, so the rest of this category was left alone"
+        ));
+        Some(())
+    };
     for warning in &item.warnings {
         done.note(warning.clone());
     }
@@ -1181,7 +1637,8 @@ fn execute_item(
         done.note(note);
     }
     for (repair, credit) in repairs {
-        apply_repair(reg, repair, *credit, plan, &mut done, errors);
+        *entry += 1;
+        apply_repair(reg, repair, *credit, backup, *entry, &mut done, errors);
     }
     let mut walked = HashSet::new();
     for target in &item.targets {
@@ -1193,7 +1650,10 @@ fn execute_item(
                 recursive,
                 min_age,
             } => {
-                let (dirs, notes) = resolve_dirs(fs, dir);
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
                 for note in notes {
                     done.note(note);
                 }
@@ -1210,21 +1670,44 @@ fn execute_item(
                     }
                     let mut counter = PreviewItem::blank(&item.id);
                     let mut hits = Vec::new();
-                    walk_files(
+                    let mut budget = WalkBudget::new(true);
+                    let finished = walk_files(
                         fs,
                         &dir,
                         mask,
                         *recursive,
                         *min_age,
                         0,
-                        &mut hits,
+                        &mut |hit| {
+                            hits.push(hit);
+                            hits.len() < MAX_WALK_HITS
+                        },
+                        keep_going,
+                        &mut budget,
                         &mut counter,
                     );
                     for note in counter.restricted {
                         done.note(note);
                     }
                     done.restricted_extra += counter.restricted_extra;
-                    for hit in hits {
+                    if let Some(note) = budget.shortfall(&dir) {
+                        done.note(note);
+                    }
+                    if !finished && !budget.exhausted && hits.len() < MAX_WALK_HITS {
+                        // Canceled while listing: nothing from this walk goes.
+                        done.canceled = true;
+                        return done;
+                    } else if !finished && !budget.exhausted {
+                        done.note(format!(
+                            "{dir}: more than {} files; the rest were left for another clean",
+                            hits.len()
+                        ));
+                    }
+                    for (index, hit) in hits.into_iter().enumerate() {
+                        if index % 256 == 255 && !keep_going() {
+                            done.canceled = true;
+                            return done;
+                        }
                         delete_file(fs, &dir, &hit, &mut done, errors);
                     }
                 }
@@ -1234,7 +1717,10 @@ fn execute_item(
                 names,
                 sidecars,
             } => {
-                let (dirs, notes) = resolve_dirs(fs, dir);
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
                 for note in notes {
                     done.note(note);
                 }
@@ -1249,18 +1735,71 @@ fn execute_item(
                         continue;
                     }
                     for name in names {
-                        for path in with_sidecars(&dir, name, *sidecars) {
-                            if fs.is_dir(&path) {
-                                done.note(format!("not a file: {path}"));
-                                continue;
-                            }
-                            if !fs.exists(&path) {
-                                continue;
-                            }
-                            let bytes = fs.len(&path).unwrap_or(0);
-                            let hit = FileHit { path, bytes };
-                            delete_file(fs, &dir, &hit, &mut done, errors);
+                        if !keep_going() {
+                            done.canceled = true;
+                            return done;
                         }
+                        if started(&mut done).is_some() {
+                            return done;
+                        }
+                        // A file with side files is a database set, which
+                        // Hivemend does not delete.
+                        if *sidecars {
+                            done.note(format!("{dir}\\{name}: database files are not deleted"));
+                            continue;
+                        }
+                        let path = format!("{dir}\\{name}");
+                        if fs.is_dir(&path) {
+                            done.note(format!("not a file: {path}"));
+                            continue;
+                        }
+                        if !fs.exists(&path) {
+                            continue;
+                        }
+                        let hit = FileHit {
+                            bytes: fs.len(&path).unwrap_or(0),
+                            path,
+                            min_age: None,
+                        };
+                        delete_file(fs, &dir, &hit, &mut done, errors);
+                    }
+                }
+            }
+            PrivacyTarget::Cookies { dir, names, keep } => {
+                if let CookieKeep::LeaveAlone(reason) = keep {
+                    done.note(reason.clone());
+                    continue;
+                }
+                let Some((dirs, notes)) = resolve_dirs(fs, dir, keep_going) else {
+                    done.canceled = true;
+                    return done;
+                };
+                for note in notes {
+                    done.note(note);
+                }
+                for dir in dirs {
+                    if !walked.insert(format!("cookies\0{}", dir.to_ascii_lowercase())) {
+                        continue;
+                    }
+                    let Some(db) = cookie_db(fs, &dir, names) else {
+                        continue;
+                    };
+                    // Asked again before every database, so a Cancel made
+                    // after the profiles were found still edits nothing more.
+                    if !keep_going() {
+                        done.canceled = true;
+                        return done;
+                    }
+                    if started(&mut done).is_some() {
+                        return done;
+                    }
+                    match keep {
+                        CookieKeep::Sites(sites) => {
+                            trim_cookie_db(fs, &dir, &db, sites, &mut done, errors);
+                        }
+                        // Every cookie, by the same edit: the database is
+                        // never deleted.
+                        _ => trim_cookie_db(fs, &dir, &db, &[], &mut done, errors),
                     }
                 }
             }
@@ -1294,12 +1833,6 @@ fn execute_item(
                     }
                 }
             }
-            PrivacyTarget::FreeSpace { drive } => match sys.wipe_free_space(drive) {
-                Ok(()) => {
-                    done.note = "Started. It runs on its own for a long while.".to_string();
-                }
-                Err(err) => errors.push(format!("free-space wipe ({drive}): {err}")),
-            },
         }
     }
     done
@@ -1309,7 +1842,8 @@ fn apply_repair(
     reg: &mut dyn Registry,
     repair: &Repair,
     credit: usize,
-    plan: &crate::backup::BackupPlan,
+    backup: &mut BackupWriter,
+    entry: usize,
     done: &mut ItemOutcome,
     errors: &mut Vec<String>,
 ) {
@@ -1321,20 +1855,105 @@ fn apply_repair(
         done.note(format!("refused: {key}"));
         return;
     }
-    if !plan.covers(key) {
-        done.note(format!("not backed up, left alone: {key}"));
-        return;
-    }
-    let result = match repair {
-        Repair::DeleteKey { key } => reg.delete_tree(key),
-        Repair::DeleteValue { key, name } => reg.delete_value(key, name),
-        Repair::DeleteFile { .. } | Repair::None => return,
-    };
-    match result {
-        Ok(()) => done.values += credit,
+    // Recorded, removed, and committed in one registry transaction; a
+    // change from elsewhere meanwhile leaves it in place.
+    match crate::engine::delete_in_transaction(reg, repair, backup, entry) {
+        Ok(crate::engine::Deleted::Removed) => done.values += credit,
+        Ok(crate::engine::Deleted::AlreadyGone) => done.already_gone += 1,
+        Ok(crate::engine::Deleted::NotBackedUp) => {
+            done.note(format!("not backed up, left alone: {key}"));
+        }
+        Ok(crate::engine::Deleted::Untrusted(why)) => done.note(why),
+        Ok(crate::engine::Deleted::TooLarge) => {
+            done.note(format!(
+                "left alone, its backup would be larger than a restore accepts: {key}"
+            ));
+        }
+        Ok(crate::engine::Deleted::BackupFailed(why)) => {
+            // The writer refuses everything after a failed write, so no
+            // registry entry is removed from here on; say so once.
+            let message = format!(
+                "the backup could not be written ({why}); no more registry entries were removed"
+            );
+            if !errors.contains(&message) {
+                errors.push(message);
+            }
+        }
+        Ok(crate::engine::Deleted::RemovedUnconfirmed(why)) => {
+            done.values += credit;
+            errors.push(format!(
+                "{key}: removed, but its backup record could not be completed ({why}); its saved data is in the backup as entry {entry}, which a restore lists but does not put back by itself"
+            ));
+        }
         Err(RegError::NotFound) => done.already_gone += 1,
         Err(RegError::Denied(message)) => done.note(format!("{key}: {message}")),
         Err(RegError::Message(message)) => errors.push(format!("{key}: {message}")),
+    }
+}
+
+/// Trim one cookie database to the kept sites, after the same location
+/// checks a delete gets: the file and the profile are both resolved, so a
+/// link cannot carry the edit outside the profile.
+fn trim_cookie_db(
+    fs: &mut dyn FileView,
+    root: &str,
+    db: &str,
+    sites: &[String],
+    done: &mut ItemOutcome,
+    errors: &mut Vec<String>,
+) {
+    if !privacy_file_allowed(fs, root, db) {
+        done.note(format!("refused: {db}"));
+        return;
+    }
+    let real = match fs.pin(db) {
+        // A second name for the database would be edited too.
+        Ok(pin) if pin.kind == ItemKind::File && pin.links > 1 => {
+            done.note(format!(
+                "refused: {db} has more than one name (a hard link)"
+            ));
+            return;
+        }
+        Ok(pin) if pin.kind == ItemKind::File => pin.real_path.clone(),
+        Ok(_) => {
+            done.note(format!("not a file: {db}"));
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {db}: {err}"));
+            return;
+        }
+    };
+    let real_root = fs
+        .pin(root)
+        .map(|pin| pin.real_path)
+        .unwrap_or_else(|_| root.to_string());
+    if !privacy_file_allowed(fs, &real_root, &real) {
+        done.note(format!("refused: {db} (it resolves to {real})"));
+        return;
+    }
+    // Read where the database is once more, immediately before editing it:
+    // the edit opens the path, not a held handle, so a move after the
+    // checks above leaves it alone instead of trimming a file that was
+    // never approved.
+    let real_again = match fs.pin(db) {
+        Ok(pin) if pin.kind == ItemKind::File => pin.real_path,
+        Ok(_) => {
+            done.note(format!("not a file: {db}"));
+            return;
+        }
+        Err(err) => {
+            done.note(format!("refused: {db}: {err}"));
+            return;
+        }
+    };
+    if !real_again.eq_ignore_ascii_case(&real) {
+        done.note(format!("changed since it was listed, left alone: {db}"));
+        return;
+    }
+    match crate::cookies::trim_cookies(std::path::Path::new(&real), sites) {
+        Ok(count) => done.cookies += count.removed,
+        Err(err) => errors.push(format!("cookies in {db}: {err}")),
     }
 }
 
@@ -1378,9 +1997,44 @@ fn delete_file(
         ));
         return;
     }
-    let result = fs
-        .pin_acquire(&mut pin, Access::Delete)
-        .and_then(|()| fs.pin_delete(pin));
+    // Every delete is taken exclusively, so nothing else can write, rename,
+    // or delete the file while held; a shared hold could not stop a rename
+    // after the decision. The hold reports where the file is now, and the
+    // scope check runs again on it: a file that moved after it was listed,
+    // even to another place under this root, was never approved at its new
+    // place, so it stays. A file listed for being old then has its age read
+    // again: written to, or replaced, since it was listed, or busy now, and
+    // it stays.
+    let confirmed = pin.real_path.clone();
+    let result = match fs.pin_acquire(&mut pin, Access::DeleteExclusive) {
+        Ok(()) => {
+            let real_root = fs
+                .pin(root)
+                .map(|pin| pin.real_path)
+                .unwrap_or_else(|_| root.to_string());
+            if !pin.real_path.eq_ignore_ascii_case(&confirmed)
+                || !privacy_file_allowed(fs, &real_root, &pin.real_path)
+            {
+                done.note(format!(
+                    "changed since it was listed, left alone: {}",
+                    hit.path
+                ));
+                return;
+            }
+            if hit
+                .min_age
+                .is_some_and(|min| !pin.age.is_some_and(|age| age >= min))
+            {
+                done.note(format!(
+                    "changed since it was listed, left alone: {}",
+                    hit.path
+                ));
+                return;
+            }
+            fs.pin_delete(pin)
+        }
+        Err(err) => Err(err),
+    };
     match result {
         Ok(()) => {
             done.files += 1;
@@ -1608,11 +2262,8 @@ mod tests {
     struct FakeSys {
         clipboard: usize,
         bin: (usize, u64),
-        drives: Vec<String>,
-        free: u64,
         cleared: bool,
         emptied: bool,
-        wiped: Vec<String>,
     }
 
     impl SystemTargets for FakeSys {
@@ -1633,19 +2284,6 @@ mod tests {
         fn empty_bin(&mut self) -> Result<(), String> {
             self.emptied = true;
             self.bin = (0, 0);
-            Ok(())
-        }
-
-        fn fixed_drives(&self) -> Vec<String> {
-            self.drives.clone()
-        }
-
-        fn free_bytes(&self, _drive: &str) -> u64 {
-            self.free
-        }
-
-        fn wipe_free_space(&mut self, drive: &str) -> Result<(), String> {
-            self.wiped.push(drive.to_string());
             Ok(())
         }
     }
@@ -1794,7 +2432,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-test");
         // chrome-data is vetoed by a running browser; user-temp is not ticked.
         let procs = FakeProcs {
             running: vec!["chrome.exe".into()],
@@ -1811,7 +2449,7 @@ mod tests {
             &mut sys,
             &procs,
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -1825,11 +2463,11 @@ mod tests {
         assert!(fs.exists(r"C:\Users\test\AppData\Local\Temp\old.tmp"));
         assert!(reg.values(&format!(r"{EXPLORER}\RunMRU")).is_err());
         // The backup covers the removed values and restores through reg.exe.
-        let body = crate::backup::read_backup(&backup).unwrap();
+        let body = crate::backup::read_backup(backup.path()).unwrap();
         assert!(body.contains("RunMRU"));
         assert!(body.contains("mspaint"));
         assert!(body.starts_with("Windows Registry Editor Version 5.00"));
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -1858,6 +2496,16 @@ mod tests {
             fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
                 self.inner.delete_tree(path)
             }
+
+            fn begin(&mut self) -> Result<Box<dyn crate::registry::RegTransaction + '_>, RegError> {
+                let locked = self.locked.clone();
+                Ok(Box::new(crate::registry::DenyTx {
+                    inner: self.inner.begin()?,
+                    deny_subkeys: None,
+                    deny_values: Some(locked),
+                    deny_writes: None,
+                }))
+            }
         }
 
         let mut reg = Locked {
@@ -1866,7 +2514,7 @@ mod tests {
         };
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-locked-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-locked-test");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let outcome = clean_with_progress(
             &mut reg,
@@ -1874,7 +2522,7 @@ mod tests {
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
@@ -1888,7 +2536,7 @@ mod tests {
         );
         assert_eq!(row("typed-paths").values, 1);
         assert!(reg.inner.values(&format!(r"{EXPLORER}\RunMRU")).is_ok());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -1965,7 +2613,11 @@ mod tests {
         let mut done = ItemOutcome::blank("test");
         let mut errors = Vec::new();
         for path in [format!(r"{root}\ok.tmp"), format!(r"{root}\out\keep.txt")] {
-            let hit = FileHit { path, bytes: 8 };
+            let hit = FileHit {
+                path,
+                bytes: 8,
+                min_age: None,
+            };
             delete_file(&mut fs, root, &hit, &mut done, &mut errors);
         }
         assert_eq!(done.files, 1);
@@ -1976,6 +2628,66 @@ mod tests {
                 .any(|note| note.contains("resolves to"))
         );
         assert_eq!(fs.read(r"C:\Users\me\Documents\keep.txt"), Some(vec![2; 8]));
+    }
+
+    #[test]
+    fn a_file_moved_after_listing_is_not_deleted() {
+        // PV-01 through the production Privacy delete, ordinary and
+        // age-filtered: the file moves between the scope check and the
+        // exclusive hold, and the hold reports where it is now. A move to
+        // another place under the same root is still refused, as is a move
+        // out of it; the file stays where it is now, with its data.
+        let day = Duration::from_secs(24 * 3600);
+        for min_age in [None, Some(day * 2)] {
+            let mut fs = MemoryFs::with_windows_dirs();
+            let root = r"C:\Users\me\AppData\Local\Temp";
+            let sub = format!(r"{root}\Sub");
+            fs.add_dir(&sub);
+            for name in ["near.tmp", "far.tmp", "stays.tmp"] {
+                fs.add_file_bytes(&format!(r"{root}\{name}"), vec![7; 8], Some(day * 3));
+            }
+            fs.add_file_bytes(r"C:\Users\me\Documents\keep.txt", vec![2; 8], None);
+            fs.relocate_on_acquire(&format!(r"{root}\near.tmp"), &format!(r"{sub}\near.tmp"));
+            fs.relocate_on_acquire(
+                &format!(r"{root}\far.tmp"),
+                r"C:\Users\me\Documents\far.tmp",
+            );
+            let mut done = ItemOutcome::blank("user-temp");
+            let mut errors = Vec::new();
+            for name in ["near.tmp", "far.tmp", "stays.tmp"] {
+                let hit = FileHit {
+                    path: format!(r"{root}\{name}"),
+                    bytes: 8,
+                    min_age,
+                };
+                delete_file(&mut fs, root, &hit, &mut done, &mut errors);
+            }
+            assert!(errors.is_empty(), "{errors:?} (age {min_age:?})");
+            assert_eq!(done.files, 1, "(age {min_age:?}): {done:?}");
+            assert_eq!(
+                fs.read(&format!(r"{sub}\near.tmp")),
+                Some(vec![7; 8]),
+                "(age {min_age:?})"
+            );
+            assert_eq!(
+                fs.read(r"C:\Users\me\Documents\far.tmp"),
+                Some(vec![7; 8]),
+                "(age {min_age:?})"
+            );
+            assert!(
+                !fs.exists(&format!(r"{root}\stays.tmp")),
+                "(age {min_age:?}): the control was not deleted"
+            );
+            assert!(
+                done.restricted
+                    .iter()
+                    .filter(|note| note.contains("left alone"))
+                    .count()
+                    == 2,
+                "(age {min_age:?}): {:?}",
+                done.restricted
+            );
+        }
     }
 
     #[test]
@@ -2040,39 +2752,38 @@ mod tests {
         let mut sys = FakeSys {
             clipboard: 1,
             bin: (2, 70),
-            drives: vec![r"C:\".into()],
-            free: 1000,
             ..FakeSys::default()
         };
-        let built = build_items(&sys);
-        assert!(built.iter().any(|item| item.id == r"freespace-C:"));
         let items = [builtin("clipboard"), builtin("recycle-bin")].to_vec();
         let report = preview(&reg, &fs, &sys, &quiet(), &items);
         assert_eq!(report.items[0].other, 1);
         assert_eq!(report.items[1].files, 2);
-        let backup = std::env::temp_dir().join("hive-mend-privacy-special-test.reg");
-        let freespace = built
-            .into_iter()
-            .find(|item| item.id == r"freespace-C:")
-            .expect("wipe row");
-        let report = preview(&reg, &fs, &sys, &quiet(), std::slice::from_ref(&freespace));
-        assert_eq!(report.items[0].bytes, 1000);
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-special-test");
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
-            &[builtin("clipboard"), builtin("recycle-bin"), freespace],
-            &backup,
+            &items,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert!(sys.cleared && sys.emptied);
-        assert_eq!(sys.wiped, vec![r"C:\".to_string()]);
         assert_eq!(outcome.items[0].other, 1);
         assert_eq!(outcome.items[1].files, 2);
-        assert!(!outcome.items[2].note.is_empty());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn no_category_overwrites_free_space() {
+        // Overwriting a drive's free space does not reliably erase anything
+        // on an SSD or NVMe drive and only adds wear, so it is not offered.
+        assert!(
+            build_items()
+                .iter()
+                .all(|item| !item.id.starts_with("freespace"))
+        );
     }
 
     #[test]
@@ -2080,7 +2791,7 @@ mod tests {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-cancel-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-test");
         let items = [builtin("run-dialog"), builtin("typed-paths")].to_vec();
         let mut calls = 0;
         let outcome = clean_with_progress(
@@ -2089,7 +2800,7 @@ mod tests {
             &mut sys,
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| {
                 calls += 1;
                 calls < 2
@@ -2100,7 +2811,7 @@ mod tests {
         assert_eq!(outcome.items.len(), 1);
         assert_eq!(outcome.items[0].id, "run-dialog");
         assert!(reg.values(&format!(r"{EXPLORER}\RunMRU")).is_err());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2123,20 +2834,20 @@ mod tests {
         assert!(!report.items[0].gated_out);
         assert_eq!(report.items[0].values, 1);
         assert!(report.items[1].gated_out);
-        let backup = std::env::temp_dir().join("hive-mend-privacy-plugin-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-plugin-test");
         let outcome = clean_with_progress(
             &mut reg,
             &mut MemoryFs::with_windows_dirs(),
             &mut FakeSys::default(),
             &quiet(),
             &items,
-            &backup,
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
         assert_eq!(outcome.items[0].values, 1);
         assert!(outcome.items[1].gated_out);
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -2151,40 +2862,791 @@ mod tests {
         );
         fs.add_dir(&format!("{home}\\Profiles\\abc.default"));
         fs.add_dir(&format!("{home}\\Profiles\\plain.default"));
-        let profiles = firefox_profiles(&fs, home);
+        let profiles = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true).unwrap();
         assert_eq!(profiles.len(), 2);
     }
 
     #[test]
-    fn exact_files_take_sidecars_and_leave_the_rest() {
+    fn firefox_profiles_stay_within_the_limit_from_both_sources() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
+        // The ini names MAX_PROFILES profiles, the folder holds as many
+        // others (and repeats of the ini's ones in other letter case).
+        let mut ini = String::new();
+        for n in 0..MAX_PROFILES {
+            ini.push_str(&format!(
+                "[Profile{n}]\nIsRelative=1\nPath=Profiles/ini{n}\n"
+            ));
+            fs.add_dir(&format!(r"{home}\Profiles\ini{n}"));
+        }
+        for n in 0..MAX_PROFILES / 2 {
+            fs.add_dir(&format!(r"{home}\Profiles\dir{n}"));
+        }
+        fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini.into_bytes(), None);
+        let mut notes = Vec::new();
+        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true).unwrap();
+        assert_eq!(profiles.len(), MAX_PROFILES);
+        let unique: std::collections::HashSet<String> = profiles
+            .iter()
+            .map(|dir| dir.to_ascii_lowercase())
+            .collect();
+        assert_eq!(unique.len(), MAX_PROFILES);
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("more than") && note.contains(home)),
+            "{notes:?}"
+        );
+
+        // Within the limit, repeats count once and nothing is noted.
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.add_file_bytes(
+            &format!(r"{home}\profiles.ini"),
+            b"[Profile0]\nIsRelative=1\nPath=Profiles/A\n[Profile1]\nIsRelative=0\nPath=C:\\Users\\test\\AppData\\Roaming\\Mozilla\\Firefox\\Profiles\\a\n".to_vec(),
+            None,
+        );
+        fs.add_dir(&format!(r"{home}\Profiles\a"));
+        let mut notes = Vec::new();
+        assert_eq!(
+            firefox_profiles(&fs, home, &mut notes, &mut || true)
+                .unwrap()
+                .len(),
+            1
+        );
+        assert!(notes.is_empty(), "{notes:?}");
+    }
+
+    #[test]
+    fn profile_discovery_stops_when_cancelled() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
+        let mut ini = String::new();
+        for n in 0..900 {
+            ini.push_str(&format!(
+                "[Profile{n}]\nIsRelative=1\nPath=Profiles/ini{n}\n"
+            ));
+            fs.add_dir(&format!(r"{home}\Profiles\ini{n}"));
+        }
+        fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini.into_bytes(), None);
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for n in 0..900 {
+            fs.add_dir(&format!(r"{users}\P{n:04}"));
+        }
+        let all = firefox_profiles(&fs, home, &mut Vec::new(), &mut || true).unwrap();
+        assert_eq!(all.len(), 900);
+        // Told to stop: nothing found is handed back, and it asks only once.
+        let mut asked = 0;
+        let stopped = firefox_profiles(&fs, home, &mut Vec::new(), &mut || {
+            asked += 1;
+            false
+        });
+        assert_eq!(stopped, None);
+        assert_eq!(asked, 1);
+        let mut asked = 0;
+        let stopped = child_dirs(&fs, users, &mut Vec::new(), &mut || {
+            asked += 1;
+            false
+        });
+        assert_eq!(stopped, None);
+        assert_eq!(asked, 1);
+    }
+
+    /// Cancel while browser profiles are still being found: Clean edits no
+    /// cookie database and says it was cancelled, and Preview says so too.
+    #[test]
+    fn cancel_during_profile_discovery_stops_preview_and_clean() {
         let mut reg = seed_reg();
         let mut fs = seed_fs();
         let mut sys = FakeSys::default();
-        let backup = std::env::temp_dir().join("hive-mend-privacy-sidecar-test.reg");
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for n in 0..300 {
+            fs.add_file_bytes(
+                &format!(r"{users}\P{n:03}\Network\Cookies"),
+                vec![7; 64],
+                None,
+            );
+        }
+        let items = vec![builtin("chrome-data")];
+        // The first question (before the category) says go on; every one
+        // after it, which discovery asks, says stop.
+        let mut calls = 0;
+        let preview = preview_with(&reg, &fs, &sys, &quiet(), &items, &mut || {
+            calls += 1;
+            calls < 2
+        });
+        assert!(calls >= 2, "discovery never asked");
+        assert!(preview.canceled);
+        assert!(preview.items.is_empty());
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-discovery-cancel");
+        let mut calls = 0;
         let outcome = clean_with_progress(
             &mut reg,
             &mut fs,
             &mut sys,
             &quiet(),
-            &[builtin("chrome-data")],
-            &backup,
+            &items,
+            &mut backup,
+            &mut |_, _, _| {
+                calls += 1;
+                calls < 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(calls >= 2, "discovery never asked");
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert_eq!(outcome.items[0].cookies, 0);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .all(|note| !note.contains("Cookies")),
+            "a database was looked at: {:?}",
+            outcome.items[0].restricted
+        );
+        for n in 0..300 {
+            let db = format!(r"{users}\P{n:03}\Network\Cookies");
+            assert_eq!(fs.read(&db), Some(vec![7; 64]), "{db}");
+        }
+    }
+
+    /// Cancel after the few profiles were found (too few for discovery to
+    /// ask): it is still seen before the first cookie database.
+    #[test]
+    fn cancel_after_discovery_stops_before_the_first_database() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for n in 0..3 {
+            fs.add_file_bytes(&format!(r"{users}\P{n}\Network\Cookies"), vec![7; 64], None);
+        }
+        let items = vec![builtin("chrome-data")];
+        let mut calls = 0;
+        let preview = preview_with(&reg, &fs, &sys, &quiet(), &items, &mut || {
+            calls += 1;
+            calls < 2
+        });
+        assert!(preview.canceled);
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-db");
+        let mut calls = 0;
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &items,
+            &mut backup,
+            &mut |_, _, _| {
+                calls += 1;
+                calls < 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .all(|note| !note.contains("Cookies")),
+            "a database was looked at: {:?}",
+            outcome.items[0].restricted
+        );
+    }
+
+    #[test]
+    fn an_oversized_profiles_ini_is_not_read() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let home = r"C:\Users\test\AppData\Roaming\Mozilla\Firefox";
+        let mut ini = b"[Profile0]\nIsRelative=1\nPath=Profiles/listed\n".to_vec();
+        ini.resize(MAX_PROFILES_INI + 1, b';');
+        fs.add_file_bytes(&format!(r"{home}\profiles.ini"), ini, None);
+        fs.add_dir(&format!(r"{home}\elsewhere"));
+        fs.add_dir(&format!(r"{home}\Profiles\plain"));
+        let mut notes = Vec::new();
+        let profiles = firefox_profiles(&fs, home, &mut notes, &mut || true).unwrap();
+        assert_eq!(profiles, vec![format!(r"{home}\Profiles\plain")]);
+        assert!(
+            notes.iter().any(|note| note.contains("not read")),
+            "{notes:?}"
+        );
+    }
+
+    /// Browser categories never delete a database file: cookies are only
+    /// removed from inside the database by SQLite, and history, logins,
+    /// and form data stay.
+    #[test]
+    fn browser_categories_delete_no_database_files() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        fs.add_file_bytes(
+            &format!(r"{profile}\Network\Cookies-journal"),
+            vec![0; 2],
+            None,
+        );
+        let before: Vec<String> = [
+            "History",
+            "History-wal",
+            "Login Data",
+            "Web Data",
+            r"Network\Cookies",
+            r"Network\Cookies-journal",
+        ]
+        .iter()
+        .map(|name| format!(r"{profile}\{name}"))
+        .filter(|path| fs.exists(path))
+        .collect();
+        assert!(before.len() >= 4);
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-no-db-delete");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[
+                builtin("chrome-data"),
+                builtin("edge-data"),
+                builtin("firefox-data"),
+            ],
+            &mut backup,
             &mut |_, _, _| true,
         )
         .unwrap();
-        // History plus its -wal sidecar; -shm/-journal were absent.
-        assert_eq!(outcome.items[0].files, 2);
-        assert_eq!(outcome.items[0].bytes, 58);
-        assert!(!fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History"));
-        // Saved logins and autofill survive the clean.
+        let _ = std::fs::remove_file(backup.path());
+        for path in &before {
+            assert!(fs.exists(path), "{path} was deleted");
+        }
+        assert!(outcome.items.iter().all(|item| item.files == 0));
         assert!(
-            fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Login Data")
+            builtin("chrome-data")
+                .targets
+                .iter()
+                .all(|target| matches!(target, PrivacyTarget::Cookies { .. }))
         );
-        assert!(fs.exists(r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Web Data"));
+    }
+
+    #[test]
+    fn a_custom_file_with_side_files_is_never_deleted_as_a_set() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        fs.add_file_bytes(&format!(r"{temp}\one.log"), vec![1; 3], None);
+        let mut set = builtin("user-temp");
+        set.targets = vec![PrivacyTarget::ExactFiles {
+            dir: DirSpec::Fixed(temp.into()),
+            names: vec!["one.log".into()],
+            sidecars: true,
+        }];
+        let mut single = set.clone();
+        single.id = "single".into();
+        single.targets = vec![PrivacyTarget::ExactFiles {
+            dir: DirSpec::Fixed(temp.into()),
+            names: vec!["one.log".into()],
+            sidecars: false,
+        }];
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-single");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[set],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(fs.exists(&format!(r"{temp}\one.log")), "deleted as a set");
         assert!(
-            fs.exists(
-                r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\Cache\f_000001"
-            )
+            outcome.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("not deleted"))
         );
-        let _ = std::fs::remove_file(&backup);
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[single],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(!fs.exists(&format!(r"{temp}\one.log")));
+        assert_eq!(outcome.items[0].files, 1);
+    }
+
+    #[test]
+    fn an_administrator_window_leaves_per_user_registry_targets() {
+        let mut items = builtin_items();
+        let before: usize = items.iter().map(|item| item.targets.len()).sum();
+        leave_per_user_registry(&mut items);
+        let after: usize = items.iter().map(|item| item.targets.len()).sum();
+        assert!(after < before);
+        for item in &items {
+            for target in &item.targets {
+                if let PrivacyTarget::RegTree { key } | PrivacyTarget::RegValues { key, .. } =
+                    target
+                {
+                    assert!(!crate::pathutil::per_user_key(key), "{key}");
+                }
+            }
+        }
+        let run = items.iter().find(|item| item.id == "run-dialog").unwrap();
+        assert!(!run.warnings.is_empty());
+    }
+
+    #[test]
+    fn a_browser_that_starts_after_planning_is_still_respected() {
+        // Closed while the plan is made, running by the time its turn comes.
+        struct StartsLater(std::cell::Cell<u32>);
+        impl ProcessList for StartsLater {
+            fn running(&self, _exe: &str) -> bool {
+                let calls = self.0.get() + 1;
+                self.0.set(calls);
+                calls > 1
+            }
+        }
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let history = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History";
+        assert!(fs.exists(history));
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-starts-later");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &StartsLater(std::cell::Cell::new(0)),
+            &[builtin("chrome-data")],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(outcome.items[0].skipped_running);
+        assert!(fs.exists(history), "a running browser's files were cleaned");
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn an_administrator_window_leaves_browser_data_alone() {
+        let mut items: Vec<PrivacyItem> = build_items()
+            .into_iter()
+            .filter(|item| ["chrome-data", "edge-data", "user-temp"].contains(&item.id.as_str()))
+            .collect();
+        leave_browsers_alone(&mut items);
+        for item in &items {
+            let browser = item.id != "user-temp";
+            assert_eq!(item.targets.is_empty(), browser, "{}", item.id);
+            assert_eq!(!item.warnings.is_empty(), browser, "{}", item.id);
+        }
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let mut sys = FakeSys::default();
+        let history = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default\History";
+        let chrome: Vec<PrivacyItem> = items
+            .iter()
+            .filter(|item| item.id == "chrome-data")
+            .cloned()
+            .collect();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-admin-browsers");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &chrome,
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(
+            fs.exists(history),
+            "an administrator window cleaned browser data"
+        );
+        assert_eq!(outcome.items[0].files, 0);
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    #[test]
+    fn firefox_cache_is_found_in_the_local_profile_folder() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.set_var("LOCALAPPDATA", r"C:\Users\test\AppData\Local");
+        fs.set_var("APPDATA", r"C:\Users\test\AppData\Roaming");
+        let cache = r"C:\Users\test\AppData\Local\Mozilla\Firefox\Profiles\abc.default\cache2";
+        fs.add_file_bytes(&format!(r"{cache}\entries\A1"), vec![0; 10], None);
+        let (dirs, _) = resolve_dirs(
+            &fs,
+            &DirSpec::FirefoxLocal {
+                sub: "cache2".into(),
+            },
+            &mut || true,
+        )
+        .unwrap();
+        assert_eq!(dirs, [cache.to_string()]);
+        let fox = builtin("firefox-data");
+        assert!(fox.name.contains("cookies"));
+        assert!(
+            !fox.detail
+                .to_ascii_lowercase()
+                .starts_with("browsing history")
+        );
+    }
+
+    #[test]
+    fn a_program_installed_for_this_account_counts_as_installed() {
+        let mut reg = MemoryRegistry::new();
+        assert!(!uninstall_present(&reg, "WinRAR"));
+        reg.set_sz(
+            r"HKCU\Software\Microsoft\Windows\CurrentVersion\Uninstall\WinRAR archiver",
+            "DisplayName",
+            "WinRAR 7.10 (64-bit)",
+        );
+        assert!(uninstall_present(&reg, "WinRAR"));
+    }
+
+    #[test]
+    fn a_temp_file_written_since_it_was_listed_is_left_alone() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        // Listed as older than two days, but written an hour ago since.
+        fs.add_file_bytes(
+            &format!(r"{temp}\fresh.tmp"),
+            vec![1; 8],
+            Some(Duration::from_secs(3600)),
+        );
+        fs.add_file_bytes(&format!(r"{temp}\old.tmp"), vec![1; 8], Some(day * 3));
+        let mut done = ItemOutcome::blank("user-temp");
+        let mut errors = Vec::new();
+        for name in ["fresh.tmp", "old.tmp"] {
+            let hit = FileHit {
+                path: format!(r"{temp}\{name}"),
+                bytes: 8,
+                min_age: Some(day * 2),
+            };
+            delete_file(&mut fs, temp, &hit, &mut done, &mut errors);
+        }
+        assert!(
+            fs.exists(&format!(r"{temp}\fresh.tmp")),
+            "a recently written file was deleted"
+        );
+        assert!(!fs.exists(&format!(r"{temp}\old.tmp")));
+        assert_eq!(done.files, 1);
+    }
+
+    #[test]
+    fn an_old_file_written_or_opened_after_listing_is_left_alone() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for name in ["written.tmp", "busy.tmp", "old.tmp"] {
+            fs.add_file_bytes(&format!(r"{temp}\{name}"), vec![1; 8], Some(day * 3));
+        }
+        // Old when pinned, written between the pin and the exclusive open.
+        fs.set_written_since(&format!(r"{temp}\written.tmp"));
+        // Held open by another program for writing.
+        fs.set_busy(&format!(r"{temp}\busy.tmp"));
+        let mut done = ItemOutcome::blank("user-temp");
+        let mut errors = Vec::new();
+        for name in ["written.tmp", "busy.tmp", "old.tmp"] {
+            let hit = FileHit {
+                path: format!(r"{temp}\{name}"),
+                bytes: 8,
+                min_age: Some(day * 2),
+            };
+            delete_file(&mut fs, temp, &hit, &mut done, &mut errors);
+        }
+        assert!(fs.exists(&format!(r"{temp}\written.tmp")));
+        assert!(fs.exists(&format!(r"{temp}\busy.tmp")));
+        assert!(!fs.exists(&format!(r"{temp}\old.tmp")));
+        assert_eq!(done.files, 1);
+        assert!(errors.is_empty(), "{errors:?}");
+        assert!(
+            done.restricted
+                .iter()
+                .any(|note| note.contains("busy.tmp") && note.contains("in use")),
+            "{:?}",
+            done.restricted
+        );
+    }
+
+    #[test]
+    fn a_canceled_preview_stops_inside_a_large_folder_and_says_so() {
+        let reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for index in 0..20_000 {
+            fs.add_file_bytes(&format!(r"{temp}\f{index}.tmp"), vec![0], Some(day * 9));
+        }
+        let sys = FakeSys::default();
+        let mut asked = 0;
+        let report = preview_with(
+            &reg,
+            &fs,
+            &sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut || {
+                asked += 1;
+                asked < 4
+            },
+        );
+        assert!(report.canceled);
+        let counted: usize = report.items.iter().map(|item| item.files).sum();
+        assert!(counted < 20_000, "{counted}");
+        let whole = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
+        assert!(!whole.canceled);
+        assert!(whole.files() >= 20_000);
+    }
+
+    #[test]
+    fn long_folder_paths_count_against_the_walk_budget() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let long = "x".repeat(200);
+        for index in 0..200 {
+            fs.add_dir(&format!(r"{temp}\{long}{index}"));
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut budget = WalkBudget::new(false);
+        budget.bytes_left = 5_000;
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |_| true,
+            &mut || true,
+            &mut budget,
+            &mut row,
+        );
+        // No file matched, yet the queued folder paths alone ran it out.
+        assert!(!finished);
+        assert!(budget.exhausted);
+        assert!(budget.folders_left > MAX_WALK_FOLDERS - 30, "kept too many");
+        assert!(budget.shortfall(temp).unwrap().contains("too large"));
+    }
+
+    #[test]
+    fn files_too_deep_or_past_the_profile_limit_are_reported_not_skipped_silently() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let mut deep = temp.to_string();
+        for level in 0..70 {
+            deep.push_str(&format!(r"\d{level}"));
+        }
+        let day = Duration::from_secs(24 * 3600);
+        fs.add_file_bytes(&format!(r"{deep}\x.tmp"), vec![0], Some(day * 9));
+        let sys = FakeSys::default();
+        let preview = preview(&reg, &fs, &sys, &quiet(), &[builtin("user-temp")]);
+        assert!(
+            preview.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("levels down")),
+            "{:?}",
+            preview.items[0].restricted
+        );
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-deep");
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(fs.exists(&format!(r"{deep}\x.tmp")));
+        assert!(
+            outcome.items[0]
+                .restricted
+                .iter()
+                .any(|note| note.contains("levels down")),
+            "{:?}",
+            outcome.items[0].restricted
+        );
+        // More profiles than are looked at: said, not silently cut.
+        let users = r"C:\Users\test\AppData\Local\Google\Chrome\User Data";
+        for index in 0..1_001 {
+            fs.add_dir(&format!(r"{users}\P{index:04}"));
+        }
+        let (_, notes) = resolve_dirs(
+            &fs,
+            &DirSpec::Chromium {
+                vendor: "Google\\Chrome".into(),
+                sub: String::new(),
+            },
+            &mut || true,
+        )
+        .unwrap();
+        assert!(
+            notes
+                .iter()
+                .any(|note| note.contains("more than 1000 profiles")),
+            "{notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_walk_out_of_folders_stops_and_says_so() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        for index in 0..50 {
+            fs.add_dir(&format!(r"{temp}\d{index}"));
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut budget = WalkBudget::new(false);
+        budget.folders_left = 5;
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |_| true,
+            &mut || true,
+            &mut budget,
+            &mut row,
+        );
+        assert!(!finished);
+        assert!(budget.exhausted);
+    }
+
+    #[test]
+    fn cancel_stops_a_clean_inside_a_large_folder() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        let day = Duration::from_secs(24 * 3600);
+        for index in 0..20_000 {
+            fs.add_file_bytes(&format!(r"{temp}\c{index}.tmp"), vec![0], Some(day * 9));
+        }
+        let mut sys = FakeSys::default();
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cancel-inside");
+        let mut calls = 0;
+        let outcome = clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &[builtin("user-temp")],
+            &mut backup,
+            // Yes for the category itself and the start of its walk; no
+            // from the first check inside the folder.
+            &mut |_, _, _| {
+                calls += 1;
+                calls <= 2
+            },
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(outcome.canceled);
+        assert!(outcome.items[0].canceled);
+        assert_eq!(outcome.items[0].files, 0, "files went after Cancel");
+        assert!(fs.exists(&format!(r"{temp}\c19999.tmp")));
+    }
+
+    #[test]
+    fn a_walk_stops_when_its_files_are_enough() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let temp = r"C:\Users\test\AppData\Local\Temp";
+        for index in 0..50 {
+            fs.add_file_bytes(&format!(r"{temp}\sub\f{index}.tmp"), vec![0], None);
+        }
+        let mut row = PreviewItem::blank("user-temp");
+        let mut hits = Vec::new();
+        let finished = walk_files(
+            &fs,
+            temp,
+            "*",
+            true,
+            None,
+            0,
+            &mut |hit| {
+                hits.push(hit);
+                hits.len() < 10
+            },
+            &mut || true,
+            &mut WalkBudget::new(false),
+            &mut row,
+        );
+        assert!(!finished);
+        assert_eq!(hits.len(), 10);
+    }
+
+    #[test]
+    fn an_uncertain_keep_list_never_widens_what_is_removed() {
+        use std::io::{Error, ErrorKind};
+        let absent = cookie_keep_choice(Err(Error::from(ErrorKind::NotFound)), false);
+        assert_eq!(absent.0, CookieKeep::All);
+        let unreadable = cookie_keep_choice(Err(Error::from(ErrorKind::PermissionDenied)), false);
+        assert!(matches!(unreadable.0, CookieKeep::LeaveAlone(_)));
+        let invalid = cookie_keep_choice(Ok("not a site\n".into()), false);
+        assert!(matches!(invalid.0, CookieKeep::LeaveAlone(_)));
+        assert_eq!(invalid.1.len(), 1);
+        let mixed = cookie_keep_choice(Ok("github.com\nnot a site\n".into()), false);
+        assert!(matches!(mixed.0, CookieKeep::LeaveAlone(_)));
+        let comments = cookie_keep_choice(Ok("# nothing kept\n".into()), false);
+        assert_eq!(comments.0, CookieKeep::All);
+        let sites = cookie_keep_choice(Ok("github.com\n".into()), false);
+        assert_eq!(sites.0, CookieKeep::Sites(vec!["github.com".into()]));
+        let elevated = cookie_keep_choice(Ok("github.com\n".into()), true);
+        assert!(matches!(elevated.0, CookieKeep::LeaveAlone(_)));
+    }
+
+    #[test]
+    fn cookies_left_alone_are_not_touched() {
+        let mut reg = seed_reg();
+        let mut fs = seed_fs();
+        let profile = r"C:\Users\test\AppData\Local\Google\Chrome\User Data\Default";
+        fs.add_file_bytes(&format!(r"{profile}\Network\Cookies"), vec![0; 40], None);
+        let mut items = vec![builtin("chrome-data")];
+        set_cookie_keep(
+            &mut items,
+            &CookieKeep::LeaveAlone("kept by request".into()),
+        );
+        assert!(items[0].detail.contains("Cookies are left alone"));
+        let mut sys = FakeSys::default();
+        let report = preview(&reg, &fs, &sys, &quiet(), &items);
+        assert!(
+            report.items[0]
+                .restricted
+                .iter()
+                .any(|note| note == "kept by request")
+        );
+        let mut backup = crate::backup::test_writer("hive-mend-privacy-cookies-alone");
+        clean_with_progress(
+            &mut reg,
+            &mut fs,
+            &mut sys,
+            &quiet(),
+            &items,
+            &mut backup,
+            &mut |_, _, _| true,
+        )
+        .unwrap();
+        assert!(fs.exists(&format!(r"{profile}\Network\Cookies")));
+        assert!(fs.exists(&format!(r"{profile}\History")));
+        let _ = std::fs::remove_file(backup.path());
     }
 }

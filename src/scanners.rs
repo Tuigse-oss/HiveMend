@@ -602,16 +602,20 @@ fn walk_deep(
             continue;
         }
         let extracted = paths_in_command(text);
+        // As in the other scanners, only the program and the code files a
+        // command loads count: a missing log or output argument does not make
+        // a working command stale.
         let candidates = if extracted.is_empty() {
             vec![text.to_string()]
         } else {
-            extracted
+            command_dependencies(&extracted)
         };
         for candidate in candidates {
             let expanded = expand_env(ctx.fs, &candidate);
             if expanded.contains('%')
                 || under_windows_dir(ctx.fs, &expanded)
                 || file_present(ctx.fs, &expanded)
+                || ctx.fs.is_dir(&expanded)
             {
                 continue;
             }
@@ -752,11 +756,12 @@ fn dword(values: &[RegValue], name: &str) -> Option<u32> {
 }
 
 fn is_kb(name: &str) -> bool {
-    let rest = name.get(2..).unwrap_or("");
-    name.len() > 2
-        && name[..2].eq_ignore_ascii_case("KB")
-        && !rest.is_empty()
-        && rest.chars().all(|ch| ch.is_ascii_digit())
+    // Byte-based: a name starting with a multi-byte character must not be
+    // sliced inside it.
+    let bytes = name.as_bytes();
+    bytes.len() > 2
+        && bytes[..2].eq_ignore_ascii_case(b"KB")
+        && bytes[2..].iter().all(u8::is_ascii_digit)
 }
 
 fn desktop_dirs(ctx: &ScanCtx<'_>) -> Vec<String> {
@@ -964,29 +969,36 @@ fn scan_startup_approved(
 }
 
 fn startup_shortcut_exists(ctx: &mut ScanCtx<'_>, name: &str) -> bool {
-    let mut dirs = Vec::new();
-    if let Some(appdata) = ctx.fs.var("APPDATA") {
-        dirs.push(format!(
-            "{appdata}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
-        ));
+    // Both Startup folders must be locatable to prove a shortcut is gone.
+    // Each name is checked directly, where an unreadable location counts as
+    // present, rather than through a listing that comes back empty on error.
+    let (Some(appdata), Some(program_data)) = (ctx.fs.var("APPDATA"), ctx.fs.var("ProgramData"))
+    else {
+        return true;
+    };
+    if name.contains(['\\', '/']) {
+        return true;
     }
-    if let Some(program_data) = ctx.fs.var("ProgramData") {
-        dirs.push(format!(
-            "{program_data}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup"
-        ));
-    }
-    dirs.iter().any(|dir| {
-        ctx.fs
-            .list(dir)
-            .iter()
-            .any(|item| item.kind == ItemKind::File && item.name.eq_ignore_ascii_case(name))
+    [appdata, program_data].iter().any(|root| {
+        ctx.fs.exists(&format!(
+            "{root}\\Microsoft\\Windows\\Start Menu\\Programs\\Startup\\{name}"
+        ))
     })
 }
 
+/// True unless the key was read and has no value of that name. An
+/// unreadable key counts as holding it.
 fn named_value_exists(ctx: &mut ScanCtx<'_>, key: &str, name: &str) -> bool {
-    read_values(ctx, key)
-        .iter()
-        .any(|value| value.name.eq_ignore_ascii_case(name))
+    match ctx.reg.values(key) {
+        Ok(values) => values
+            .iter()
+            .any(|value| value.name.eq_ignore_ascii_case(name)),
+        Err(RegError::NotFound) => false,
+        Err(err) => {
+            ctx.warnings.push(format!("{key}: {err}"));
+            true
+        }
+    }
 }
 
 fn scan_association_toasts(
@@ -1108,13 +1120,45 @@ fn application_known_missing(ctx: &mut ScanCtx<'_>, exe: &str) -> bool {
 }
 
 fn progid_registered(ctx: &mut ScanCtx<'_>, progid: &str) -> bool {
-    [
-        format!(r"HKEY_CURRENT_USER\Software\Classes\{progid}"),
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Classes\{progid}"),
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Classes\{progid}"),
-    ]
-    .iter()
-    .any(|key| !read_values(ctx, key).is_empty() || !read_subkeys(ctx, key).is_empty())
+    any_key_alive(
+        ctx,
+        &[
+            format!(r"HKEY_CURRENT_USER\Software\Classes\{progid}"),
+            format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Classes\{progid}"),
+            format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Classes\{progid}"),
+        ],
+    )
+}
+
+/// Whether a key holds anything: `Some(false)` only when it is verifiably
+/// absent or empty, `None` when it could not be read.
+fn key_has_content(ctx: &mut ScanCtx<'_>, key: &str) -> Option<bool> {
+    let values = match ctx.reg.values(key) {
+        Ok(values) => !values.is_empty(),
+        Err(RegError::NotFound) => return Some(false),
+        Err(err) => {
+            ctx.warnings.push(format!("{key}: {err}"));
+            return None;
+        }
+    };
+    if values {
+        return Some(true);
+    }
+    match ctx.reg.subkeys(key) {
+        Ok(keys) => Some(!keys.is_empty()),
+        Err(RegError::NotFound) => Some(false),
+        Err(err) => {
+            ctx.warnings.push(format!("{key}: {err}"));
+            None
+        }
+    }
+}
+
+/// True unless every key is verifiably absent or empty. A key that cannot
+/// be read counts as alive: failing to look is not proof of absence.
+fn any_key_alive(ctx: &mut ScanCtx<'_>, keys: &[String]) -> bool {
+    keys.iter()
+        .any(|key| key_has_content(ctx, key) != Some(false))
 }
 
 fn scan_shell_commands(
@@ -1406,13 +1450,20 @@ fn scan_arp_cache(
 }
 
 fn uninstall_key_exists(ctx: &mut ScanCtx<'_>, name: &str) -> bool {
-    [
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}"),
-        format!(r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{name}"),
-        format!(r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\{name}"),
-    ]
-    .iter()
-    .any(|key| !read_values(ctx, key).is_empty() || !read_subkeys(ctx, key).is_empty())
+    any_key_alive(
+        ctx,
+        &[
+            format!(
+                r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
+            ),
+            format!(
+                r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
+            ),
+            format!(
+                r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Uninstall\{name}"
+            ),
+        ],
+    )
 }
 
 fn path_still_present(ctx: &ScanCtx<'_>, value: &RegValue) -> bool {
@@ -1655,6 +1706,24 @@ fn scan_autoplay(
         };
         let missing = missing_paths(ctx, &icon);
         if missing.is_empty() {
+            continue;
+        }
+        // The icon is only how the handler looks. Remove the handler only
+        // when what it starts (its ProgID or CLSID) is verifiably gone too.
+        let mut classes = Vec::new();
+        for name in ["InvokeProgID", "ProgID"] {
+            if let Some(progid) = text_value(&values, name) {
+                classes.push(progid);
+            }
+        }
+        if let Some(clsid) = text_value(&values, "CLSID") {
+            classes.push(format!(r"CLSID\{clsid}"));
+        }
+        if classes.is_empty()
+            || classes
+                .iter()
+                .any(|class| class.contains("..") || progid_registered(ctx, class))
+        {
             continue;
         }
         push_key(
@@ -2424,6 +2493,23 @@ mod tests {
             r"C:\Missing\cam.exe,0",
         );
         reg.set_sz(
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\Handlers\OldCam",
+            "InvokeProgID",
+            "Gone.Cam",
+        );
+        // A missing icon alone does not make a handler stale: this one
+        // still starts a registered ProgID.
+        reg.set_sz(
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\Handlers\LiveCam",
+            "DefaultIcon",
+            r"C:\Missing\livecam.ico",
+        );
+        reg.set_sz(
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\AutoplayHandlers\Handlers\LiveCam",
+            "InvokeProgID",
+            "Keep.Prog",
+        );
+        reg.set_sz(
             &format!(r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Explorer\MyComputer\NameSpace\{dead}"),
             "",
             "",
@@ -2496,6 +2582,7 @@ mod tests {
             "PortOnly",
             "svchost.exe",
             "Keep.Prog",
+            "LiveCam",
             "msvc.dll",
             r"Windows\Installer\abc.msi",
             quiet,
@@ -2537,6 +2624,37 @@ mod tests {
     }
 
     #[test]
+    fn deep_scan_keeps_a_present_program_with_a_missing_data_argument() {
+        let mut fs = MemoryFs::new();
+        fs.set_var("SystemRoot", r"C:\Windows");
+        fs.add_file(r"C:\Apps\runner.exe");
+        let mut reg = MemoryRegistry::new();
+        let run = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Run";
+        reg.set_sz(
+            run,
+            "App",
+            r#""C:\Apps\runner.exe" --log "C:\Logs\gone.log""#,
+        );
+        reg.set_sz(run, "Gone", r#""C:\Apps\removed.exe" --quiet"#);
+        let opts = ScanOptions {
+            only: vec![ScannerId::DeepScan],
+            include_deep: true,
+            ..ScanOptions::default()
+        };
+        let report = scan(&Engine::try_builtin().unwrap(), &reg, &fs, &opts);
+        let flagged: Vec<&str> = report
+            .findings
+            .iter()
+            .filter_map(|finding| finding.value.as_deref())
+            .collect();
+        assert!(!flagged.contains(&"App"), "a working command was flagged");
+        assert!(
+            flagged.contains(&"Gone"),
+            "a missing program is still found"
+        );
+    }
+
+    #[test]
     fn temp_sweep_needs_a_known_old_age() {
         use std::time::Duration;
         let mut fs = MemoryFs::new();
@@ -2568,5 +2686,95 @@ mod tests {
             .collect();
         assert!(keys.iter().any(|key| key.ends_with("\\old.tmp")));
         assert!(!keys.iter().any(|key| key.ends_with("\\mystery.tmp")));
+    }
+
+    #[test]
+    fn an_unreadable_reference_is_not_proof_that_it_is_gone() {
+        use crate::registry::RegError;
+        // Denies reads of the Run key; everything else is the memory store.
+        struct DenyRun(MemoryRegistry);
+        impl Registry for DenyRun {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                self.0.subkeys(path)
+            }
+            fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+                if path.to_ascii_lowercase().ends_with(r"currentversion\run") {
+                    return Err(RegError::Denied("access denied".into()));
+                }
+                self.0.values(path)
+            }
+            fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+                self.0.delete_value(path, name)
+            }
+            fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+                self.0.delete_tree(path)
+            }
+            fn set_value(
+                &mut self,
+                path: &str,
+                name: &str,
+                data: &ValueKind,
+            ) -> Result<(), RegError> {
+                self.0.set_value(path, name, data)
+            }
+        }
+        let mut fs = MemoryFs::with_windows_dirs();
+        fs.set_var("APPDATA", r"C:\Users\Ada\AppData\Roaming");
+        let mut inner = MemoryRegistry::new();
+        let approved = r"HKCU\Software\Microsoft\Windows\CurrentVersion\Explorer\StartupApproved";
+        inner.set(
+            &format!(r"{approved}\Run"),
+            "Chat",
+            ValueKind::Binary(vec![3; 12]),
+        );
+        inner.set(
+            &format!(r"{approved}\Run"),
+            "Gone",
+            ValueKind::Binary(vec![2; 12]),
+        );
+        let reg = DenyRun(inner);
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &reg,
+            &fs,
+            &ScanOptions::default(),
+        );
+        assert!(
+            !report
+                .findings
+                .iter()
+                .any(|f| f.key.contains("StartupApproved")),
+            "an approval was flagged because its Run key could not be read"
+        );
+        // Positive control: readable and verifiably absent is still found.
+        let mut readable = MemoryRegistry::new();
+        readable.set(
+            &format!(r"{approved}\Run"),
+            "Gone",
+            ValueKind::Binary(vec![2; 12]),
+        );
+        let report = scan(
+            &Engine::try_builtin().unwrap(),
+            &readable,
+            &fs,
+            &ScanOptions::default(),
+        );
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.value.as_deref() == Some("Gone"))
+        );
+    }
+
+    #[test]
+    fn kb_names_are_checked_without_slicing_inside_a_character() {
+        assert!(is_kb("KB123456"));
+        assert!(is_kb("kb1"));
+        assert!(!is_kb("KB"));
+        assert!(!is_kb("KBx1"));
+        for name in ["中文程序", "日本語", "🙂 app", "Ké9", "K中", "汉KB1"] {
+            assert!(!is_kb(name), "{name}");
+        }
     }
 }

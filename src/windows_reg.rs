@@ -9,14 +9,16 @@ use windows_sys::Win32::Foundation::{
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CLASSES_ROOT, HKEY_CURRENT_CONFIG, HKEY_CURRENT_USER, HKEY_LOCAL_MACHINE,
-    HKEY_USERS, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ, KEY_SET_VALUE, KEY_WOW64_64KEY,
-    REG_BINARY, REG_DWORD, REG_EXPAND_SZ, REG_LINK, REG_MULTI_SZ, REG_OPTION_OPEN_LINK, REG_SZ,
-    RegCloseKey, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW, RegOpenKeyExW, RegQueryValueExW,
+    HKEY_USERS, KEY_CREATE_SUB_KEY, KEY_ENUMERATE_SUB_KEYS, KEY_QUERY_VALUE, KEY_READ,
+    KEY_SET_VALUE, KEY_WOW64_64KEY, REG_BINARY, REG_CREATED_NEW_KEY, REG_DWORD, REG_EXPAND_SZ,
+    REG_LINK, REG_MULTI_SZ, REG_OPTION_NON_VOLATILE, REG_OPTION_OPEN_LINK, REG_SZ, RegCloseKey,
+    RegCreateKeyExW, RegCreateKeyTransactedW, RegDeleteValueW, RegEnumKeyExW, RegEnumValueW,
+    RegOpenKeyExW, RegOpenKeyTransactedW, RegQueryValueExW, RegSetValueExW,
 };
 
 use crate::model::{RegValue, ValueKind};
 use crate::pathutil::canonical_path;
-use crate::registry::{RegError, Registry};
+use crate::registry::{RegError, RegTransaction, Registry};
 
 const DELETE_ACCESS: u32 = 0x0001_0000;
 /// `KEY_FLAGS_INFORMATION.KeyFlags` bit for a symbolic-link key.
@@ -30,6 +32,204 @@ const MAX_DELETE_DEPTH: usize = 512;
 
 #[derive(Clone, Copy, Debug, Default)]
 pub struct WindowsRegistry;
+
+thread_local! {
+    /// The transaction every open and create on this thread goes through
+    /// while a [`WindowsTransaction`] call runs; null otherwise.
+    static TX: std::cell::Cell<windows_sys::Win32::Foundation::HANDLE> =
+        const { std::cell::Cell::new(ptr::null_mut()) };
+}
+
+/// Sets this thread's transaction for one call and clears it after.
+struct TxScope(windows_sys::Win32::Foundation::HANDLE);
+
+impl TxScope {
+    fn enter(tx: windows_sys::Win32::Foundation::HANDLE) -> Self {
+        Self(TX.with(|cell| cell.replace(tx)))
+    }
+}
+
+impl Drop for TxScope {
+    fn drop(&mut self) {
+        TX.with(|cell| cell.set(self.0));
+    }
+}
+
+/// A Windows registry transaction (KTM). Every key it opens or creates goes
+/// through the same link-refusing walk as [`WindowsRegistry`], transacted.
+/// Windows aborts it if anything else changes a key it has written, so the
+/// commit then fails and nothing it did is applied; dropping it uncommitted
+/// rolls it back.
+pub struct WindowsTransaction {
+    tx: windows_sys::Win32::Foundation::HANDLE,
+    done: bool,
+    /// The value name `touch` writes and removes again, new for each
+    /// transaction.
+    marker: Vec<u16>,
+}
+
+/// A fresh marker value name.
+fn touch_marker() -> Vec<u16> {
+    use std::hash::{BuildHasher, Hasher};
+    let mut hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    hasher.write_u128(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|time| time.as_nanos())
+            .unwrap_or_default(),
+    );
+    wide(&format!("Hivemend transaction {:016x}", hasher.finish()))
+}
+
+impl WindowsTransaction {
+    pub fn begin() -> Result<Self, RegError> {
+        use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+        use windows_sys::Win32::Storage::FileSystem::CreateTransaction;
+        let tx = unsafe {
+            CreateTransaction(
+                ptr::null_mut(),
+                ptr::null_mut(),
+                0,
+                0,
+                0,
+                0,
+                ptr::null_mut(),
+            )
+        };
+        if tx == INVALID_HANDLE_VALUE || tx.is_null() {
+            return Err(RegError::Message(format!(
+                "registry transactions are not available ({})",
+                std::io::Error::last_os_error()
+            )));
+        }
+        Ok(Self {
+            tx,
+            done: false,
+            marker: touch_marker(),
+        })
+    }
+}
+
+impl Drop for WindowsTransaction {
+    fn drop(&mut self) {
+        use windows_sys::Win32::Foundation::CloseHandle;
+        use windows_sys::Win32::Storage::FileSystem::RollbackTransaction;
+        unsafe {
+            if !self.done {
+                RollbackTransaction(self.tx);
+            }
+            CloseHandle(self.tx);
+        }
+    }
+}
+
+impl Registry for WindowsTransaction {
+    fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.subkeys(path)
+    }
+    fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.values(path)
+    }
+    fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.delete_value(path, name)
+    }
+    fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.delete_tree(path)
+    }
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        WindowsRegistry.set_value(path, name, data)
+    }
+}
+
+impl WindowsTransaction {
+    /// Write the marker value to `key` inside the transaction and remove
+    /// it again, so the key is part of the transaction.
+    fn touch_inside(&self, key: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        let opened = open(key, true)?;
+        let name = &self.marker;
+        let marker = 1u32.to_le_bytes();
+        let set = unsafe {
+            RegSetValueExW(
+                opened.key,
+                name.as_ptr(),
+                0,
+                REG_DWORD,
+                marker.as_ptr(),
+                marker.len() as u32,
+            )
+        };
+        if set != ERROR_SUCCESS {
+            return Err(failure(
+                set,
+                format!("{key}: could not start its transaction ({set})"),
+            ));
+        }
+        let removed = unsafe { RegDeleteValueW(opened.key, name.as_ptr()) };
+        if removed != ERROR_SUCCESS {
+            return Err(failure(
+                removed,
+                format!("{key}: could not start its transaction ({removed})"),
+            ));
+        }
+        Ok(())
+    }
+}
+
+impl RegTransaction for WindowsTransaction {
+    fn delete_tree_exact(&mut self, path: &str, expected: &[String]) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        delete_tree_checked(path, Some(expected))
+    }
+
+    fn require_trusted(&self, key: &str) -> Result<(), RegError> {
+        let _scope = TxScope::enter(self.tx);
+        require_trusted_key(key)
+    }
+
+    fn touch(&mut self, key: &str) -> Result<(), RegError> {
+        self.touch_inside(key)?;
+        // Outside the transaction a value of that name must not exist: if it
+        // does, the transaction's write and delete stood in for a value
+        // someone else owns, and committing would remove it. One that
+        // appears later changes a touched key, which fails the commit.
+        let plain = open(key, false)?;
+        let present = unsafe {
+            RegQueryValueExW(
+                plain.key,
+                self.marker.as_ptr(),
+                ptr::null(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+                ptr::null_mut(),
+            )
+        };
+        if present == ERROR_SUCCESS {
+            return Err(RegError::Message(format!(
+                "{key} has a value with the name Hivemend uses to start its transaction; left alone"
+            )));
+        }
+        Ok(())
+    }
+
+    fn commit(mut self: Box<Self>) -> Result<(), RegError> {
+        use windows_sys::Win32::Storage::FileSystem::CommitTransaction;
+        let ok = unsafe { CommitTransaction(self.tx) };
+        self.done = true;
+        if ok == 0 {
+            let err = std::io::Error::last_os_error();
+            return Err(RegError::Message(format!(
+                "the change was not applied: another program changed the key meanwhile, or Windows refused ({err})"
+            )));
+        }
+        Ok(())
+    }
+}
 
 struct Opened {
     key: HKEY,
@@ -115,21 +315,117 @@ impl Registry for WindowsRegistry {
         Ok(())
     }
 
+    fn set_value(&mut self, path: &str, name: &str, data: &ValueKind) -> Result<(), RegError> {
+        // An embedded NUL would truncate the name at the Win32 boundary.
+        if name.contains('\0') {
+            return Err(RegError::Message(format!(
+                "{path}: value name contains a NUL and cannot be addressed safely"
+            )));
+        }
+        let opened = match open(path, true) {
+            Ok(opened) => opened,
+            Err(RegError::NotFound) => create_key(path, 0)?,
+            Err(err) => return Err(err),
+        };
+        let (kind, bytes) = encode_value(data);
+        let wide = wide(name);
+        let rc = unsafe {
+            RegSetValueExW(
+                opened.key,
+                wide.as_ptr(),
+                0,
+                kind,
+                bytes.as_ptr(),
+                bytes.len() as u32,
+            )
+        };
+        if rc != ERROR_SUCCESS {
+            return Err(failure(
+                rc,
+                format!("RegSetValueExW {path}\\{name} failed ({rc})"),
+            ));
+        }
+        Ok(())
+    }
+
+    fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+        Ok(Box::new(WindowsTransaction::begin()?))
+    }
+
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
-        let (parent, leaf) = split_parent(path)?;
-        let parent = open(&parent, false)?;
-        let root = open_child(
-            parent.key,
-            &leaf,
-            KEY_READ | DELETE_ACCESS | KEY_WOW64_64KEY,
-        )
-        .map_err(|fail| fail.into_error(path))?;
-        // Pin the whole subtree first, refusing any link in it, and only
-        // then delete through the pinned handles. RegDeleteTreeW reopens by
-        // name and follows links, so a link anywhere below would have it
-        // empty the link's target instead of this tree.
-        let tree = pin_subtree(root, &canonical_path(path), 0)?;
-        delete_pinned(tree)
+        delete_tree_checked(path, None)
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    /// Tests of other behaviour on HKCU keys, in an elevated test run, set
+    /// the trust rule aside on their own thread.
+    static TRUST_ANYWAY: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Delete `path` and its subtree. Pin the whole subtree first, refusing any
+/// link in it, and only then delete through the pinned handles
+/// (RegDeleteTreeW reopens by name and follows links, so a link anywhere
+/// below would have it empty the link's target instead). With `expected`,
+/// the pinned keys must be exactly those, or nothing is deleted.
+fn delete_tree_checked(path: &str, expected: Option<&[String]>) -> Result<(), RegError> {
+    let (parent, leaf) = split_parent(path)?;
+    let parent = open(&parent, false)?;
+    let root = open_child(
+        parent.key,
+        &leaf,
+        KEY_READ | DELETE_ACCESS | KEY_WOW64_64KEY,
+    )
+    .map_err(|fail| fail.into_error(path))?;
+    let tree = pin_subtree(root, &canonical_path(path), 0)?;
+    if let Some(expected) = expected {
+        let mut pinned = Vec::new();
+        pinned_paths(&tree, &mut pinned);
+        if !crate::registry::same_keys(&pinned, expected) {
+            return Err(RegError::Message(format!(
+                "{path} changed while it was being removed (a key appeared or went); nothing was removed"
+            )));
+        }
+    }
+    delete_pinned(tree)
+}
+
+fn pinned_paths(tree: &Pinned, out: &mut Vec<String>) {
+    out.push(canonical_path(&tree.path));
+    for child in &tree.children {
+        pinned_paths(child, out);
+    }
+}
+
+/// As an administrator, refuse a key (or, for one that does not exist yet,
+/// the nearest key above it) that programs running without elevation can
+/// change. Without elevation there is nothing to refuse: the window can only
+/// do what its own account can.
+pub(crate) fn require_trusted_key(path: &str) -> Result<(), RegError> {
+    #[cfg(test)]
+    if TRUST_ANYWAY.with(|flag| flag.get()) {
+        return Ok(());
+    }
+    if !crate::store::elevated() {
+        return Ok(());
+    }
+    let mut at = canonical_path(path);
+    loop {
+        match open(&at, false) {
+            Ok(opened) => {
+                return crate::store::check_registry_key_security(opened.key as _, &at).map_err(
+                    |why| {
+                        RegError::Denied(format!("{why}; an administrator window leaves it alone"))
+                    },
+                );
+            }
+            Err(RegError::NotFound) => match split_parent(&at) {
+                Ok((parent, _)) => at = parent,
+                Err(_) => return Err(RegError::NotFound),
+            },
+            Err(err) => return Err(err),
+        }
     }
 }
 
@@ -218,6 +514,95 @@ fn enum_subkeys(key: HKEY, path: &str) -> Result<Vec<String>, RegError> {
         index = index.saturating_add(1);
     }
     Ok(names)
+}
+
+/// Create the last component of `path` under its existing parent, reached by
+/// the same link-checked walk as every other open. A name that already exists
+/// as a link is refused rather than created through.
+/// Open `path` for writing values, creating it and any missing parent keys
+/// one level at a time. Each level is opened without following links and
+/// refused if it is one, so a value is never written through a link.
+fn create_key(path: &str, depth: usize) -> Result<Opened, RegError> {
+    if depth > MAX_LINK_HOPS + 64 {
+        return Err(RegError::Message(format!("{path}: too deep to create")));
+    }
+    let (parent, leaf) = split_parent(path)?;
+    let parent = match open_with(&parent, KEY_CREATE_SUB_KEY) {
+        Ok(parent) => parent,
+        Err(RegError::NotFound) => {
+            drop(create_key(&parent, depth + 1)?);
+            open_with(&parent, KEY_CREATE_SUB_KEY)?
+        }
+        Err(err) => return Err(err),
+    };
+    if let Ok(existing) = open_child(
+        parent.key,
+        &leaf,
+        KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+    ) {
+        if is_link(existing.key)? {
+            return Err(RegError::Message(format!(
+                "{path} is a registry link; links are never written through"
+            )));
+        }
+        return Ok(existing);
+    }
+    let wide = wide(&leaf);
+    let mut key: HKEY = ptr::null_mut();
+    let mut disposition = 0u32;
+    let tx = TX.with(|cell| cell.get());
+    let rc = unsafe {
+        if tx.is_null() {
+            RegCreateKeyExW(
+                parent.key,
+                wide.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                ptr::null(),
+                &mut key,
+                &mut disposition,
+            )
+        } else {
+            RegCreateKeyTransactedW(
+                parent.key,
+                wide.as_ptr(),
+                0,
+                ptr::null(),
+                REG_OPTION_NON_VOLATILE,
+                KEY_SET_VALUE | KEY_QUERY_VALUE | KEY_WOW64_64KEY,
+                ptr::null(),
+                &mut key,
+                &mut disposition,
+                tx,
+                ptr::null(),
+            )
+        }
+    };
+    if rc != ERROR_SUCCESS || key.is_null() {
+        return Err(failure(rc, format!("RegCreateKeyExW {path} failed ({rc})")));
+    }
+    let opened = Opened { key, close: true };
+    // The key was missing a moment ago. If the create opened an existing
+    // key instead, something appeared in between, possibly a link that the
+    // create followed: refuse rather than write to whatever it reached.
+    if disposition != REG_CREATED_NEW_KEY {
+        return Err(RegError::Message(format!(
+            "{path} appeared while it was being created; nothing was written"
+        )));
+    }
+    if is_link(opened.key)? {
+        return Err(RegError::Message(format!(
+            "{path} became a registry link while it was created"
+        )));
+    }
+    Ok(opened)
+}
+
+/// A value's registry type and raw bytes, as RegSetValueExW takes them.
+fn encode_value(data: &ValueKind) -> (u32, Vec<u8>) {
+    data.encoded()
 }
 
 fn failure(rc: u32, message: String) -> RegError {
@@ -375,10 +760,20 @@ fn decode_multi(bytes: &[u8]) -> Vec<String> {
 /// the walk then restarts from that target. Any other link is refused, so a
 /// read, backup, or delete always reaches the key its path names.
 fn open(path: &str, write: bool) -> Result<Opened, RegError> {
-    let mut access = KEY_READ | KEY_WOW64_64KEY;
     if write {
-        access |= KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS;
+        open_with(
+            path,
+            KEY_SET_VALUE | KEY_ENUMERATE_SUB_KEYS | KEY_QUERY_VALUE | DELETE_ACCESS,
+        )
+    } else {
+        open_with(path, 0)
     }
+}
+
+/// Open `path` with read access plus `extra`, crossing only the links
+/// Windows itself defines.
+fn open_with(path: &str, extra: u32) -> Result<Opened, RegError> {
+    let access = KEY_READ | KEY_WOW64_64KEY | extra;
     let original = canonical_path(path);
     let mut current = original.clone();
     for _ in 0..=MAX_LINK_HOPS {
@@ -465,17 +860,30 @@ fn open_child(parent: HKEY, name: &str, access: u32) -> Result<Opened, OpenFail>
     if name.is_empty() || name.contains('\0') || name.contains('\\') {
         return Err(OpenFail::Code(ERROR_PATH_NOT_FOUND));
     }
+    let tx = TX.with(|cell| cell.get());
     let open = |access: u32| {
         let wide = wide(name);
         let mut opened = ptr::null_mut();
         let rc = unsafe {
-            RegOpenKeyExW(
-                parent,
-                wide.as_ptr(),
-                REG_OPTION_OPEN_LINK,
-                access,
-                &mut opened,
-            )
+            if tx.is_null() {
+                RegOpenKeyExW(
+                    parent,
+                    wide.as_ptr(),
+                    REG_OPTION_OPEN_LINK,
+                    access,
+                    &mut opened,
+                )
+            } else {
+                RegOpenKeyTransactedW(
+                    parent,
+                    wide.as_ptr(),
+                    REG_OPTION_OPEN_LINK,
+                    access,
+                    &mut opened,
+                    tx,
+                    ptr::null(),
+                )
+            }
         };
         if rc == ERROR_SUCCESS && !opened.is_null() {
             Ok(Opened {
@@ -846,6 +1254,312 @@ mod live_tests {
     }
 
     #[test]
+    fn live_a_value_named_like_the_marker_is_never_removed() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendMarkerTest{}",
+            std::process::id()
+        ));
+        let mut reg = WindowsRegistry;
+        reg.set_value(&root.0, "stale", &ValueKind::Dword(1))
+            .unwrap();
+        let mut tx = WindowsTransaction::begin().unwrap();
+        // Another program's value that happens to carry the marker's name,
+        // with raw bytes of an unusual type.
+        let name = String::from_utf16_lossy(&tx.marker[..tx.marker.len() - 1]);
+        let theirs = ValueKind::Other {
+            kind: 11,
+            bytes: vec![9, 8, 7, 6, 5, 4, 3, 2],
+        };
+        reg.set_value(&root.0, &name, &theirs).unwrap();
+        let touched = tx.touch(&root.0);
+        drop(tx);
+        let after = reg.values(&root.0).unwrap();
+        assert!(touched.is_err(), "the key was not refused");
+        assert!(
+            after
+                .iter()
+                .any(|value| value.name == name && value.data == theirs),
+            "their value was changed or removed: {after:?}"
+        );
+    }
+
+    #[test]
+    fn live_a_key_created_elsewhere_during_removal_stops_it() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendExactTest{}",
+            std::process::id()
+        ));
+        let tree = format!(r"{}\Tree", root.0);
+        let mut reg = WindowsRegistry;
+        reg.set_value(&format!(r"{tree}\A"), "x", &ValueKind::Dword(1))
+            .unwrap();
+        let mut tx = WindowsTransaction::begin().unwrap();
+        let expected = vec![canonical_path(&tree), canonical_path(&format!(r"{tree}\A"))];
+        tx.touch(&tree).unwrap();
+        tx.touch(&format!(r"{tree}\A")).unwrap();
+        // Created by another program after the tree was recorded.
+        reg.set_value(&format!(r"{tree}\Late"), "y", &ValueKind::Dword(2))
+            .unwrap();
+        let deleted = tx.delete_tree_exact(&tree, &expected);
+        let committed = if deleted.is_ok() {
+            Box::new(tx).commit()
+        } else {
+            drop(tx);
+            Err(RegError::Message("not deleted".into()))
+        };
+        let late = reg.values(&format!(r"{tree}\Late"));
+        assert!(committed.is_err(), "the removal went through");
+        assert!(late.is_ok(), "the late key was removed without a backup");
+        assert!(reg.values(&format!(r"{tree}\A")).is_ok(), "rolled back");
+    }
+
+    /// Runs only elevated (it skips otherwise).
+    #[test]
+    fn live_elevated_a_machine_key_users_can_change_is_refused() {
+        use windows_sys::Win32::Foundation::LocalFree;
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::System::Registry::RegSetKeySecurity;
+        if !crate::store::elevated() {
+            eprintln!("skipped: needs an elevated test run");
+            return;
+        }
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        let root = Cleanup(format!(
+            r"HKLM\SOFTWARE\HiveMendTrustTest{}",
+            std::process::id()
+        ));
+        let open_key = format!(r"{}\Open", root.0);
+        let closed_key = format!(r"{}\Closed", root.0);
+        let mut reg = WindowsRegistry;
+        reg.set_value(&open_key, "x", &ValueKind::Dword(1)).unwrap();
+        reg.set_value(&closed_key, "x", &ValueKind::Dword(1))
+            .unwrap();
+        // Users get full control of Open.
+        let sddl = wide("D:P(A;;KA;;;SY)(A;;KA;;;BA)(A;;KA;;;BU)");
+        let mut sd = ptr::null_mut();
+        assert_ne!(
+            unsafe {
+                ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                    sddl.as_ptr(),
+                    SDDL_REVISION_1,
+                    &mut sd,
+                    ptr::null_mut(),
+                )
+            },
+            0
+        );
+        let opened = open_with(&open_key, 0x0004_0000).unwrap(); // WRITE_DAC
+        let rc = unsafe { RegSetKeySecurity(opened.key, DACL_SECURITY_INFORMATION, sd) };
+        unsafe { LocalFree(sd as _) };
+        drop(opened);
+        assert_eq!(rc, ERROR_SUCCESS);
+        let refused = require_trusted_key(&open_key);
+        let below = require_trusted_key(&format!(r"{open_key}\NotYet\Deeper"));
+        let allowed = require_trusted_key(&closed_key);
+        assert!(matches!(refused, Err(RegError::Denied(_))), "{refused:?}");
+        assert!(matches!(below, Err(RegError::Denied(_))), "{below:?}");
+        assert!(allowed.is_ok(), "{allowed:?}");
+        // Keys whose default security lets only SYSTEM and Administrators
+        // write are accepted.
+        for key in [r"HKLM\SOFTWARE\Classes", r"HKLM\SOFTWARE"] {
+            let trusted = require_trusted_key(key);
+            assert!(trusted.is_ok(), "{key}: {trusted:?}");
+        }
+        // Windows' default security on these lets TERMINAL SERVER USER
+        // write: refused, and the message says who.
+        for key in [
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall",
+            r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\SharedDLLs",
+        ] {
+            match require_trusted_key(key) {
+                Err(RegError::Denied(why)) => {
+                    assert!(why.contains("TERMINAL SERVER USER"), "{key}: {why}")
+                }
+                other => panic!("{key}: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn live_a_transaction_fails_when_a_touched_key_changes_elsewhere() {
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendTxTest{}",
+            std::process::id()
+        ));
+        let child = format!(r"{}\Child", root.0);
+        let mut reg = WindowsRegistry;
+        reg.set_value(&root.0, "keep", &ValueKind::Dword(1))
+            .unwrap();
+        reg.set_value(&root.0, "stale", &ValueKind::Dword(1))
+            .unwrap();
+        reg.set_value(&child, "x", &ValueKind::Dword(1)).unwrap();
+
+        // Changed elsewhere after the touch: the commit fails, nothing applied.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&root.0).unwrap();
+        reg.set_value(&root.0, "keep", &ValueKind::Dword(2))
+            .unwrap();
+        let _ = tx.delete_value(&root.0, "stale");
+        assert!(Box::new(tx).commit().is_err());
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+
+        // Dropped without commit: rolled back.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&root.0).unwrap();
+        tx.delete_value(&root.0, "stale").unwrap();
+        assert!(
+            !tx.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+        drop(tx);
+        assert!(
+            reg.values(&root.0)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "stale")
+        );
+
+        // Untouched by anyone else: a whole subtree goes on commit.
+        let mut tx = WindowsTransaction::begin().unwrap();
+        tx.touch(&child).unwrap();
+        tx.delete_tree(&child).unwrap();
+        assert!(
+            reg.subkeys(&root.0).unwrap().iter().any(|k| k == "Child"),
+            "visible before commit"
+        );
+        Box::new(tx).commit().unwrap();
+        assert!(!reg.subkeys(&root.0).unwrap().iter().any(|k| k == "Child"));
+    }
+
+    #[test]
+    fn live_restore_writes_in_one_transaction_and_never_through_a_link() {
+        use crate::regfile::{RegOp, apply_ops};
+        // This test is about links; the trust rule has its own test.
+        TRUST_ANYWAY.with(|flag| flag.set(true));
+        let keys = LinkedKeys::create_named("Restore");
+        let mut reg = WindowsRegistry;
+        let restored = keys.path("Restored");
+        let ok = vec![
+            RegOp::CreateKey(restored.clone()),
+            RegOp::SetValue {
+                key: restored.clone(),
+                name: "x".into(),
+                data: ValueKind::Dword(7),
+            },
+        ];
+        apply_ops(&mut reg, &ok).expect("plain restore");
+        assert!(
+            reg.values(&restored)
+                .unwrap()
+                .iter()
+                .any(|v| v.name == "x" && v.data == ValueKind::Dword(7))
+        );
+        // Through the link: refused, and the first write of the same
+        // restore is rolled back with it.
+        let through = vec![
+            RegOp::SetValue {
+                key: restored.clone(),
+                name: "y".into(),
+                data: ValueKind::Dword(8),
+            },
+            RegOp::SetValue {
+                key: keys.path(r"Holder\Link"),
+                name: "planted".into(),
+                data: ValueKind::Dword(1),
+            },
+        ];
+        assert!(apply_ops(&mut reg, &through).is_err());
+        let target = reg.values(&keys.path("Target")).unwrap();
+        assert!(
+            !target.iter().any(|v| v.name == "planted"),
+            "written through a link"
+        );
+        assert!(
+            !reg.values(&restored).unwrap().iter().any(|v| v.name == "y"),
+            "a failed restore left part of itself"
+        );
+    }
+
+    #[test]
+    fn live_set_value_creates_missing_parent_keys() {
+        // A fresh profile has no StartupApproved key yet; writing a flag
+        // there must create every missing level, not fail with not found.
+        struct Cleanup(String);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = WindowsRegistry.delete_tree(&self.0);
+            }
+        }
+        // Its own root: the other live tests share TestKey's.
+        let root = Cleanup(format!(
+            r"HKCU\Software\HiveMendCreateTest{}",
+            std::process::id()
+        ));
+        let mut reg = WindowsRegistry;
+        assert!(matches!(reg.values(&root.0), Err(RegError::NotFound)));
+        let deep = format!(r"{}\New\Deeper\Leaf", root.0);
+        assert!(matches!(reg.values(&deep), Err(RegError::NotFound)));
+        let data = ValueKind::Binary(vec![3, 0, 0, 0, 1, 2, 3, 4, 5, 6, 7, 8]);
+        reg.set_value(&deep, "Flag", &data)
+            .expect("write through new keys");
+        let values = reg.values(&deep).expect("read new key");
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Flag" && value.data == data)
+        );
+        // Writing again replaces the value in the key that now exists.
+        reg.set_value(&deep, "Flag", &ValueKind::Dword(2))
+            .expect("rewrite");
+        let values = reg.values(&deep).expect("re-read new key");
+        assert!(
+            values
+                .iter()
+                .any(|value| value.name == "Flag" && value.data == ValueKind::Dword(2))
+        );
+    }
+
+    #[test]
     fn live_missing_key_reads_fail_cleanly() {
         let reg = WindowsRegistry;
         assert!(reg.subkeys(r"HKCU\Software\HiveMendNoSuchKey").is_err());
@@ -1051,7 +1765,11 @@ mod live_tests {
 
     impl LinkedKeys {
         fn create() -> Self {
-            let root = format!(r"HKCU\Software\HiveMendLinkTest{}", std::process::id());
+            Self::create_named("")
+        }
+
+        fn create_named(tag: &str) -> Self {
+            let root = format!(r"HKCU\Software\HiveMendLinkTest{tag}{}", std::process::id());
             let subkey = root.strip_prefix("HKCU\\").unwrap().to_string();
             // The guard exists before any setup step can fail, so a failed
             // assert still cleans up.

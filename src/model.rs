@@ -152,6 +152,39 @@ impl ValueKind {
             _ => None,
         }
     }
+
+    /// The registry type and the exact bytes Windows stores for this value.
+    pub fn encoded(&self) -> (u32, Vec<u8>) {
+        fn utf16z(text: &str, out: &mut Vec<u8>) {
+            for unit in text.encode_utf16() {
+                out.extend(unit.to_le_bytes());
+            }
+            out.extend([0, 0]);
+        }
+        match self {
+            Self::Sz(text) => {
+                let mut out = Vec::new();
+                utf16z(text, &mut out);
+                (1, out)
+            }
+            Self::ExpandSz(text) => {
+                let mut out = Vec::new();
+                utf16z(text, &mut out);
+                (2, out)
+            }
+            Self::Binary(bytes) => (3, bytes.clone()),
+            Self::Dword(value) => (4, value.to_le_bytes().to_vec()),
+            Self::MultiSz(parts) => {
+                let mut out = Vec::new();
+                for part in parts {
+                    utf16z(part, &mut out);
+                }
+                out.extend([0, 0]);
+                (7, out)
+            }
+            Self::Other { kind, bytes } => (*kind, bytes.clone()),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -189,6 +222,17 @@ pub struct Finding {
 }
 
 impl Finding {
+    /// A registry repair in a hive the signed-in user can write, which an
+    /// administrator window leaves to a normal window.
+    pub fn per_user(&self) -> bool {
+        match &self.repair {
+            Repair::DeleteValue { key, .. } | Repair::DeleteKey { key } => {
+                crate::pathutil::per_user_key(key)
+            }
+            Repair::None | Repair::DeleteFile { .. } => false,
+        }
+    }
+
     pub fn repairable(&self) -> bool {
         !matches!(self.repair, Repair::None)
     }

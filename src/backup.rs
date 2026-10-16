@@ -24,37 +24,341 @@ pub fn backup_name(now: SystemTime) -> String {
     format!("hive-mend-{}.reg", ymd_hms(secs))
 }
 
-/// Reserve a unique backup path by creating the file now. Two repairs within
-/// the same second would otherwise derive the same second-resolution name and
-/// the second would truncate the first, destroying its recovery record. The
-/// returned file exists (empty); the caller fills it with [`write_backup`],
-/// and its sidecar directory is derived from this unique name.
-pub fn reserve_backup_path(dir: &Path, now: SystemTime) -> std::io::Result<PathBuf> {
-    std::fs::create_dir_all(dir)?;
-    let base = backup_name(now);
-    let stem = base.strip_suffix(".reg").unwrap_or(&base);
-    for attempt in 0..10_000u32 {
-        let name = if attempt == 0 {
-            base.clone()
-        } else {
-            format!("{stem}-{attempt}.reg")
-        };
-        let path = dir.join(&name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Ok(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(err) => return Err(err),
+/// A reserved backup file, written only through the handle that created
+/// it, so nothing else can be truncated or redirected in its place.
+/// Every [`append`](BackupWriter::append) is flushed to disk before it
+/// returns: a repair deletes only after its record is durable.
+pub struct BackupWriter {
+    file: std::fs::File,
+    path: PathBuf,
+    started: bool,
+    /// Bytes written so far, to the backup and to its signature.
+    len: u64,
+    sig_len: u64,
+    /// The limits this writer keeps to: the reader's.
+    max_len: u64,
+    max_sig: u64,
+    /// A write failed: nothing more is written, so the job stops.
+    failed: bool,
+    /// The keyed signature kept beside it, for administrator backups.
+    signature: Option<(std::fs::File, Box<dyn RunningMac>)>,
+}
+
+/// The largest backup Hivemend restores, and so the largest it writes: an
+/// append that would pass it is refused before anything is written.
+pub const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
+
+/// The largest signature file Hivemend reads, and so the largest it
+/// writes: room for some 50,000 saves.
+pub const MAX_SIGNATURE_BYTES: u64 = 4 * 1024 * 1024;
+
+/// The longest signature line: a 20-digit length, a space, 64 hex
+/// characters (HMAC-SHA256), and CRLF.
+const MAX_SIGNATURE_LINE: u64 = 20 + 1 + 64 + 2;
+
+/// A keyed checksum over everything fed to it so far. Sent along with its
+/// writer to the thread that does the work.
+pub trait RunningMac: Send {
+    /// Add `bytes`; returns the checksum of everything added so far.
+    fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String>;
+}
+
+/// Where a backup's signature is kept: `<backup>.sig`.
+pub fn signature_path(backup: &Path) -> PathBuf {
+    let mut path = backup.as_os_str().to_owned();
+    path.push(".sig");
+    PathBuf::from(path)
+}
+
+/// A checksum in lowercase hex.
+pub fn signature_text(mac: &[u8]) -> String {
+    mac.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+/// The signature file holds one line per append, never rewritten:
+/// `<length> <checksum of the backup's first length bytes>`. A restore uses
+/// the longest prefix whose line matches, so an interrupted append leaves
+/// every earlier one usable.
+pub fn signature_line(len: u64, mac: &[u8]) -> String {
+    format!("{len} {}\r\n", signature_text(mac))
+}
+
+/// The (length, checksum hex) lines of a signature file, longest first;
+/// a cut-off last line is ignored. The single checksum an earlier version
+/// wrote counts as covering the whole backup (`whole_len`).
+#[cfg_attr(not(windows), allow(dead_code))]
+pub fn signature_generations(text: &str, whole_len: u64) -> Vec<(u64, String)> {
+    let hex = |part: &str| {
+        part.len() >= 16
+            && part.len().is_multiple_of(2)
+            && part.bytes().all(|b| b.is_ascii_hexdigit())
+    };
+    let whole = text.trim();
+    if whole.len() == 64 && hex(whole) {
+        return vec![(whole_len, text.trim().to_ascii_lowercase())];
+    }
+    let mut found: Vec<(u64, String)> = text
+        .split("\r\n")
+        .filter_map(|line| {
+            let (len, mac) = line.split_once(' ')?;
+            (hex(mac)).then_some((len.parse().ok()?, mac.to_ascii_lowercase()))
+        })
+        .collect();
+    found.sort_by_key(|(len, _)| std::cmp::Reverse(*len));
+    found
+}
+
+fn create_reserved(path: &Path) -> std::io::Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // Delete access, so an unused reservation is removed through this
+        // handle; read sharing only, so nothing else can write, rename, or
+        // delete it while it is held.
+        const DELETE: u32 = 0x0001_0000;
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        const SYNCHRONIZE: u32 = 0x0010_0000;
+        const FILE_SHARE_READ: u32 = 0x1;
+        options.access_mode(GENERIC_WRITE | DELETE | SYNCHRONIZE);
+        options.share_mode(FILE_SHARE_READ);
+    }
+    options.open(path)
+}
+
+fn dispose(file: &std::fs::File, path: &Path) {
+    #[cfg(windows)]
+    {
+        let _ = path;
+        crate::fs::host_dispose(file);
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = file;
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+impl BackupWriter {
+    /// Reserve `<dir>\<stem>.reg`, or `<stem>-2.reg` and so on, by creating
+    /// it. Two repairs in the same second never share a file.
+    pub fn reserve(dir: &Path, stem: &str) -> std::io::Result<Self> {
+        std::fs::create_dir_all(dir)?;
+        for attempt in 0..10_000u32 {
+            let name = if attempt == 0 {
+                format!("{stem}.reg")
+            } else {
+                format!("{stem}-{}.reg", attempt + 1)
+            };
+            let path = dir.join(&name);
+            match create_reserved(&path) {
+                Ok(file) => {
+                    return Ok(Self {
+                        file,
+                        path,
+                        started: false,
+                        len: 0,
+                        sig_len: 0,
+                        max_len: MAX_BACKUP_BYTES,
+                        max_sig: MAX_SIGNATURE_BYTES,
+                        failed: false,
+                        signature: None,
+                    });
+                }
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(err) => return Err(err),
+            }
+        }
+        Err(std::io::Error::new(
+            std::io::ErrorKind::AlreadyExists,
+            "could not reserve a unique backup name",
+        ))
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// True until something has been written.
+    pub fn is_empty(&self) -> bool {
+        !self.started
+    }
+
+    /// Keep a keyed signature of the backup beside it, in a new
+    /// `<backup>.sig`, brought up to date by every append. Only before
+    /// anything is written.
+    pub fn sign_with(&mut self, mac: Box<dyn RunningMac>) -> std::io::Result<()> {
+        if self.started || self.signature.is_some() {
+            return Err(std::io::Error::other("the backup is already being written"));
+        }
+        let file = create_reserved(&signature_path(&self.path))?;
+        self.signature = Some((file, mac));
+        Ok(())
+    }
+
+    /// True when a signature is being kept.
+    pub fn is_signed(&self) -> bool {
+        self.signature.is_some()
+    }
+
+    /// True once a write has failed; every later append fails too.
+    pub fn has_failed(&self) -> bool {
+        self.failed
+    }
+
+    /// Lower limits, so tests can reach them with small files.
+    #[cfg(test)]
+    pub(crate) fn limit_for_test(&mut self, max_len: u64, max_sig: u64) {
+        self.max_len = max_len;
+        self.max_sig = max_sig;
+    }
+
+    /// Bytes `text` takes once encoded (with the byte-order mark if it is
+    /// the first thing written).
+    fn encoded_len(&self, text: &str, first: bool) -> u64 {
+        text.encode_utf16().count() as u64 * 2 + if first { 2 } else { 0 }
+    }
+
+    /// True when appending each of `texts` in turn stays within the
+    /// limits, signature lines included.
+    fn fits(&self, texts: &[&str]) -> bool {
+        let mut len = self.len;
+        let mut sig = self.sig_len;
+        for (index, text) in texts.iter().enumerate() {
+            len += self.encoded_len(text, !self.started && index == 0);
+            if self.signature.is_some() {
+                sig += MAX_SIGNATURE_LINE;
+            }
+        }
+        len <= self.max_len && sig <= self.max_sig
+    }
+
+    /// Append `text` only if `then` will fit after it as well, so a record
+    /// that must follow (an entry's confirmation) can always be written.
+    /// Refused with `FileTooLarge` before anything is written otherwise.
+    pub fn append_reserving(&mut self, text: &str, then: &str) -> std::io::Result<()> {
+        if !self.fits(&[text, then]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "the backup would be larger than Hivemend can restore",
+            ));
+        }
+        self.append(text)
+    }
+
+    /// Append `text` as UTF-16 (with the byte-order mark first) and flush it
+    /// to disk, then add its signature line. An append that would make the
+    /// backup larger than [`MAX_BACKUP_BYTES`] is refused (`FileTooLarge`)
+    /// before anything is written. If a write fails, the backup is cut back
+    /// to its last complete append and no more is written: the caller
+    /// stops, and nothing is removed on the strength of an incomplete record.
+    pub fn append(&mut self, text: &str) -> std::io::Result<()> {
+        use std::io::{Seek, Write};
+        if self.failed {
+            return Err(std::io::Error::other(
+                "an earlier write to the backup failed, so nothing more is written",
+            ));
+        }
+        let mut bytes = Vec::with_capacity(text.len() * 2 + 2);
+        if !self.started {
+            bytes.extend([0xFF, 0xFE]);
+        }
+        for unit in text.encode_utf16() {
+            bytes.extend(unit.to_le_bytes());
+        }
+        let new_len = self.len + bytes.len() as u64;
+        if !self.fits(&[text]) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::FileTooLarge,
+                "the backup would be larger than Hivemend can restore",
+            ));
+        }
+        let written = (&self.file)
+            .write_all(&bytes)
+            .and_then(|()| self.file.sync_data());
+        if let Err(err) = written {
+            self.failed = true;
+            let _ = self.file.set_len(self.len);
+            let _ = (&self.file).seek(std::io::SeekFrom::Start(self.len));
+            let _ = self.file.sync_data();
+            return Err(err);
+        }
+        self.len = new_len;
+        self.started = true;
+        if let Some((file, mac)) = &mut self.signature {
+            // One new line per append; earlier lines are never touched, so
+            // a failure here leaves every earlier append verifiable.
+            let signed = mac
+                .update(&bytes)
+                .map_err(std::io::Error::other)
+                .and_then(|mac| {
+                    let line = signature_line(new_len, &mac);
+                    (&*file).write_all(line.as_bytes())?;
+                    file.sync_data()?;
+                    Ok(line.len() as u64)
+                });
+            match signed {
+                Ok(written) => self.sig_len += written,
+                Err(err) => {
+                    self.failed = true;
+                    return Err(err);
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove an unused reservation, through its own handle. A file that
+    /// has been written is a recovery record and is kept.
+    pub fn discard(self) {
+        if self.started {
+            return;
+        }
+        dispose(&self.file, &self.path);
+        if let Some((file, _)) = &self.signature {
+            dispose(file, &signature_path(&self.path));
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::AlreadyExists,
-        "could not reserve a unique backup name",
-    ))
 }
+
+/// A writer for tests, reserved in this process's own temp folder.
+#[cfg(test)]
+pub(crate) fn test_writer(stem: &str) -> BackupWriter {
+    let dir = std::env::temp_dir().join(format!("hm-tests-{}", std::process::id()));
+    BackupWriter::reserve(&dir, stem).expect("reserve a test backup")
+}
+
+/// Reserve the next `hive-mend-<time>.reg` in `dir`.
+pub fn reserve_backup(dir: &Path, now: SystemTime) -> std::io::Result<BackupWriter> {
+    let name = backup_name(now);
+    BackupWriter::reserve(dir, name.strip_suffix(".reg").unwrap_or(&name))
+}
+
+/// The registry sections a backup holds for `repairs`, without the file's
+/// header, and the keys that could not be read.
+pub fn registry_sections(reg: &dyn Registry, repairs: &[Repair]) -> (String, Vec<String>) {
+    let registry: Vec<Repair> = repairs
+        .iter()
+        .filter(|repair| {
+            matches!(
+                repair,
+                Repair::DeleteKey { .. } | Repair::DeleteValue { .. }
+            )
+        })
+        .cloned()
+        .collect();
+    let plan = export_repairs(reg, &registry, Path::new("unused.reg"));
+    let body = plan
+        .body
+        .split_once(HEADER_END)
+        .map(|(_, rest)| rest.to_string())
+        .unwrap_or_default();
+    (body, plan.unreadable)
+}
+
+/// The last line of every backup's header.
+const HEADER_END: &str = "; Restore it from the Restore page in Hivemend.\r\n";
 
 /// What a repair is about to remove, in `.reg` form.
 pub struct BackupPlan {
@@ -148,7 +452,9 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
     let mut body = String::from("Windows Registry Editor Version 5.00\r\n\r\n");
     body.push_str(BACKUP_MARKER);
     body.push_str("\r\n");
-    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
+    body.push_str(crate::regfile::FORMAT_2);
+    body.push_str("\r\n");
+    body.push_str(HEADER_END);
     let mut unreadable = Vec::new();
 
     for key in trees {
@@ -158,7 +464,9 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                 body.push_str("\r\n");
                 body.push_str(&section);
             }
-            Err(RegError::NotFound) => body.push_str(&format!("\r\n; already gone {key}\r\n")),
+            Err(RegError::NotFound) => {
+                body.push_str(&format!("\r\n; already gone {key}\r\n"));
+            }
             Err(err) => {
                 body.push_str(&format!(
                     "\r\n; not backed up, left alone: {key}: {err}\r\n"
@@ -192,7 +500,7 @@ pub fn export_repairs(reg: &dyn Registry, repairs: &[Repair], backup_file: &Path
                             body.push_str("\r\n");
                         }
                         None => {
-                            body.push_str(&format!("; already gone {}\r\n", value_label(&name)))
+                            body.push_str(&format!("; already gone {}\r\n", value_label(&name)));
                         }
                     }
                 }
@@ -302,7 +610,7 @@ fn export_tree(
     Ok(())
 }
 
-fn format_value(value: &RegValue) -> String {
+pub(crate) fn format_value(value: &RegValue) -> String {
     let name = if value.name.is_empty() {
         "@".to_string()
     } else {
@@ -405,15 +713,13 @@ fn civil_from_days(days_since_epoch: i64) -> (i32, u32, u32) {
     (year, month, day)
 }
 
-pub fn write_backup(path: &Path, body: &str) -> Result<(), std::io::Error> {
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
+/// A `.reg` body as Regedit writes it: UTF-16LE with a byte-order mark.
+pub fn encode_reg(body: &str) -> Vec<u8> {
     let mut bytes = vec![0xFF, 0xFE];
     for unit in body.encode_utf16() {
         bytes.extend(unit.to_le_bytes());
     }
-    std::fs::write(path, bytes)
+    bytes
 }
 
 /// Read a `.reg` file written by this program or by Regedit (UTF-16 or ANSI).
@@ -430,30 +736,42 @@ pub struct BackupSummary {
     pub files: Vec<(String, PathBuf)>,
     /// Restoring writes to HKEY_LOCAL_MACHINE or another machine-wide hive.
     pub machine_wide: bool,
+    /// Restoring writes to HKEY_CURRENT_USER.
+    pub per_user: bool,
+    /// Entries saved but never confirmed as removed (a repair that stopped
+    /// part way), by number and first key: never restored automatically,
+    /// their data stays in the file for manual recovery.
+    pub unconfirmed: Vec<(usize, String)>,
 }
 
 impl BackupSummary {
+    /// What a restore of `text` would do, from the same parser the restore
+    /// uses, so the listing and the restore never disagree. A file the
+    /// parser refuses shows no registry changes.
     pub fn parse(text: &str) -> Self {
+        use crate::regfile::RegOp;
         let mut summary = Self::default();
-        let mut continued = false;
-        for line in text.lines() {
-            let line = line.trim_end_matches('\r');
-            let was_continued = continued;
-            continued = line.ends_with('\\');
-            if was_continued {
-                continue;
-            }
-            if let Some(key) = line.strip_prefix('[') {
-                summary.keys += 1;
-                let upper = key.to_ascii_uppercase();
-                if !upper.starts_with("HKEY_CURRENT_USER")
-                    && !upper.starts_with("-HKEY_CURRENT_USER")
+        if let Ok(parsed) = crate::regfile::parse_backup(text) {
+            summary.unconfirmed = parsed.unconfirmed.clone();
+            for op in &parsed.ops {
+                match op {
+                    RegOp::CreateKey(_) | RegOp::DeleteKey(_) => summary.keys += 1,
+                    RegOp::SetValue { .. } | RegOp::DeleteValue { .. } => summary.values += 1,
+                }
+                if op
+                    .key()
+                    .to_ascii_uppercase()
+                    .starts_with("HKEY_CURRENT_USER")
                 {
+                    summary.per_user = true;
+                } else {
                     summary.machine_wide = true;
                 }
-            } else if line.starts_with('"') || line.starts_with('@') {
-                summary.values += 1;
-            } else if let Some(rest) = line.strip_prefix(FILE_LINE)
+            }
+        }
+        for line in text.lines() {
+            let line = line.trim_end_matches('\r');
+            if let Some(rest) = line.strip_prefix(FILE_LINE)
                 && let Some((original, copy)) = rest.split_once(FILE_ARROW)
             {
                 summary
@@ -475,38 +793,251 @@ pub struct BackupInfo {
     pub summary: BackupSummary,
 }
 
-/// `.reg` files in one backup folder, newest first.
-pub fn list_backups(dir: &Path, store: crate::store::Store) -> Vec<BackupInfo> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
+/// What one backup folder contributed to the inventory: the backups that
+/// could be listed and read, newest first, plus one line per failure. A
+/// folder that does not exist yet contributes nothing and no error: its
+/// store is optional until the first repair writes to it. Anything else
+/// that goes wrong is reported here, never shown as an empty or partial
+/// list with no warning.
+#[derive(Clone, Debug, Default)]
+pub struct BackupInventory {
+    pub items: Vec<BackupInfo>,
+    pub errors: Vec<String>,
+}
+
+/// `.reg` files in one backup folder, newest first, with read failures.
+pub fn list_backups(dir: &Path, store: crate::store::Store) -> BackupInventory {
+    list_backups_until(dir, store, &|| false)
+}
+
+/// [`list_backups`], giving up between files once `stop` says the answer is
+/// no longer wanted (what it found by then is returned).
+pub fn list_backups_until(
+    dir: &Path,
+    store: crate::store::Store,
+    stop: &dyn Fn() -> bool,
+) -> BackupInventory {
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        // Not created yet: an optional store, not a failure.
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return BackupInventory::default();
+        }
+        Err(err) => {
+            return BackupInventory {
+                items: Vec::new(),
+                errors: vec![format!("could not list {}: {err}", dir.display())],
+            };
+        }
     };
-    let mut found = Vec::new();
-    for entry in entries.flatten() {
+    inventory_from_entries(dir, store, entries, stop, &dir_entry_stat, &read_backup)
+}
+
+/// What the inventory knows about one enumerated entry, from a single
+/// fallible query: whether it is a regular file, and for a file its size
+/// and timestamp. One query keeps type and metadata from disagreeing, and a
+/// failed query is an error, never a guess.
+struct EntryStat {
+    is_file: bool,
+    len: u64,
+    modified: Option<SystemTime>,
+}
+
+/// [`EntryStat`] through the platform: follows links like the listing
+/// always has, and reports any failure instead of defaulting.
+fn dir_entry_stat(entry: &std::fs::DirEntry) -> Result<EntryStat, String> {
+    entry
+        .metadata()
+        .map(|meta| EntryStat {
+            is_file: meta.is_file(),
+            len: meta.len(),
+            modified: meta.modified().ok(),
+        })
+        .map_err(|err| err.to_string())
+}
+
+/// [`list_backups_until`] over an entry stream, checking entries through
+/// `stat` and reading through `read`: the seam fault-injection tests use
+/// for unreadable entries, uncheckable entries, and files.
+fn inventory_from_entries(
+    dir: &Path,
+    store: crate::store::Store,
+    entries: impl IntoIterator<Item = std::io::Result<std::fs::DirEntry>>,
+    stop: &dyn Fn() -> bool,
+    stat: &dyn Fn(&std::fs::DirEntry) -> Result<EntryStat, String>,
+    read: &dyn Fn(&Path) -> Result<String, std::io::Error>,
+) -> BackupInventory {
+    let mut inventory = BackupInventory::default();
+    for entry in entries {
+        if stop() {
+            break;
+        }
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(err) => {
+                inventory.errors.push(format!(
+                    "an entry in {} could not be read ({err}); the list may be incomplete",
+                    dir.display()
+                ));
+                continue;
+            }
+        };
         let path = entry.path();
         let is_reg = path
             .extension()
             .and_then(|ext| ext.to_str())
             .is_some_and(|ext| ext.eq_ignore_ascii_case("reg"));
-        if !is_reg || !path.is_file() {
+        if !is_reg {
             continue;
         }
-        let meta = entry.metadata().ok();
-        let summary = read_backup(&path)
-            .map(|text| BackupSummary::parse(&text))
-            .unwrap_or_default();
-        found.push(BackupInfo {
+        // An entry whose type cannot be checked is unknown, not a known
+        // non-file: it is reported and left out, never silently skipped.
+        let stat = match stat(&entry) {
+            Ok(stat) => stat,
+            Err(err) => {
+                inventory.errors.push(format!(
+                    "could not check {} ({err}); it is not listed",
+                    path.display()
+                ));
+                continue;
+            }
+        };
+        if !stat.is_file {
+            continue;
+        }
+        // A file larger than any restore accepts is not even read.
+        let summary = if stat.len <= MAX_BACKUP_BYTES {
+            match read(&path) {
+                Ok(text) => BackupSummary::parse(&text),
+                Err(err) => {
+                    inventory.errors.push(format!(
+                        "could not read {} ({err}); it is not listed",
+                        path.display()
+                    ));
+                    continue;
+                }
+            }
+        } else {
+            BackupSummary::default()
+        };
+        inventory.items.push(BackupInfo {
             store,
-            modified: meta.as_ref().and_then(|meta| meta.modified().ok()),
-            size: meta.map(|meta| meta.len()).unwrap_or(0),
+            modified: stat.modified,
+            size: stat.len,
             path,
             summary,
         });
     }
-    found.sort_by_key(|info| std::cmp::Reverse(info.modified));
-    found
+    inventory
+        .items
+        .sort_by_key(|info| std::cmp::Reverse(info.modified));
+    inventory
 }
 
-/// True when the text carries a Hive Mend marker line: the unified marker, or
+/// One background worker answering refresh requests, newest first. A request
+/// made while the worker runs does not start another: the worker sees it,
+/// stops its current pass early, and starts again for the newest one. Only a
+/// result for the newest request is published, and nothing older can replace
+/// it. Every request gets an answer: a pass that fails (panics) publishes
+/// `None` instead of a value, unless a newer request is already waiting, which
+/// is then answered as usual.
+pub struct Refresher<T> {
+    state: std::sync::Mutex<RefreshState<T>>,
+}
+
+struct RefreshState<T> {
+    wanted: u64,
+    running: bool,
+    ready: Option<(u64, Option<T>)>,
+}
+
+impl<T> Default for Refresher<T> {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl<T> Refresher<T> {
+    pub const fn new() -> Self {
+        Self {
+            state: std::sync::Mutex::new(RefreshState {
+                wanted: 0,
+                running: false,
+                ready: None,
+            }),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, RefreshState<T>> {
+        self.state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Ask for a fresh answer. Returns the request's number, or `None` when
+    /// the worker already running will take it up instead.
+    pub fn request(&self) -> Option<u64> {
+        let mut state = self.lock();
+        state.wanted += 1;
+        if state.running {
+            return None;
+        }
+        state.running = true;
+        Some(state.wanted)
+    }
+
+    /// The newest request's number.
+    pub fn wanted(&self) -> u64 {
+        self.lock().wanted
+    }
+
+    /// The published answer (`None` if it failed) and the request it
+    /// answers, taken once.
+    pub fn take(&self) -> Option<(u64, Option<T>)> {
+        self.lock().ready.take()
+    }
+
+    /// The worker for request `number` could not be started: that request
+    /// is answered as failed, and the next request starts a worker.
+    pub fn not_started(&self, number: u64) {
+        let mut state = self.lock();
+        state.running = false;
+        if state.wanted == number {
+            state.ready = Some((number, None));
+        }
+    }
+
+    /// The worker's loop for request `number` (from [`request`]): compute,
+    /// passing a check that turns true once a newer request is made, and
+    /// publish if no newer one came meanwhile; otherwise compute again for
+    /// the newest. `published` is called after each publish.
+    ///
+    /// [`request`]: Refresher::request
+    pub fn work(
+        &self,
+        mut number: u64,
+        compute: impl Fn(&dyn Fn() -> bool) -> T,
+        published: impl Fn(),
+    ) {
+        loop {
+            let value = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                compute(&|| self.wanted() != number)
+            }))
+            .ok();
+            let mut state = self.lock();
+            if state.wanted == number {
+                state.ready = Some((number, value));
+                state.running = false;
+                drop(state);
+                published();
+                return;
+            }
+            number = state.wanted;
+        }
+    }
+}
+
+/// True when the text carries a Hivemend marker line: the unified marker, or
 /// the older services-only marker so a services backup can still be restored.
 pub fn is_hive_mend_backup(text: &str) -> bool {
     text.lines().any(|line| {
@@ -515,49 +1046,303 @@ pub fn is_hive_mend_backup(text: &str) -> bool {
     })
 }
 
-/// Merge a `.reg` file with the 64-bit `reg.exe`, the same as Regedit's Merge.
-/// Refuses files this program did not write.
-#[cfg(windows)]
-pub fn import_reg_file(path: &Path) -> Result<(), String> {
-    let text =
-        read_backup(path).map_err(|err| format!("could not read {}: {err}", path.display()))?;
-    if !is_hive_mend_backup(&text) {
-        return Err(format!(
-            "{} is not a Hive Mend backup; refusing to merge it",
-            path.display()
-        ));
-    }
-    use std::os::windows::process::CommandExt;
-    const CREATE_NO_WINDOW: u32 = 0x0800_0000;
-    // System32 from the API, not %SystemRoot%: an elevated restore must run
-    // the real reg.exe, whatever environment launched this process.
-    let system = crate::fs::host_known_dir(crate::fs::KnownDir::System)
-        .ok_or("could not locate the System32 folder")?;
-    let reg_exe = Path::new(&system).join("reg.exe");
-    let output = std::process::Command::new(reg_exe)
-        .arg("import")
-        .arg(path)
-        .creation_flags(CREATE_NO_WINDOW)
-        .output()
-        .map_err(|err| format!("could not start reg.exe: {err}"))?;
-    if output.status.success() {
-        return Ok(());
-    }
-    let mut message = String::from_utf8_lossy(&output.stderr).trim().to_string();
-    if message.is_empty() {
-        message = String::from_utf8_lossy(&output.stdout).trim().to_string();
-    }
-    if message.is_empty() {
-        message = format!("reg.exe import failed ({})", output.status);
-    }
-    Err(message)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::{Repair, ScannerId};
     use crate::registry::MemoryRegistry;
+
+    #[test]
+    fn one_backup_reader_runs_and_only_the_newest_answer_is_published() {
+        use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+        use std::sync::{Arc, mpsc};
+        use std::time::{Duration, Instant};
+        let refresher = Arc::new(Refresher::<usize>::new());
+        let active = Arc::new(AtomicUsize::new(0));
+        let most = Arc::new(AtomicUsize::new(0));
+        let passes = Arc::new(AtomicUsize::new(0));
+        let stopped_early = Arc::new(AtomicBool::new(false));
+        let published = Arc::new(AtomicUsize::new(0));
+        let (started, wait_started) = mpsc::channel::<()>();
+        let started = std::sync::Mutex::new(started);
+        let first = refresher
+            .request()
+            .expect("the first request starts the reader");
+        let worker = {
+            let (refresher, active, most, passes, stopped_early, published) = (
+                refresher.clone(),
+                active.clone(),
+                most.clone(),
+                passes.clone(),
+                stopped_early.clone(),
+                published.clone(),
+            );
+            std::thread::spawn(move || {
+                refresher.work(
+                    first,
+                    |stale: &dyn Fn() -> bool| {
+                        let now = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        most.fetch_max(now, Ordering::SeqCst);
+                        let pass = passes.fetch_add(1, Ordering::SeqCst);
+                        if pass == 0 {
+                            // A slow first pass: it waits to be superseded.
+                            started.lock().unwrap().send(()).unwrap();
+                            let deadline = Instant::now() + Duration::from_secs(20);
+                            while !stale() && Instant::now() < deadline {
+                                std::thread::sleep(Duration::from_millis(1));
+                            }
+                            stopped_early.store(stale(), Ordering::SeqCst);
+                        }
+                        active.fetch_sub(1, Ordering::SeqCst);
+                        pass
+                    },
+                    || {
+                        published.fetch_add(1, Ordering::SeqCst);
+                    },
+                )
+            })
+        };
+        wait_started.recv().unwrap();
+        // Requests while it reads start no second reader.
+        for _ in 0..5 {
+            assert_eq!(refresher.request(), None);
+        }
+        worker.join().unwrap();
+        assert!(stopped_early.load(Ordering::SeqCst), "the old pass ran on");
+        assert_eq!(passes.load(Ordering::SeqCst), 2);
+        assert_eq!(most.load(Ordering::SeqCst), 1, "two readers at once");
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        // Only the answer to the newest request, from the second pass.
+        assert_eq!(refresher.take(), Some((6, Some(1))));
+        assert_eq!(refresher.wanted(), 6);
+        assert_eq!(refresher.take(), None);
+        // Idle again: the next request starts a reader.
+        assert_eq!(refresher.request(), Some(7));
+    }
+
+    #[test]
+    fn a_reader_that_fails_still_answers_and_does_not_block_later_refreshes() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        // Failing alone: its request is answered as failed.
+        let refresher = Refresher::<u8>::new();
+        let first = refresher.request().unwrap();
+        let published = AtomicUsize::new(0);
+        refresher.work(
+            first,
+            |_: &dyn Fn() -> bool| panic!("read failed"),
+            || {
+                published.fetch_add(1, Ordering::SeqCst);
+            },
+        );
+        assert_eq!(published.load(Ordering::SeqCst), 1);
+        assert_eq!(refresher.take(), Some((1, None)));
+        // Failing with a newer request already waiting: that one is read.
+        let second = refresher.request().unwrap();
+        let passes = AtomicUsize::new(0);
+        refresher.work(
+            second,
+            |_: &dyn Fn() -> bool| {
+                if passes.fetch_add(1, Ordering::SeqCst) == 0 {
+                    assert_eq!(refresher.request(), None);
+                    panic!("read failed");
+                }
+                7
+            },
+            || {},
+        );
+        assert_eq!(refresher.take(), Some((3, Some(7))));
+        assert_eq!(refresher.request(), Some(4));
+        // A worker that could not be started: answered, and not running.
+        refresher.not_started(4);
+        assert_eq!(refresher.take(), Some((4, None)));
+        assert_eq!(refresher.request(), Some(5));
+    }
+
+    #[test]
+    fn a_backup_listing_stops_between_files_when_no_longer_wanted() {
+        let dir = std::env::temp_dir().join(format!("hm-list-stop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        for n in 0..5 {
+            std::fs::write(dir.join(format!("b{n}.reg")), b"x").unwrap();
+        }
+        let all = list_backups(&dir, crate::store::Store::User);
+        let looked = std::cell::Cell::new(0);
+        let some = list_backups_until(&dir, crate::store::Store::User, &|| {
+            looked.set(looked.get() + 1);
+            looked.get() > 2
+        });
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(all.items.len(), 5);
+        assert!(all.errors.is_empty());
+        assert_eq!(some.items.len(), 2);
+        assert!(some.errors.is_empty());
+    }
+
+    #[test]
+    fn a_missing_backup_folder_is_empty_not_failed() {
+        // PV-04: a store that was never created is the normal empty state,
+        // not a read failure.
+        let dir = std::env::temp_dir().join(format!(
+            "hm-list-missing-{}-{}",
+            std::process::id(),
+            "no-such-folder"
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        assert!(inventory.items.is_empty());
+        assert!(inventory.errors.is_empty());
+    }
+
+    #[test]
+    fn an_unlistable_backup_folder_is_reported_not_empty() {
+        // PV-04: an existing store that cannot be enumerated is a failure
+        // with a message, never a quiet "no backups".
+        let dir = std::env::temp_dir().join(format!("hm-list-file-{}", std::process::id()));
+        std::fs::write(&dir, b"not a folder").unwrap();
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        let _ = std::fs::remove_file(&dir);
+        assert!(inventory.items.is_empty());
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.errors[0].contains("could not list"),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn a_backup_that_cannot_be_read_is_reported_and_not_listed() {
+        // PV-04: a listed backup that fails to read is skipped with a
+        // message; the readable ones still list.
+        let dir = std::env::temp_dir().join(format!("hm-list-unread-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.reg"), b"unreadable").unwrap();
+        let entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &dir_entry_stat,
+            &|path| {
+                if path.file_name().and_then(|name| name.to_str()) == Some("bad.reg") {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "denied",
+                    ))
+                } else {
+                    read_backup(path)
+                }
+            },
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("good.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("bad.reg"), "{inventory:?}");
+        assert!(inventory.errors[0].contains("not listed"), "{inventory:?}");
+    }
+
+    #[test]
+    fn an_unreadable_entry_is_reported_and_the_rest_listed() {
+        // PV-04: a failure midway through enumeration leaves a labeled
+        // partial list, not a quiet short one.
+        let dir = std::env::temp_dir().join(format!("hm-list-entry-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("kept.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        let mut entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        entries.push(Err(std::io::Error::other("boom")));
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &dir_entry_stat,
+            &read_backup,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("incomplete"), "{inventory:?}");
+    }
+
+    #[test]
+    fn an_entry_that_cannot_be_checked_is_reported_and_not_listed() {
+        // PV-04 residual: a .reg entry whose file-type/metadata query fails
+        // is unknown, not a known non-file. It is reported and left out,
+        // never silently skipped or listed as an empty backup.
+        let dir = std::env::temp_dir().join(format!("hm-list-stat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(
+            dir.join("good.reg"),
+            b"Windows Registry Editor Version 5.00\r\n",
+        )
+        .unwrap();
+        std::fs::write(dir.join("bad.reg"), b"uncheckable").unwrap();
+        let entries: Vec<std::io::Result<std::fs::DirEntry>> =
+            std::fs::read_dir(&dir).unwrap().collect();
+        let inventory = inventory_from_entries(
+            &dir,
+            crate::store::Store::User,
+            entries,
+            &|| false,
+            &|entry| {
+                if entry.file_name().to_str() == Some("bad.reg") {
+                    Err("denied".to_string())
+                } else {
+                    dir_entry_stat(entry)
+                }
+            },
+            &read_backup,
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("good.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.errors.len(), 1, "{inventory:?}");
+        assert!(inventory.errors[0].contains("bad.reg"), "{inventory:?}");
+        assert!(
+            inventory.errors[0].contains("could not check"),
+            "{inventory:?}"
+        );
+    }
+
+    #[test]
+    fn folders_stay_silent_and_oversized_files_stay_listed() {
+        // Controls for the residual fix: a known directory (even named
+        // *.reg) is silently skipped, and a backup larger than any restore
+        // accepts is listed without being read, with no error either way.
+        let dir = std::env::temp_dir().join(format!("hm-list-kinds-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::create_dir_all(dir.join("sub.reg")).unwrap();
+        let big = vec![0u8; MAX_BACKUP_BYTES as usize + 1];
+        std::fs::write(dir.join("huge.reg"), &big).unwrap();
+        let inventory = list_backups(&dir, crate::store::Store::User);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(inventory.items.len(), 1, "{inventory:?}");
+        assert!(
+            inventory.items[0].path.ends_with("huge.reg"),
+            "{inventory:?}"
+        );
+        assert_eq!(inventory.items[0].size, big.len() as u64);
+        assert_eq!(inventory.items[0].summary, BackupSummary::default());
+        assert!(inventory.errors.is_empty(), "{inventory:?}");
+    }
 
     fn finding(key: &str, repair: Repair) -> Finding {
         Finding {
@@ -611,16 +1396,29 @@ mod tests {
     }
 
     #[test]
-    fn reserve_backup_path_never_reuses_a_name() {
+    fn a_reserved_backup_is_written_through_its_own_handle() {
         let dir = std::env::temp_dir().join(format!("hivemend-reserve-{}", std::process::id()));
         std::fs::remove_dir_all(&dir).ok();
         let now = UNIX_EPOCH + std::time::Duration::from_secs(1_700_000_000);
-        let first = reserve_backup_path(&dir, now).unwrap();
-        let second = reserve_backup_path(&dir, now).unwrap();
-        assert_ne!(first, second);
-        assert!(first.exists() && second.exists());
+        let mut first = reserve_backup(&dir, now).unwrap();
+        let second = reserve_backup(&dir, now).unwrap();
+        assert_ne!(first.path(), second.path());
+        assert!(first.path().exists() && second.path().exists());
         // The matching sidecar directories differ too.
-        assert_ne!(files_dir(&first), files_dir(&second));
+        assert_ne!(files_dir(first.path()), files_dir(second.path()));
+        first
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        first.append("; Hive Mend backup.\r\n").unwrap();
+        let text = read_backup(first.path()).unwrap();
+        assert!(text.starts_with("Windows Registry Editor Version 5.00"));
+        assert!(is_hive_mend_backup(&text));
+        // An unused reservation goes; a written one is kept.
+        let (first_path, second_path) = (first.path().to_path_buf(), second.path().to_path_buf());
+        first.discard();
+        second.discard();
+        assert!(first_path.exists());
+        assert!(!second_path.exists());
         std::fs::remove_dir_all(&dir).ok();
     }
 
@@ -698,23 +1496,6 @@ mod tests {
         );
         // The listed child could not be exported, so the whole tree is left.
         assert!(!plan.covers(parent));
-    }
-
-    #[test]
-    #[cfg(windows)]
-    fn import_rejects_foreign_reg_file_before_shelling_out() {
-        let dir = std::env::temp_dir().join(format!("hivemend-refuse-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let path = dir.join("crafted.reg");
-        std::fs::write(
-            &path,
-            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Evil]\r\n",
-        )
-        .unwrap();
-        let err = import_reg_file(&path).unwrap_err();
-        assert!(err.contains("not a Hive Mend backup"), "unexpected: {err}");
-        // Must fail before reg.exe is ever invoked: safe on any platform.
-        std::fs::remove_dir_all(&dir).ok();
     }
 
     #[test]
@@ -825,5 +1606,135 @@ mod tests {
         assert_eq!(summary.files.len(), 2);
         assert_eq!(summary.files[0].0, one);
         assert_eq!(summary.files[0].1, first);
+    }
+
+    /// A stand-in checksum: the running sum of the bytes, as 8 bytes.
+    struct Sum(u64);
+
+    impl RunningMac for Sum {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            self.0 = bytes
+                .iter()
+                .fold(self.0, |sum, byte| sum + u64::from(*byte));
+            Ok(self.0.to_be_bytes().to_vec())
+        }
+    }
+
+    /// Signs like `Sum` until `fail_after` appends, then fails.
+    struct FailsLater {
+        sum: Sum,
+        left: usize,
+    }
+
+    impl RunningMac for FailsLater {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            if self.left == 0 {
+                return Err("injected signing failure".into());
+            }
+            self.left -= 1;
+            self.sum.update(bytes)
+        }
+    }
+
+    #[test]
+    fn a_failed_append_keeps_every_earlier_signature_and_stops_the_writer() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-fail-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer
+            .sign_with(Box::new(FailsLater {
+                sum: Sum(0),
+                left: 2,
+            }))
+            .unwrap();
+        writer
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        writer.append("; entry 1\r\n").unwrap();
+        let signed_len = std::fs::metadata(writer.path()).unwrap().len();
+        let err = writer.append("; entry 1 removed\r\n").unwrap_err();
+        assert!(err.to_string().contains("injected"), "{err}");
+        assert!(writer.has_failed());
+        // Nothing more is written after a failure.
+        assert!(writer.append("; entry 2\r\n").is_err());
+        let sig = std::fs::read_to_string(signature_path(writer.path())).unwrap();
+        let generations = signature_generations(&sig, 0);
+        let _ = std::fs::remove_dir_all(&dir);
+        // The two complete appends are still signed, as they were.
+        assert_eq!(generations.len(), 2);
+        assert_eq!(generations[0].0, signed_len);
+    }
+
+    #[test]
+    fn a_signature_past_its_limit_is_refused_before_writing() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-limit-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer.sign_with(Box::new(Sum(0))).unwrap();
+        // Room for one signature line at its longest: the first append
+        // fits, the second would not.
+        writer.limit_for_test(MAX_BACKUP_BYTES, MAX_SIGNATURE_LINE);
+        writer.append("a\r\n").unwrap();
+        let before = std::fs::read(writer.path()).unwrap();
+        let err = writer.append("d\r\n").unwrap_err();
+        let after = std::fs::read(writer.path()).unwrap();
+        let sig = std::fs::read_to_string(signature_path(writer.path())).unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        assert_eq!(after, before, "the refused append wrote data");
+        assert_eq!(signature_generations(&sig, 0).len(), 1);
+        assert!(!writer.has_failed());
+    }
+
+    #[test]
+    fn an_append_past_the_restore_limit_is_refused_before_writing() {
+        let mut writer = test_writer("hive-mend-too-large");
+        writer
+            .append("Windows Registry Editor Version 5.00\r\n")
+            .unwrap();
+        let before = std::fs::metadata(writer.path()).unwrap().len();
+        let huge = "x".repeat((MAX_BACKUP_BYTES / 2) as usize);
+        let err = writer.append(&huge).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::FileTooLarge);
+        // Refused whole, and the writer still works for smaller entries.
+        assert!(!writer.has_failed());
+        assert_eq!(std::fs::metadata(writer.path()).unwrap().len(), before);
+        writer.append("; small\r\n").unwrap();
+        let _ = std::fs::remove_file(writer.path());
+    }
+
+    #[test]
+    fn the_signature_always_covers_exactly_what_is_on_disk() {
+        let dir = std::env::temp_dir().join(format!("hm-sig-{}", std::process::id()));
+        let mut writer = BackupWriter::reserve(&dir, "signed").unwrap();
+        writer.sign_with(Box::new(Sum(0))).unwrap();
+        let sig = signature_path(writer.path());
+        let mut expected = String::new();
+        for text in [
+            "Windows Registry Editor Version 5.00\r\n",
+            "; entry 1\r\n",
+            "[HKEY_X]\r\n",
+        ] {
+            writer.append(text).unwrap();
+            let bytes = std::fs::read(writer.path()).unwrap();
+            let sum: u64 = bytes.iter().map(|byte| u64::from(*byte)).sum();
+            // One more line per append; the earlier lines stay as they were.
+            expected.push_str(&signature_line(bytes.len() as u64, &sum.to_be_bytes()));
+            assert_eq!(std::fs::read_to_string(&sig).unwrap(), expected);
+        }
+        let generations = signature_generations(&expected, 0);
+        assert_eq!(generations.len(), 3);
+        assert!(generations[0].0 > generations[1].0, "longest first");
+        // Too late to start signing once written.
+        assert!(writer.sign_with(Box::new(Sum(0))).is_err());
+        let path = writer.path().to_path_buf();
+        drop(writer);
+        // An unused signed reservation leaves neither file behind.
+        let mut unused = BackupWriter::reserve(&dir, "unused").unwrap();
+        unused.sign_with(Box::new(Sum(0))).unwrap();
+        let unused_path = unused.path().to_path_buf();
+        unused.discard();
+        let left = (unused_path.exists(), signature_path(&unused_path).exists());
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(path.ends_with("signed.reg"));
+        assert_eq!(left, (false, false));
     }
 }

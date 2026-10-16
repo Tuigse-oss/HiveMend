@@ -11,43 +11,40 @@
 //! - The window cannot be closed while a repair or restore is running.
 #![allow(unsafe_op_in_unsafe_fn)]
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
+use hive_mend::art::Icon;
 use hive_mend::{
-    BackupInfo, BackupSummary, CleanOutcome, Engine, Exclusions, FileView, Finding, HiveEntry,
-    HostFs, ItemKind, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, RecycleItem, Repair,
-    RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
-    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, ShredMethod, ShredOptions,
-    ShredOutcome, ShredTarget, StartType, Store, WINDOWS_TOOLS, WindowsProcessList,
-    WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores, backups_dir,
-    backups_location, build_items, clean_with_progress, custom_privacy_file, decode_text_owned,
-    exclusions_file, expand_target, fixed_drives, format_bytes, format_uptime, gather_hives,
-    gather_snapshot, list_backups, list_recycle_bin, parse_custom, plan_profile, preview,
-    random_seed, repair_with_progress, restore_backup, scan_with_progress, settings_file,
-    shred_allowed, shred_paths, shred_recycle_items, sort_services, start_services, still_reported,
-    stop_services, user_dir, volume_ssd,
+    BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
+    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, Preview, PrivacyItem, Repair, RepairOutcome,
+    SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange, ServiceInfo,
+    ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, WINDOWS_TOOLS,
+    WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes, backup_stores,
+    backups_dir, backups_location, build_items, clean_with_progress, custom_privacy_file,
+    decode_text_owned, exclusions_file, expand_target, format_bytes, format_uptime, gather_hives,
+    gather_snapshot, group_digits, list_backups_until, parse_custom, plan_profile, preview_with,
+    repair_with_progress, restore_backup, scan_with_progress, settings_file, sort_services,
+    start_services, still_reported, stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
-    CreatePen, CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
+    CreateSolidBrush, DT_CALCRECT, DT_CENTER, DT_END_ELLIPSIS, DT_NOPREFIX, DT_RIGHT,
     DT_SINGLELINE, DT_VCENTER, DT_WORDBREAK, DeleteDC, DeleteObject, DrawTextW, EndPaint, FillRect,
-    GRADIENT_FILL_RECT_H, GRADIENT_FILL_RECT_V, GradientFill, HALFTONE, HBITMAP, HBRUSH, HDC,
-    HFONT, InvalidateRect, PAINTSTRUCT, RoundRect, SRCCOPY, SelectObject, SetBkColor, SetBkMode,
-    SetBrushOrgEx, SetStretchBltMode, SetTextColor, StretchBlt, TRANSPARENT, TRIVERTEX,
+    HBITMAP, HBRUSH, HDC, HFONT, InvalidateRect, PAINTSTRUCT, SRCCOPY, SelectObject, SetBkColor,
+    SetBkMode, SetTextColor, TRANSPARENT,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
 };
 use windows_sys::Win32::System::LibraryLoader::{GetModuleFileNameW, GetModuleHandleW};
 use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
-use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, REG_SZ, RegSetKeyValueW};
 use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
@@ -57,33 +54,30 @@ use windows_sys::Win32::UI::Controls::{
     LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT,
     LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
     LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
-    LVN_ITEMCHANGING, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT,
-    LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK,
-    NMHDR, NMLISTVIEW, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
+    LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER,
+    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
+    LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR, NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS,
+    PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
-    EnableWindow, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
+    EnableWindow, GetFocus, TME_LEAVE, TRACKMOUSEEVENT, TrackMouseEvent,
 };
-use windows_sys::Win32::UI::Shell::{
-    DragAcceptFiles, DragFinish, DragQueryFileW, HDROP, IsUserAnAdmin, ShellExecuteW,
-};
+use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    ES_AUTOHSCROLL, GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IMAGE_BITMAP, IsDialogMessageW, IsWindow,
-    LR_CREATEDIBSECTION, LR_LOADFROMFILE, LoadCursorW, LoadImageW, MB_DEFBUTTON2,
+    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, HMENU, HTCLIENT,
+    IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW, MB_DEFBUTTON2,
     MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
     MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
     RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
     SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
     TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_DROPFILES, WM_ERASEBKGND, WM_GETMINMAXINFO, WM_GETTEXT, WM_GETTEXTLENGTH, WM_LBUTTONUP,
-    WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR,
+    WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
+    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
@@ -94,6 +88,8 @@ const WM_RELAYOUT: u32 = WM_APP + 3;
 const WM_REDO: u32 = WM_APP + 4;
 /// Apply a popup-menu choice made after its handler returned.
 const WM_MENU_PICKED: u32 = WM_APP + 5;
+/// The backup list was read in the background.
+const WM_BACKUPS_READY: u32 = WM_APP + 6;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -107,6 +103,24 @@ const ID_RESTORE: u16 = 1101;
 const ID_OPEN_BACKUPS: u16 = 1102;
 const ID_UNIGNORE: u16 = 1103;
 const ID_SCANNER_BASE: u16 = 1200;
+const ID_RESTORE_POINT: u16 = 1150;
+const ID_SU_ENABLE: u16 = 1600;
+const ID_SU_DISABLE: u16 = 1601;
+const ID_SU_OPEN: u16 = 1602;
+const ID_SU_REFRESH: u16 = 1603;
+const ID_SU_LIST: u16 = 2010;
+const ID_PG_UNINSTALL: u16 = 1610;
+const ID_PG_OPEN: u16 = 1611;
+const ID_PG_REFRESH: u16 = 1612;
+const ID_PG_LIST: u16 = 2011;
+const ID_DS_UP: u16 = 1620;
+const ID_DS_OPEN: u16 = 1621;
+const ID_DS_LIST: u16 = 2012;
+const ID_DUP_EXTRAS: u16 = 1630;
+const ID_DUP_NONE: u16 = 1631;
+const ID_DUP_RECYCLE: u16 = 1632;
+const ID_DUP_OPEN: u16 = 1633;
+const ID_DUP_LIST: u16 = 2013;
 const ID_SVC_REFRESH: u16 = 1300;
 const ID_SVC_ALL: u16 = 1301;
 const ID_SVC_NONE: u16 = 1302;
@@ -116,14 +130,8 @@ const ID_SVC_STOP: u16 = 1305;
 const ID_PRIV_PREVIEW: u16 = 1400;
 const ID_PRIV_ALL: u16 = 1401;
 const ID_PRIV_NONE: u16 = 1402;
+const ID_PRIV_KEEP: u16 = 1404;
 const ID_PRIV_CLEAN: u16 = 1403;
-const ID_SHRED_ADD: u16 = 1500;
-const ID_SHRED_BIN: u16 = 1501;
-const ID_SHRED_ALL: u16 = 1502;
-const ID_SHRED_NONE: u16 = 1503;
-const ID_SHRED_REMOVE: u16 = 1504;
-const ID_SHRED_PASSES: u16 = 1505;
-const ID_SHRED: u16 = 1506;
 const ID_FINDINGS: u16 = 2000;
 const ID_PROGRESS: u16 = 2001;
 const ID_BACKUPS: u16 = 2002;
@@ -131,8 +139,7 @@ const ID_IGNORED: u16 = 2003;
 const ID_SVC_LIST: u16 = 2004;
 const ID_SVC_TUNE: u16 = 2005;
 const ID_PRIV_LIST: u16 = 2006;
-const ID_SHRED_LIST: u16 = 2007;
-const ID_SHRED_PATH: u16 = 2008;
+const IDOK: u16 = 1;
 const IDCANCEL: u16 = 2;
 
 const MENU_DETAILS: usize = 1;
@@ -147,24 +154,35 @@ const MENU_SVC_MANUAL: usize = 15;
 const MENU_SVC_DISABLED: usize = 16;
 
 /// Layout is designed at 96 DPI and scaled.
-const HEADER_H: i32 = 72;
+const HEADER_H: i32 = 56;
 const SIDEBAR_W: i32 = 172;
 const CONTENT_X: i32 = 196;
-const FOOTER_H: i32 = 8;
+const FOOTER_H: i32 = 0;
 const TITLE_Y: i32 = HEADER_H + 14;
 const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
 const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
-const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 18;
+/// The restore-point checkbox sits under the scanner grid.
+const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6;
+const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52;
 
-const BG: u32 = rgb(255, 255, 255);
-const SIDEBAR_BG: u32 = rgb(232, 236, 242);
+/// The window background; cards and tiles sit on it as white surfaces.
+const BG: u32 = rgb(245, 247, 246);
+const SURFACE: u32 = rgb(255, 255, 255);
+const BORDER: u32 = rgb(222, 229, 224);
+/// The primary action colour (Scan now, the open page's marker).
+const ACCENT_GREEN: u32 = rgb(24, 122, 66);
+const ACCENT_GREEN_HOVER: u32 = rgb(16, 100, 52);
+/// Soft green fill for the open page and hovered tiles.
+const ACCENT_TINT: u32 = rgb(224, 240, 229);
+const HOVER_TINT: u32 = rgb(232, 238, 234);
+const SIDEBAR_BG: u32 = rgb(238, 242, 239);
 const INK: u32 = rgb(28, 28, 28);
-const MUTED: u32 = rgb(92, 98, 108);
-const LINK: u32 = rgb(16, 120, 52);
-const BLUE_INK: u32 = rgb(24, 64, 140);
-const ACCENT: u32 = rgb(196, 32, 32);
+const MUTED: u32 = rgb(88, 98, 92);
+const LINK: u32 = rgb(22, 110, 56);
+/// Deep Celtic green, the theme colour shared with the icons in `art`.
+const THEME_INK: u32 = rgb(22, 86, 48);
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -174,23 +192,29 @@ enum Page {
     Settings,
     Services,
     Privacy,
-    Shredder,
+    Startup,
+    Programs,
+    DiskSpace,
+    Duplicates,
     Monitor,
     Tools,
     About,
 }
 
-const NAV: &[(&str, Page)] = &[
-    ("Status", Page::Status),
-    ("Start Scan", Page::Scan),
-    ("Restore", Page::Restore),
-    ("Settings", Page::Settings),
-    ("Services", Page::Services),
-    ("Privacy", Page::Privacy),
-    ("Shredder", Page::Shredder),
-    ("Monitor", Page::Monitor),
-    ("Tools", Page::Tools),
-    ("About", Page::About),
+const NAV: &[(&str, Page, Icon)] = &[
+    ("Home", Page::Status, Icon::Logo),
+    ("Scan", Page::Scan, Icon::Scan),
+    ("Restore", Page::Restore, Icon::Restore),
+    ("Privacy", Page::Privacy, Icon::Privacy),
+    ("Startup", Page::Startup, Icon::Startup),
+    ("Programs", Page::Programs, Icon::Programs),
+    ("Disk Space", Page::DiskSpace, Icon::DiskSpace),
+    ("Duplicates", Page::Duplicates, Icon::Duplicates),
+    ("Services", Page::Services, Icon::Optimize),
+    ("Monitor", Page::Monitor, Icon::Monitor),
+    ("Tools", Page::Tools, Icon::Tools),
+    ("Settings", Page::Settings, Icon::Settings),
+    ("About", Page::About, Icon::About),
 ];
 
 /// Friendly names and what each scanner looks at, for Settings.
@@ -218,10 +242,7 @@ const SCANNERS: &[(ScannerId, &str)] = &[
         "Broken shortcuts and old temp files",
     ),
     (ScannerId::RegistryIntegrity, "Shell folders (report only)"),
-    (
-        ScannerId::DeepScan,
-        "Deep Scan (slower; review results closely)",
-    ),
+    (ScannerId::DeepScan, "Deep Scan (review results closely)"),
 ];
 
 const OPTIMIZE: [ScannerId; 4] = [
@@ -239,7 +260,26 @@ enum Job {
     Restoring,
     Services,
     Cleaning,
-    Shredding,
+    Analyzing,
+    Finding,
+    Recycling,
+    Previewing,
+}
+
+/// Disk Space page views.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiskView {
+    Folders,
+    Files,
+    Kinds,
+}
+
+/// What a Disk Space row stands for.
+#[derive(Clone, Copy)]
+enum DiskRow {
+    Folder(usize),
+    File(usize),
+    Kind,
 }
 
 /// Services page views: suggested Manual starts, or every service.
@@ -266,6 +306,9 @@ enum Action {
     OpenTool(usize),
     Refresh,
     SvcView(SvcView),
+    DiskRoot(usize),
+    DupRoot(usize),
+    DiskView(DiskView),
 }
 
 impl Action {
@@ -289,6 +332,8 @@ enum JobResult {
         result: Result<RepairOutcome, String>,
         /// Ticked rows a fresh scan no longer reported.
         fixed_meanwhile: Vec<Finding>,
+        /// What happened with the Windows restore point, if one was asked for.
+        restore_note: Option<String>,
     },
     Restore {
         file: PathBuf,
@@ -302,16 +347,18 @@ enum JobResult {
     Privacy {
         result: Result<CleanOutcome, String>,
     },
-    Shred {
-        outcome: ShredOutcome,
+    Disk {
+        report: Box<hive_mend::DiskReport>,
     },
-}
-
-/// One staged row: a file or folder target, optionally a Recycle Bin item
-/// whose metadata is deleted after its data shreds.
-struct ShredRow {
-    target: ShredTarget,
-    bin: Option<RecycleItem>,
+    Dups {
+        result: Result<hive_mend::DupReport, String>,
+    },
+    Recycled {
+        results: Vec<(String, Result<(), String>)>,
+    },
+    PrivacyPreview {
+        report: Preview,
+    },
 }
 
 struct Progress {
@@ -326,6 +373,8 @@ static PROGRESS: Mutex<Progress> = Mutex::new(Progress {
     text: String::new(),
 });
 static RESULT: Mutex<Option<JobResult>> = Mutex::new(None);
+/// The backup listing: one reader at a time, newest request wins.
+static BACKUPS: hive_mend::Refresher<BackupInventory> = hive_mend::Refresher::new();
 static CANCEL: AtomicBool = AtomicBool::new(false);
 
 // Reentrancy guard for the window procedure. Synchronous dispatches
@@ -349,6 +398,7 @@ const DEFER_DONE: u32 = 2;
 const DEFER_CLOSE: u32 = 4;
 const DEFER_LAYOUT: u32 = 8;
 const DEFER_PAINT: u32 = 16;
+const DEFER_BACKUPS: u32 = 32;
 
 // Native modal UI (message boxes, confirmations, popup menus, the UAC
 // relaunch) never runs inside a handler. A handler queues it here and
@@ -401,9 +451,11 @@ enum Redo {
     PowerRows(Vec<usize>, bool),
     SetRows(Vec<usize>, StartType),
     PrivacyClean,
-    Shred,
     Repair,
     Restore(usize),
+    Startup(Vec<usize>, bool),
+    Uninstall(usize),
+    Recycle,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -445,8 +497,10 @@ struct App {
     dpi: u32,
     fonts: Fonts,
     bg_brush: HBRUSH,
-    icons: Vec<HBITMAP>,
-    tool_icons: Vec<HBITMAP>,
+    /// Icons rendered by `art` at the pixel sizes drawn so far.
+    art: HashMap<(Icon, i32), HBITMAP>,
+    /// Anti-aliased corner sprites for rounded boxes, by radius and colours.
+    corners: HashMap<(i32, u32, u32, i32, u32), HBITMAP>,
     hotspots: Vec<HotSpot>,
     hover: Option<usize>,
     tracking: bool,
@@ -455,6 +509,12 @@ struct App {
     settings: Settings,
     exclusions: Exclusions,
     backups: Vec<BackupInfo>,
+    /// The refresh the shown list answers.
+    backups_shown: u64,
+    /// The newest backup listing could not be read.
+    backups_failed: bool,
+    /// What the shown listing failed to read: stores, entries, or files.
+    backup_errors: Vec<String>,
 
     job: Job,
     findings: Vec<Finding>,
@@ -476,6 +536,44 @@ struct App {
     btn_restore: HWND,
     btn_open_backups: HWND,
     scanner_boxes: Vec<(ScannerId, HWND)>,
+    chk_restore_point: HWND,
+    startup_items: Vec<hive_mend::StartupItem>,
+    startup_loaded: bool,
+    startup_note: String,
+    startup_list: HWND,
+    btn_su_enable: HWND,
+    btn_su_disable: HWND,
+    btn_su_open: HWND,
+    btn_su_refresh: HWND,
+    programs: Vec<hive_mend::InstalledProgram>,
+    programs_loaded: bool,
+    programs_note: String,
+    programs_list: HWND,
+    btn_pg_uninstall: HWND,
+    btn_pg_open: HWND,
+    btn_pg_refresh: HWND,
+    disk_roots: Vec<(String, String)>,
+    disk_report: Option<Box<hive_mend::DiskReport>>,
+    disk_root: Option<usize>,
+    disk_at: usize,
+    disk_view: DiskView,
+    disk_rows: Vec<DiskRow>,
+    disk_note: String,
+    disk_list: HWND,
+    btn_ds_up: HWND,
+    btn_ds_open: HWND,
+    dup_report: Option<hive_mend::DupReport>,
+    dup_root: Option<usize>,
+    /// (set, file) for each list row.
+    dup_rows: Vec<(usize, usize)>,
+    dup_checked: Vec<bool>,
+    dup_filling: bool,
+    dup_note: String,
+    dup_list: HWND,
+    btn_dup_extras: HWND,
+    btn_dup_none: HWND,
+    btn_dup_recycle: HWND,
+    btn_dup_open: HWND,
     ignored_list: HWND,
     btn_unignore: HWND,
 
@@ -504,21 +602,10 @@ struct App {
     btn_priv_preview: HWND,
     btn_priv_all: HWND,
     btn_priv_none: HWND,
+    btn_priv_keep: HWND,
+    /// When the cookies-to-keep list was last read, to notice edits.
+    priv_keep_stamp: Option<std::time::SystemTime>,
     btn_priv_clean: HWND,
-    shred_rows: Vec<ShredRow>,
-    shred_checked: Vec<bool>,
-    shred_note: String,
-    shred_warn: Vec<String>,
-    shred_filling: bool,
-    shred_list: HWND,
-    shred_path: HWND,
-    btn_shred_add: HWND,
-    btn_shred_bin: HWND,
-    btn_shred_all: HWND,
-    btn_shred_none: HWND,
-    btn_shred_remove: HWND,
-    btn_shred_passes: HWND,
-    btn_shred: HWND,
 }
 
 pub fn run() -> std::process::ExitCode {
@@ -529,10 +616,15 @@ pub fn run() -> std::process::ExitCode {
         };
         InitCommonControlsEx(&icc);
         let class_name = wide("HiveMendWindow");
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            GetSystemMetrics, ICON_SMALL, SM_CXICON, SM_CXSMICON, WM_SETICON,
+        };
+        let big = logo_icon(GetSystemMetrics(SM_CXICON));
         let class = WNDCLASSW {
             lpfnWndProc: Some(wnd_proc),
             hInstance: GetModuleHandleW(std::ptr::null()),
             hCursor: LoadCursorW(std::ptr::null_mut(), IDC_ARROW),
+            hIcon: big,
             lpszClassName: class_name.as_ptr(),
             ..std::mem::zeroed()
         };
@@ -540,7 +632,7 @@ pub fn run() -> std::process::ExitCode {
             return std::process::ExitCode::from(1);
         }
         let dpi = GetDpiForSystem().max(96);
-        let title = wide("Hive Mend");
+        let title = wide("Hivemend");
         let hwnd = CreateWindowExW(
             WS_EX_CONTROLPARENT,
             class_name.as_ptr(),
@@ -558,6 +650,8 @@ pub fn run() -> std::process::ExitCode {
         if hwnd.is_null() {
             return std::process::ExitCode::from(1);
         }
+        let small = logo_icon(GetSystemMetrics(SM_CXSMICON));
+        SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
             if IsDialogMessageW(hwnd, &msg) == 0 {
@@ -576,7 +670,6 @@ unsafe extern "system" fn wnd_proc(
     lparam: LPARAM,
 ) -> LRESULT {
     if msg == WM_CREATE {
-        DragAcceptFiles(hwnd, 1);
         let app = Box::new(App::new(hwnd));
         SetWindowLongPtrW(hwnd, GWLP_USERDATA, Box::into_raw(app) as isize);
         let _guard = HandlerGuard::enter();
@@ -585,6 +678,7 @@ unsafe extern "system" fn wnd_proc(
         }
         let app = &mut *window_app(hwnd);
         app.sync_controls();
+        app.refresh_backups();
         drop(_guard);
         flush_deferred(hwnd);
         return 0;
@@ -704,14 +798,25 @@ unsafe extern "system" fn wnd_proc(
                 SetBkColor(wparam as HDC, BG);
                 app.bg_brush as LRESULT
             }
-            WM_DROPFILES => {
-                let drop = wparam as HDROP;
-                app.drop_files(drop);
-                DragFinish(drop);
-                0
-            }
             WM_JOB_PROGRESS => {
                 app.show_progress();
+                0
+            }
+            WM_BACKUPS_READY => {
+                if let Some((refresh, inventory)) = BACKUPS.take()
+                    && refresh == BACKUPS.wanted()
+                {
+                    // A failed read keeps the list shown before, and says so.
+                    // A partial read replaces the list but labels what failed.
+                    app.backups_failed = inventory.is_none();
+                    if let Some(inventory) = inventory {
+                        app.backups = inventory.items;
+                        app.backup_errors = inventory.errors;
+                    }
+                    app.backups_shown = refresh;
+                    app.fill_backups();
+                    app.invalidate();
+                }
                 0
             }
             WM_JOB_DONE => {
@@ -741,10 +846,10 @@ unsafe extern "system" fn wnd_proc(
                         | Job::Restoring
                         | Job::Services
                         | Job::Cleaning
-                        | Job::Shredding
+                        | Job::Recycling
                 ) {
                     app.message(
-                        "Hive Mend is still working. Please wait for it to finish before closing.",
+                        "Hivemend is still working. Please wait for it to finish before closing.",
                         MB_ICONWARNING,
                     );
                     break 'handled 0;
@@ -792,9 +897,9 @@ fn app_handles(msg: u32) -> bool {
             | WM_CONTEXTMENU
             | WM_CTLCOLORSTATIC
             | WM_CTLCOLORBTN
-            | WM_DROPFILES
             | WM_JOB_PROGRESS
             | WM_JOB_DONE
+            | WM_BACKUPS_READY
             | WM_REDO
             | WM_MENU_PICKED
             | WM_CLOSE
@@ -818,6 +923,7 @@ fn nested_reply(msg: u32) -> (u32, NestedReply) {
     match msg {
         WM_JOB_PROGRESS => (DEFER_PROGRESS, NestedReply::Handled),
         WM_JOB_DONE => (DEFER_DONE, NestedReply::Handled),
+        WM_BACKUPS_READY => (DEFER_BACKUPS, NestedReply::Handled),
         WM_CLOSE => (DEFER_CLOSE, NestedReply::Handled),
         WM_SIZE | WM_DPICHANGED | WM_RELAYOUT => (DEFER_LAYOUT, NestedReply::Default),
         WM_PAINT => (DEFER_PAINT, NestedReply::Default),
@@ -837,6 +943,9 @@ fn deferred_messages(bits: u32) -> Vec<u32> {
     }
     if bits & DEFER_DONE != 0 {
         out.push(WM_JOB_DONE);
+    }
+    if bits & DEFER_BACKUPS != 0 {
+        out.push(WM_BACKUPS_READY);
     }
     if bits & DEFER_CLOSE != 0 {
         out.push(WM_CLOSE);
@@ -861,12 +970,19 @@ fn flush_deferred(hwnd: HWND) {
 /// Show queued native UI, one item at a time, with no handler active. Runs
 /// only from flush_deferred, after the guard is released. A flush nested in
 /// one of these modal loops leaves the queue to the loop already running.
+/// The next queued native item. The queue's lock is released before this
+/// returns: a modal call made with it held would leave any handler that runs
+/// inside the dialog and queues a message waiting on it forever.
+fn pop_native() -> Option<Native> {
+    lock(&NATIVE).pop_front()
+}
+
 fn run_native(hwnd: HWND) {
     if SHOWING.swap(true, Ordering::SeqCst) {
         return;
     }
-    let title = wide("Hive Mend");
-    while let Some(next) = lock(&NATIVE).pop_front() {
+    let title = wide("Hivemend");
+    while let Some(next) = pop_native() {
         if unsafe { IsWindow(hwnd) } == 0 {
             if let Native::Menu { menu, .. } = next {
                 unsafe { DestroyMenu(menu as HMENU) };
@@ -934,17 +1050,34 @@ fn run_native(hwnd: HWND) {
                 }
             }
             Native::Shell { file, args } => {
-                let file = wide(&file);
-                let args = args.as_deref().map(wide);
-                unsafe {
+                let target = wide(&file);
+                let params = args.as_deref().map(wide);
+                let result = unsafe {
                     ShellExecuteW(
                         hwnd,
                         wide("open").as_ptr(),
-                        file.as_ptr(),
-                        args.as_ref().map_or(std::ptr::null(), |args| args.as_ptr()),
+                        target.as_ptr(),
+                        params
+                            .as_ref()
+                            .map_or(std::ptr::null(), |params| params.as_ptr()),
                         std::ptr::null(),
                         SW_SHOWNORMAL,
-                    );
+                    )
+                };
+                // Values of 32 and below are errors; say so instead of
+                // leaving it looking as if the program started.
+                let code = result as isize;
+                if code <= 32 {
+                    let why = match code {
+                        2 | 3 => "it was not found".to_string(),
+                        5 => "access was denied".to_string(),
+                        1223 => "it was canceled".to_string(),
+                        other => format!("error {other}"),
+                    };
+                    let text = wide(&format!("Windows could not open {file}: {why}."));
+                    unsafe {
+                        MessageBoxW(hwnd, text.as_ptr(), title.as_ptr(), MB_OK | MB_ICONWARNING);
+                    }
                 }
             }
         }
@@ -978,33 +1111,41 @@ impl Drop for HandlerGuard {
 impl App {
     fn new(hwnd: HWND) -> Self {
         let dpi = unsafe { GetDpiForWindow(hwnd) }.max(96);
+        let elevated = unsafe { IsUserAnAdmin() } != 0;
+        // An administrator window takes no policy from the per-user folder,
+        // which programs running without elevation can change: it starts
+        // from the built-in settings (restore points on) and never saves.
+        let settings = if elevated {
+            Settings::default()
+        } else {
+            Settings::load(&settings_file())
+        };
         let mut app = Self {
             hwnd,
             page: Page::Status,
             dpi,
             fonts: make_fonts(dpi),
             bg_brush: unsafe { CreateSolidBrush(BG) },
-            icons: [
-                "PM-RegScan.bmp",
-                "PM-ServiceOptimizer.bmp",
-                "PM-SysMonitor.bmp",
-                "PM-Settings.bmp",
-                "PM-About.bmp",
-            ]
-            .into_iter()
-            .map(load_bitmap)
-            .collect(),
-            tool_icons: WINDOWS_TOOLS
-                .iter()
-                .map(|tool| load_bitmap(tool.icon))
-                .collect(),
+            art: HashMap::new(),
+            corners: HashMap::new(),
             hotspots: Vec::new(),
             hover: None,
             tracking: false,
-            elevated: unsafe { IsUserAnAdmin() } != 0,
-            settings: Settings::load(&settings_file()),
-            exclusions: Exclusions::load(&exclusions_file()),
-            backups: all_backups(),
+            elevated,
+            settings,
+            // An administrator window reads no per-user policy, the ignore
+            // list included: programs running without elevation can change
+            // that folder.
+            exclusions: if elevated {
+                Exclusions::default()
+            } else {
+                Exclusions::load(&exclusions_file())
+            },
+            // Read in the background once the window exists.
+            backups: Vec::new(),
+            backups_shown: 0,
+            backups_failed: false,
+            backup_errors: Vec::new(),
             job: Job::Idle,
             findings: Vec::new(),
             checked: Vec::new(),
@@ -1024,6 +1165,43 @@ impl App {
             btn_restore: std::ptr::null_mut(),
             btn_open_backups: std::ptr::null_mut(),
             scanner_boxes: Vec::new(),
+            chk_restore_point: std::ptr::null_mut(),
+            startup_items: Vec::new(),
+            startup_loaded: false,
+            startup_note: String::new(),
+            startup_list: std::ptr::null_mut(),
+            btn_su_enable: std::ptr::null_mut(),
+            btn_su_disable: std::ptr::null_mut(),
+            btn_su_open: std::ptr::null_mut(),
+            btn_su_refresh: std::ptr::null_mut(),
+            programs: Vec::new(),
+            programs_loaded: false,
+            programs_note: String::new(),
+            programs_list: std::ptr::null_mut(),
+            btn_pg_uninstall: std::ptr::null_mut(),
+            btn_pg_open: std::ptr::null_mut(),
+            btn_pg_refresh: std::ptr::null_mut(),
+            disk_roots: Vec::new(),
+            disk_report: None,
+            disk_root: None,
+            disk_at: 0,
+            disk_view: DiskView::Folders,
+            disk_rows: Vec::new(),
+            disk_note: String::new(),
+            disk_list: std::ptr::null_mut(),
+            btn_ds_up: std::ptr::null_mut(),
+            btn_ds_open: std::ptr::null_mut(),
+            dup_report: None,
+            dup_root: None,
+            dup_rows: Vec::new(),
+            dup_checked: Vec::new(),
+            dup_filling: false,
+            dup_note: String::new(),
+            dup_list: std::ptr::null_mut(),
+            btn_dup_extras: std::ptr::null_mut(),
+            btn_dup_none: std::ptr::null_mut(),
+            btn_dup_recycle: std::ptr::null_mut(),
+            btn_dup_open: std::ptr::null_mut(),
             ignored_list: std::ptr::null_mut(),
             btn_unignore: std::ptr::null_mut(),
             svc_view: SvcView::Tuneup,
@@ -1051,21 +1229,9 @@ impl App {
             btn_priv_preview: std::ptr::null_mut(),
             btn_priv_all: std::ptr::null_mut(),
             btn_priv_none: std::ptr::null_mut(),
+            btn_priv_keep: std::ptr::null_mut(),
+            priv_keep_stamp: None,
             btn_priv_clean: std::ptr::null_mut(),
-            shred_rows: Vec::new(),
-            shred_checked: Vec::new(),
-            shred_note: String::new(),
-            shred_warn: Vec::new(),
-            shred_filling: false,
-            shred_list: std::ptr::null_mut(),
-            shred_path: std::ptr::null_mut(),
-            btn_shred_add: std::ptr::null_mut(),
-            btn_shred_bin: std::ptr::null_mut(),
-            btn_shred_all: std::ptr::null_mut(),
-            btn_shred_none: std::ptr::null_mut(),
-            btn_shred_remove: std::ptr::null_mut(),
-            btn_shred_passes: std::ptr::null_mut(),
-            btn_shred: std::ptr::null_mut(),
         };
         app.create_controls();
         app
@@ -1125,6 +1291,77 @@ impl App {
             unsafe { SendMessageW(check, BM_SETCHECK, state, 0) };
             self.scanner_boxes.push((*id, check));
         }
+        self.startup_list = list_view(
+            hwnd,
+            ID_SU_LIST,
+            0,
+            0,
+            &[
+                ("Name", 220),
+                ("Status", 90),
+                ("For", 110),
+                ("Command", 420),
+            ],
+        );
+        self.btn_su_enable = button(hwnd, ID_SU_ENABLE, "Enable", BS_PUSHBUTTON);
+        self.btn_su_disable = button(hwnd, ID_SU_DISABLE, "Disable", BS_PUSHBUTTON);
+        self.btn_su_open = button(hwnd, ID_SU_OPEN, "Open File Location", BS_PUSHBUTTON);
+        self.btn_su_refresh = button(hwnd, ID_SU_REFRESH, "Refresh", BS_PUSHBUTTON);
+        self.programs_list = list_view(
+            hwnd,
+            ID_PG_LIST,
+            LVS_SINGLESEL,
+            0,
+            &[
+                ("Name", 260),
+                ("Publisher", 180),
+                ("Installed", 95),
+                ("Size", 80),
+                ("Version", 120),
+            ],
+        );
+        self.btn_pg_uninstall = button(hwnd, ID_PG_UNINSTALL, "Uninstall", BS_PUSHBUTTON);
+        self.btn_pg_open = button(hwnd, ID_PG_OPEN, "Open Install Folder", BS_PUSHBUTTON);
+        self.btn_pg_refresh = button(hwnd, ID_PG_REFRESH, "Refresh", BS_PUSHBUTTON);
+        self.disk_list = list_view(
+            hwnd,
+            ID_DS_LIST,
+            LVS_SINGLESEL,
+            0,
+            &[("Name", 380), ("Size", 100), ("Share", 80), ("Files", 100)],
+        );
+        self.btn_ds_up = button(hwnd, ID_DS_UP, "Up One Level", BS_PUSHBUTTON);
+        self.btn_ds_open = button(hwnd, ID_DS_OPEN, "Open in Explorer", BS_PUSHBUTTON);
+        self.dup_list = list_view(
+            hwnd,
+            ID_DUP_LIST,
+            0,
+            LVS_EX_CHECKBOXES,
+            &[("Name", 240), ("Folder", 380), ("Size", 90), ("Set", 70)],
+        );
+        self.btn_dup_extras = button(hwnd, ID_DUP_EXTRAS, "Tick Extra Copies", BS_PUSHBUTTON);
+        self.btn_dup_none = button(hwnd, ID_DUP_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_dup_recycle = button(
+            hwnd,
+            ID_DUP_RECYCLE,
+            "Move Ticked to Recycle Bin",
+            BS_PUSHBUTTON,
+        );
+        self.btn_dup_open = button(hwnd, ID_DUP_OPEN, "Open Folder", BS_PUSHBUTTON);
+        self.chk_restore_point = button(
+            hwnd,
+            ID_RESTORE_POINT,
+            "Create a Windows restore point before repairs (needs administrator rights)",
+            BS_AUTOCHECKBOX,
+        );
+        unsafe {
+            SendMessageW(
+                self.chk_restore_point,
+                BM_SETCHECK,
+                (!self.settings.skip_restore_point) as usize,
+                0,
+            )
+        };
         self.ignored_list = list_view(hwnd, ID_IGNORED, 0, 0, &[("Ignored entry", 700)]);
         self.btn_unignore = button(
             hwnd,
@@ -1173,22 +1410,8 @@ impl App {
         self.btn_priv_preview = button(hwnd, ID_PRIV_PREVIEW, "Preview", BS_PUSHBUTTON);
         self.btn_priv_all = button(hwnd, ID_PRIV_ALL, "Tick All", BS_PUSHBUTTON);
         self.btn_priv_none = button(hwnd, ID_PRIV_NONE, "Untick All", BS_PUSHBUTTON);
+        self.btn_priv_keep = button(hwnd, ID_PRIV_KEEP, "Cookies to Keep", BS_PUSHBUTTON);
         self.btn_priv_clean = button(hwnd, ID_PRIV_CLEAN, "Clean Ticked", BS_PUSHBUTTON);
-        self.shred_list = list_view(
-            hwnd,
-            ID_SHRED_LIST,
-            0,
-            LVS_EX_CHECKBOXES,
-            &[("Name", 240), ("Size", 110), ("Location", 470)],
-        );
-        self.shred_path = edit(hwnd, ID_SHRED_PATH);
-        self.btn_shred_add = button(hwnd, ID_SHRED_ADD, "Add", BS_PUSHBUTTON);
-        self.btn_shred_bin = button(hwnd, ID_SHRED_BIN, "Add Recycle Bin", BS_PUSHBUTTON);
-        self.btn_shred_all = button(hwnd, ID_SHRED_ALL, "Tick All", BS_PUSHBUTTON);
-        self.btn_shred_none = button(hwnd, ID_SHRED_NONE, "Untick All", BS_PUSHBUTTON);
-        self.btn_shred_remove = button(hwnd, ID_SHRED_REMOVE, "Remove", BS_PUSHBUTTON);
-        self.btn_shred_passes = button(hwnd, ID_SHRED_PASSES, "Passes: 3", BS_PUSHBUTTON);
-        self.btn_shred = button(hwnd, ID_SHRED, "Shred Ticked", BS_PUSHBUTTON);
         self.apply_fonts();
         self.fill_backups();
         self.fill_ignored();
@@ -1221,18 +1444,30 @@ impl App {
             self.btn_priv_preview,
             self.btn_priv_all,
             self.btn_priv_none,
+            self.btn_priv_keep,
             self.btn_priv_clean,
-            self.shred_list,
-            self.shred_path,
-            self.btn_shred_add,
-            self.btn_shred_bin,
-            self.btn_shred_all,
-            self.btn_shred_none,
-            self.btn_shred_remove,
-            self.btn_shred_passes,
-            self.btn_shred,
         ];
         all.extend(self.scanner_boxes.iter().map(|(_, hwnd)| *hwnd));
+        all.push(self.chk_restore_point);
+        all.extend([
+            self.startup_list,
+            self.btn_su_enable,
+            self.btn_su_disable,
+            self.btn_su_open,
+            self.btn_su_refresh,
+            self.programs_list,
+            self.btn_pg_uninstall,
+            self.btn_pg_open,
+            self.btn_pg_refresh,
+            self.disk_list,
+            self.btn_ds_up,
+            self.btn_ds_open,
+            self.dup_list,
+            self.btn_dup_extras,
+            self.btn_dup_none,
+            self.btn_dup_recycle,
+            self.btn_dup_open,
+        ]);
         all
     }
 
@@ -1251,8 +1486,24 @@ impl App {
         unsafe { InvalidateRect(self.hwnd, std::ptr::null(), 0) };
     }
 
+    /// Draw `icon` `size` pixels square at (x, y), rendering it once per size.
+    fn draw_icon(&mut self, hdc: HDC, icon: Icon, x: i32, y: i32, size: i32) {
+        if size <= 0 {
+            return;
+        }
+        let bitmap = *self.art.entry((icon, size)).or_insert_with(|| unsafe {
+            dib(
+                &hive_mend::art::render_bgra_premultiplied(icon, size as usize),
+                size,
+            )
+        });
+        if !bitmap.is_null() {
+            unsafe { alpha_blit(hdc, bitmap, x, y, size) };
+        }
+    }
+
     fn release(self) {
-        for bitmap in self.icons.iter().chain(self.tool_icons.iter()) {
+        for bitmap in self.art.values().chain(self.corners.values()) {
             if !bitmap.is_null() {
                 unsafe { DeleteObject(*bitmap) };
             }
@@ -1303,6 +1554,17 @@ impl App {
             Action::Elevate => self.elevate(),
             Action::OpenTool(index) => self.open_tool(index),
             Action::Refresh => self.invalidate(),
+            Action::DiskRoot(index) => self.start_disk(index),
+            Action::DupRoot(index) => self.start_dups(index),
+            Action::DiskView(view) => {
+                if self.busy() {
+                    return;
+                }
+                self.disk_view = view;
+                self.fill_disk();
+                self.sync_controls();
+                self.invalidate();
+            }
             Action::SvcView(view) => {
                 if self.busy() {
                     return;
@@ -1314,7 +1576,7 @@ impl App {
         }
     }
 
-    /// Open a built-in Windows screen. Hive Mend only launches it.
+    /// Open a built-in Windows screen. Hivemend only launches it.
     fn open_tool(&self, index: usize) {
         if self.busy() {
             return;
@@ -1343,10 +1605,26 @@ impl App {
         if matches!(page, Page::Restore | Page::Status | Page::Monitor) && !self.busy() {
             self.refresh_backups();
         }
+        if page == Page::Startup && !self.startup_loaded {
+            self.refresh_startup();
+        }
+        if page == Page::Programs && !self.busy() {
+            // Every visit: an uninstaller may have finished since.
+            self.refresh_programs();
+        }
+        if matches!(page, Page::DiskSpace | Page::Duplicates) && self.disk_roots.is_empty() {
+            self.disk_roots = disk_roots();
+        }
         if page == Page::Services && !self.svc_loaded {
             self.refresh_services();
         }
-        if page == Page::Privacy && self.priv_items.is_empty() && !self.busy() {
+        // An administrator window never looks at the keep list, not even
+        // its timestamp: its Privacy page does not depend on that file.
+        if page == Page::Privacy
+            && !self.busy()
+            && (self.priv_items.is_empty()
+                || (!self.elevated && self.priv_keep_stamp != keep_list_stamp()))
+        {
             self.rebuild_privacy();
         }
         self.sync_controls();
@@ -1364,6 +1642,90 @@ impl App {
                 self.save_settings();
             }
             return;
+        }
+        if id == ID_RESTORE_POINT {
+            if code == BN_CLICKED {
+                let on = unsafe { SendMessageW(self.chk_restore_point, BM_GETCHECK, 0, 0) } == 1;
+                self.settings.skip_restore_point = !on;
+                self.save_settings();
+            }
+            return;
+        }
+        match id {
+            ID_SU_ENABLE => {
+                let rows = selected_rows(self.startup_list);
+                self.toggle_startup(&rows, true);
+                return;
+            }
+            ID_SU_DISABLE => {
+                let rows = selected_rows(self.startup_list);
+                self.toggle_startup(&rows, false);
+                return;
+            }
+            ID_SU_OPEN => {
+                self.open_startup_location();
+                return;
+            }
+            ID_SU_REFRESH => {
+                self.refresh_startup();
+                self.invalidate();
+                return;
+            }
+            ID_PG_UNINSTALL => {
+                let rows = selected_rows(self.programs_list);
+                self.uninstall_program(&rows);
+                return;
+            }
+            ID_PG_OPEN => {
+                self.open_program_folder();
+                return;
+            }
+            ID_DS_UP => {
+                if let Some(parent) = self
+                    .disk_report
+                    .as_ref()
+                    .and_then(|report| report.nodes.get(self.disk_at))
+                    .and_then(|node| node.parent)
+                {
+                    self.disk_at = parent;
+                    self.disk_view = DiskView::Folders;
+                    self.fill_disk();
+                    self.sync_controls();
+                    self.invalidate();
+                }
+                return;
+            }
+            ID_DS_OPEN => {
+                self.open_disk_row();
+                return;
+            }
+            ID_DUP_EXTRAS => {
+                self.dup_tick(true);
+                return;
+            }
+            ID_DUP_NONE => {
+                self.dup_tick(false);
+                return;
+            }
+            ID_DUP_RECYCLE => {
+                self.recycle_ticked();
+                return;
+            }
+            ID_DUP_OPEN => {
+                self.open_dup_row();
+                return;
+            }
+            // Enter, which IsDialogMessage turns into IDOK.
+            IDOK if self.page == Page::DiskSpace && unsafe { GetFocus() } == self.disk_list => {
+                self.open_disk_selection();
+                return;
+            }
+            ID_PG_REFRESH => {
+                self.refresh_programs();
+                self.invalidate();
+                return;
+            }
+            _ => {}
         }
         match id {
             ID_SCAN => {
@@ -1386,13 +1748,13 @@ impl App {
                     CANCEL.store(true, Ordering::SeqCst);
                     progress_text("Stopping the scan...");
                     self.show_progress();
-                } else if self.job == Job::Cleaning {
+                } else if self.job == Job::Cleaning
+                    || self.job == Job::Analyzing
+                    || self.job == Job::Finding
+                    || self.job == Job::Previewing
+                {
                     CANCEL.store(true, Ordering::SeqCst);
-                    progress_text("Stopping after this category...");
-                    self.show_progress();
-                } else if self.job == Job::Shredding {
-                    CANCEL.store(true, Ordering::SeqCst);
-                    progress_text("Stopping after this file...");
+                    progress_text("Stopping...");
                     self.show_progress();
                 }
             }
@@ -1417,14 +1779,8 @@ impl App {
             ID_PRIV_PREVIEW => self.run_priv_preview(),
             ID_PRIV_ALL => self.priv_tick_all(true),
             ID_PRIV_NONE => self.priv_tick_all(false),
+            ID_PRIV_KEEP => self.edit_cookie_keep(),
             ID_PRIV_CLEAN => self.start_privacy_clean(),
-            ID_SHRED_ADD => self.shred_add_typed(),
-            ID_SHRED_BIN => self.shred_add_bin(),
-            ID_SHRED_ALL => self.shred_tick_all(true),
-            ID_SHRED_NONE => self.shred_tick_all(false),
-            ID_SHRED_REMOVE => self.shred_remove_highlighted(),
-            ID_SHRED_PASSES => self.shred_cycle_passes(),
-            ID_SHRED => self.start_shred(),
             _ => {}
         }
     }
@@ -1469,6 +1825,14 @@ impl App {
                 }
                 _ => {}
             }
+        } else if id == ID_DS_LIST && header.code == LVN_KEYDOWN {
+            // Backspace goes up a level, as in Explorer.
+            let key = unsafe { &*(lparam as *const NMLVKEYDOWN) };
+            if { key.wVKey } == 0x08 {
+                self.command(ID_DS_UP, 0);
+            }
+        } else if id == ID_DS_LIST && matches!(header.code, NM_DBLCLK | NM_RETURN) {
+            self.open_disk_selection();
         } else if id == ID_BACKUPS && header.code == NM_DBLCLK {
             if let Some(row) = selected_rows(self.backup_list).first() {
                 self.start_restore(*row);
@@ -1509,6 +1873,34 @@ impl App {
             if let Some(row) = selected_rows(self.svc_list).first() {
                 self.show_svc_details(*row);
             }
+        } else if id == ID_DUP_LIST {
+            match header.code {
+                LVN_ITEMCHANGING => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.dup_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old && self.busy() {
+                            return 1;
+                        }
+                    }
+                }
+                LVN_ITEMCHANGED => {
+                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
+                    if !self.dup_filling && change.uChanged & LVIF_STATE != 0 {
+                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
+                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
+                        if new != old
+                            && let Some(slot) = self.dup_checked.get_mut(change.iItem as usize)
+                        {
+                            *slot = new == 2;
+                            self.update_dup_label();
+                        }
+                    }
+                }
+                NM_DBLCLK => self.open_dup_row(),
+                _ => {}
+            }
         } else if id == ID_PRIV_LIST {
             match header.code {
                 LVN_ITEMCHANGING => {
@@ -1538,38 +1930,6 @@ impl App {
                 NM_DBLCLK => {
                     if let Some(row) = selected_rows(self.priv_list).first() {
                         self.show_priv_details(*row);
-                    }
-                }
-                _ => {}
-            }
-        } else if id == ID_SHRED_LIST {
-            match header.code {
-                LVN_ITEMCHANGING => {
-                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
-                    if !self.shred_filling && change.uChanged & LVIF_STATE != 0 {
-                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
-                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
-                        if new != old && self.busy() {
-                            return 1;
-                        }
-                    }
-                }
-                LVN_ITEMCHANGED => {
-                    let change = unsafe { &*(lparam as *const NMLISTVIEW) };
-                    if !self.shred_filling && change.uChanged & LVIF_STATE != 0 {
-                        let new = (change.uNewState & LVIS_STATEIMAGEMASK) >> 12;
-                        let old = (change.uOldState & LVIS_STATEIMAGEMASK) >> 12;
-                        if new != old {
-                            if let Some(slot) = self.shred_checked.get_mut(change.iItem as usize) {
-                                *slot = new == 2;
-                            }
-                            self.update_shred_label();
-                        }
-                    }
-                }
-                NM_DBLCLK => {
-                    if let Some(row) = selected_rows(self.shred_list).first() {
-                        self.show_shred_details(*row);
                     }
                 }
                 _ => {}
@@ -1736,7 +2096,7 @@ impl App {
             Repair::DeleteKey { .. } => "Delete key".to_string(),
             Repair::DeleteFile {
                 keep_copy: true, ..
-            } => "Delete shortcut (copy kept)".to_string(),
+            } => "Move shortcut into backup".to_string(),
             Repair::DeleteFile {
                 keep_copy: false, ..
             } => "Delete file (no undo)".to_string(),
@@ -1781,6 +2141,13 @@ impl App {
     }
 
     fn ignore_rows(&mut self, rows: &[usize]) {
+        if self.elevated {
+            self.message(
+                "The ignore list is changed from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         if rows.is_empty() {
             self.message(
                 "Click a row to highlight it first. Hold Ctrl or Shift to pick several.",
@@ -1948,7 +2315,7 @@ impl App {
                     let arg = format!("/select,\"{}\"", finding.key);
                     shell_open(self.hwnd, "explorer.exe", Some(&arg));
                 } else {
-                    open_in_regedit(self.hwnd, &finding.key);
+                    open_in_regedit(self.hwnd, &finding.key, self.elevated);
                 }
             }
             MENU_IGNORE => self.ignore_rows(rows),
@@ -2069,7 +2436,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_services_backup_file() else {
+        let Some(mut backup) = next_services_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -2077,7 +2444,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to start on demand (Manual)?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
+            "Set {} to start on demand (Manual)?\n\nHivemend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page. Each change takes full effect when the service next starts.",
             if selected.len() == 1 {
                 format!(
                     "{} ({})",
@@ -2087,7 +2454,8 @@ impl App {
             } else {
                 format!("these {} services", selected.len())
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -2103,7 +2471,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 8));
         }
         if !self.confirm(&question, Redo::ServicesApply) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Services;
@@ -2121,7 +2489,7 @@ impl App {
                 &mut ScmServiceStore,
                 &WindowsRegistry,
                 &selected,
-                &backup_file,
+                &mut backup,
                 &mut |done, total| {
                     set_progress(
                         done,
@@ -2278,7 +2646,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_services_backup_file() else {
+        let Some(mut backup) = next_services_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -2286,7 +2654,7 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Set {} to {}?\n\nHive Mend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
+            "Set {} to {}?\n\nHivemend saves the current start types in\n{}\nbefore changing anything. You can undo this on the Restore page.",
             if changes.len() == 1 {
                 format!(
                     "{} (now {})",
@@ -2297,7 +2665,8 @@ impl App {
                 format!("these {} services", changes.len())
             },
             to.label(),
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -2306,7 +2675,7 @@ impl App {
             question.push_str("\n\nDisabled means Windows cannot start it at all, even on demand. Prefer Manual unless you are sure.");
         }
         if !self.confirm(&question, Redo::SetRows(rows.to_vec(), to)) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Services;
@@ -2320,7 +2689,7 @@ impl App {
                 &mut ScmServiceStore,
                 &WindowsRegistry,
                 &changes,
-                &backup_file,
+                &mut backup,
                 &mut |done, total| {
                     set_progress(
                         done,
@@ -2435,39 +2804,49 @@ impl App {
     // ---- privacy ----
 
     fn rebuild_privacy(&mut self) {
-        let mut items = build_items(&WindowsSystemTargets);
-        // The custom list and the remembered ticks live in the per-user
-        // folder, which programs running without elevation can edit. An
-        // elevated window acts on neither: it starts with nothing ticked and
-        // shows why the custom list is left out.
-        if self.elevated {
-            if custom_privacy_file().exists() {
-                let mut custom = parse_custom("", &HostFs);
-                custom.warnings.push(
-                    "Custom items are not used while Hive Mend runs as administrator. Start it without administrator rights to clean them."
-                        .to_string(),
-                );
-                items.push(custom);
-            }
-        } else if let Ok(bytes) = std::fs::read(custom_privacy_file()) {
-            let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
-            if !custom.targets.is_empty() || !custom.warnings.is_empty() {
-                items.push(custom);
-            }
-        }
-        let ticked: Vec<String> = if self.elevated {
-            Vec::new()
-        } else {
-            self.settings.privacy_ticked.clone()
-        };
-        self.priv_checked = items
-            .iter()
-            .map(|item| ticked.iter().any(|id| id == &item.id))
-            .collect();
+        let ticked = self.settings.privacy_ticked.clone();
+        let (items, checked, stamp) = privacy_plan(self.elevated, &mut PolicyOnDisk, &ticked);
+        self.priv_keep_stamp = stamp;
+        self.priv_checked = checked;
         self.priv_items = items;
         self.priv_preview = None;
         self.priv_outcome = None;
         self.fill_privacy();
+    }
+
+    /// Open the cookies-to-keep list in Notepad, creating it with help text.
+    fn edit_cookie_keep(&mut self) {
+        if self.elevated {
+            self.message(
+                "Edit your cookies-to-keep list from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let file = hive_mend::cookies_keep_file();
+        if !file.exists() {
+            if let Some(parent) = file.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let help = "# Cookies to keep: one site per line, such as github.com.\r\n# Its subdomains are kept too. Every other cookie is removed when\r\n# you clean a browser's cookies. Save, then go back to\r\n# Hivemend's Privacy page.\r\n";
+            if let Err(err) = std::fs::write(&file, help) {
+                self.message(
+                    &format!("Could not create {}: {err}", file.display()),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        }
+        let Some(system) = hive_mend::host_known_dir(hive_mend::KnownDir::System) else {
+            self.message("Could not locate Notepad.", MB_ICONWARNING);
+            return;
+        };
+        let notepad = format!(r"{system}\notepad.exe");
+        shell_open(
+            self.hwnd,
+            &notepad,
+            Some(&format!("\"{}\"", file.display())),
+        );
     }
 
     fn save_priv_ticks(&mut self) {
@@ -2493,13 +2872,41 @@ impl App {
         if self.priv_items.is_empty() {
             self.rebuild_privacy();
         }
-        let report = preview(
-            &WindowsRegistry,
-            &HostFs,
-            &WindowsSystemTargets,
-            &WindowsProcessList,
-            &self.priv_items,
-        );
+        // Counting can walk large folders: do it off the window's thread so
+        // the window stays responsive.
+        self.job = Job::Previewing;
+        CANCEL.store(false, Ordering::SeqCst);
+        self.priv_preview = None;
+        self.priv_note = "Counting what each category holds...".to_string();
+        set_progress(0, 0, "Counting what each category holds...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let items = self.priv_items.clone();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let report = preview_with(
+                &WindowsRegistry,
+                &HostFs,
+                &WindowsSystemTargets,
+                &WindowsProcessList,
+                &items,
+                &mut || !CANCEL.load(Ordering::SeqCst),
+            );
+            finish_job(hwnd, JobResult::PrivacyPreview { report });
+        });
+    }
+
+    fn finish_priv_preview(&mut self, report: Preview) {
+        if report.canceled {
+            // A partial count is not a preview: Clean stays unavailable.
+            self.priv_preview = None;
+            self.priv_note = "Preview canceled. Preview again before cleaning.".to_string();
+            self.sync_controls();
+            self.fill_privacy();
+            self.invalidate();
+            return;
+        }
         self.priv_note = format!(
             "Preview: {} files, {} registry values, {} in scope.",
             report.files(),
@@ -2534,6 +2941,9 @@ impl App {
         }
         if row.other > 0 {
             parts.push(count(row.other, "item", "items"));
+        }
+        if row.cookies > 0 {
+            parts.push(count(row.cookies, "cookie", "cookies"));
         }
         if row.bytes > 0 {
             parts.push(format_bytes(row.bytes));
@@ -2635,7 +3045,7 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_privacy_backup_file() else {
+        let Some(mut backup) = next_privacy_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -2643,14 +3053,15 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Clean {} {}?\n\nHive Mend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up.",
+            "Clean {} {}?\n\nHivemend saves the registry entries in\n{}\nbefore removing anything. You can undo those on the Restore page. Files (temp, caches, bin contents) are deleted for good and are not backed up. On SSDs the drive clears deleted files itself; for stronger protection, turn on BitLocker or Device Encryption.",
             selected.len(),
             if selected.len() == 1 {
                 "category"
             } else {
                 "categories"
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
@@ -2670,7 +3081,7 @@ impl App {
             question.push_str(&format!("\n...and {} more", selected.len() - 10));
         }
         if !self.confirm(&question, Redo::PrivacyClean) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Cleaning;
@@ -2688,7 +3099,7 @@ impl App {
                 &mut WindowsSystemTargets,
                 &WindowsProcessList,
                 &selected,
-                &backup_file,
+                &mut backup,
                 &mut |done, total, name| {
                     set_progress(
                         done,
@@ -2718,6 +3129,13 @@ impl App {
                     format_bytes(outcome.bytes()),
                     outcome.values()
                 )];
+                let cookies: usize = outcome.items.iter().map(|item| item.cookies).sum();
+                if cookies > 0 {
+                    lines.push(format!(
+                        "Removed {} and kept the ones for sites on your list.",
+                        count(cookies, "cookie", "cookies")
+                    ));
+                }
                 if outcome.canceled {
                     lines.push("Canceled: categories after the stop were left alone.".to_string());
                 }
@@ -2755,15 +3173,10 @@ impl App {
                 };
                 self.priv_outcome = Some(outcome);
                 self.message(&lines.join("\n"), icon);
-                let report = preview(
-                    &WindowsRegistry,
-                    &HostFs,
-                    &WindowsSystemTargets,
-                    &WindowsProcessList,
-                    &self.priv_items,
-                );
-                self.priv_preview = Some(report);
+                // Count again in the background, as Preview does.
+                self.priv_preview = None;
                 self.fill_privacy();
+                self.run_priv_preview();
             }
         }
     }
@@ -2797,6 +3210,9 @@ impl App {
         }
         if item.other > 0 {
             parts.push(count(item.other, "item", "items"));
+        }
+        if item.cookies > 0 {
+            parts.push(count(item.cookies, "cookie", "cookies"));
         }
         if parts.is_empty() {
             parts.push("already empty".to_string());
@@ -2849,462 +3265,766 @@ impl App {
         }
     }
 
-    // ---- shredder ------------------------------------------------------
+    // ---- startup -------------------------------------------------------
 
-    fn shred_add_typed(&mut self) {
+    fn refresh_startup(&mut self) {
+        self.startup_items = hive_mend::list_startup(&WindowsRegistry, &HostFs);
+        self.startup_loaded = true;
+        let off = self
+            .startup_items
+            .iter()
+            .filter(|item| !item.enabled)
+            .count();
+        self.startup_note = format!(
+            "{} programs start with Windows; {off} turned off.",
+            self.startup_items.len() - off
+        );
+        unsafe {
+            SendMessageW(self.startup_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.startup_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, item) in self.startup_items.iter().enumerate() {
+            insert_row(
+                self.startup_list,
+                row,
+                &[
+                    &item.name,
+                    if item.enabled { "Enabled" } else { "Disabled" },
+                    item.scope.label(),
+                    &item.command,
+                ],
+            );
+        }
+        unsafe {
+            SendMessageW(self.startup_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.startup_list, std::ptr::null(), 1);
+        }
+    }
+
+    /// Turn the highlighted startup items on or off, after a confirmation and
+    /// a backup of their current flags.
+    fn toggle_startup(&mut self, rows: &[usize], enable: bool) {
         if self.busy() {
             return;
         }
-        let text = edit_text(self.shred_path);
-        if text.trim().is_empty() {
+        let picked: Vec<hive_mend::StartupItem> = rows
+            .iter()
+            .filter_map(|row| self.startup_items.get(*row).cloned())
+            .collect();
+        if picked.is_empty() {
             self.message(
-                "Type a file or folder path first, or drop files onto this window.",
+                "Highlight one or more startup items first.",
                 MB_ICONINFORMATION,
             );
             return;
         }
-        if self.stage_path(&text) {
-            set_text(self.shred_path, "");
-        }
-    }
-
-    /// Stage one path after the shred gate passes. True when staged.
-    fn stage_path(&mut self, text: &str) -> bool {
-        let path = text.trim().trim_matches('"').to_string();
-        if path.is_empty() {
-            return false;
-        }
-        if self
-            .shred_rows
-            .iter()
-            .any(|row| row.target.path.eq_ignore_ascii_case(&path))
-        {
-            self.message("That path is already staged.", MB_ICONINFORMATION);
-            return false;
-        }
-        if let Err(reason) = shred_allowed(&HostFs, &path) {
-            self.message(&format!("Not staged.\n\n{reason}"), MB_ICONWARNING);
-            return false;
-        }
-        let is_dir = HostFs.kind_of(&path) == ItemKind::Dir;
-        self.shred_rows.push(ShredRow {
-            target: ShredTarget { path, is_dir },
-            bin: None,
-        });
-        self.shred_checked.push(true);
-        self.after_stage();
-        true
-    }
-
-    fn shred_add_bin(&mut self) {
-        if self.busy() {
-            return;
-        }
-        let (items, notes) = list_recycle_bin(&HostFs, &fixed_drives());
-        if items.is_empty() {
-            let mut text = "The Recycle Bin is empty.".to_string();
-            if !notes.is_empty() {
-                text.push_str(&format!("\n\n{}", notes.join("\n")));
-            }
-            self.message(&text, MB_ICONINFORMATION);
-            return;
-        }
-        let mut added = 0;
-        let mut refused = Vec::new();
-        for item in items {
-            if self
-                .shred_rows
+        // Your own items are changed from a normal window: an administrator
+        // window does not write into your hive, which programs running
+        // without elevation can redirect.
+        if self.elevated
+            && picked
                 .iter()
-                .any(|row| row.target.path.eq_ignore_ascii_case(&item.data))
-            {
-                continue;
-            }
-            // The gate runs again at shred time; refusing early explains why.
-            if let Err(reason) = shred_allowed(&HostFs, &item.data) {
-                refused.push(reason);
-                continue;
-            }
-            self.shred_rows.push(ShredRow {
-                target: ShredTarget {
-                    path: item.data.clone(),
-                    is_dir: false,
+                .any(|item| item.scope == hive_mend::StartupScope::User)
+        {
+            self.message(
+                "Items for your account are changed from Hivemend started without administrator rights. Highlight only items for all users here.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        if !self.elevated
+            && picked
+                .iter()
+                .any(|item| item.scope == hive_mend::StartupScope::Machine)
+        {
+            self.message(
+                "Items that start for all users can only be changed with administrator rights. Use Run as administrator, or highlight only your own items.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let changing = picked.iter().filter(|item| item.enabled != enable).count();
+        if changing == 0 {
+            self.message(
+                if enable {
+                    "Those items are already enabled."
+                } else {
+                    "Those items are already disabled."
                 },
-                bin: Some(item),
-            });
-            self.shred_checked.push(true);
-            added += 1;
-        }
-        self.after_stage();
-        self.shred_note = format!("Staged {added} Recycle Bin files.");
-        let mut extra = Vec::new();
-        extra.extend(notes.iter().take(5).cloned());
-        extra.extend(refused.iter().take(5).cloned());
-        if !extra.is_empty() {
-            self.message(&extra.join("\n"), MB_ICONINFORMATION);
-        }
-        self.invalidate();
-    }
-
-    fn shred_remove_highlighted(&mut self) {
-        if self.busy() {
-            return;
-        }
-        let mut rows = selected_rows(self.shred_list);
-        if rows.is_empty() {
-            self.message(
-                "Highlight the staged rows to remove first.",
                 MB_ICONINFORMATION,
             );
             return;
         }
-        rows.sort_unstable_by(|left, right| right.cmp(left));
-        for row in rows {
-            if row < self.shred_rows.len() {
-                self.shred_rows.remove(row);
-                self.shred_checked.remove(row);
-            }
-        }
-        self.after_stage();
-    }
-
-    fn shred_tick_all(&mut self, on: bool) {
-        if self.busy() {
+        let verb = if enable { "Enable" } else { "Disable" };
+        let question = format!(
+            "{verb} {changing} startup {}?\n\n{}Hivemend saves the current settings in\n{}\nfirst, so this can be undone on the Restore page.",
+            if changing == 1 { "item" } else { "items" },
+            if enable {
+                ""
+            } else {
+                "Disabled items stay installed; they just stop starting with Windows, the same switch Task Manager uses. "
+            },
+            backups_location()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_default()
+        );
+        if !self.confirm(&question, Redo::Startup(rows.to_vec(), enable)) {
             return;
         }
-        for slot in self.shred_checked.iter_mut() {
-            *slot = on;
-        }
-        self.fill_shredder();
-        self.update_shred_label();
-    }
-
-    fn shred_cycle_passes(&mut self) {
-        if self.busy() {
+        let Some(mut backup) = next_backup_file_with("startup") else {
+            self.message(
+                "Could not reserve a backup file in the backups folder. Nothing was changed.",
+                MB_ICONWARNING,
+            );
             return;
-        }
-        self.settings.shred_passes = match self.settings.shred_passes {
-            1 => 3,
-            3 => 7,
-            _ => 1,
         };
-        self.save_settings();
-        self.update_shred_label();
+        let refs: Vec<&hive_mend::StartupItem> = picked.iter().collect();
+        let (body, refused) = hive_mend::startup_backup(&WindowsRegistry, &refs);
+        if let Err(err) = backup.append(&body) {
+            self.message(
+                &format!("The backup could not be written, so nothing was changed.\n\n{err}"),
+                MB_ICONWARNING,
+            );
+            return;
+        }
+        let outcome = hive_mend::set_startup(
+            &mut WindowsRegistry,
+            &refs,
+            enable,
+            hive_mend::filetime_now(),
+            &refused,
+        );
+        let mut lines = vec![format!(
+            "{} {}.",
+            if enable { "Enabled:" } else { "Disabled:" },
+            outcome.changed
+        )];
+        if !refused.is_empty() {
+            lines.push(format!(
+                "Left alone (its current setting could not be recorded): {}",
+                refused.join(", ")
+            ));
+        }
+        for error in outcome.errors.iter().take(5) {
+            lines.push(format!("Failed: {error}"));
+        }
+        lines.push(format!("Backup: {}", backup.path().display()));
+        self.refresh_startup();
+        self.refresh_backups();
+        self.message(
+            &lines.join("\n"),
+            if outcome.errors.is_empty() {
+                MB_ICONINFORMATION
+            } else {
+                MB_ICONWARNING
+            },
+        );
     }
 
-    fn shred_method(&self) -> ShredMethod {
-        ShredMethod::from_passes(self.settings.shred_passes).unwrap_or(ShredMethod::ThreePass)
+    fn open_startup_location(&mut self) {
+        let Some(item) = selected_rows(self.startup_list)
+            .first()
+            .and_then(|row| self.startup_items.get(*row))
+            .cloned()
+        else {
+            self.message("Highlight a startup item first.", MB_ICONINFORMATION);
+            return;
+        };
+        // The program it starts, or the shortcut itself when the target is
+        // not a plain path.
+        let target = hive_mend::paths_in_command(&item.command)
+            .into_iter()
+            .next()
+            .filter(|path| path.as_bytes().get(1) == Some(&b':'))
+            .unwrap_or_else(|| format!(r"{}\{}", item.location, item.name));
+        if target.starts_with("HKEY_") {
+            open_in_regedit(self.hwnd, &item.location, self.elevated);
+        } else {
+            let arg = format!("/select,\"{target}\"");
+            shell_open(self.hwnd, "explorer.exe", Some(&arg));
+        }
     }
 
-    fn shred_ticked_rows(&self) -> Vec<usize> {
-        self.shred_checked
+    // ---- programs ------------------------------------------------------
+
+    fn refresh_programs(&mut self) {
+        self.programs = hive_mend::list_programs(&WindowsRegistry);
+        self.programs_loaded = true;
+        let total: u64 = self
+            .programs
             .iter()
-            .enumerate()
-            .filter(|(_, on)| **on)
-            .map(|(row, _)| row)
-            .collect()
-    }
-
-    fn after_stage(&mut self) {
-        self.refresh_shred_warn();
-        self.fill_shredder();
-        self.update_shred_label();
-        self.invalidate();
-    }
-
-    fn refresh_shred_warn(&mut self) {
-        let mut drives = Vec::new();
-        for row in &self.shred_rows {
-            let bytes = row.target.path.trim().as_bytes();
-            if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
-                if !drives.contains(&drive) {
-                    drives.push(drive);
-                }
-            }
-        }
-        let mut warn = Vec::new();
-        for drive in drives {
-            match volume_ssd(&drive) {
-                Some(true) => warn.push(format!(
-                    "{drive} is a solid-state drive: shredding cannot reach its spare blocks, so traces may survive."
-                )),
-                None => warn.push(format!(
-                    "Could not tell whether {drive} is solid-state; shredded data may survive."
-                )),
-                Some(false) => {}
-            }
-        }
-        self.shred_warn = warn;
-    }
-
-    fn update_shred_label(&self) {
-        let count = self.shred_checked.iter().filter(|on| **on).count();
-        set_text(
-            self.btn_shred_passes,
-            &format!("Passes: {}", self.settings.shred_passes),
+            .filter_map(|program| program.size)
+            .sum();
+        self.programs_note = format!(
+            "{} programs installed, using about {} by their own estimates.",
+            self.programs.len(),
+            hive_mend::format_bytes(total)
         );
-        let text = if count == 0 {
-            "Shred Ticked".to_string()
-        } else {
-            format!("Shred Ticked ({count})")
-        };
-        set_text(self.btn_shred, &text);
-        unsafe { EnableWindow(self.btn_shred, (count > 0 && !self.busy()) as i32) };
-    }
-
-    fn shred_row_cells(&self, index: usize) -> (String, String, String) {
-        let row = &self.shred_rows[index];
-        if let Some(item) = &row.bin {
-            (
-                format!("{} (Recycle Bin)", item.display),
-                format_bytes(item.bytes),
-                row.target.path.clone(),
-            )
-        } else if row.target.is_dir {
-            (
-                file_name(&row.target.path),
-                "Folder".to_string(),
-                row.target.path.clone(),
-            )
-        } else {
-            let size = HostFs
-                .len(&row.target.path)
-                .map(format_bytes)
+        unsafe {
+            SendMessageW(self.programs_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.programs_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, program) in self.programs.iter().enumerate() {
+            let size = program
+                .size
+                .map(hive_mend::format_bytes)
                 .unwrap_or_default();
-            (file_name(&row.target.path), size, row.target.path.clone())
+            insert_row(
+                self.programs_list,
+                row,
+                &[
+                    &program.name,
+                    &program.publisher,
+                    &program.installed,
+                    &size,
+                    &program.version,
+                ],
+            );
         }
-    }
-
-    fn fill_shredder(&mut self) {
-        self.shred_filling = true;
         unsafe {
-            SendMessageW(self.shred_list, WM_SETREDRAW, 0, 0);
-            SendMessageW(self.shred_list, LVM_DELETEALLITEMS, 0, 0);
-            for row in 0..self.shred_rows.len() {
-                let (name, size, location) = self.shred_row_cells(row);
-                insert_row(self.shred_list, row, &[&name, &size, &location]);
-                set_state_image(
-                    self.shred_list,
-                    row,
-                    if self.shred_checked.get(row).copied().unwrap_or(false) {
-                        2
-                    } else {
-                        1
-                    },
-                );
-            }
-            SendMessageW(self.shred_list, WM_SETREDRAW, 1, 0);
-            InvalidateRect(self.shred_list, std::ptr::null(), 1);
-        }
-        self.shred_filling = false;
-        self.update_shred_label();
-    }
-
-    fn size_shred_columns(&self, width: i32) {
-        let name = self.s(240);
-        let size = self.s(110);
-        let location = (width - name - size - self.s(26)).max(self.s(120));
-        unsafe {
-            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 0, name as isize);
-            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 1, size as isize);
-            SendMessageW(self.shred_list, LVM_SETCOLUMNWIDTH, 2, location as isize);
+            SendMessageW(self.programs_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.programs_list, std::ptr::null(), 1);
         }
     }
 
-    fn start_shred(&mut self) {
+    /// Start the highlighted program's own uninstaller, after a confirmation.
+    fn uninstall_program(&mut self, rows: &[usize]) {
         if self.busy() {
             return;
         }
-        let ticked = self.shred_ticked_rows();
-        if ticked.is_empty() {
+        let Some(&row) = rows.first() else {
+            self.message("Highlight a program first.", MB_ICONINFORMATION);
+            return;
+        };
+        let Some(program) = self.programs.get(row).cloned() else {
+            return;
+        };
+        // An administrator window never starts uninstallers: one started
+        // from here would run with administrator rights, whatever wrote it.
+        // From a normal window, the uninstaller asks for rights itself.
+        if self.elevated {
             self.message(
-                "Tick the staged rows you want to shred first.",
+                &format!(
+                    "Uninstall {} from Hivemend started without administrator rights. Its uninstaller will ask for administrator rights itself if it needs them.",
+                    program.name
+                ),
                 MB_ICONINFORMATION,
             );
             return;
         }
-        let method = self.shred_method();
-        let mut files = Vec::new();
-        let mut bin = Vec::new();
-        for row in &ticked {
-            let staged = &self.shred_rows[*row];
-            match &staged.bin {
-                Some(item) => bin.push(item.clone()),
-                None => files.push(staged.target.clone()),
+        let launch = match hive_mend::uninstall_launch(&HostFs, &program.uninstall, self.elevated) {
+            Ok(launch) => launch,
+            Err(err) => {
+                self.message(
+                    &format!(
+                        "Hivemend cannot start the uninstaller for {}: {err}.\n\nYou can try Settings > Apps > Installed apps instead.",
+                        program.name
+                    ),
+                    MB_ICONWARNING,
+                );
+                return;
             }
-        }
-        let mut question = format!(
-            "Shred {} {} with {}?\n\nThis cannot be undone. No backup is possible.",
-            ticked.len(),
-            if ticked.len() == 1 { "item" } else { "items" },
-            method.label()
+        };
+        let question = format!(
+            "Start the uninstaller for {}?\n\n{} {}\n\nThis runs the program's own uninstaller with the command it registered. Most ask before removing anything, but a silent one (such as /S) removes the program right away. Programs are not backed up.",
+            program.name, launch.exe, launch.params
         );
-        for warn in &self.shred_warn {
-            question.push_str(&format!("\n\n{warn}"));
-        }
-        for row in ticked.iter().take(10) {
-            question.push_str(&format!("\n{}", self.shred_rows[*row].target.path));
-        }
-        if ticked.len() > 10 {
-            question.push_str(&format!("\n...and {} more", ticked.len() - 10));
-        }
-        if !self.confirm(&question, Redo::Shred) {
+        if !self.confirm(&question, Redo::Uninstall(row)) {
             return;
         }
-        self.job = Job::Shredding;
-        self.page = Page::Shredder;
-        CANCEL.store(false, Ordering::SeqCst);
-        set_progress(
-            0,
-            (files.len() + bin.len()).max(1) * method.passes(),
-            "Starting the shred...",
+        let params = (!launch.params.is_empty()).then_some(launch.params.as_str());
+        shell_open(self.hwnd, &launch.exe, params);
+        self.programs_note = format!(
+            "Asked Windows to start the uninstaller for {}. Click Refresh when it finishes.",
+            program.name
         );
+        self.invalidate();
+    }
+
+    fn open_program_folder(&mut self) {
+        let Some(program) = selected_rows(self.programs_list)
+            .first()
+            .and_then(|row| self.programs.get(*row))
+            .cloned()
+        else {
+            self.message("Highlight a program first.", MB_ICONINFORMATION);
+            return;
+        };
+        let folder = program.install_location.trim_end_matches('\\').to_string();
+        if folder.as_bytes().get(1) == Some(&b':') && std::path::Path::new(&folder).is_dir() {
+            shell_open(self.hwnd, "explorer.exe", Some(&format!("\"{folder}\"")));
+            return;
+        }
+        match hive_mend::uninstall_launch(&HostFs, &program.uninstall, false) {
+            Ok(launch) => {
+                let arg = format!("/select,\"{}\"", launch.exe);
+                shell_open(self.hwnd, "explorer.exe", Some(&arg));
+            }
+            Err(_) => self.message(
+                &format!("{} did not record where it is installed.", program.name),
+                MB_ICONINFORMATION,
+            ),
+        }
+    }
+
+    // ---- disk space ----------------------------------------------------
+
+    fn start_disk(&mut self, index: usize) {
+        if self.busy() {
+            return;
+        }
+        let Some((_, root)) = self.disk_roots.get(index).cloned() else {
+            return;
+        };
+        self.job = Job::Analyzing;
+        self.disk_root = Some(index);
+        self.disk_report = None;
+        self.disk_view = DiskView::Folders;
+        CANCEL.store(false, Ordering::SeqCst);
+        let used = drive_used_bytes(&root).max(1);
+        set_progress(0, 1000, &format!("Reading {root}..."));
         self.sync_controls();
         self.show_progress();
         self.invalidate();
         let hwnd = self.hwnd as isize;
         std::thread::spawn(move || {
-            let seed = random_seed();
-            let opts = ShredOptions {
-                method,
-                rename: true,
-            };
-            let file_total = files.len() * method.passes();
-            let grand = (file_total + bin.len() * method.passes()).max(1);
-            let mut outcome =
-                shred_paths(&mut HostFs, &files, &opts, seed, &mut |done, _, name| {
-                    set_progress(
-                        done,
-                        grand,
-                        &format!("Shredding {name} ({done} of {grand})..."),
-                    );
-                    post(hwnd, WM_JOB_PROGRESS);
+            let mut last = std::time::Instant::now();
+            let report =
+                hive_mend::analyze(&hive_mend::HostLister, &root, &mut |files, bytes, dir| {
+                    if last.elapsed() >= std::time::Duration::from_millis(200) {
+                        last = std::time::Instant::now();
+                        let done = (bytes.saturating_mul(1000) / used).min(990) as usize;
+                        set_progress(
+                            done,
+                            1000,
+                            &format!(
+                                "{} in {} files so far. Reading {dir}",
+                                format_bytes(bytes),
+                                group_digits(files)
+                            ),
+                        );
+                        post(hwnd, WM_JOB_PROGRESS);
+                    }
                     !CANCEL.load(Ordering::SeqCst)
                 });
-            if !outcome.canceled && !bin.is_empty() {
-                let second =
-                    shred_recycle_items(&mut HostFs, &bin, &opts, seed, &mut |done, _, name| {
-                        let at = file_total + done;
-                        set_progress(at, grand, &format!("Shredding {name} ({at} of {grand})..."));
-                        post(hwnd, WM_JOB_PROGRESS);
-                        !CANCEL.load(Ordering::SeqCst)
-                    });
-                outcome.shredded += second.shredded;
-                outcome.bytes += second.bytes;
-                outcome.shredded_paths.extend(second.shredded_paths);
-                outcome.refused.extend(second.refused);
-                outcome.errors.extend(second.errors);
-                outcome.canceled = second.canceled;
-            }
-            finish_job(hwnd, JobResult::Shred { outcome });
+            finish_job(
+                hwnd,
+                JobResult::Disk {
+                    report: Box::new(report),
+                },
+            );
         });
     }
 
-    fn finish_shred(&mut self, outcome: ShredOutcome) {
-        let mut lines = vec![format!(
-            "Shredded {} files ({}).",
-            outcome.shredded,
-            format_bytes(outcome.bytes)
-        )];
-        if outcome.canceled {
-            lines.push(
-                "Canceled: rows after the stop were left alone. Shredded files cannot be recovered."
-                    .to_string(),
+    fn fill_disk(&mut self) {
+        let Some(report) = self.disk_report.as_ref() else {
+            return;
+        };
+        let total = report.nodes[0].bytes.max(1);
+        let share = |bytes: u64| format!("{:.1}%", bytes as f64 * 100.0 / total as f64);
+        let mut rows: Vec<(DiskRow, [String; 4])> = Vec::new();
+        match self.disk_view {
+            DiskView::Folders => {
+                let here = report.nodes[self.disk_at].bytes.max(1);
+                for child in report.children_by_size(self.disk_at) {
+                    let node = &report.nodes[child];
+                    rows.push((
+                        DiskRow::Folder(child),
+                        [
+                            node.name.clone(),
+                            format_bytes(node.bytes),
+                            format!("{:.1}%", node.bytes as f64 * 100.0 / here as f64),
+                            group_digits(node.files),
+                        ],
+                    ));
+                }
+                let own = report.nodes[self.disk_at].bytes
+                    - report.nodes[self.disk_at]
+                        .children
+                        .iter()
+                        .map(|child| report.nodes[*child].bytes)
+                        .sum::<u64>();
+                if own > 0 {
+                    rows.push((
+                        DiskRow::Kind,
+                        [
+                            "(files in this folder)".to_string(),
+                            format_bytes(own),
+                            format!("{:.1}%", own as f64 * 100.0 / here as f64),
+                            String::new(),
+                        ],
+                    ));
+                }
+            }
+            DiskView::Files => {
+                for (index, file) in report.largest.iter().enumerate() {
+                    rows.push((
+                        DiskRow::File(index),
+                        [
+                            file.path.clone(),
+                            format_bytes(file.bytes),
+                            share(file.bytes),
+                            String::new(),
+                        ],
+                    ));
+                }
+            }
+            DiskView::Kinds => {
+                let mut kinds = report.kinds.clone();
+                kinds.sort_by_key(|kind| std::cmp::Reverse(kind.1));
+                for (kind, bytes, files) in kinds {
+                    rows.push((
+                        DiskRow::Kind,
+                        [
+                            kind.label().to_string(),
+                            format_bytes(bytes),
+                            share(bytes),
+                            group_digits(files),
+                        ],
+                    ));
+                }
+            }
+        }
+        unsafe {
+            SendMessageW(self.disk_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.disk_list, LVM_DELETEALLITEMS, 0, 0);
+        }
+        for (row, (_, cells)) in rows.iter().enumerate() {
+            let cells: Vec<&str> = cells.iter().map(String::as_str).collect();
+            insert_row(self.disk_list, row, &cells);
+        }
+        self.disk_rows = rows.into_iter().map(|(row, _)| row).collect();
+        unsafe {
+            SendMessageW(self.disk_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.disk_list, std::ptr::null(), 1);
+        }
+    }
+
+    /// Go into the highlighted folder, or show the highlighted file.
+    fn open_disk_selection(&mut self) {
+        let row = selected_rows(self.disk_list).first().copied();
+        match row.and_then(|row| self.disk_rows.get(row).copied()) {
+            Some(DiskRow::Folder(node)) => {
+                self.disk_at = node;
+                self.fill_disk();
+                self.sync_controls();
+                self.invalidate();
+            }
+            Some(DiskRow::File(_)) => self.open_disk_row(),
+            _ => {}
+        }
+    }
+
+    fn open_disk_row(&mut self) {
+        let Some(report) = self.disk_report.as_ref() else {
+            return;
+        };
+        let row = selected_rows(self.disk_list).first().copied();
+        let arg = match row.and_then(|row| self.disk_rows.get(row).copied()) {
+            Some(DiskRow::Folder(node)) => format!("\"{}\"", report.path_of(node)),
+            Some(DiskRow::File(index)) => match report.largest.get(index) {
+                Some(file) => format!("/select,\"{}\"", file.path),
+                None => return,
+            },
+            _ => format!("\"{}\"", report.path_of(self.disk_at)),
+        };
+        shell_open(self.hwnd, "explorer.exe", Some(&arg));
+    }
+
+    // ---- duplicates ----------------------------------------------------
+
+    fn start_dups(&mut self, index: usize) {
+        if self.busy() {
+            return;
+        }
+        let Some((_, root)) = self.disk_roots.get(index).cloned() else {
+            return;
+        };
+        let protected = match hive_mend::protected_roots(&HostFs) {
+            Ok(protected) => protected,
+            Err(err) => {
+                self.message(
+                    &format!("The search cannot run safely: {err}."),
+                    MB_ICONWARNING,
+                );
+                return;
+            }
+        };
+        self.job = Job::Finding;
+        self.dup_root = Some(index);
+        self.dup_report = None;
+        CANCEL.store(false, Ordering::SeqCst);
+        set_progress(0, 1, &format!("Reading {root}..."));
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            let mut last = std::time::Instant::now();
+            let report = hive_mend::find_duplicates(
+                &hive_mend::HostLister,
+                &hive_mend::HostContent {
+                    stop: Some(&CANCEL),
+                },
+                &root,
+                DUP_MIN_BYTES,
+                &protected,
+                &mut |text, done, total| {
+                    if last.elapsed() >= std::time::Duration::from_millis(200) {
+                        last = std::time::Instant::now();
+                        set_progress(done, total.max(1), text);
+                        post(hwnd, WM_JOB_PROGRESS);
+                    }
+                    !CANCEL.load(Ordering::SeqCst)
+                },
             );
+            finish_job(hwnd, JobResult::Dups { result: Ok(report) });
+        });
+    }
+
+    fn fill_dups(&mut self) {
+        self.dup_filling = true;
+        self.dup_rows.clear();
+        unsafe {
+            SendMessageW(self.dup_list, WM_SETREDRAW, 0, 0);
+            SendMessageW(self.dup_list, LVM_DELETEALLITEMS, 0, 0);
         }
-        for refused in outcome.refused.iter().take(8) {
-            lines.push(format!("Refused: {refused}"));
+        if let Some(report) = self.dup_report.as_ref() {
+            for (set, group) in report.groups.iter().enumerate() {
+                for (file, path) in group.files.iter().enumerate() {
+                    let (folder, name) = path.rsplit_once('\\').unwrap_or(("", path));
+                    let row = self.dup_rows.len();
+                    insert_row(
+                        self.dup_list,
+                        row,
+                        &[
+                            name,
+                            folder,
+                            &format_bytes(group.bytes),
+                            &(set + 1).to_string(),
+                        ],
+                    );
+                    self.dup_rows.push((set, file));
+                }
+            }
         }
-        if outcome.refused.len() > 8 {
-            lines.push(format!("...and {} more refused", outcome.refused.len() - 8));
+        self.dup_checked.resize(self.dup_rows.len(), false);
+        self.dup_checked.truncate(self.dup_rows.len());
+        for (row, on) in self.dup_checked.iter().enumerate() {
+            set_state_image(self.dup_list, row, if *on { 2 } else { 1 });
         }
-        for error in outcome.errors.iter().take(5) {
-            lines.push(format!("Failed: {error}"));
+        unsafe {
+            SendMessageW(self.dup_list, WM_SETREDRAW, 1, 0);
+            InvalidateRect(self.dup_list, std::ptr::null(), 1);
         }
-        // Shredded rows leave the stage; refused and failed rows stay. A
-        // folder row is done when the folder itself is gone: the core only
-        // lists the files it shredded, and a failed folder still exists.
-        let rows = std::mem::take(&mut self.shred_rows);
-        let checks = std::mem::take(&mut self.shred_checked);
-        for (row, on) in rows.into_iter().zip(checks) {
-            let done = if row.bin.is_some() || !row.target.is_dir {
-                outcome
-                    .shredded_paths
-                    .iter()
-                    .any(|path| path == &row.target.path)
-            } else {
-                !HostFs.exists(&row.target.path)
-            };
-            if done {
+        self.dup_filling = false;
+        self.update_dup_label();
+    }
+
+    /// Tick every copy but the first of each set, or untick everything.
+    fn dup_tick(&mut self, extras: bool) {
+        if self.busy() {
+            return;
+        }
+        self.dup_checked = self
+            .dup_rows
+            .iter()
+            .map(|(_, file)| extras && *file > 0)
+            .collect();
+        self.fill_dups();
+    }
+
+    fn dup_ticked_paths(&self) -> Vec<String> {
+        let Some(report) = self.dup_report.as_ref() else {
+            return Vec::new();
+        };
+        self.dup_rows
+            .iter()
+            .zip(&self.dup_checked)
+            .filter(|(_, on)| **on)
+            .filter_map(|((set, file), _)| report.groups.get(*set)?.files.get(*file).cloned())
+            .collect()
+    }
+
+    fn update_dup_label(&self) {
+        let count = self.dup_checked.iter().filter(|on| **on).count();
+        let label = if count == 0 {
+            "Move Ticked to Recycle Bin".to_string()
+        } else {
+            format!("Move {count} to Recycle Bin")
+        };
+        set_text(self.btn_dup_recycle, &label);
+    }
+
+    fn recycle_ticked(&mut self) {
+        if self.busy() {
+            return;
+        }
+        if self.elevated {
+            self.message(
+                "Hivemend does not remove duplicates with administrator rights. Open it without administrator rights to move your own files to the Recycle Bin.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let Some(report) = self.dup_report.clone() else {
+            return;
+        };
+        let mut plan: Vec<(hive_mend::DupGroup, Vec<usize>)> = Vec::new();
+        for (set, group) in report.groups.iter().enumerate() {
+            let remove: Vec<usize> = self
+                .dup_rows
+                .iter()
+                .zip(&self.dup_checked)
+                .filter(|((row_set, _), on)| **on && *row_set == set)
+                .map(|((_, file), _)| *file)
+                .collect();
+            if remove.is_empty() {
                 continue;
             }
-            self.shred_rows.push(row);
-            self.shred_checked.push(on);
+            if remove.len() >= group.files.len() {
+                self.message(
+                    &format!(
+                        "Every copy in set {} is ticked. Untick at least one copy to keep.",
+                        set + 1
+                    ),
+                    MB_ICONINFORMATION,
+                );
+                return;
+            }
+            plan.push((group.clone(), remove));
         }
-        self.shred_note = if outcome.canceled {
-            format!(
-                "Canceled: shredded {} files ({}) so far.",
-                outcome.shredded,
-                format_bytes(outcome.bytes)
-            )
-        } else {
-            format!(
-                "Shredded {} files ({}).",
-                outcome.shredded,
-                format_bytes(outcome.bytes)
-            )
+        let count: usize = plan.iter().map(|(_, remove)| remove.len()).sum();
+        if count == 0 {
+            self.message(
+                "Tick the copies to remove first, or use Tick Extra Copies.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let bytes: u64 = plan
+            .iter()
+            .map(|(group, remove)| group.bytes * remove.len() as u64)
+            .sum();
+        let question = format!(
+            "Move {} ({}) to the Recycle Bin?\n\nOne copy of every set is kept. Each file is compared byte by byte with the kept copy first and left alone if it no longer matches. You can put files back from the Recycle Bin.",
+            count_of(count as u64, "file", "files"),
+            format_bytes(bytes)
+        );
+        if !self.confirm(&question, Redo::Recycle) {
+            return;
+        }
+        let protected = match hive_mend::protected_roots(&HostFs) {
+            Ok(protected) => protected,
+            Err(err) => {
+                self.message(&format!("Nothing was moved: {err}."), MB_ICONWARNING);
+                return;
+            }
         };
-        let icon = if outcome.errors.is_empty() {
-            MB_ICONINFORMATION
-        } else {
-            MB_ICONWARNING
-        };
-        self.refresh_shred_warn();
-        self.fill_shredder();
-        self.message(&lines.join("\n"), icon);
+        self.job = Job::Recycling;
+        set_progress(0, count.max(1), "Checking and moving files...");
+        self.sync_controls();
+        self.show_progress();
+        self.invalidate();
+        let hwnd = self.hwnd as isize;
+        std::thread::spawn(move || {
+            use windows_sys::Win32::System::Com::{COINIT_APARTMENTTHREADED, CoInitializeEx};
+            unsafe { CoInitializeEx(std::ptr::null(), COINIT_APARTMENTTHREADED as u32) };
+            let mut results = Vec::new();
+            let mut done = 0;
+            for (group, remove) in plan {
+                let outcomes = hive_mend::remove_checked(
+                    &hive_mend::HostContent::default(),
+                    &group,
+                    &remove,
+                    &protected,
+                    &mut |path, held| {
+                        done += 1;
+                        set_progress(done, count.max(1), &format!("Moving {path}"));
+                        post(hwnd, WM_JOB_PROGRESS);
+                        hive_mend::recycle(held)
+                    },
+                );
+                results.extend(outcomes);
+            }
+            finish_job(hwnd, JobResult::Recycled { results });
+        });
     }
 
-    fn show_shred_details(&mut self, row: usize) {
-        let Some(staged) = self.shred_rows.get(row) else {
-            return;
-        };
-        let mut lines = vec![staged.target.path.clone()];
-        if let Some(item) = &staged.bin {
-            lines.push(format!("Original name: {}", item.display));
-            lines.push(format!("Bin metadata: {}", item.meta));
-            lines.push(format!("Size: {}", format_bytes(item.bytes)));
-        } else if staged.target.is_dir {
-            lines.push("A folder: every file inside is shredded.".to_string());
-        } else if let Some(len) = HostFs.len(&staged.target.path) {
-            lines.push(format!("Size: {}", format_bytes(len)));
+    fn finish_recycle(&mut self, results: Vec<(String, Result<(), String>)>) {
+        let moved: Vec<&String> = results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_ok())
+            .map(|(path, _)| path)
+            .collect();
+        let kept: Vec<&String> = results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .map(|(path, _)| path)
+            .collect();
+        if let Some(report) = self.dup_report.as_mut() {
+            // A set with a file that was kept may have changed since the
+            // search; it is dropped until the next search.
+            report
+                .groups
+                .retain(|group| !group.files.iter().any(|path| kept.contains(&path)));
+            for group in &mut report.groups {
+                group.files.retain(|path| !moved.contains(&path));
+            }
+            report.groups.retain(|group| group.files.len() > 1);
         }
-        let bytes = staged.target.path.trim().as_bytes();
-        if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-            let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
-            match volume_ssd(&drive) {
-                Some(true) => lines.push(format!(
-                    "{drive} is a solid-state drive: traces may survive in spare blocks."
-                )),
-                None => lines.push(format!("Could not tell whether {drive} is solid-state.")),
-                Some(false) => {}
+        let mut lines = vec![format!(
+            "Moved {} to the Recycle Bin.",
+            count_of(moved.len() as u64, "file", "files")
+        )];
+        for (path, outcome) in results
+            .iter()
+            .filter(|(_, outcome)| outcome.is_err())
+            .take(8)
+        {
+            if let Err(why) = outcome {
+                lines.push(format!("Kept {path}: {why}"));
             }
         }
-        self.message(&lines.join("\n"), MB_ICONINFORMATION);
+        let failed = !kept.is_empty();
+        if failed {
+            lines.push("Search again to list the sets with kept files.".to_string());
+        }
+        self.dup_checked.clear();
+        self.sync_controls();
+        self.fill_dups();
+        self.message(
+            &lines.join("\n"),
+            if failed {
+                MB_ICONWARNING
+            } else {
+                MB_ICONINFORMATION
+            },
+        );
     }
 
-    fn drop_files(&mut self, drop: HDROP) {
-        if self.page != Page::Shredder || self.busy() {
+    fn open_dup_row(&mut self) {
+        let Some(path) = selected_rows(self.dup_list)
+            .first()
+            .and_then(|row| self.dup_rows.get(*row))
+            .and_then(|(set, file)| {
+                self.dup_report
+                    .as_ref()?
+                    .groups
+                    .get(*set)?
+                    .files
+                    .get(*file)
+                    .cloned()
+            })
+        else {
+            self.message("Highlight a file first.", MB_ICONINFORMATION);
             return;
-        }
-        let count = unsafe { DragQueryFileW(drop, 0xffff_ffff, std::ptr::null_mut(), 0) };
-        for index in 0..count {
-            let len = unsafe { DragQueryFileW(drop, index, std::ptr::null_mut(), 0) } as usize;
-            let mut buf = vec![0u16; len + 1];
-            unsafe { DragQueryFileW(drop, index, buf.as_mut_ptr(), buf.len() as u32) };
-            let path = String::from_utf16_lossy(&buf[..len]);
-            self.stage_path(&path);
-        }
-        self.invalidate();
+        };
+        shell_open(
+            self.hwnd,
+            "explorer.exe",
+            Some(&format!("/select,\"{path}\"")),
+        );
     }
 
     fn fill_services(&mut self) {
@@ -3491,7 +4211,7 @@ impl App {
         if self.busy() {
             return;
         }
-        let selected = self.ticked();
+        let mut selected = self.ticked();
         if selected.is_empty() {
             self.message(
                 "Tick the entries you want to repair first.",
@@ -3499,7 +4219,24 @@ impl App {
             );
             return;
         }
-        let Some(backup_file) = next_backup_file() else {
+        // An administrator window leaves per-user registry entries to a
+        // normal window: a program running without elevation can redirect
+        // keys in those hives.
+        let per_user = if self.elevated {
+            let before = selected.len();
+            selected.retain(|finding| !finding.per_user());
+            before - selected.len()
+        } else {
+            0
+        };
+        if selected.is_empty() {
+            self.message(
+                "The ticked entries are in your own part of the registry. Repair them from Hivemend started without administrator rights.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
+        let Some(mut backup) = next_backup_file() else {
             self.message(
                 "Could not reserve a backup file in the backups folder. Nothing was changed.",
                 MB_ICONWARNING,
@@ -3507,18 +4244,27 @@ impl App {
             return;
         };
         let mut question = format!(
-            "Repair {} {}?\n\nHive Mend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
+            "Repair {} {}?\n\nHivemend first checks that each one is still broken, then saves a backup in\n{}\nbefore removing anything. You can undo the repair on the Restore page.",
             selected.len(),
             if selected.len() == 1 {
                 "entry"
             } else {
                 "entries"
             },
-            backup_file
+            backup
+                .path()
                 .parent()
                 .map(|dir| dir.display().to_string())
                 .unwrap_or_default()
         );
+        if per_user > 0 {
+            question.push_str(&format!(
+                "\n\n{per_user} ticked {} in your own part of the registry {} left alone; repair {} from Hivemend started without administrator rights.",
+                if per_user == 1 { "entry" } else { "entries" },
+                if per_user == 1 { "is" } else { "are" },
+                if per_user == 1 { "it" } else { "them" },
+            ));
+        }
         let permanent = selected.iter().filter(|f| f.permanent()).count();
         if permanent > 0 {
             question.push_str(&format!(
@@ -3533,7 +4279,7 @@ impl App {
             ));
         }
         if !self.confirm(&question, Redo::Repair) {
-            discard_reserved_backup(&backup_file);
+            backup.discard();
             return;
         }
         self.job = Job::Repairing;
@@ -3543,6 +4289,8 @@ impl App {
         self.show_progress();
         self.invalidate();
         let hwnd = self.hwnd as isize;
+        // Windows only creates restore points for administrators.
+        let make_point = self.elevated && !self.settings.skip_restore_point;
         std::thread::spawn(move || {
             let engine = match Engine::try_builtin() {
                 Ok(engine) => engine,
@@ -3552,6 +4300,7 @@ impl App {
                         JobResult::Repair {
                             result: Err(format!("Could not load the scanner rules: {err}")),
                             fixed_meanwhile: Vec::new(),
+                            restore_note: None,
                         },
                     );
                     return;
@@ -3588,20 +4337,29 @@ impl App {
                 .filter(|finding| !confirmed.contains(finding))
                 .cloned()
                 .collect();
+            let mut restore_note = None;
             let result = if confirmed.is_empty() {
+                backup.discard();
                 Ok(RepairOutcome {
                     backup_file: PathBuf::new(),
                     ..RepairOutcome::default()
                 })
             } else {
+                let point = if make_point {
+                    set_progress(1, 3, "Creating a Windows restore point...");
+                    post(hwnd, WM_JOB_PROGRESS);
+                    Some(hive_mend::restorepoint::begin("Hivemend repair"))
+                } else {
+                    None
+                };
                 set_progress(1, 3, "Saving the backup...");
                 post(hwnd, WM_JOB_PROGRESS);
                 let total = confirmed.len();
-                repair_with_progress(
+                let repaired = repair_with_progress(
                     &mut WindowsRegistry,
                     &mut HostFs,
                     &confirmed,
-                    &backup_file,
+                    &mut backup,
                     &mut |done, _| {
                         set_progress(
                             total + done * 2,
@@ -3611,13 +4369,33 @@ impl App {
                         post(hwnd, WM_JOB_PROGRESS);
                     },
                 )
-                .map_err(|err| format!("The backup could not be written: {err}"))
+                .map_err(|err| format!("The backup could not be written: {err}"));
+                restore_note = match point {
+                    Some(Ok(point)) => {
+                        let changed = repaired.as_ref().is_ok_and(|outcome| outcome.applied > 0);
+                        match hive_mend::restorepoint::end(point, changed) {
+                            Ok(()) => changed.then(|| {
+                                "Windows also saved a restore point before the repair. (Windows keeps at most one a day, so it may reuse today's.)".to_string()
+                            }),
+                            Err(why) if changed => Some(format!(
+                                "The Windows restore point may not have been saved: {why}. The registry backup was saved as usual."
+                            )),
+                            Err(_) => None,
+                        }
+                    }
+                    Some(Err(why)) => Some(format!(
+                        "No Windows restore point was made: {why}. The registry backup was saved as usual."
+                    )),
+                    None => None,
+                };
+                repaired
             };
             finish_job(
                 hwnd,
                 JobResult::Repair {
                     result,
                     fixed_meanwhile,
+                    restore_note,
                 },
             );
         });
@@ -3627,6 +4405,7 @@ impl App {
         &mut self,
         result: Result<RepairOutcome, String>,
         fixed_meanwhile: Vec<Finding>,
+        restore_note: Option<String>,
     ) {
         let outcome = match result {
             Ok(outcome) => outcome,
@@ -3647,6 +4426,9 @@ impl App {
         self.drop_rows(&rows);
         let already = outcome.already_gone + fixed_meanwhile.len();
         let mut lines = vec![format!("Removed: {}", outcome.applied)];
+        if let Some(note) = restore_note {
+            lines.push(note);
+        }
         if already > 0 {
             lines.push(format!(
                 "Already fixed before repair reached them: {already}"
@@ -3656,6 +4438,15 @@ impl App {
         if left > 0 {
             lines.push(format!(
                 "Left alone because they could not be backed up or are protected: {left}"
+            ));
+        }
+        for note in outcome.notes.iter().take(5) {
+            lines.push(format!("Left alone: {note}"));
+        }
+        if outcome.notes.len() > 5 {
+            lines.push(format!(
+                "...and {} more left alone",
+                outcome.notes.len() - 5
             ));
         }
         if !outcome.errors.is_empty() {
@@ -3707,9 +4498,21 @@ impl App {
 
     // ---- restore -------------------------------------------------------
 
+    /// Read the backup list off the window's thread (each file is read and
+    /// parsed), and show it when it arrives. One reader runs at a time: a
+    /// refresh while it reads makes it stop early and read again.
     fn refresh_backups(&mut self) {
-        self.backups = all_backups();
-        self.fill_backups();
+        let Some(refresh) = BACKUPS.request() else {
+            return;
+        };
+        let hwnd = self.hwnd as isize;
+        let started = std::thread::Builder::new().spawn(move || {
+            BACKUPS.work(refresh, all_backups, || post(hwnd, WM_BACKUPS_READY));
+        });
+        if started.is_err() {
+            BACKUPS.not_started(refresh);
+            post(hwnd, WM_BACKUPS_READY);
+        }
     }
 
     fn fill_backups(&self) {
@@ -3743,10 +4546,10 @@ impl App {
         let Some(backup) = self.backups.get(row).cloned() else {
             return;
         };
-        // Only the protected store is trusted by an elevated instance. Other
-        // folders can be changed by other accounts or by this account's
-        // non-elevated programs, so their backups restore only without
-        // elevation, which can change only this account's own entries.
+        if let Some(text) = restore_block(&backup.summary, &backup.path, self.elevated) {
+            self.message(&text, MB_ICONINFORMATION);
+            return;
+        }
         if self.elevated && !backup.store.elevated_may_restore() {
             let place = if backup.store == Store::Legacy {
                 format!(
@@ -3757,21 +4560,24 @@ impl App {
             };
             self.message(
                 &format!(
-                    "This backup is in {place}, so Hive Mend does not restore it with administrator rights.\n\nStart Hive Mend without administrator rights to put back the entries for your own account."
+                    "This backup is in {place}, so Hivemend does not restore it with administrator rights.\n\nStart Hivemend without administrator rights to put back the entries for your own account."
                 ),
                 MB_ICONWARNING,
             );
             return;
         }
-        if backup.summary.machine_wide && !self.elevated && !backup.store.elevated_may_restore() {
+        // A backup with entries for this account restores that part here;
+        // only a backup that is entirely machine-wide needs elevation first.
+        let only_machine = backup.summary.machine_wide && !backup.summary.per_user;
+        if only_machine && !self.elevated && !backup.store.elevated_may_restore() {
             self.message(
-                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hive Mend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
+                "This backup includes machine-wide entries but was not saved in the protected backup store, so Hivemend cannot restore it with administrator rights. Check the file and merge it yourself with Registry Editor if you need those entries back.",
                 MB_ICONWARNING,
             );
             return;
         }
-        if backup.summary.machine_wide && !self.elevated {
-            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hive Mend as administrator now?";
+        if only_machine && !self.elevated {
+            let ask = "This backup includes machine-wide entries, so putting it back needs administrator rights.\n\nRestart Hivemend as administrator now?";
             if self.confirm(ask, Redo::Restore(row)) {
                 self.elevate();
             }
@@ -3804,10 +4610,19 @@ impl App {
     ) {
         match result {
             Ok((summary, files, errors)) => {
-                let mut text = format!("Restored {} from\n{}", contents(&summary), file.display());
-                if files > 0 {
-                    text.push_str(&format!("\n\n{files} shortcuts were put back."));
-                }
+                // The headline counts only what was verified: shortcuts put
+                // back by this restore, not every shortcut the backup names.
+                // A missing archive is never claimed as restored.
+                let expected = summary.files.len();
+                let mut text = if errors.is_empty() && files == expected {
+                    format!("Restored {} from\n{}", contents(&summary), file.display())
+                } else {
+                    format!(
+                        "Restore from\n{} put back {files} of {expected} shortcuts ({}).",
+                        file.display(),
+                        contents(&summary)
+                    )
+                };
                 if !errors.is_empty() {
                     text.push_str("\n\nSome files could not be put back:\n");
                     text.push_str(
@@ -3841,6 +4656,11 @@ impl App {
     // ---- settings ------------------------------------------------------
 
     fn save_settings(&self) {
+        // Never written from an administrator window: a program running
+        // without elevation could redirect the per-user folder.
+        if self.elevated {
+            return;
+        }
         let _ = self.settings.save(&settings_file());
     }
 
@@ -3852,6 +4672,13 @@ impl App {
     }
 
     fn unignore(&mut self) {
+        if self.elevated {
+            self.message(
+                "The ignore list is changed from Hivemend started without administrator rights. An administrator window does not write to your per-user folder.",
+                MB_ICONINFORMATION,
+            );
+            return;
+        }
         let rows = selected_rows(self.ignored_list);
         if rows.is_empty() {
             self.message(
@@ -3915,9 +4742,10 @@ impl App {
             JobResult::Repair {
                 result,
                 fixed_meanwhile,
+                restore_note,
             } => {
                 self.sync_controls();
-                self.finish_repair(result, fixed_meanwhile);
+                self.finish_repair(result, fixed_meanwhile, restore_note);
             }
             JobResult::Restore { file, result } => {
                 self.sync_controls();
@@ -3932,13 +4760,78 @@ impl App {
                 self.sync_controls();
                 self.finish_services(op, result, services);
             }
+            JobResult::Disk { report } => {
+                let unread = if report.unreadable > 0 {
+                    format!(
+                        " {} could not be read{}.",
+                        count_of(report.unreadable, "folder", "folders"),
+                        if self.elevated {
+                            ""
+                        } else {
+                            " (Run as administrator to include more)"
+                        }
+                    )
+                } else {
+                    String::new()
+                };
+                self.disk_note = format!(
+                    "{}{} holds {} in {}.{unread}",
+                    if report.canceled {
+                        "Stopped early: "
+                    } else if report.incomplete {
+                        "Too many folders to count them all; partial totals: "
+                    } else {
+                        ""
+                    },
+                    report.path_of(0),
+                    format_bytes(report.nodes[0].bytes),
+                    count_of(report.nodes[0].files, "file", "files"),
+                );
+                self.disk_at = 0;
+                self.disk_report = Some(report);
+                self.sync_controls();
+                self.fill_disk();
+            }
+            JobResult::Dups { result } => {
+                match result {
+                    Ok(report) => {
+                        let extra: u64 = report.groups.iter().map(|group| group.extra()).sum();
+                        let unread = if report.unreadable > 0 {
+                            format!(
+                                " {} could not be read.",
+                                count_of(report.unreadable, "item", "items")
+                            )
+                        } else {
+                            String::new()
+                        };
+                        self.dup_note = format!(
+                            "{}{} of identical files in {}; keeping one of each frees {}.{unread}",
+                            if report.canceled {
+                                "Stopped early: "
+                            } else if report.incomplete {
+                                "Too many files to search them all; from the part searched: "
+                            } else {
+                                ""
+                            },
+                            count_of(report.groups.len() as u64, "set", "sets"),
+                            report.root,
+                            format_bytes(extra),
+                        );
+                        self.dup_report = Some(report);
+                    }
+                    Err(err) => {
+                        self.dup_note = "The search could not run.".to_string();
+                        self.message(&err, MB_ICONWARNING);
+                    }
+                }
+                self.sync_controls();
+                self.fill_dups();
+            }
+            JobResult::Recycled { results } => self.finish_recycle(results),
+            JobResult::PrivacyPreview { report } => self.finish_priv_preview(report),
             JobResult::Privacy { result } => {
                 self.sync_controls();
                 self.finish_privacy(result);
-            }
-            JobResult::Shred { outcome } => {
-                self.sync_controls();
-                self.finish_shred(outcome);
             }
         }
         self.sync_controls();
@@ -3995,6 +4888,18 @@ impl App {
                 .filter(|(index, _)| ticked(&self.svc_checked, *index))
                 .map(|(_, change)| format!("{}>{:?}", change.name, change.to))
                 .collect(),
+            Redo::Startup(rows, _) => rows
+                .iter()
+                .filter_map(|row| self.startup_items.get(*row))
+                .map(|item| format!("{}|{}", item.approved_key, item.name))
+                .collect(),
+            Redo::Recycle => self.dup_ticked_paths(),
+            Redo::Uninstall(row) => self
+                .programs
+                .get(*row)
+                .map(|program| format!("{}|{}", program.key, program.uninstall))
+                .into_iter()
+                .collect(),
             Redo::PowerRows(rows, _) | Redo::SetRows(rows, _) => rows
                 .iter()
                 .filter_map(|row| self.services.get(*row))
@@ -4006,13 +4911,6 @@ impl App {
                 .enumerate()
                 .filter(|(index, _)| ticked(&self.priv_checked, *index))
                 .map(|(_, item)| item.id.clone())
-                .collect(),
-            Redo::Shred => self
-                .shred_rows
-                .iter()
-                .enumerate()
-                .filter(|(index, _)| ticked(&self.shred_checked, *index))
-                .map(|(_, row)| row.target.path.clone())
                 .collect(),
             Redo::Restore(row) => self
                 .backups
@@ -4031,9 +4929,11 @@ impl App {
             Redo::PowerRows(rows, start) => self.power_rows(&rows, start),
             Redo::SetRows(rows, to) => self.set_rows(&rows, to),
             Redo::PrivacyClean => self.start_privacy_clean(),
-            Redo::Shred => self.start_shred(),
             Redo::Repair => self.start_repair(),
             Redo::Restore(row) => self.start_restore(row),
+            Redo::Startup(rows, enable) => self.toggle_startup(&rows, enable),
+            Redo::Uninstall(row) => self.uninstall_program(&[row]),
+            Redo::Recycle => self.recycle_ticked(),
         }
     }
 
@@ -4120,15 +5020,17 @@ impl App {
                     place(self.list, left, list_top, width, list_h);
                     let mut x = left;
                     for (control, w) in [
-                        (self.btn_scan, 110),
-                        (self.btn_all, 96),
-                        (self.btn_none, 104),
-                        (self.btn_ignore, 156),
+                        (self.btn_scan, 104),
+                        (self.btn_all, 88),
+                        (self.btn_none, 98),
+                        (self.btn_ignore, 150),
                     ] {
                         place(control, x, button_y, self.s(w), button_h);
                         x += self.s(w + 8);
                     }
-                    let repair_w = self.s(200);
+                    // Whatever room is left, up to the usual width, so it
+                    // never covers Ignore at the minimum window size.
+                    let repair_w = (right - x).clamp(self.s(150), self.s(200));
                     place(
                         self.btn_repair,
                         right - repair_w,
@@ -4192,6 +5094,14 @@ impl App {
                         self.s(26),
                     );
                 }
+                visible.push(self.chk_restore_point);
+                place(
+                    self.chk_restore_point,
+                    left,
+                    self.s(SETTINGS_RESTORE_POINT_Y),
+                    width - self.s(12),
+                    self.s(26),
+                );
                 let ignored_top = self.s(SETTINGS_IGNORED_Y + 62);
                 visible.extend([self.ignored_list, self.btn_unignore]);
                 place(
@@ -4277,7 +5187,7 @@ impl App {
                 }
             }
             Page::Privacy => {
-                if matches!(self.job, Job::Cleaning) {
+                if matches!(self.job, Job::Cleaning | Job::Previewing) {
                     visible.push(self.progress);
                     place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
                     visible.push(self.btn_cancel);
@@ -4294,19 +5204,22 @@ impl App {
                         self.btn_priv_preview,
                         self.btn_priv_all,
                         self.btn_priv_none,
+                        self.btn_priv_keep,
                         self.btn_priv_clean,
                     ]);
                     place(self.priv_list, left, list_top, width, list_h);
                     let mut x = left;
                     for (control, w) in [
-                        (self.btn_priv_preview, 110),
-                        (self.btn_priv_all, 96),
-                        (self.btn_priv_none, 104),
+                        (self.btn_priv_preview, 100),
+                        (self.btn_priv_all, 90),
+                        (self.btn_priv_none, 100),
+                        (self.btn_priv_keep, 136),
                     ] {
                         place(control, x, button_y, self.s(w), button_h);
                         x += self.s(w + 8);
                     }
-                    let clean_w = self.s(220);
+                    // Whatever room is left, up to the usual width.
+                    let clean_w = (right - x).clamp(self.s(140), self.s(220));
                     place(
                         self.btn_priv_clean,
                         right - clean_w,
@@ -4317,43 +5230,139 @@ impl App {
                     self.size_priv_columns(width);
                 }
             }
-            Page::Shredder => {
-                if matches!(self.job, Job::Shredding) {
+            Page::Startup => {
+                visible.extend([
+                    self.startup_list,
+                    self.btn_su_enable,
+                    self.btn_su_disable,
+                    self.btn_su_open,
+                    self.btn_su_refresh,
+                ]);
+                let top = self.s(LIST_Y);
+                place(
+                    self.startup_list,
+                    left,
+                    top,
+                    width,
+                    (button_y - self.s(14) - top).max(self.s(80)),
+                );
+                let mut x = left;
+                for (control, w) in [
+                    (self.btn_su_enable, 110),
+                    (self.btn_su_disable, 110),
+                    (self.btn_su_open, 170),
+                ] {
+                    place(control, x, button_y, self.s(w), button_h);
+                    x += self.s(w + 8);
+                }
+                let refresh_w = self.s(110);
+                place(
+                    self.btn_su_refresh,
+                    right - refresh_w,
+                    button_y,
+                    refresh_w,
+                    button_h,
+                );
+                let command_w = (width - self.s(220 + 90 + 110 + 26)).max(self.s(160));
+                unsafe {
+                    SendMessageW(self.startup_list, LVM_SETCOLUMNWIDTH, 3, command_w as isize)
+                };
+            }
+            Page::Programs => {
+                visible.extend([
+                    self.programs_list,
+                    self.btn_pg_uninstall,
+                    self.btn_pg_open,
+                    self.btn_pg_refresh,
+                ]);
+                let top = self.s(LIST_Y);
+                place(
+                    self.programs_list,
+                    left,
+                    top,
+                    width,
+                    (button_y - self.s(14) - top).max(self.s(80)),
+                );
+                place(self.btn_pg_uninstall, left, button_y, self.s(110), button_h);
+                place(
+                    self.btn_pg_open,
+                    left + self.s(118),
+                    button_y,
+                    self.s(170),
+                    button_h,
+                );
+                let refresh_w = self.s(110);
+                place(
+                    self.btn_pg_refresh,
+                    right - refresh_w,
+                    button_y,
+                    refresh_w,
+                    button_h,
+                );
+                let name_w = (width - self.s(180 + 95 + 80 + 120 + 26)).max(self.s(160));
+                unsafe { SendMessageW(self.programs_list, LVM_SETCOLUMNWIDTH, 0, name_w as isize) };
+            }
+            Page::DiskSpace => {
+                if self.job == Job::Analyzing {
                     visible.push(self.progress);
-                    place(self.progress, left, self.s(BODY_Y + 16), width, self.s(22));
+                    place(self.progress, left, self.s(BODY_Y + 52), width, self.s(22));
                     visible.push(self.btn_cancel);
                     place(
                         self.btn_cancel,
                         left,
-                        self.s(BODY_Y + 88),
+                        self.s(BODY_Y + 124),
                         self.s(110),
                         button_h,
                     );
-                } else {
-                    visible.extend([
-                        self.shred_path,
-                        self.btn_shred_add,
-                        self.shred_list,
-                        self.btn_shred_bin,
-                        self.btn_shred_all,
-                        self.btn_shred_none,
-                        self.btn_shred_remove,
-                        self.btn_shred_passes,
-                        self.btn_shred,
-                    ]);
-                    let edit_y = self.s(BODY_Y + 26);
-                    let add_w = self.s(90);
-                    place(self.btn_shred_add, right - add_w, edit_y, add_w, self.s(28));
+                } else if self.disk_report.is_some() {
+                    visible.extend([self.disk_list, self.btn_ds_up, self.btn_ds_open]);
+                    let top = self.s(BODY_Y + 44);
                     place(
-                        self.shred_path,
+                        self.disk_list,
                         left,
-                        edit_y,
-                        width - add_w - self.s(8),
-                        self.s(28),
+                        top,
+                        width,
+                        (button_y - self.s(14) - top).max(self.s(80)),
                     );
-                    let top = self.s(BODY_Y + 62);
+                    place(self.btn_ds_up, left, button_y, self.s(130), button_h);
                     place(
-                        self.shred_list,
+                        self.btn_ds_open,
+                        left + self.s(138),
+                        button_y,
+                        self.s(160),
+                        button_h,
+                    );
+                    let name_w = (width - self.s(100 + 80 + 100 + 26)).max(self.s(160));
+                    unsafe { SendMessageW(self.disk_list, LVM_SETCOLUMNWIDTH, 0, name_w as isize) };
+                    let can_go_up = self.disk_view == DiskView::Folders && self.disk_at != 0;
+                    unsafe { EnableWindow(self.btn_ds_up, i32::from(can_go_up)) };
+                }
+            }
+            Page::Duplicates => {
+                if matches!(self.job, Job::Finding | Job::Recycling) {
+                    visible.push(self.progress);
+                    place(self.progress, left, self.s(BODY_Y + 52), width, self.s(22));
+                    if self.job == Job::Finding {
+                        visible.push(self.btn_cancel);
+                        place(
+                            self.btn_cancel,
+                            left,
+                            self.s(BODY_Y + 124),
+                            self.s(110),
+                            button_h,
+                        );
+                    }
+                } else if self.dup_report.is_some() {
+                    visible.extend([
+                        self.dup_list,
+                        self.btn_dup_extras,
+                        self.btn_dup_none,
+                        self.btn_dup_recycle,
+                        self.btn_dup_open,
+                    ]);
+                    let top = self.s(BODY_Y + 44);
+                    place(
+                        self.dup_list,
                         left,
                         top,
                         width,
@@ -4361,18 +5370,25 @@ impl App {
                     );
                     let mut x = left;
                     for (control, w) in [
-                        (self.btn_shred_bin, 150),
-                        (self.btn_shred_all, 96),
-                        (self.btn_shred_none, 104),
-                        (self.btn_shred_remove, 110),
-                        (self.btn_shred_passes, 110),
+                        (self.btn_dup_extras, 150),
+                        (self.btn_dup_none, 110),
+                        (self.btn_dup_open, 120),
                     ] {
                         place(control, x, button_y, self.s(w), button_h);
                         x += self.s(w + 8);
                     }
-                    let shred_w = self.s(200);
-                    place(self.btn_shred, right - shred_w, button_y, shred_w, button_h);
-                    self.size_shred_columns(width);
+                    let recycle_w = self.s(250);
+                    place(
+                        self.btn_dup_recycle,
+                        right - recycle_w,
+                        button_y,
+                        recycle_w,
+                        button_h,
+                    );
+                    let folder_w = (width - self.s(240 + 90 + 70 + 26)).max(self.s(160));
+                    unsafe {
+                        SendMessageW(self.dup_list, LVM_SETCOLUMNWIDTH, 1, folder_w as isize)
+                    };
                 }
             }
             Page::Status | Page::About | Page::Monitor | Page::Tools => {}
@@ -4395,12 +5411,7 @@ impl App {
             self.btn_priv_preview,
             self.btn_priv_all,
             self.btn_priv_none,
-            self.btn_shred_add,
-            self.btn_shred_bin,
-            self.btn_shred_all,
-            self.btn_shred_none,
-            self.btn_shred_remove,
-            self.btn_shred_passes,
+            self.btn_priv_keep,
         ] {
             unsafe { EnableWindow(control, idle as i32) };
         }
@@ -4412,12 +5423,9 @@ impl App {
         unsafe { EnableWindow(self.svc_list, idle as i32) };
         unsafe { EnableWindow(self.svc_tune_list, idle as i32) };
         unsafe { EnableWindow(self.priv_list, idle as i32) };
-        unsafe { EnableWindow(self.shred_list, idle as i32) };
-        unsafe { EnableWindow(self.shred_path, idle as i32) };
         self.update_repair_label();
         self.update_svc_apply_label();
         self.update_priv_clean_label();
-        self.update_shred_label();
     }
 
     fn size_svc_columns(&self, width: i32) {
@@ -4501,8 +5509,11 @@ impl App {
                 Page::Restore => self.draw_restore(mem, rect),
                 Page::Settings => self.draw_settings(mem, rect),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
+                Page::Startup => self.draw_startup(mem, rect),
+                Page::Programs => self.draw_programs(mem, rect),
+                Page::DiskSpace => self.draw_disk(mem, rect, previous_hover),
+                Page::Duplicates => self.draw_dups(mem, rect, previous_hover),
                 Page::Privacy => self.draw_privacy(mem, rect),
-                Page::Shredder => self.draw_shredder(mem, rect),
                 Page::Monitor => self.draw_monitor(mem, rect, previous_hover),
                 Page::Tools => self.draw_tools(mem, rect, previous_hover),
                 Page::About => self.draw_about(mem, rect),
@@ -4524,30 +5535,16 @@ impl App {
 
     unsafe fn draw_chrome(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         let header = self.s(HEADER_H);
-        // A lighter top half over a deeper bottom half gives the header its gloss.
-        gradient(
+        // A clean title bar: logo, name, a hairline beneath.
+        fill(
             hdc,
             RECT {
                 left: 0,
                 top: 0,
                 right: rect.right,
-                bottom: header / 2,
-            },
-            (44, 110, 196),
-            (96, 166, 230),
-            false,
-        );
-        gradient(
-            hdc,
-            RECT {
-                left: 0,
-                top: header / 2,
-                right: rect.right,
                 bottom: header,
             },
-            (16, 72, 160),
-            (52, 128, 206),
-            false,
+            SURFACE,
         );
         fill(
             hdc,
@@ -4557,95 +5554,82 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            rgb(12, 52, 120),
+            BORDER,
         );
+        let logo = self.s(30);
+        self.draw_icon(hdc, Icon::Logo, self.s(20), (header - logo) / 2, logo);
         text(
             hdc,
-            self.fonts.title,
-            rgb(255, 255, 255),
+            self.fonts.heading,
+            INK,
             RECT {
-                left: self.s(24),
+                left: self.s(20) + logo + self.s(12),
                 top: 0,
                 right: rect.right / 2,
                 bottom: header,
             },
-            "Hive Mend",
+            "Hivemend",
             DT_SINGLELINE | DT_VCENTER,
         );
-        let help_size = measure(hdc, self.fonts.body_bold, "Help");
+        let help_size = measure(hdc, self.fonts.body, "Help");
         let help = RECT {
-            left: rect.right - self.s(20) - help_size.0,
+            left: rect.right - self.s(24) - help_size.0,
             top: header / 2 - self.s(13),
-            right: rect.right - self.s(20),
+            right: rect.right - self.s(24),
             bottom: header / 2 + self.s(13),
         };
         let help_lit = lit(hover, help);
         text(
             hdc,
-            self.fonts.body_bold,
-            if help_lit {
-                rgb(255, 255, 255)
-            } else {
-                rgb(214, 232, 250)
-            },
+            self.fonts.body,
+            if help_lit { ACCENT_GREEN } else { MUTED },
             help,
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
         );
-        if help_lit {
-            fill(
-                hdc,
-                RECT {
-                    left: help.left,
-                    top: help.bottom - 1,
-                    right: help.right,
-                    bottom: help.bottom,
-                },
-                rgb(255, 255, 255),
-            );
-        }
         self.spot(help, Action::Page(Page::About));
-        let badge = RECT {
-            left: rect.right - self.s(260),
-            top: 0,
-            right: help.left - self.s(16),
-            bottom: header,
-        };
+        let right_edge = help.left - self.s(20);
         if self.elevated {
+            let label = "Administrator";
+            let size = measure(hdc, self.fonts.small, label);
+            let badge = RECT {
+                left: right_edge - size.0 - self.s(20),
+                top: header / 2 - self.s(12),
+                right: right_edge,
+                bottom: header / 2 + self.s(12),
+            };
+            self.panel(hdc, badge, self.s(12), ACCENT_TINT, ACCENT_TINT, 0, SURFACE);
             text(
                 hdc,
                 self.fonts.small,
-                rgb(220, 236, 255),
+                THEME_INK,
                 badge,
-                "Running as administrator",
-                DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
             );
         } else {
             let label = "Run as administrator";
-            let size = measure(hdc, self.fonts.body_bold, label);
+            let size = measure(hdc, self.fonts.body, label);
             let link = RECT {
-                left: badge.right - size.0 - self.s(24),
-                top: header / 2 - self.s(17),
-                right: badge.right,
-                bottom: header / 2 + self.s(17),
+                left: right_edge - size.0 - self.s(28),
+                top: header / 2 - self.s(16),
+                right: right_edge,
+                bottom: header / 2 + self.s(16),
             };
             let lit = lit(hover, link);
-            round_box(
+            self.panel(
                 hdc,
                 link,
-                self.s(16),
-                if lit {
-                    rgb(255, 255, 255)
-                } else {
-                    rgb(232, 242, 255)
-                },
-                rgb(160, 196, 236),
+                self.s(8),
+                if lit { ACCENT_TINT } else { SURFACE },
+                ACCENT_GREEN,
                 1,
+                SURFACE,
             );
             text(
                 hdc,
-                self.fonts.body_bold,
-                BLUE_INK,
+                self.fonts.body,
+                ACCENT_GREEN,
                 link,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -4653,69 +5637,83 @@ impl App {
             self.spot(link, Action::Elevate);
         }
 
+        // The navigation rail: icon and label per page; the open page gets
+        // a soft green fill and an accent bar.
         let side = RECT {
             left: 0,
             top: header,
             right: self.s(SIDEBAR_W),
-            bottom: rect.bottom - self.s(FOOTER_H),
+            bottom: rect.bottom,
         };
         fill(hdc, side, SIDEBAR_BG);
         fill(
             hdc,
             RECT {
-                left: side.right,
+                left: side.right - 1,
                 top: header,
-                right: side.right + 1,
+                right: side.right,
                 bottom: side.bottom,
             },
-            rgb(206, 212, 222),
+            BORDER,
         );
-        gradient(
-            hdc,
-            RECT {
-                left: 0,
-                top: rect.bottom - self.s(FOOTER_H),
-                right: rect.right,
-                bottom: rect.bottom,
-            },
-            (236, 214, 70),
-            (90, 176, 72),
-            false,
-        );
-        let mut y = header + self.s(20);
-        for (label, page) in NAV {
-            let pill = RECT {
-                left: self.s(16),
+        let mut y = header + self.s(14);
+        for (label, page, icon) in NAV {
+            let item = RECT {
+                left: self.s(10),
                 top: y,
-                right: self.s(SIDEBAR_W - 16),
+                right: self.s(SIDEBAR_W - 10),
                 bottom: y + self.s(38),
             };
             let selected = self.page == *page;
-            let lit = lit(hover, pill);
-            let (fill_color, border, width) = if selected {
-                (rgb(222, 236, 253), rgb(40, 110, 190), 2)
-            } else if lit {
-                (rgb(246, 250, 255), rgb(120, 160, 210), 1)
-            } else {
-                (rgb(255, 255, 255), rgb(184, 190, 200), 1)
-            };
-            round_box(hdc, pill, self.s(18), fill_color, border, width);
-            let font = if selected {
-                self.fonts.body_bold
-            } else {
-                self.fonts.body
-            };
-            let label = label.replace("&&", "&");
+            let lit = lit(hover, item);
+            if selected || lit {
+                let tint = if selected { ACCENT_TINT } else { HOVER_TINT };
+                self.panel(hdc, item, self.s(8), tint, tint, 0, SIDEBAR_BG);
+            }
+            if selected {
+                let bar_h = self.s(16);
+                self.panel(
+                    hdc,
+                    RECT {
+                        left: item.left,
+                        top: item.top + (self.s(38) - bar_h) / 2,
+                        right: item.left + self.s(4),
+                        bottom: item.top + (self.s(38) + bar_h) / 2,
+                    },
+                    self.s(2),
+                    ACCENT_GREEN,
+                    ACCENT_GREEN,
+                    0,
+                    ACCENT_TINT,
+                );
+            }
+            let icon_px = self.s(22);
+            self.draw_icon(
+                hdc,
+                *icon,
+                item.left + self.s(14),
+                item.top + (self.s(38) - icon_px) / 2,
+                icon_px,
+            );
             text(
                 hdc,
-                font,
-                if selected { BLUE_INK } else { INK },
-                pill,
-                &label,
-                DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+                if selected {
+                    self.fonts.body_bold
+                } else {
+                    self.fonts.body
+                },
+                if selected { THEME_INK } else { INK },
+                RECT {
+                    left: item.left + self.s(14) + icon_px + self.s(12),
+                    top: item.top,
+                    right: item.right - self.s(8),
+                    bottom: item.bottom,
+                },
+                label,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
-            self.spot(pill, Action::Page(*page));
-            y += self.s(46);
+            self.spot(item, Action::Page(*page));
+            y += self.s(40);
         }
         if self.busy() {
             let note = match self.job {
@@ -4724,7 +5722,10 @@ impl App {
                 Job::Restoring => "Restoring...",
                 Job::Services => "Working...",
                 Job::Cleaning => "Cleaning...",
-                Job::Shredding => "Shredding...",
+                Job::Analyzing => "Reading sizes...",
+                Job::Finding => "Comparing files...",
+                Job::Recycling => "Recycling...",
+                Job::Previewing => "Counting...",
                 Job::Idle => "",
             };
             text(
@@ -4741,6 +5742,109 @@ impl App {
                 DT_SINGLELINE | DT_CENTER,
             );
         }
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// A rounded box with anti-aliased corners: `fill`, an optional
+    /// `border` `width` pixels thick, drawn over a `behind` background.
+    unsafe fn panel(
+        &mut self,
+        hdc: HDC,
+        rect: RECT,
+        radius: i32,
+        fill_color: u32,
+        border: u32,
+        width: i32,
+        behind: u32,
+    ) {
+        let w = rect.right - rect.left;
+        let h = rect.bottom - rect.top;
+        let r = radius.min(w / 2).min(h / 2).max(1);
+        let key = (r, fill_color, border, width, behind);
+        let sprite = *self.corners.entry(key).or_insert_with(|| {
+            let part = |c: u32| {
+                (
+                    (c & 0xff) as u8,
+                    ((c >> 8) & 0xff) as u8,
+                    ((c >> 16) & 0xff) as u8,
+                )
+            };
+            dib(
+                &hive_mend::art::corner_sprite(
+                    r as usize,
+                    part(fill_color),
+                    part(border),
+                    width as f32,
+                    part(behind),
+                ),
+                r * 2,
+            )
+        });
+        // Body, then the straight edges, then the four corner quarters.
+        fill(
+            hdc,
+            RECT {
+                left: rect.left + r,
+                top: rect.top,
+                right: rect.right - r,
+                bottom: rect.bottom,
+            },
+            fill_color,
+        );
+        fill(
+            hdc,
+            RECT {
+                left: rect.left,
+                top: rect.top + r,
+                right: rect.right,
+                bottom: rect.bottom - r,
+            },
+            fill_color,
+        );
+        if width > 0 {
+            for edge in [
+                (rect.left + r, rect.top, rect.right - r, rect.top + width),
+                (
+                    rect.left + r,
+                    rect.bottom - width,
+                    rect.right - r,
+                    rect.bottom,
+                ),
+                (rect.left, rect.top + r, rect.left + width, rect.bottom - r),
+                (
+                    rect.right - width,
+                    rect.top + r,
+                    rect.right,
+                    rect.bottom - r,
+                ),
+            ] {
+                fill(
+                    hdc,
+                    RECT {
+                        left: edge.0,
+                        top: edge.1,
+                        right: edge.2,
+                        bottom: edge.3,
+                    },
+                    border,
+                );
+            }
+        }
+        if sprite.is_null() {
+            return;
+        }
+        let mem = CreateCompatibleDC(hdc);
+        let old = SelectObject(mem, sprite);
+        for (dx, dy, sx, sy) in [
+            (rect.left, rect.top, 0, 0),
+            (rect.right - r, rect.top, r, 0),
+            (rect.left, rect.bottom - r, 0, r),
+            (rect.right - r, rect.bottom - r, r, r),
+        ] {
+            BitBlt(hdc, dx, dy, r, r, mem, sx, sy, SRCCOPY);
+        }
+        SelectObject(mem, old);
+        DeleteDC(mem);
     }
 
     unsafe fn heading(&self, hdc: HDC, rect: RECT, title: &str, accent: Option<&str>) {
@@ -4765,7 +5869,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.title,
-                ACCENT,
+                INK,
                 RECT {
                     left: x,
                     top,
@@ -4831,158 +5935,211 @@ impl App {
         ]
     }
 
+    /// The home page: a status banner with the one primary action, then the
+    /// other tools as tiles, then a quiet line of statistics.
     unsafe fn draw_status(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
-        self.heading(hdc, rect, "Select an", Some("Action"));
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
-        let cards = [
-            (
-                0,
-                "Scan Your Registry",
-                "Find entries left behind by programs that are no longer installed",
-                Action::ScanAll,
-            ),
-            (
-                1,
-                "Optimize Your System",
-                "Quick check of startup programs, uninstall entries, shared DLLs, and COM controls",
-                Action::Optimize,
-            ),
-            (
-                2,
-                "Monitor Your System",
-                "Memory, disk space, and uptime at a glance",
-                Action::Page(Page::Monitor),
-            ),
-        ];
-        let mut y = self.s(HEADER_H + 64);
-        let card_h = self.s(84);
-        for (icon, title, subtitle, action) in cards {
-            let card = RECT {
-                left,
-                top: y,
-                right,
-                bottom: y + card_h,
-            };
-            let disabled = action.starts_job() && self.busy();
-            let lit = !disabled && lit(hover, card);
-            round_box(
-                hdc,
-                card,
-                self.s(18),
-                if lit {
-                    rgb(236, 244, 253)
-                } else {
-                    rgb(248, 250, 252)
-                },
-                if lit {
-                    rgb(60, 130, 210)
-                } else {
-                    rgb(186, 196, 210)
-                },
-                if lit { 2 } else { 1 },
-            );
-            let icon_w = self.s(70);
-            if let Some(bitmap) = self.icons.get(icon).copied().filter(|b| !b.is_null()) {
-                blit(
-                    hdc,
-                    bitmap,
-                    card.left + self.s(14),
-                    card.top + (card_h - self.s(64)) / 2,
-                    icon_w,
-                    self.s(64),
-                );
-            }
-            let text_left = card.left + self.s(104);
-            let color = if disabled { MUTED } else { BLUE_INK };
-            text(
-                hdc,
-                self.fonts.heading,
-                color,
-                RECT {
-                    left: text_left,
-                    top: card.top + self.s(14),
-                    right: card.right - self.s(16),
-                    bottom: card.top + self.s(44),
-                },
-                title,
-                DT_SINGLELINE,
-            );
-            text(
-                hdc,
-                self.fonts.body,
-                MUTED,
-                RECT {
-                    left: text_left,
-                    top: card.top + self.s(46),
-                    right: card.right - self.s(16),
-                    bottom: card.bottom - self.s(8),
-                },
-                subtitle,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            self.spot(card, action);
-            y += card_h + self.s(12);
-        }
+        let mut y = self.s(TITLE_Y);
 
-        y += self.s(10);
+        // Status banner.
+        let banner = RECT {
+            left,
+            top: y,
+            right,
+            bottom: y + self.s(120),
+        };
+        self.panel(hdc, banner, self.s(10), SURFACE, BORDER, 1, BG);
+        let (badge, headline, detail) = self.status_text();
+        let badge_px = self.s(72);
+        self.draw_icon(
+            hdc,
+            badge,
+            banner.left + self.s(22),
+            banner.top + (self.s(120) - badge_px) / 2,
+            badge_px,
+        );
+        let button = RECT {
+            left: banner.right - self.s(22) - self.s(150),
+            top: banner.top + (self.s(120) - self.s(42)) / 2,
+            right: banner.right - self.s(22),
+            bottom: banner.top + (self.s(120) + self.s(42)) / 2,
+        };
+        let text_left = banner.left + self.s(22) + badge_px + self.s(20);
         text(
             hdc,
             self.fonts.title,
             INK,
             RECT {
+                left: text_left,
+                top: banner.top + self.s(24),
+                right: button.left - self.s(16),
+                bottom: banner.top + self.s(62),
+            },
+            &headline,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        text(
+            hdc,
+            self.fonts.body,
+            MUTED,
+            RECT {
+                left: text_left,
+                top: banner.top + self.s(64),
+                right: button.left - self.s(16),
+                bottom: banner.bottom - self.s(12),
+            },
+            &detail,
+            DT_WORDBREAK | DT_END_ELLIPSIS,
+        );
+        let disabled = self.busy();
+        let button_lit = !disabled && lit(hover, button);
+        let fill_color = if disabled {
+            rgb(160, 176, 166)
+        } else if button_lit {
+            ACCENT_GREEN_HOVER
+        } else {
+            ACCENT_GREEN
+        };
+        self.panel(hdc, button, self.s(8), fill_color, fill_color, 0, SURFACE);
+        text(
+            hdc,
+            self.fonts.body_bold,
+            SURFACE,
+            button,
+            "Scan now",
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER,
+        );
+        self.spot(button, Action::ScanAll);
+        y = banner.bottom + self.s(22);
+
+        // Tools grid.
+        text(
+            hdc,
+            self.fonts.heading,
+            INK,
+            RECT {
                 left,
                 top: y,
                 right,
-                bottom: y + self.s(40),
+                bottom: y + self.s(28),
             },
-            "Status & Summary",
+            "Tools",
             DT_SINGLELINE,
         );
-        y += self.s(46);
-        let label_w = self.s(150);
-        for (label, value) in self.summary_rows() {
+        y += self.s(36);
+        let tiles = [
+            (Icon::Privacy, "Privacy", Action::Page(Page::Privacy)),
+            (Icon::Startup, "Startup", Action::Page(Page::Startup)),
+            (Icon::Programs, "Programs", Action::Page(Page::Programs)),
+            (Icon::DiskSpace, "Disk Space", Action::Page(Page::DiskSpace)),
+            (
+                Icon::Duplicates,
+                "Duplicates",
+                Action::Page(Page::Duplicates),
+            ),
+            (Icon::Optimize, "Services", Action::Page(Page::Services)),
+            (Icon::Scan, "Quick Scan", Action::Optimize),
+            (Icon::Monitor, "Monitor", Action::Page(Page::Monitor)),
+            (Icon::Restore, "Restore", Action::Page(Page::Restore)),
+        ];
+        let gap = self.s(12);
+        let tile_w = (right - left - gap * 2) / 3;
+        let tile_h = self.s(84);
+        for (index, (icon, label, action)) in tiles.into_iter().enumerate() {
+            let column = (index % 3) as i32;
+            let row = (index / 3) as i32;
+            let tile = RECT {
+                left: left + column * (tile_w + gap),
+                top: y + row * (tile_h + gap),
+                right: left + column * (tile_w + gap) + tile_w,
+                bottom: y + row * (tile_h + gap) + tile_h,
+            };
+            let disabled = action.starts_job() && self.busy();
+            let tile_lit = !disabled && lit(hover, tile);
+            self.panel(
+                hdc,
+                tile,
+                self.s(10),
+                if tile_lit { ACCENT_TINT } else { SURFACE },
+                if tile_lit { ACCENT_GREEN } else { BORDER },
+                1,
+                BG,
+            );
+            let icon_px = self.s(40);
+            self.draw_icon(
+                hdc,
+                icon,
+                tile.left + (tile_w - icon_px) / 2,
+                tile.top + self.s(10),
+                icon_px,
+            );
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                if disabled { MUTED } else { INK },
                 RECT {
-                    left,
-                    top: y,
-                    right: left + label_w,
-                    bottom: y + self.s(24),
+                    left: tile.left + self.s(6),
+                    top: tile.top + self.s(10) + icon_px + self.s(6),
+                    right: tile.right - self.s(6),
+                    bottom: tile.bottom - self.s(6),
                 },
                 label,
-                DT_SINGLELINE,
+                DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS,
             );
-            text(
-                hdc,
-                self.fonts.body,
-                INK,
-                RECT {
-                    left: left + label_w,
-                    top: y,
-                    right,
-                    bottom: y + self.s(24),
-                },
-                &value,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
-            );
-            y += self.s(26);
+            self.spot(tile, action);
         }
-        y += self.s(6);
-        let mut x = left;
-        if self.scanned && self.page == Page::Status {
-            let label = "View scan results";
-            let size = measure(hdc, self.fonts.body, label);
+        y += tile_h * 3 + gap * 2 + self.s(18);
+
+        // Statistics, quietly.
+        let rows = self.summary_rows();
+        let stats = rows
+            .iter()
+            .filter(|(label, _)| matches!(*label, "Last repair" | "Backups" | "Ignored"))
+            .map(|(label, value)| format!("{label}: {value}"))
+            .collect::<Vec<_>>()
+            .join("   \u{00b7}   ");
+        let stats_size = measure(hdc, self.fonts.small, &stats);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left,
+                top: y,
+                right,
+                bottom: y + self.s(22),
+            },
+            &stats,
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+        let mut x = left + stats_size.0 + self.s(24);
+        let mut links: Vec<(&str, Action)> = Vec::new();
+        if self.scanned {
+            links.push(("View scan results", Action::Page(Page::Scan)));
+        }
+        links.push(("Reset statistics", Action::ResetStats));
+        for (label, action) in links {
+            let size = measure(hdc, self.fonts.small, label);
+            if x + size.0 > right {
+                break;
+            }
             let link = RECT {
                 left: x,
                 top: y,
                 right: x + size.0,
                 bottom: y + size.1,
             };
-            text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
-            if lit(hover, link) {
+            let link_lit = lit(hover, link);
+            text(
+                hdc,
+                self.fonts.small,
+                if link_lit { ACCENT_GREEN_HOVER } else { LINK },
+                link,
+                label,
+                DT_SINGLELINE,
+            );
+            if link_lit {
                 fill(
                     hdc,
                     RECT {
@@ -4991,34 +6148,48 @@ impl App {
                         right: link.right,
                         bottom: link.bottom,
                     },
-                    LINK,
+                    ACCENT_GREEN_HOVER,
                 );
             }
-            self.spot(link, Action::Page(Page::Scan));
-            x = link.right + self.s(24);
+            self.spot(link, action);
+            x = link.right + self.s(20);
         }
-        let label = "Click to reset statistics";
-        let size = measure(hdc, self.fonts.body, label);
-        let link = RECT {
-            left: x,
-            top: y,
-            right: x + size.0,
-            bottom: y + size.1,
+    }
+
+    /// The home banner's badge, headline, and detail line.
+    fn status_text(&self) -> (Icon, String, String) {
+        let when = if self.settings.last_scan.is_empty() {
+            String::new()
+        } else {
+            format!(" on {}", self.settings.last_scan)
         };
-        text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
-        if lit(hover, link) {
-            fill(
-                hdc,
-                RECT {
-                    left: link.left,
-                    top: link.bottom - 1,
-                    right: link.right,
-                    bottom: link.bottom,
-                },
-                LINK,
+        if self.job == Job::Scanning {
+            return (
+                Icon::StatusUnknown,
+                "Scanning your registry...".to_string(),
+                "Results appear on the Scan page when it finishes.".to_string(),
             );
         }
-        self.spot(link, Action::ResetStats);
+        match self.settings.last_problems {
+            None => (
+                Icon::StatusUnknown,
+                "No scan yet".to_string(),
+                "Scan to find registry entries, shortcuts, and temp files left behind by programs that are no longer installed.".to_string(),
+            ),
+            Some(0) => (
+                Icon::StatusOk,
+                "Your registry looks healthy".to_string(),
+                format!("The last scan{when} found no stale entries."),
+            ),
+            Some(count) => (
+                Icon::StatusWarn,
+                format!(
+                    "{count} stale {} found",
+                    if count == 1 { "entry" } else { "entries" }
+                ),
+                format!("From the last scan{when}. Scan again to review and repair them."),
+            ),
+        }
     }
 
     unsafe fn draw_privacy(&mut self, hdc: HDC, rect: RECT) {
@@ -5026,7 +6197,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Cleaning {
             self.heading(hdc, rect, "Privacy", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hivemend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5065,12 +6236,89 @@ impl App {
         );
     }
 
-    unsafe fn draw_shredder(&mut self, hdc: HDC, rect: RECT) {
+    unsafe fn draw_startup(&mut self, hdc: HDC, rect: RECT) {
+        self.heading(hdc, rect, "Startup", None);
+        let line = if self.startup_note.is_empty() {
+            "Programs that start when you sign in to Windows.".to_string()
+        } else {
+            self.startup_note.clone()
+        };
+        self.subtitle(hdc, rect, &line);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: self.s(CONTENT_X),
+                top: self.s(BODY_Y),
+                right: rect.right - self.s(24),
+                bottom: self.s(BODY_Y + 22),
+            },
+            "Highlight items, then Enable or Disable. Disabling keeps the program installed, like Task Manager's Startup tab.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_programs(&mut self, hdc: HDC, rect: RECT) {
+        self.heading(hdc, rect, "Programs", None);
+        let line = if self.programs_note.is_empty() {
+            "The programs installed on this PC.".to_string()
+        } else {
+            self.programs_note.clone()
+        };
+        self.subtitle(hdc, rect, &line);
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: self.s(CONTENT_X),
+                top: self.s(BODY_Y),
+                right: rect.right - self.s(24),
+                bottom: self.s(BODY_Y + 22),
+            },
+            "Highlight a program, then Uninstall to start its own uninstaller. Store apps are in Settings > Apps.",
+            DT_SINGLELINE | DT_END_ELLIPSIS,
+        );
+    }
+
+    unsafe fn draw_disk(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
-        if self.job == Job::Shredding {
-            self.heading(hdc, rect, "Shredder", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+        self.heading(hdc, rect, "Disk Space", None);
+        let inside = self
+            .disk_report
+            .as_ref()
+            .filter(|_| self.disk_at != 0 && self.disk_view == DiskView::Folders)
+            .map(|report| {
+                let node = &report.nodes[self.disk_at];
+                format!(
+                    "{} holds {} in {}.",
+                    report.path_of(self.disk_at),
+                    format_bytes(node.bytes),
+                    count_of(node.files, "file", "files")
+                )
+            });
+        let line = if self.job == Job::Analyzing {
+            "Reading folder sizes. Nothing is changed.".to_string()
+        } else if let Some(inside) = inside {
+            inside
+        } else if !self.disk_note.is_empty() {
+            self.disk_note.clone()
+        } else {
+            "See what takes up space. Hivemend only reads here; it never deletes anything."
+                .to_string()
+        };
+        self.subtitle(hdc, rect, &line);
+        // Drive pills on the left; view pills on the right once there is a
+        // report.
+        let mut x = left;
+        let roots = self.disk_roots.clone();
+        for (index, (label, _)) in roots.iter().enumerate() {
+            let selected = self.disk_root == Some(index);
+            x = self.pill(hdc, x, label, selected, hover, Action::DiskRoot(index));
+        }
+        if self.job == Job::Analyzing {
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5078,40 +6326,147 @@ impl App {
                 INK,
                 RECT {
                     left,
-                    top: self.s(BODY_Y + 48),
+                    top: self.s(BODY_Y + 84),
                     right,
-                    bottom: self.s(BODY_Y + 74),
+                    bottom: self.s(BODY_Y + 110),
                 },
                 &text_line,
-                DT_SINGLELINE | DT_END_ELLIPSIS,
+                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
             );
             return;
         }
-        self.heading(hdc, rect, "Shredder", None);
-        let line = if !self.shred_note.is_empty() {
-            self.shred_note.clone()
-        } else {
-            "Stage files, pick passes, then Shred. Shredding cannot be undone.".to_string()
+        if self.disk_report.is_none() {
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 120),
+                },
+                "Pick a drive or your user folder above. Hivemend adds up every folder without following links, then lists the biggest folders, the largest files, and the space by kind of file.",
+                DT_WORDBREAK | DT_NOPREFIX,
+            );
+            return;
+        }
+        let views = [
+            ("Folders", DiskView::Folders),
+            ("Largest files", DiskView::Files),
+            ("File types", DiskView::Kinds),
+        ];
+        let widths: i32 = views
+            .iter()
+            .map(|(label, _)| measure(hdc, self.fonts.body_bold, label).0 + self.s(28 + 8))
+            .sum();
+        let mut x = (right - widths + self.s(8)).max(x + self.s(16));
+        for (label, view) in views {
+            let selected = self.disk_view == view;
+            x = self.pill(hdc, x, label, selected, hover, Action::DiskView(view));
+        }
+    }
+
+    unsafe fn draw_dups(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
+        let left = self.s(CONTENT_X);
+        let right = rect.right - self.s(24);
+        self.heading(hdc, rect, "Duplicates", None);
+        let line = match self.job {
+            Job::Finding => "Comparing file contents. Nothing is changed.".to_string(),
+            Job::Recycling => "Checking each file again, then moving it.".to_string(),
+            _ if !self.dup_note.is_empty() => self.dup_note.clone(),
+            _ => "Find identical files of 1 MB or more. Matching is by content, not name."
+                .to_string(),
         };
         self.subtitle(hdc, rect, &line);
-        let hint = if self.shred_warn.is_empty() {
-            "Drop files here, type a path and Add, or stage the Recycle Bin. Refused paths are never touched.".to_string()
-        } else {
-            self.shred_warn.join(" ")
+        let mut x = left;
+        let roots = self.disk_roots.clone();
+        for (index, (label, _)) in roots.iter().enumerate() {
+            let selected = self.dup_root == Some(index);
+            x = self.pill(hdc, x, label, selected, hover, Action::DupRoot(index));
+        }
+        let _ = x;
+        if matches!(self.job, Job::Finding | Job::Recycling) {
+            let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
+            text(
+                hdc,
+                self.fonts.body,
+                INK,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 84),
+                    right,
+                    bottom: self.s(BODY_Y + 110),
+                },
+                &text_line,
+                DT_SINGLELINE | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+            return;
+        }
+        if self.dup_report.is_none() {
+            text(
+                hdc,
+                self.fonts.body,
+                MUTED,
+                RECT {
+                    left,
+                    top: self.s(BODY_Y + 48),
+                    right,
+                    bottom: self.s(BODY_Y + 140),
+                },
+                "Pick a drive or your user folder above. The Windows, Program Files, and ProgramData folders are left out, and links and cloud-only files are never read. Ticked copies go to the Recycle Bin, and one copy of every set is always kept.",
+                DT_WORDBREAK | DT_NOPREFIX,
+            );
+        }
+    }
+
+    /// A rounded tab-like button; returns where the next one starts.
+    unsafe fn pill(
+        &mut self,
+        hdc: HDC,
+        x: i32,
+        label: &str,
+        selected: bool,
+        hover: Option<RECT>,
+        action: Action,
+    ) -> i32 {
+        let size = measure(hdc, self.fonts.body_bold, label);
+        let tab = RECT {
+            left: x,
+            top: self.s(BODY_Y),
+            right: x + size.0 + self.s(28),
+            bottom: self.s(BODY_Y + 30),
         };
+        let lit = lit(hover, tab);
+        self.panel(
+            hdc,
+            tab,
+            self.s(14),
+            if selected {
+                rgb(222, 240, 226)
+            } else if lit {
+                rgb(240, 247, 241)
+            } else {
+                rgb(249, 251, 249)
+            },
+            if selected {
+                rgb(46, 130, 76)
+            } else {
+                rgb(184, 198, 188)
+            },
+            1,
+            BG,
+        );
         text(
             hdc,
-            self.fonts.small,
-            MUTED,
-            RECT {
-                left,
-                top: self.s(BODY_Y),
-                right,
-                bottom: self.s(BODY_Y + 22),
-            },
-            &hint,
-            DT_SINGLELINE | DT_END_ELLIPSIS,
+            self.fonts.body_bold,
+            if selected { THEME_INK } else { INK },
+            tab,
+            label,
+            DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
         );
+        self.spot(tab, action);
+        tab.right + self.s(8)
     }
 
     unsafe fn draw_services(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
@@ -5119,7 +6474,7 @@ impl App {
         let right = rect.right - self.s(24);
         if self.job == Job::Services {
             self.heading(hdc, rect, "Services", None);
-            self.subtitle(hdc, rect, "Please keep Hive Mend open until it finishes.");
+            self.subtitle(hdc, rect, "Please keep Hivemend open until it finishes.");
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
@@ -5160,28 +6515,29 @@ impl App {
             };
             let selected = self.svc_view == view;
             let lit = lit(hover, tab);
-            round_box(
+            self.panel(
                 hdc,
                 tab,
                 self.s(14),
                 if selected {
-                    rgb(225, 236, 250)
+                    rgb(222, 240, 226)
                 } else if lit {
-                    rgb(240, 244, 250)
+                    rgb(240, 247, 241)
                 } else {
-                    rgb(248, 250, 252)
+                    rgb(249, 251, 249)
                 },
                 if selected {
-                    rgb(60, 130, 210)
+                    rgb(46, 130, 76)
                 } else {
-                    rgb(186, 196, 210)
+                    rgb(184, 198, 188)
                 },
-                if selected { 2 } else { 1 },
+                1,
+                BG,
             );
             text(
                 hdc,
                 self.fonts.body_bold,
-                if selected { BLUE_INK } else { INK },
+                if selected { THEME_INK } else { INK },
                 tab,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5226,7 +6582,7 @@ impl App {
                 let line = if self.job == Job::Scanning {
                     "Scanning only reads the registry. Nothing is changed."
                 } else {
-                    "Please keep Hive Mend open until the repair finishes."
+                    "Please keep Hivemend open until the repair finishes."
                 };
                 self.subtitle(hdc, rect, line);
                 let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
@@ -5312,7 +6668,19 @@ impl App {
 
     unsafe fn draw_restore(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "Restore", None);
-        let line = if self.backups.is_empty() {
+        // A refresh still reading in the background is not an empty list.
+        let reading = BACKUPS.wanted() != self.backups_shown;
+        let line = if reading {
+            "Reading the backups...".to_string()
+        } else if self.backups_failed {
+            "The backup folder could not be read. Open this page again to try once more."
+                .to_string()
+        } else if !self.backup_errors.is_empty() {
+            format!(
+                "Some backups could not be read and are not listed: {}. Open this page again to try once more.",
+                self.backup_errors.first().cloned().unwrap_or_default()
+            )
+        } else if self.backups.is_empty() {
             "No backups yet. Each repair saves one here before it changes anything.".to_string()
         } else {
             "Each repair saved what it removed. Pick a backup to put those entries back."
@@ -5323,7 +6691,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                BLUE_INK,
+                THEME_INK,
                 RECT {
                     left: rect.right - self.s(160),
                     top: self.s(SUBTITLE_Y),
@@ -5338,7 +6706,15 @@ impl App {
 
     unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT) {
         self.heading(hdc, rect, "Settings", None);
-        self.subtitle(hdc, rect, "Changes are saved as you make them.");
+        self.subtitle(
+            hdc,
+            rect,
+            if self.elevated {
+                "As administrator, Hivemend starts from the defaults, leaves your ignore list out, and forgets changes when it closes. Start Hivemend normally to save them."
+            } else {
+                "Changes are saved as you make them."
+            },
+        );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
         text(
@@ -5472,7 +6848,7 @@ impl App {
                 right,
                 bottom: y + self.s(40),
             },
-            "Hive Mend Health",
+            "Hivemend Health",
             DT_SINGLELINE,
         );
         y += self.s(46);
@@ -5708,13 +7084,14 @@ impl App {
                 ..bar
             }
         };
-        round_box(
+        self.panel(
             hdc,
             track,
             self.s(6),
-            rgb(238, 242, 247),
-            rgb(186, 196, 210),
+            rgb(236, 242, 238),
+            rgb(184, 198, 188),
             1,
+            BG,
         );
         let color = if used >= 90 {
             rgb(200, 60, 60)
@@ -5744,7 +7121,7 @@ impl App {
         self.subtitle(
             hdc,
             rect,
-            "Screens that ship with Windows. Hive Mend only opens them.",
+            "Screens that ship with Windows. Hivemend only opens them.",
         );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(28);
@@ -5765,38 +7142,28 @@ impl App {
                 bottom: y + row_h,
             };
             let lit = lit(hover, tile);
-            round_box(
+            self.panel(
                 hdc,
                 tile,
-                self.s(12),
-                if lit {
-                    rgb(236, 244, 253)
-                } else {
-                    rgb(248, 250, 252)
-                },
-                if lit {
-                    rgb(60, 130, 210)
-                } else {
-                    rgb(186, 196, 210)
-                },
-                if lit { 2 } else { 1 },
+                self.s(10),
+                if lit { ACCENT_TINT } else { SURFACE },
+                if lit { ACCENT_GREEN } else { BORDER },
+                1,
+                BG,
             );
             let icon_size = self.s(40);
-            if let Some(bitmap) = self.tool_icons.get(index).copied().filter(|b| !b.is_null()) {
-                blit(
-                    hdc,
-                    bitmap,
-                    tile.left + self.s(8),
-                    tile.top + (row_h - icon_size) / 2,
-                    icon_size,
-                    icon_size,
-                );
-            }
+            self.draw_icon(
+                hdc,
+                tool.icon,
+                tile.left + self.s(8),
+                tile.top + (row_h - icon_size) / 2,
+                icon_size,
+            );
             let text_left = tile.left + self.s(8) + icon_size + self.s(8);
             text(
                 hdc,
                 self.fonts.body_bold,
-                BLUE_INK,
+                THEME_INK,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(4),
@@ -5828,21 +7195,43 @@ impl App {
         self.subtitle(
             hdc,
             rect,
-            &format!("Hive Mend {}", env!("CARGO_PKG_VERSION")),
+            &format!(
+                "Hivemend {} \u{00b7} a TUIGSE LLC project",
+                env!("CARGO_PKG_VERSION")
+            ),
         );
         let left = self.s(CONTENT_X);
-        let icon_w = self.s(70);
+        let icon_w = self.s(64);
         let right = (rect.right - self.s(24) - icon_w - self.s(24)).max(left + self.s(200));
-        if let Some(bitmap) = self.icons.get(4).copied().filter(|b| !b.is_null()) {
-            blit(
-                hdc,
-                bitmap,
-                rect.right - self.s(24) - icon_w,
-                self.s(TITLE_Y),
-                icon_w,
-                self.s(64),
-            );
-        }
+        self.draw_icon(
+            hdc,
+            Icon::Logo,
+            rect.right - self.s(24) - icon_w,
+            self.s(TITLE_Y),
+            icon_w,
+        );
+        // The publisher's emblem beneath the product's logo.
+        let emblem_top = self.s(TITLE_Y) + icon_w + self.s(20);
+        self.draw_icon(
+            hdc,
+            Icon::Tuigse,
+            rect.right - self.s(24) - icon_w,
+            emblem_top,
+            icon_w,
+        );
+        text(
+            hdc,
+            self.fonts.small,
+            MUTED,
+            RECT {
+                left: rect.right - self.s(24) - icon_w - self.s(20),
+                top: emblem_top + icon_w + self.s(4),
+                right: rect.right - self.s(4),
+                bottom: emblem_top + icon_w + self.s(24),
+            },
+            "TUIGSE LLC",
+            DT_SINGLELINE | DT_CENTER,
+        );
         let gap = self.s(10);
         let mut y = self.s(BODY_Y);
         y = paragraph(
@@ -5852,7 +7241,7 @@ impl App {
             left,
             right,
             y,
-            "Hive Mend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
+            "Hivemend finds registry entries, shortcuts, and old temp files left behind by programs that are no longer installed on Windows 10 or 11, and removes the ones you pick.",
         ) + gap / 2;
         y = paragraph(
             hdc,
@@ -5861,7 +7250,7 @@ impl App {
             left,
             right,
             y,
-            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0).",
+            "Use at your own risk: provided as is, without warranty (MIT or Apache-2.0). Notices for the open-source parts it includes are in THIRD-PARTY-NOTICES.txt, shipped with it.",
         ) + gap;
         y = paragraph(
             hdc,
@@ -5875,7 +7264,7 @@ impl App {
         for line in [
             "Scanning only reads. Nothing changes until you choose Repair and confirm.",
             "A file only counts as missing when it is on a local disk that is plugged in. Network, USB, and unreadable paths are left alone.",
-            "Before repairing, the ticked entries are checked again. Registry entries and shortcuts are saved to a backup first; old temporary files are deleted for good and are not backed up.",
+            "Before repairing, the ticked entries are checked again. Each registry entry is saved to the backup and removed in one registry transaction, so one that changes meanwhile stays; shortcuts are moved into the backup, and Restore moves them back. Old temporary files are deleted for good and are not backed up.",
             "It never touches Winlogon, default-app choices, the services Windows needs to boot or stay secure, files inside the Windows folder, or built-in protocols such as http.",
             "Services change only on the Services page, one ticked row at a time, with the old start types backed up first.",
             "Privacy cleaning removes only your own history, temp, and cache files; registry entries are backed up first, and thumbnail caches, Prefetch, and Windows system folders are never touched.",
@@ -5883,7 +7272,7 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body,
-                BLUE_INK,
+                THEME_INK,
                 left,
                 left + self.s(16),
                 y,
@@ -5914,7 +7303,6 @@ impl App {
                     .map(|dir| dir.display().to_string())
                     .unwrap_or_default(),
             ),
-            ("Images", image_root().display().to_string()),
         ] {
             paragraph(
                 hdc,
@@ -5943,7 +7331,7 @@ impl App {
             left,
             right,
             y,
-            "From a terminal, run hive-mend --help for the scan, repair, restore, and shred commands.",
+            "From a terminal, run hivemend --help for the scan, repair, and restore commands.",
         );
     }
 }
@@ -6078,6 +7466,43 @@ fn find_path(text: &str) -> Option<usize> {
     })
 }
 
+/// Why the Restore button does nothing for this backup in this window, if
+/// it does nothing. A backup holding only entries a repair never confirmed
+/// explains how to recover them by hand instead of offering a restore, in
+/// either window. An elevated window restores only machine-wide entries
+/// (from the protected store, as checked later); one holding only entries
+/// for the account points to a normal window.
+fn restore_block(summary: &BackupSummary, path: &Path, elevated: bool) -> Option<String> {
+    let restorable = summary.keys + summary.values + summary.files.len();
+    if restorable == 0 && !summary.unconfirmed.is_empty() {
+        let mut lines: Vec<String> = summary
+            .unconfirmed
+            .iter()
+            .take(10)
+            .map(|(entry, key)| format!("entry {entry}: {key}"))
+            .collect();
+        if summary.unconfirmed.len() > 10 {
+            lines.push(format!("...and {} more", summary.unconfirmed.len() - 10));
+        }
+        return Some(format!(
+            "This backup holds only entries the repair never confirmed as removed (it stopped while saving them), so Hivemend does not put them back by itself:\n\n{}\n\nTheir saved data is still in {}. If one is missing from the registry, you can open that file in Notepad, check the entry, and add it back with Registry Editor.",
+            lines.join("\n"),
+            path.display()
+        ));
+    }
+    // Only the protected store is trusted by an elevated instance. Other
+    // folders can be changed by other accounts or by this account's
+    // non-elevated programs, so their backups restore only without
+    // elevation, which can change only this account's own entries.
+    if elevated && !summary.machine_wide {
+        return Some(
+            "This backup only holds entries for your own account. Restore it from Hivemend started without administrator rights."
+                .into(),
+        );
+    }
+    None
+}
+
 fn contents(summary: &BackupSummary) -> String {
     let mut parts = Vec::new();
     if summary.keys > 0 {
@@ -6088,6 +7513,12 @@ fn contents(summary: &BackupSummary) -> String {
     }
     if !summary.files.is_empty() {
         parts.push(plural(summary.files.len(), "shortcut"));
+    }
+    if !summary.unconfirmed.is_empty() {
+        parts.push(match summary.unconfirmed.len() {
+            1 => "1 entry needing manual recovery".to_string(),
+            count => format!("{count} entries needing manual recovery"),
+        });
     }
     if parts.is_empty() {
         "nothing that can be restored".into()
@@ -6140,26 +7571,30 @@ fn local_time_text(time: SystemTime) -> String {
 
 /// `hive-mend-YYYYMMDD-HHMMSS.reg` in local time, reserved so a name is never
 /// reused; `None` when no name could be reserved.
-fn next_backup_file() -> Option<PathBuf> {
+fn next_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("hive-mend")
 }
 
 /// `services-YYYYMMDD-HHMMSS.reg` in local time, reserved; `None` on failure.
-fn next_services_backup_file() -> Option<PathBuf> {
+fn next_services_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("services")
 }
 
-/// Backups from every store, newest first, each tagged with its store.
-fn all_backups() -> Vec<BackupInfo> {
-    let mut all: Vec<BackupInfo> = backup_stores()
-        .into_iter()
-        .flat_map(|(store, dir)| list_backups(&dir, store))
-        .collect();
-    all.sort_by_key(|info| std::cmp::Reverse(info.modified));
+/// Backups from every store, newest first, each tagged with its store,
+/// with one line per store, entry, or file that could not be read.
+fn all_backups(stop: &dyn Fn() -> bool) -> BackupInventory {
+    let mut all = BackupInventory::default();
+    for (store, dir) in backup_stores() {
+        let inventory = list_backups_until(&dir, store, stop);
+        all.items.extend(inventory.items);
+        all.errors.extend(inventory.errors);
+    }
+    all.items
+        .sort_by_key(|info| std::cmp::Reverse(info.modified));
     all
 }
 
-fn next_privacy_backup_file() -> Option<PathBuf> {
+fn next_privacy_backup_file() -> Option<hive_mend::BackupWriter> {
     next_backup_file_with("privacy")
 }
 
@@ -6167,7 +7602,7 @@ fn count(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
-fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
+fn next_backup_file_with(prefix: &str) -> Option<hive_mend::BackupWriter> {
     let Ok(dir) = backups_dir() else {
         return None;
     };
@@ -6179,40 +7614,15 @@ fn next_backup_file_with(prefix: &str) -> Option<PathBuf> {
             t.wYear, t.wMonth, t.wDay, t.wHour, t.wMinute, t.wSecond
         )
     };
-    // Reserve the name by creating the (empty) file now, so a second window
-    // choosing a name in the same second cannot land on this one and later
-    // overwrite its backup. A cancelled job removes the placeholder with
-    // `discard_reserved_backup`. Return None rather than an unreserved name:
-    // the caller aborts the job instead of writing a backup it never reserved.
-    for attempt in 0..10_000u32 {
-        let name = if attempt == 0 {
-            format!("{prefix}-{stamp}.reg")
-        } else {
-            format!("{prefix}-{stamp}-{}.reg", attempt + 1)
-        };
-        let path = dir.join(name);
-        match std::fs::OpenOptions::new()
-            .write(true)
-            .create_new(true)
-            .open(&path)
-        {
-            Ok(_) => return Some(path),
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => continue,
-            Err(_) => return None,
-        }
+    // Reserved by creating it, and written only through this handle. None
+    // when nothing could be reserved, or (as administrator) its signature
+    // could not be kept: the caller then changes nothing.
+    let mut writer = hive_mend::BackupWriter::reserve(&dir, &format!("{prefix}-{stamp}")).ok()?;
+    if hive_mend::sign_protected(&mut writer).is_err() {
+        writer.discard();
+        return None;
     }
-    None
-}
-
-/// Remove a just-reserved backup placeholder after the user cancels. Only an
-/// empty file is removed, so a real backup is never deleted.
-fn discard_reserved_backup(path: &std::path::Path) {
-    if std::fs::metadata(path)
-        .map(|meta| meta.len() == 0)
-        .unwrap_or(false)
-    {
-        let _ = std::fs::remove_file(path);
-    }
+    Some(writer)
 }
 
 // ---- Win32 helpers -----------------------------------------------------
@@ -6305,34 +7715,6 @@ fn button(parent: HWND, id: u16, label: &str, style: i32) -> HWND {
             GetModuleHandleW(std::ptr::null()),
             std::ptr::null(),
         )
-    }
-}
-
-fn edit(parent: HWND, id: u16) -> HWND {
-    unsafe {
-        CreateWindowExW(
-            0,
-            wide("EDIT").as_ptr(),
-            std::ptr::null(),
-            WS_CHILD | WS_BORDER | WS_TABSTOP | ES_AUTOHSCROLL as u32,
-            0,
-            0,
-            10,
-            10,
-            parent,
-            id as usize as HMENU,
-            GetModuleHandleW(std::ptr::null()),
-            std::ptr::null(),
-        )
-    }
-}
-
-fn edit_text(control: HWND) -> String {
-    unsafe {
-        let len = SendMessageW(control, WM_GETTEXTLENGTH, 0, 0) as usize;
-        let mut buf = vec![0u16; len + 1];
-        SendMessageW(control, WM_GETTEXT, buf.len(), buf.as_mut_ptr() as isize);
-        String::from_utf16_lossy(&buf[..len])
     }
 }
 
@@ -6462,64 +7844,6 @@ unsafe fn fill(hdc: HDC, rect: RECT, color: u32) {
     DeleteObject(brush);
 }
 
-unsafe fn round_box(hdc: HDC, rect: RECT, radius: i32, fill_color: u32, border: u32, width: i32) {
-    let pen = CreatePen(0, width, border);
-    let brush = CreateSolidBrush(fill_color);
-    let old_pen = SelectObject(hdc, pen);
-    let old_brush = SelectObject(hdc, brush);
-    RoundRect(
-        hdc,
-        rect.left,
-        rect.top,
-        rect.right,
-        rect.bottom,
-        radius,
-        radius,
-    );
-    SelectObject(hdc, old_pen);
-    SelectObject(hdc, old_brush);
-    DeleteObject(pen);
-    DeleteObject(brush);
-}
-
-unsafe fn gradient(hdc: HDC, rect: RECT, start: (u8, u8, u8), end: (u8, u8, u8), vertical: bool) {
-    let mut vert = [
-        TRIVERTEX {
-            x: rect.left,
-            y: rect.top,
-            Red: (start.0 as u16) << 8,
-            Green: (start.1 as u16) << 8,
-            Blue: (start.2 as u16) << 8,
-            Alpha: 0,
-        },
-        TRIVERTEX {
-            x: rect.right,
-            y: rect.bottom,
-            Red: (end.0 as u16) << 8,
-            Green: (end.1 as u16) << 8,
-            Blue: (end.2 as u16) << 8,
-            Alpha: 0,
-        },
-    ];
-    let mut mesh = windows_sys::Win32::Graphics::Gdi::GRADIENT_RECT {
-        UpperLeft: 0,
-        LowerRight: 1,
-    };
-    let mode = if vertical {
-        GRADIENT_FILL_RECT_V
-    } else {
-        GRADIENT_FILL_RECT_H
-    };
-    GradientFill(
-        hdc,
-        vert.as_mut_ptr(),
-        2,
-        &mut mesh as *mut _ as *mut _,
-        1,
-        mode,
-    );
-}
-
 unsafe fn text(hdc: HDC, font: HFONT, color: u32, rect: RECT, value: &str, flags: u32) {
     let old = SelectObject(hdc, font);
     SetTextColor(hdc, color);
@@ -6588,14 +7912,76 @@ unsafe fn measure(hdc: HDC, font: HFONT, value: &str) -> (i32, i32) {
     (rect.right - rect.left, rect.bottom - rect.top)
 }
 
-unsafe fn blit(hdc: HDC, bitmap: HBITMAP, x: i32, y: i32, w: i32, h: i32) {
+/// A 32-bit top-down DIB section holding `bgra` (`size` x `size` pixels).
+unsafe fn dib(bgra: &[u8], size: i32) -> HBITMAP {
+    use windows_sys::Win32::Graphics::Gdi::{
+        BITMAPINFO, BITMAPINFOHEADER, CreateDIBSection, DIB_RGB_COLORS,
+    };
+    let mut info: BITMAPINFO = std::mem::zeroed();
+    info.bmiHeader = BITMAPINFOHEADER {
+        biSize: std::mem::size_of::<BITMAPINFOHEADER>() as u32,
+        biWidth: size,
+        biHeight: -size,
+        biPlanes: 1,
+        biBitCount: 32,
+        ..std::mem::zeroed()
+    };
+    let mut bits: *mut std::ffi::c_void = std::ptr::null_mut();
+    let bitmap = CreateDIBSection(
+        std::ptr::null_mut(),
+        &info,
+        DIB_RGB_COLORS,
+        &mut bits,
+        std::ptr::null_mut(),
+        0,
+    );
+    if bitmap.is_null() || bits.is_null() {
+        return std::ptr::null_mut();
+    }
+    std::ptr::copy_nonoverlapping(bgra.as_ptr(), bits as *mut u8, bgra.len());
+    bitmap
+}
+
+/// Draw a premultiplied 32-bit bitmap with its alpha channel.
+unsafe fn alpha_blit(hdc: HDC, bitmap: HBITMAP, x: i32, y: i32, size: i32) {
+    use windows_sys::Win32::Graphics::Gdi::{AC_SRC_ALPHA, AC_SRC_OVER, AlphaBlend, BLENDFUNCTION};
     let mem = CreateCompatibleDC(hdc);
     let old = SelectObject(mem, bitmap);
-    SetStretchBltMode(hdc, HALFTONE);
-    SetBrushOrgEx(hdc, 0, 0, std::ptr::null_mut());
-    StretchBlt(hdc, x, y, w, h, mem, 0, 0, 70, 64, SRCCOPY);
+    let blend = BLENDFUNCTION {
+        BlendOp: AC_SRC_OVER as u8,
+        BlendFlags: 0,
+        SourceConstantAlpha: 255,
+        AlphaFormat: AC_SRC_ALPHA as u8,
+    };
+    AlphaBlend(hdc, x, y, size, size, mem, 0, 0, size, size, blend);
     SelectObject(mem, old);
     DeleteDC(mem);
+}
+
+/// The beehive logo as a window icon `size` pixels square.
+unsafe fn logo_icon(size: i32) -> windows_sys::Win32::UI::WindowsAndMessaging::HICON {
+    use windows_sys::Win32::Graphics::Gdi::CreateBitmap;
+    use windows_sys::Win32::UI::WindowsAndMessaging::{CreateIconIndirect, ICONINFO};
+    let size = size.max(16);
+    // Icons take straight (not premultiplied) alpha.
+    let rgba = hive_mend::art::render_rgba(Icon::Logo, size as usize);
+    let bgra: Vec<u8> = rgba
+        .chunks(4)
+        .flat_map(|px| [px[2], px[1], px[0], px[3]])
+        .collect();
+    let color = dib(&bgra, size);
+    let mask = CreateBitmap(size, size, 1, 1, std::ptr::null());
+    let info = ICONINFO {
+        fIcon: 1,
+        xHotspot: 0,
+        yHotspot: 0,
+        hbmMask: mask,
+        hbmColor: color,
+    };
+    let icon = CreateIconIndirect(&info);
+    DeleteObject(color);
+    DeleteObject(mask);
+    icon
 }
 
 fn copy_text(hwnd: HWND, value: &str) {
@@ -6629,24 +8015,196 @@ fn copy_text(hwnd: HWND, value: &str) {
 
 /// Queue a shell open for after the handler returns: ShellExecuteW can pump
 /// messages (its own error dialog, a DDE or COM wait).
+/// When the cookies-to-keep list last changed, or None if there is none.
+/// The per-user files Privacy reads: the custom list, the cookies-to-keep
+/// list, and the keep list's timestamp.
+trait PolicyFiles {
+    fn custom(&mut self) -> std::io::Result<Vec<u8>>;
+    fn keep(&mut self) -> std::io::Result<String>;
+    fn keep_stamp(&mut self) -> Option<std::time::SystemTime>;
+}
+
+struct PolicyOnDisk;
+
+impl PolicyFiles for PolicyOnDisk {
+    fn custom(&mut self) -> std::io::Result<Vec<u8>> {
+        std::fs::read(custom_privacy_file())
+    }
+    fn keep(&mut self) -> std::io::Result<String> {
+        std::fs::read(hive_mend::cookies_keep_file()).map(decode_text_owned)
+    }
+    fn keep_stamp(&mut self) -> Option<std::time::SystemTime> {
+        keep_list_stamp()
+    }
+}
+
+/// The Privacy page's categories, which are ticked, and the keep list's
+/// timestamp. The custom list, the remembered ticks, and the keep list live
+/// in the per-user folder, which programs running without elevation can
+/// edit: an elevated window touches none of them, not even to see whether
+/// they exist. It starts with nothing ticked and says why custom items and
+/// browser data are left out.
+fn privacy_plan(
+    elevated: bool,
+    files: &mut dyn PolicyFiles,
+    ticked: &[String],
+) -> (Vec<PrivacyItem>, Vec<bool>, Option<std::time::SystemTime>) {
+    let mut items = build_items();
+    if elevated {
+        let mut custom = parse_custom("", &HostFs);
+        custom.warnings.push(
+            "Custom items are not used while Hivemend runs as administrator. Start it without administrator rights to clean them."
+                .to_string(),
+        );
+        items.push(custom);
+    } else if let Ok(bytes) = files.custom() {
+        let custom = parse_custom(&decode_text_owned(bytes), &HostFs);
+        if !custom.targets.is_empty() || !custom.warnings.is_empty() {
+            items.push(custom);
+        }
+    }
+    let stamp = if elevated { None } else { files.keep_stamp() };
+    if elevated {
+        hive_mend::leave_per_user_registry(&mut items);
+    }
+    let (keep, warnings) = if elevated {
+        hive_mend::leave_browsers_alone(&mut items);
+        (
+            hive_mend::CookieKeep::LeaveAlone(
+                "Browser data is cleaned from Hivemend started without administrator rights."
+                    .to_string(),
+            ),
+            Vec::new(),
+        )
+    } else {
+        hive_mend::cookie_keep_choice(files.keep(), false)
+    };
+    hive_mend::set_cookie_keep(&mut items, &keep);
+    for item in items.iter_mut().filter(|item| {
+        item.targets
+            .iter()
+            .any(|target| matches!(target, hive_mend::PrivacyTarget::Cookies { .. }))
+    }) {
+        item.warnings.extend(
+            warnings
+                .iter()
+                .map(|warning| format!("cookies-keep.txt {warning}")),
+        );
+    }
+    let checked = items
+        .iter()
+        .map(|item| !elevated && ticked.iter().any(|id| id == &item.id))
+        .collect();
+    (items, checked, stamp)
+}
+
+fn keep_list_stamp() -> Option<std::time::SystemTime> {
+    std::fs::metadata(hive_mend::cookies_keep_file())
+        .and_then(|meta| meta.modified())
+        .ok()
+}
+
+/// Duplicates smaller than this are not worth the reading.
+const DUP_MIN_BYTES: u64 = 1024 * 1024;
+
+/// `1 file`, `2 files`, `1,000 files`.
+fn count_of(count: u64, one: &str, many: &str) -> String {
+    format!(
+        "{} {}",
+        group_digits(count),
+        if count == 1 { one } else { many }
+    )
+}
+
+/// The fixed drives, then the user's own folder, as Disk Space choices.
+fn disk_roots() -> Vec<(String, String)> {
+    use windows_sys::Win32::Storage::FileSystem::{GetDriveTypeW, GetLogicalDrives};
+    const DRIVE_FIXED: u32 = 3;
+    let mask = unsafe { GetLogicalDrives() };
+    let mut roots = Vec::new();
+    for letter in 0..26u8 {
+        if mask & (1 << letter) == 0 {
+            continue;
+        }
+        let root = format!("{}:\\", (b'A' + letter) as char);
+        if unsafe { GetDriveTypeW(wide(&root).as_ptr()) } == DRIVE_FIXED && !is_subst(&root[..2]) {
+            roots.push((root[..2].to_string(), root));
+        }
+    }
+    if let Ok(profile) = std::env::var("USERPROFILE")
+        && profile.as_bytes().get(1) == Some(&b':')
+    {
+        roots.push(("Your user folder".to_string(), profile));
+    }
+    roots
+}
+
+/// A SUBST drive: another name for a folder on a real drive, so it is not
+/// offered as a drive of its own (it would bypass protected-folder checks
+/// spelled for the real drive).
+fn is_subst(drive: &str) -> bool {
+    use windows_sys::Win32::Storage::FileSystem::QueryDosDeviceW;
+    let mut target = vec![0u16; 1024];
+    let len = unsafe {
+        QueryDosDeviceW(
+            wide(drive).as_ptr(),
+            target.as_mut_ptr(),
+            target.len() as u32,
+        )
+    } as usize;
+    len > 0 && String::from_utf16_lossy(&target[..len.min(target.len())]).starts_with(r"\??\")
+}
+
+/// Bytes in use on the drive holding `path`, for the progress bar.
+fn drive_used_bytes(path: &str) -> u64 {
+    use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+    let Some(drive) = path.get(..2) else {
+        return 0;
+    };
+    let root = wide(&format!("{drive}\\"));
+    let (mut caller, mut total, mut free) = (0u64, 0u64, 0u64);
+    if unsafe { GetDiskFreeSpaceExW(root.as_ptr(), &mut caller, &mut total, &mut free) } == 0 {
+        return 0;
+    }
+    total.saturating_sub(free)
+}
+
 fn shell_open(_hwnd: HWND, file: &str, args: Option<&str>) {
+    // A bare program name would be looked up through folders a normal
+    // program can change, which matters most in an administrator window.
+    // Windows' own tools (explorer.exe, regedit.exe) live in the Windows
+    // folder, so name them there.
+    let file = if file.contains(['\\', '/', ':']) {
+        file.to_string()
+    } else {
+        match hive_mend::host_known_dir(hive_mend::KnownDir::Windows) {
+            Some(root) => format!(r"{}\{file}", root.trim_end_matches('\\')),
+            None => {
+                lock(&NATIVE).push_back(Native::Message {
+                    text: format!("Could not locate the Windows folder to start {file}."),
+                    icon: MB_ICONWARNING,
+                });
+                return;
+            }
+        }
+    };
     lock(&NATIVE).push_back(Native::Shell {
-        file: file.to_string(),
+        file,
         args: args.map(str::to_string),
     });
 }
 
 /// Registry Editor opens at its saved `LastKey`, so set that and start it.
-fn open_in_regedit(hwnd: HWND, key: &str) {
-    let data = wide(&format!("Computer\\{key}"));
-    unsafe {
-        RegSetKeyValueW(
-            HKEY_CURRENT_USER,
-            wide(r"Software\Microsoft\Windows\CurrentVersion\Applets\Regedit").as_ptr(),
-            wide("LastKey").as_ptr(),
-            REG_SZ,
-            data.as_ptr() as *const _,
-            (data.len() * 2) as u32,
+/// The setting is written through the link-refusing registry layer, and
+/// only from a normal window: an administrator window does not write into
+/// the user's own hive, so Registry Editor opens where it last was.
+fn open_in_regedit(hwnd: HWND, key: &str, elevated: bool) {
+    if !elevated {
+        use hive_mend::Registry;
+        let _ = WindowsRegistry.set_value(
+            r"HKEY_CURRENT_USER\Software\Microsoft\Windows\CurrentVersion\Applets\Regedit",
+            "LastKey",
+            &hive_mend::ValueKind::Sz(format!("Computer\\{key}")),
         );
     }
     shell_open(hwnd, "regedit.exe", Some("-m"));
@@ -6665,41 +8223,96 @@ fn exe_path() -> PathBuf {
     PathBuf::from(String::from_utf16_lossy(&buffer))
 }
 
-fn image_root() -> PathBuf {
-    let shared = PathBuf::from(r"C:\hivemendimages");
-    if shared.is_dir() {
-        return shared;
-    }
-    exe_path()
-        .parent()
-        .map(|dir| dir.join("images"))
-        .unwrap_or_else(|| PathBuf::from("images"))
-}
-
-fn load_bitmap(name: &str) -> HBITMAP {
-    let path = image_root().join(name);
-    if !Path::new(&path).exists() {
-        return std::ptr::null_mut();
-    }
-    let wide_path = wide(&path.display().to_string());
-    unsafe {
-        LoadImageW(
-            std::ptr::null_mut(),
-            wide_path.as_ptr(),
-            IMAGE_BITMAP,
-            0,
-            0,
-            LR_LOADFROMFILE | LR_CREATEDIBSECTION,
-        ) as HBITMAP
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Counts every look at the per-user files and gives fixed contents.
+    #[derive(Default)]
+    struct Watched {
+        looks: usize,
+    }
+
+    impl PolicyFiles for Watched {
+        fn custom(&mut self) -> std::io::Result<Vec<u8>> {
+            self.looks += 1;
+            Ok(b"file=%TEMP%\\x.tmp\r\n".to_vec())
+        }
+        fn keep(&mut self) -> std::io::Result<String> {
+            self.looks += 1;
+            Ok("github.com\r\n".into())
+        }
+        fn keep_stamp(&mut self) -> Option<std::time::SystemTime> {
+            self.looks += 1;
+            Some(std::time::SystemTime::now())
+        }
+    }
+
+    #[test]
+    fn a_backup_of_only_unconfirmed_entries_explains_manual_recovery() {
+        let text = format!(
+            "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n{}\r\n\r\n; entry 1\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\HmStale]\r\n\"x\"=\"1\"\r\n",
+            hive_mend::FORMAT_2
+        );
+        let summary = BackupSummary::parse(&text);
+        assert_eq!(summary.unconfirmed.len(), 1);
+        let path = Path::new(r"C:\ProgramData\HiveMend\backups\hive-mend-1.reg");
+        for elevated in [true, false] {
+            let text = restore_block(&summary, path, elevated).expect("explained");
+            assert!(text.contains("never confirmed"), "{text}");
+            assert!(
+                text.contains(r"HKEY_LOCAL_MACHINE\SOFTWARE\HmStale"),
+                "{text}"
+            );
+            assert!(text.contains("hive-mend-1.reg"), "{text}");
+            assert!(!text.contains("your own account"), "wrong scope: {text}");
+        }
+        assert!(contents(&summary).contains("manual recovery"));
+        // A per-user backup in an elevated window still points elsewhere.
+        let user = BackupSummary::parse(
+            "Windows Registry Editor Version 5.00\r\n\r\n[HKEY_CURRENT_USER\\Software\\X]\r\n\"x\"=\"1\"\r\n",
+        );
+        assert!(
+            restore_block(&user, path, true)
+                .unwrap()
+                .contains("your own account")
+        );
+        assert!(restore_block(&user, path, false).is_none());
+    }
+
+    #[test]
+    fn an_administrator_privacy_page_never_looks_at_per_user_files() {
+        let mut files = Watched::default();
+        let ticked = vec!["user-temp".to_string(), "chrome-data".to_string()];
+        let (items, checked, stamp) = privacy_plan(true, &mut files, &ticked);
+        assert_eq!(files.looks, 0, "a per-user file was read or checked");
+        assert!(stamp.is_none());
+        assert!(checked.iter().all(|on| !on), "remembered ticks were used");
+        let custom = items.iter().find(|item| item.id == "custom").unwrap();
+        assert!(custom.targets.is_empty());
+        // The same plan whatever those files hold: a normal window reads them.
+        let mut normal = Watched::default();
+        let (_, checked, _) = privacy_plan(false, &mut normal, &ticked);
+        assert!(normal.looks >= 3);
+        assert!(checked.iter().any(|on| *on));
+    }
     use windows_sys::Win32::UI::WindowsAndMessaging::{
         WM_ENTERSIZEMOVE, WM_EXITSIZEMOVE, WM_MOVING, WM_NCLBUTTONDOWN, WM_SIZING, WM_SYSCOMMAND,
     };
+
+    #[test]
+    fn the_native_queue_is_unlocked_while_an_item_is_shown() {
+        // Stands in for a handler that runs inside a message box and queues
+        // another message: it must be able to take the lock.
+        lock(&NATIVE).push_back(Native::Message {
+            text: "first".into(),
+            icon: 0,
+        });
+        let item = pop_native();
+        assert!(item.is_some());
+        assert!(NATIVE.try_lock().is_ok(), "the lock outlived the pop");
+        lock(&NATIVE).clear();
+    }
 
     #[test]
     fn modal_loop_starters_never_take_the_guard() {

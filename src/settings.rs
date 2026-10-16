@@ -4,30 +4,19 @@ use std::path::Path;
 
 use crate::model::ScannerId;
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
-    /// Scanners left out of "Scan Your Registry". Deep Scan is off by default.
+    /// Scanners left out of a full scan. Every scanner, Deep Scan included,
+    /// is on by default.
     pub disabled: Vec<ScannerId>,
     pub last_scan: String,
     pub last_problems: Option<usize>,
     pub last_repair: String,
     /// Privacy category ids left ticked. Empty means nothing ticked.
     pub privacy_ticked: Vec<String>,
-    /// Shredder overwrite passes. Only 1, 3, or 7 stick; default 3.
-    pub shred_passes: u8,
-}
-
-impl Default for Settings {
-    fn default() -> Self {
-        Self {
-            disabled: vec![ScannerId::DeepScan],
-            last_scan: String::new(),
-            last_problems: None,
-            last_repair: String::new(),
-            privacy_ticked: Vec::new(),
-            shred_passes: 3,
-        }
-    }
+    /// Repairs skip the Windows restore point. Off by default: an elevated
+    /// repair asks Windows for one first.
+    pub skip_restore_point: bool,
 }
 
 impl Settings {
@@ -52,13 +41,7 @@ impl Settings {
                         .filter(|id| !id.is_empty())
                         .collect();
                 }
-                "shred_passes" => {
-                    if let Ok(passes) = value.parse::<u8>()
-                        && matches!(passes, 1 | 3 | 7)
-                    {
-                        settings.shred_passes = passes;
-                    }
-                }
+                "restore_point" => settings.skip_restore_point = value == "0",
                 _ => {}
             }
         }
@@ -86,14 +69,14 @@ impl Settings {
             text.push_str(&format!("last_problems={count}\r\n"));
         }
         text.push_str(&format!("last_repair={}\r\n", one_line(&self.last_repair)));
+        if self.skip_restore_point {
+            text.push_str("restore_point=0\r\n");
+        }
         if !self.privacy_ticked.is_empty() {
             text.push_str(&format!(
                 "privacy_ticked={}\r\n",
                 self.privacy_ticked.join(",")
             ));
-        }
-        if self.shred_passes != 3 {
-            text.push_str(&format!("shred_passes={}\r\n", self.shred_passes));
         }
         text
     }
@@ -128,22 +111,30 @@ mod tests {
     use super::*;
 
     #[test]
-    fn deep_scan_is_off_until_enabled_and_settings_round_trip() {
+    fn deep_scan_is_on_by_default_and_settings_round_trip() {
         let mut settings = Settings::default();
-        assert!(!settings.full_scan().contains(&ScannerId::DeepScan));
+        assert!(settings.full_scan().contains(&ScannerId::DeepScan));
         assert!(settings.full_scan().contains(&ScannerId::CustomControls));
-        settings.set_enabled(ScannerId::DeepScan, true);
+        settings.set_enabled(ScannerId::DeepScan, false);
         settings.set_enabled(ScannerId::TempShortcuts, false);
         settings.last_scan = "10/12/2026 15:30".into();
         settings.last_problems = Some(12);
         settings.last_repair = "Removed 3\nBackup x".into();
         settings.privacy_ticked = ["user-temp".to_string(), "clipboard".to_string()].to_vec();
         let again = Settings::parse(&settings.to_text());
-        assert!(again.full_scan().contains(&ScannerId::DeepScan));
+        // A saved choice to leave Deep Scan out is kept.
+        assert!(!again.full_scan().contains(&ScannerId::DeepScan));
         assert!(!again.full_scan().contains(&ScannerId::TempShortcuts));
         assert_eq!(again.last_problems, Some(12));
         assert_eq!(again.last_repair, "Removed 3 Backup x");
         assert_eq!(again.privacy_ticked, ["user-temp", "clipboard"]);
         assert!(Settings::default().privacy_ticked.is_empty());
+        // Restore points are on unless turned off, and the choice is kept.
+        assert!(!Settings::default().skip_restore_point);
+        let off = Settings {
+            skip_restore_point: true,
+            ..Settings::default()
+        };
+        assert!(Settings::parse(&off.to_text()).skip_restore_point);
     }
 }

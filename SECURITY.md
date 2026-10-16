@@ -1,6 +1,6 @@
 # Security Policy
 
-Hive Mend changes the Windows registry, services, and files, so security
+Hivemend changes the Windows registry, services, and files, so security
 problems in it are taken seriously.
 
 ## Supported versions
@@ -11,7 +11,7 @@ Security fixes go into the `main` branch and the latest release.
 
 Please do not open a public issue for a security problem. Report it privately
 with **Report a vulnerability** on the repository's
-[Security tab](https://github.com/bradwilliamson/HiveMend/security/advisories/new).
+[Security tab](https://github.com/Tuigse-oss/HiveMend/security/advisories/new).
 
 Include what you can of:
 

@@ -286,7 +286,13 @@ mod live_tests {
             .find(|entry| entry.key == r"HKEY_LOCAL_MACHINE\SYSTEM")
             .expect("SYSTEM hive");
         assert!(!system.file.is_empty());
-        assert!(system.bytes.unwrap_or(0) > 0);
-        assert!(inventory.total_bytes() > 0);
+        // Only administrators can read the hive files' sizes; without
+        // elevation they are unknown, never made up.
+        if crate::store::elevated() {
+            assert!(system.bytes.unwrap_or(0) > 0);
+            assert!(inventory.total_bytes() > 0);
+        } else {
+            assert_ne!(system.bytes, Some(0));
+        }
     }
 }

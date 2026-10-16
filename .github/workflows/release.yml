@@ -55,22 +55,26 @@ jobs:
         shell: bash
         env:
           TAG: ${{ github.ref_name }}
+        # The program ships with its licenses and the third-party notices the
+        # linked crates' licenses require, never as a bare exe.
         run: |
-          mkdir dist
-          cp target/x86_64-pc-windows-msvc/release/hive-mend.exe "dist/hive-mend-$TAG-x86_64-windows.exe"
+          mkdir -p package dist
+          cp target/x86_64-pc-windows-msvc/release/Hivemend.exe package/
+          cp LICENSE-MIT LICENSE-APACHE THIRD-PARTY-NOTICES.txt README.md package/
+          (cd package && 7z a -tzip "../dist/Hivemend-$TAG-x86_64-windows.zip" ./*)
           cd dist
-          sha256sum hive-mend-*.exe > SHA256SUMS.txt
+          sha256sum Hivemend-*.zip > SHA256SUMS.txt
           cat SHA256SUMS.txt
       - name: Attest build provenance
         # Artifact attestations are free for public repositories.
         if: github.event.repository.visibility == 'public'
         uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
         with:
-          subject-path: dist/hive-mend-*.exe
+          subject-path: dist/Hivemend-*.zip
       - name: Create a draft release
         # A draft stays unpublished until it is reviewed and released by hand.
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
           TAG: ${{ github.ref_name }}
-        run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hive Mend $TAG" --generate-notes
+        run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hivemend $TAG" --generate-notes

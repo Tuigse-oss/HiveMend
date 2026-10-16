@@ -1,4 +1,4 @@
-//! Where Hive Mend keeps its data, split by trust.
+//! Where Hivemend keeps its data, split by trust.
 //!
 //! - Per-user data (settings, the ignore list, custom privacy targets, and
 //!   backups written without elevation) lives in the account's Local AppData.
@@ -32,7 +32,7 @@ pub const LEGACY_DIR: &str = r"C:\HiveMend";
 const APP: &str = "HiveMend";
 /// Largest backup a restore will read.
 #[cfg_attr(not(windows), allow(dead_code))]
-const MAX_BACKUP_BYTES: u64 = 64 * 1024 * 1024;
+use crate::backup::MAX_BACKUP_BYTES;
 
 /// Which store a backup came from.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -62,7 +62,7 @@ pub fn protected_dir(fs: &dyn FileView) -> Option<PathBuf> {
     known_root(fs, KnownDir::ProgramData).map(|root| Path::new(&root).join(APP))
 }
 
-/// Every folder Hive Mend keeps data in. Shred and privacy deletes refuse all
+/// Every folder Hivemend keeps data in. Privacy deletes refuse all
 /// of them; one that cannot be located is simply not listed, because the
 /// protected roots check already refuses everything when ProgramData or the
 /// other system folders are unknown.
@@ -71,12 +71,19 @@ pub fn data_roots(fs: &dyn FileView) -> Vec<String> {
     for dir in [user_dir(fs), protected_dir(fs)].into_iter().flatten() {
         roots.push(dir.display().to_string());
     }
+    // Where per-user files go when Local AppData cannot be located: inside
+    // Temp, so it must be protected from Temp cleaning explicitly.
+    roots.push(fallback_dir().display().to_string());
     roots
+}
+
+fn fallback_dir() -> PathBuf {
+    std::env::temp_dir().join(APP)
 }
 
 fn user_file(name: &str) -> PathBuf {
     user_dir(&crate::fs::HostFs)
-        .unwrap_or_else(|| std::env::temp_dir().join(APP))
+        .unwrap_or_else(fallback_dir)
         .join(name)
 }
 
@@ -90,6 +97,10 @@ pub fn settings_file() -> PathBuf {
 
 pub fn custom_privacy_file() -> PathBuf {
     user_file("privacy-custom.ini")
+}
+
+pub fn cookies_keep_file() -> PathBuf {
+    user_file("cookies-keep.txt")
 }
 
 /// Copy per-user files from the legacy folder the first time, when the
@@ -233,14 +244,14 @@ pub fn read_restorable(
         return Err(format!("{shown} is not a plain single-name file"));
     }
     if pin.len > MAX_BACKUP_BYTES {
-        return Err(format!("{shown} is too large to be a Hive Mend backup"));
+        return Err(format!("{shown} is too large to be a Hivemend backup"));
     }
     let real = pin.real_path.clone();
     if elevated {
         if store_of(&*fs, &real) != Store::Protected {
             return Err(format!(
                 "{shown} is not in the protected backup store, so it is not restored with \
-                 administrator rights. Restore it from Hive Mend started without \
+                 administrator rights. Restore it from Hivemend started without \
                  administrator rights; that can put back only your own (HKCU) entries."
             ));
         }
@@ -254,12 +265,15 @@ pub fn read_restorable(
     Ok((real, bytes))
 }
 
-/// Put back shortcut copies whose original is still missing, confined at both
-/// ends: the saved copy must really be inside this backup's own `-files`
-/// folder, and the destination must pass the same rule repair used to remove
-/// it (Start Menu, Desktop, or temp; never the Windows folder). The new file
-/// is created without following links, checked by its real path, and removed
-/// again if it landed anywhere else. Nothing existing is overwritten.
+/// Move saved shortcuts back to their places, confined at both ends: the
+/// saved shortcut must really be inside this backup's own `-files` folder,
+/// and the destination must pass the same rule repair used to remove it
+/// (Start Menu, Desktop, or temp; never the Windows folder), checked by its
+/// real path before anything is made. It goes back by one rename of its own
+/// handle, with all its data, and nothing existing is overwritten. A saved
+/// shortcut that cannot be opened is an unresolved recovery even when
+/// something is at its place: a file there never identifies a missing
+/// archive's contents, so it is reported, never counted as done.
 pub fn restore_files(
     fs: &mut dyn FileView,
     backup_real: &str,
@@ -293,93 +307,490 @@ fn restore_one(
     if !destination_allowed(&*fs, &original) {
         return Err("refused: not a place repair removes shortcuts from".into());
     }
-    if fs.exists(&original) {
-        return Ok(false);
-    }
     let copy_text = copy.display().to_string();
-    let mut source = fs
-        .pin(&copy_text)
+    let mut source = match fs.pin(&copy_text) {
+        Ok(source) => source,
+        // The saved shortcut cannot be opened, and nothing here proves it
+        // went back: a file at the destination never identifies a missing
+        // archive's contents. Report it as an unresolved recovery, never as
+        // a restore already done. Nothing is overwritten or retried.
+        Err(_) if fs.exists(&original) && !fs.exists(&copy_text) => {
+            return Err(format!(
+                "the saved copy {copy_text} is missing, so it cannot be verified whether it was already put back; the file at {original} was left as it is"
+            ));
+        }
+        Err(err) => return Err(format!("the saved copy {copy_text}: {err}")),
+    };
+    let confined = |source: &Pinned| {
+        let inside = files_real.is_some_and(|dir| {
+            path_under(&source.real_path, dir) && !source.real_path.eq_ignore_ascii_case(dir)
+        });
+        if !inside || source.kind != ItemKind::File || source.links != 1 {
+            return Err(format!(
+                "refused: the saved copy {copy_text} is not inside this backup's own files folder"
+            ));
+        }
+        Ok(())
+    };
+    confined(&source)?;
+    // Then held, so nothing can write, rename or delete it (or rename its
+    // folders) any more; its place and names are read again through the
+    // hold and checked again.
+    fs.pin_acquire(&mut source, Access::ReadDeleteExclusive)
         .map_err(|err| format!("the saved copy {copy_text}: {err}"))?;
-    let inside = files_real.is_some_and(|dir| {
-        path_under(&source.real_path, dir) && !source.real_path.eq_ignore_ascii_case(dir)
-    });
-    if !inside || source.kind != ItemKind::File || source.links != 1 {
+    confined(&source)?;
+    if fs.exists(&original) {
+        // Something else is there now: never overwritten, never taken for
+        // a finished restore.
         return Err(format!(
-            "refused: the saved copy {copy_text} is not inside this backup's own files folder"
+            "something is already at that place, so it was left as it is; the saved shortcut stays at {copy_text}"
         ));
     }
-    fs.pin_acquire(&mut source, Access::Read)?;
-    let bytes = fs
-        .pin_read_at(&source, 0, source.len as usize)
-        .filter(|bytes| bytes.len() as u64 == source.len)
-        .ok_or("could not read the saved copy")?;
-    let target = fs.pin_create_new(&original)?;
-    if !destination_allowed(&*fs, &target.real_path) {
-        let real = target.real_path.clone();
-        let _ = fs.pin_delete(target);
-        return Err(format!("refused: it resolves to {real}"));
-    }
-    let written = fs
-        .pin_write_at(&target, 0, &bytes)
-        .and_then(|()| fs.pin_sync(&target));
-    if let Err(err) = written {
-        let _ = fs.pin_delete(target);
-        return Err(err);
-    }
+    // The saved shortcut itself goes back: moved by its own handle in one
+    // rename, so all its data streams return with it, its size does not
+    // matter, and an interruption leaves it either here or there, whole.
+    // Where it lands is checked first and its folders are made through held
+    // handles, so a folder changed after the check cannot carry it elsewhere.
+    fs.pin_move_confined(source, &original, &|fs, real| destination_allowed(fs, real))
+        .map_err(|err| {
+            if err.contains("os error 183") || err.contains("already exists") {
+                format!(
+                    "something is already at that place, so it was left as it is; the saved shortcut stays at {copy_text}"
+                )
+            } else if err.contains("os error 17") {
+                format!(
+                    "the saved shortcut is on another drive, so it stays at {copy_text}; move it back yourself"
+                )
+            } else {
+                err
+            }
+        })?;
     Ok(true)
 }
 
-/// Restore a backup end to end: read it through a checked handle, import an
-/// exact snapshot of the checked bytes with `reg.exe`, then put back its
+/// Restore a backup end to end: read it through a checked handle (as
+/// administrator, only a backup whose signature matches those exact
+/// bytes), apply it in one registry transaction, then put back its
 /// confined shortcut copies.
 #[cfg(windows)]
 pub fn restore_backup(file: &Path) -> Result<(BackupSummary, usize, Vec<String>), String> {
     let elevated = elevated();
     let mut fs = crate::fs::HostFs;
-    let (real, bytes) = read_restorable(&mut fs, file, elevated)?;
-    let text = crate::rules::decode_text_owned(bytes.clone());
+    let (real, mut bytes) = read_restorable(&mut fs, file, elevated)?;
+    let mut unsigned_tail = false;
+    if elevated {
+        let signed = signed::verify(&mut fs, &real, &bytes).map_err(|why| {
+            format!(
+                "{} is not restored with administrator rights: {why}",
+                file.display()
+            )
+        })?;
+        // Only what the signature covers is used.
+        unsigned_tail = signed < bytes.len();
+        bytes.truncate(signed);
+    }
+    let text = crate::rules::decode_text_owned(bytes);
     if !is_hive_mend_backup(&text) {
         return Err(format!(
-            "{} is not a Hive Mend backup; refusing to restore it",
+            "{} is not a Hivemend backup; refusing to restore it",
             file.display()
         ));
     }
     let summary = BackupSummary::parse(&text);
-    let snapshot_dir = if elevated {
-        protected_dir(&fs).ok_or("could not locate the ProgramData folder")?
+    let parsed = crate::regfile::parse_backup(&text)
+        .map_err(|why| format!("{} cannot be restored: {why}", file.display()))?;
+    let (ops, notes) = restore_scope(parsed, elevated);
+    // Written through the link-refusing registry layer in one transaction:
+    // all of it, or nothing.
+    let (keys, values) = if ops.is_empty() {
+        (0, 0)
     } else {
-        user_dir(&fs).ok_or("could not locate the Local AppData folder")?
+        crate::regfile::apply_ops(&mut crate::WindowsRegistry, &ops)
+            .map_err(|err| format!("nothing was restored: {err}"))?
     };
-    if elevated {
-        ensure_protected(&snapshot_dir)?;
+    let applied = BackupSummary {
+        keys,
+        values,
+        files: summary.files.clone(),
+        machine_wide: elevated && keys > 0,
+        per_user: !elevated && keys > 0,
+        unconfirmed: summary.unconfirmed.clone(),
+    };
+    let (files, mut errors) = restore_files(&mut fs, &real, &summary);
+    errors.extend(notes);
+    if unsigned_tail {
+        errors.push(
+            "the end of the backup, written after its last signature, was left out (an interrupted save)"
+                .into(),
+        );
     }
-    let snapshot = snapshot_dir.join(format!(
-        "restore-{}-{}.reg",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|span| span.as_nanos())
-            .unwrap_or(0)
-    ));
-    let snapshot_text = snapshot.display().to_string();
-    let pin = fs.pin_create_new(&snapshot_text)?;
-    if !path_under(&pin.real_path, &snapshot_dir.display().to_string()) {
-        let _ = fs.pin_delete(pin);
-        return Err("the restore snapshot did not land in the data folder".into());
+    Ok((applied, files, errors))
+}
+
+/// Start keeping a signature for a backup an administrator window is about
+/// to write in the protected store; a normal window's backups are left
+/// unsigned. Fails, so the caller writes and changes nothing, when the
+/// signature cannot be kept.
+#[cfg(windows)]
+pub fn sign_protected(writer: &mut crate::backup::BackupWriter) -> Result<(), String> {
+    if !elevated() {
+        return Ok(());
     }
-    let written = fs
-        .pin_write_at(&pin, 0, &bytes)
-        .and_then(|()| fs.pin_sync(&pin));
-    drop(pin);
-    let imported = written.and_then(|()| crate::backup::import_reg_file(&snapshot));
-    if let Ok(mut pin) = fs.pin(&snapshot_text)
-        && fs.pin_acquire(&mut pin, Access::Delete).is_ok()
-    {
-        let _ = fs.pin_delete(pin);
+    let fs = crate::fs::HostFs;
+    let real = fs
+        .pin(&writer.path().display().to_string())
+        .map(|pin| pin.real_path)
+        .map_err(|err| format!("{}: {err}", writer.path().display()))?;
+    if store_of(&fs, &real) != Store::Protected {
+        return Err(format!(
+            "{} is not in the protected backup store",
+            writer.path().display()
+        ));
     }
-    imported?;
-    let (files, errors) = restore_files(&mut fs, &real, &summary);
-    Ok((summary, files, errors))
+    let mac = signed::Hmac::new(&signed::key()?)?;
+    writer
+        .sign_with(Box::new(mac))
+        .map_err(|err| format!("could not start its signature: {err}"))
+}
+
+/// Administrator backups are signed with HMAC-SHA256 under a key that only
+/// SYSTEM and Administrators can read, kept in the protected store. The
+/// signature file sits beside the backup, where only administrators can
+/// write. An elevated restore accepts a backup only when the signature
+/// matches the exact bytes it read.
+#[cfg(windows)]
+mod signed {
+    use super::{ItemKind, Path, check_owner_and_dacl};
+    use crate::fs::{Access, FileView};
+    use windows_sys::Win32::Security::Cryptography::{
+        BCRYPT_HASH_HANDLE, BCRYPT_HMAC_SHA256_ALG_HANDLE, BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+        BCryptCreateHash, BCryptDestroyHash, BCryptDuplicateHash, BCryptFinishHash,
+        BCryptGenRandom, BCryptHashData,
+    };
+
+    const KEY_FILE: &str = "backup.key";
+    const KEY_LEN: usize = 32;
+    /// Owner Administrators; only SYSTEM and Administrators, nothing
+    /// inherited: nobody else can read it.
+    const KEY_SDDL: &str = "O:BAD:P(A;;FA;;;SY)(A;;FA;;;BA)";
+    const READ_BITS: u32 = 0x0000_0001 // read data
+        | 0x8000_0000; // generic read
+
+    pub struct Hmac(BCRYPT_HASH_HANDLE);
+
+    impl Hmac {
+        pub fn new(key: &[u8]) -> Result<Self, String> {
+            let mut hash: BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            let status = unsafe {
+                BCryptCreateHash(
+                    BCRYPT_HMAC_SHA256_ALG_HANDLE,
+                    &mut hash,
+                    std::ptr::null_mut(),
+                    0,
+                    key.as_ptr(),
+                    key.len() as u32,
+                    0,
+                )
+            };
+            if status < 0 {
+                return Err(format!("could not start a signature ({status:#x})"));
+            }
+            Ok(Self(hash))
+        }
+
+        fn add(&mut self, bytes: &[u8]) -> Result<(), String> {
+            for chunk in bytes.chunks(1 << 30) {
+                let status =
+                    unsafe { BCryptHashData(self.0, chunk.as_ptr(), chunk.len() as u32, 0) };
+                if status < 0 {
+                    return Err(format!("could not sign ({status:#x})"));
+                }
+            }
+            Ok(())
+        }
+
+        /// The checksum so far, leaving this one running.
+        fn current(&self) -> Result<Vec<u8>, String> {
+            let mut copy: BCRYPT_HASH_HANDLE = std::ptr::null_mut();
+            let status =
+                unsafe { BCryptDuplicateHash(self.0, &mut copy, std::ptr::null_mut(), 0, 0) };
+            if status < 0 {
+                return Err(format!("could not sign ({status:#x})"));
+            }
+            let mut out = vec![0u8; 32];
+            let status = unsafe { BCryptFinishHash(copy, out.as_mut_ptr(), 32, 0) };
+            unsafe { BCryptDestroyHash(copy) };
+            if status < 0 {
+                return Err(format!("could not sign ({status:#x})"));
+            }
+            Ok(out)
+        }
+    }
+
+    // The hash handle is owned by this value alone and used by one thread
+    // at a time, which BCrypt allows.
+    unsafe impl Send for Hmac {}
+
+    impl Drop for Hmac {
+        fn drop(&mut self) {
+            unsafe { BCryptDestroyHash(self.0) };
+        }
+    }
+
+    impl crate::backup::RunningMac for Hmac {
+        fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+            self.add(bytes)?;
+            self.current()
+        }
+    }
+
+    /// The signing key: read from the protected store, or made there the
+    /// first time. Refused unless only SYSTEM and Administrators can read
+    /// or change it.
+    pub fn key() -> Result<Vec<u8>, String> {
+        key_in(&root()?)
+    }
+
+    fn root() -> Result<std::path::PathBuf, String> {
+        let root = super::protected_dir(&crate::fs::HostFs)
+            .ok_or("could not locate the ProgramData folder")?;
+        super::ensure_protected(&root)?;
+        Ok(root)
+    }
+
+    /// The key kept in the protected folder `root`.
+    pub fn key_in(root: &Path) -> Result<Vec<u8>, String> {
+        let path = root.join(KEY_FILE);
+        if let Err(err) = create_key(&path)
+            && err.raw_os_error() != Some(80)
+        {
+            return Err(format!("could not make the signing key: {err}"));
+        }
+        read_key(&path)
+    }
+
+    /// Make a new key file with its own security. Fails with "file exists"
+    /// (os error 80) when there already is one.
+    fn create_key(path: &Path) -> std::io::Result<()> {
+        use std::io::Write;
+        use std::os::windows::io::FromRawHandle;
+        use windows_sys::Win32::Foundation::{GENERIC_WRITE, INVALID_HANDLE_VALUE, LocalFree};
+        use windows_sys::Win32::Security::Authorization::{
+            ConvertStringSecurityDescriptorToSecurityDescriptorW, SDDL_REVISION_1,
+        };
+        use windows_sys::Win32::Security::{PSECURITY_DESCRIPTOR, SECURITY_ATTRIBUTES};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CREATE_NEW, CreateFileW, FILE_ATTRIBUTE_NORMAL, FILE_FLAG_OPEN_REPARSE_POINT,
+        };
+        let mut key = vec![0u8; KEY_LEN];
+        let status = unsafe {
+            BCryptGenRandom(
+                std::ptr::null_mut(),
+                key.as_mut_ptr(),
+                KEY_LEN as u32,
+                BCRYPT_USE_SYSTEM_PREFERRED_RNG,
+            )
+        };
+        if status < 0 {
+            return Err(std::io::Error::other(format!(
+                "no random bytes ({status:#x})"
+            )));
+        }
+        let sddl: Vec<u16> = KEY_SDDL.encode_utf16().chain(std::iter::once(0)).collect();
+        let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        if unsafe {
+            ConvertStringSecurityDescriptorToSecurityDescriptorW(
+                sddl.as_ptr(),
+                SDDL_REVISION_1,
+                &mut sd,
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return Err(std::io::Error::last_os_error());
+        }
+        let attrs = SECURITY_ATTRIBUTES {
+            nLength: std::mem::size_of::<SECURITY_ATTRIBUTES>() as u32,
+            lpSecurityDescriptor: sd,
+            bInheritHandle: 0,
+        };
+        let wide: Vec<u16> = path
+            .display()
+            .to_string()
+            .encode_utf16()
+            .chain(std::iter::once(0))
+            .collect();
+        let handle = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                GENERIC_WRITE,
+                0,
+                &attrs,
+                CREATE_NEW,
+                FILE_ATTRIBUTE_NORMAL | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut(),
+            )
+        };
+        let err = std::io::Error::last_os_error();
+        unsafe { LocalFree(sd as _) };
+        if handle == INVALID_HANDLE_VALUE {
+            return Err(err);
+        }
+        let mut file = unsafe { std::fs::File::from_raw_handle(handle as _) };
+        let written = file.write_all(&key).and_then(|()| file.sync_all());
+        if written.is_err() {
+            crate::fs::host_dispose(&file);
+        }
+        written
+    }
+
+    fn read_key(path: &Path) -> Result<Vec<u8>, String> {
+        let shown = path.display().to_string();
+        let mut fs = crate::fs::HostFs;
+        let mut pin = fs.pin(&shown).map_err(|err| format!("{shown}: {err}"))?;
+        if pin.kind != ItemKind::File || pin.links != 1 || pin.len != KEY_LEN as u64 {
+            return Err(format!("{shown} is not a Hivemend signing key"));
+        }
+        let handle = pin.raw_handle().ok_or("not a host handle")?;
+        super::check_handle_security(handle, &shown, None, READ_BITS)?;
+        fs.pin_acquire(&mut pin, Access::Read)?;
+        fs.pin_read_at(&pin, 0, KEY_LEN)
+            .filter(|bytes| bytes.len() == KEY_LEN)
+            .ok_or_else(|| format!("could not read {shown}"))
+    }
+
+    /// The signature beside `real` must be in the protected store, owned
+    /// and writable only by administrators, and match `bytes` exactly.
+    /// Returns how many leading bytes the signature covers.
+    pub fn verify(fs: &mut dyn FileView, real: &str, bytes: &[u8]) -> Result<usize, String> {
+        verify_in(fs, &root()?, real, bytes)
+    }
+
+    /// [`verify`] against the protected folder `root` and its key.
+    pub fn verify_in(
+        fs: &mut dyn FileView,
+        root: &Path,
+        real: &str,
+        bytes: &[u8],
+    ) -> Result<usize, String> {
+        let sig_path = crate::backup::signature_path(Path::new(real))
+            .display()
+            .to_string();
+        let mut pin = match fs.pin(&sig_path) {
+            Ok(pin) => pin,
+            Err(err) if err.contains("os error 2") => {
+                return Err(
+                    "it has no Hivemend signature. Administrator backups are signed from this \
+                     version on; an older one can still be opened in Registry Editor if you \
+                     trust it"
+                        .into(),
+                );
+            }
+            Err(err) => return Err(format!("its signature: {err}")),
+        };
+        if pin.kind != ItemKind::File
+            || pin.links != 1
+            || pin.len > crate::backup::MAX_SIGNATURE_BYTES
+        {
+            return Err("its signature file is not one Hivemend wrote".into());
+        }
+        let store = root.join("backups").display().to_string();
+        if !crate::pathutil::path_under(&pin.real_path, &store) {
+            return Err("its signature is not in the protected store".into());
+        }
+        check_owner_and_dacl(&pin, &sig_path)?;
+        fs.pin_acquire(&mut pin, Access::Read)?;
+        let stored = fs
+            .pin_read_at(&pin, 0, pin.len as usize)
+            .filter(|text| text.len() as u64 == pin.len)
+            .ok_or("could not read its signature")?;
+        let stored = String::from_utf8_lossy(&stored).into_owned();
+        // Each line signs one prefix of the backup; the longest that
+        // matches wins, so an interrupted last append costs only itself.
+        let mut generations = crate::backup::signature_generations(&stored, bytes.len() as u64);
+        generations.retain(|(len, _)| *len <= bytes.len() as u64);
+        generations.sort_by_key(|(len, _)| *len);
+        let mut mac = Hmac::new(&key_in(root)?)?;
+        let mut fed = 0usize;
+        let mut verified = None;
+        for (len, hex) in generations {
+            let len = len as usize;
+            mac.add(&bytes[fed..len])?;
+            fed = len;
+            let expected = crate::backup::signature_text(&mac.current()?);
+            // Compared in full, whatever differs first.
+            let differs = hex
+                .as_bytes()
+                .iter()
+                .zip(expected.as_bytes())
+                .fold(0u8, |acc, (a, b)| acc | (a ^ b));
+            if differs == 0 && hex.len() == expected.len() {
+                verified = Some(len);
+            }
+        }
+        verified.ok_or_else(|| "its signature does not match its contents (it was changed after Hivemend wrote it, or not written by Hivemend)".to_string())
+    }
+
+    #[cfg(test)]
+    pub fn mac_of(key: &[u8], bytes: &[u8]) -> Vec<u8> {
+        let mut mac = Hmac::new(key).unwrap();
+        mac.add(bytes).unwrap();
+        mac.current().unwrap()
+    }
+}
+
+/// The operations this window may apply, and notes on what is left for the
+/// other kind of window. An administrator window writes only machine-wide
+/// keys (a per-user key can be redirected by programs running without
+/// elevation); a normal window writes only its own HKEY_CURRENT_USER.
+pub fn restore_scope(
+    parsed: crate::regfile::ParsedBackup,
+    elevated: bool,
+) -> (Vec<crate::regfile::RegOp>, Vec<String>) {
+    let (mine, other): (Vec<_>, Vec<_>) = parsed.ops.into_iter().partition(|op| {
+        if elevated {
+            !crate::pathutil::per_user_key(op.key())
+        } else {
+            op.key().starts_with("HKEY_CURRENT_USER")
+        }
+    });
+    let mut notes = Vec::new();
+    let mut other_keys: Vec<String> = other
+        .iter()
+        .map(|op| op.key().to_ascii_lowercase())
+        .collect();
+    other_keys.sort();
+    other_keys.dedup();
+    if !other_keys.is_empty() {
+        notes.push(if elevated {
+            format!(
+                "{} per-user keys were not restored here; restore this backup again from Hivemend started without administrator rights",
+                other_keys.len()
+            )
+        } else {
+            format!(
+                "{} machine-wide keys need administrator rights; restore this backup again from Hivemend run as administrator",
+                other_keys.len()
+            )
+        });
+    }
+    for (entry, key) in &parsed.unconfirmed {
+        notes.push(format!(
+            "entry {entry} ({key}) was not confirmed as removed (the repair stopped while saving it), so it was not restored; its saved data is still in the backup file"
+        ));
+    }
+    if parsed.cut_off {
+        notes.push(
+            "the end of the backup could not be read (an interrupted save) and was left out".into(),
+        );
+    }
+    if parsed.left_out > 0 {
+        notes.push(format!(
+            "{} entries the repair did not remove were left out",
+            parsed.left_out
+        ));
+    }
+    (mine, notes)
 }
 
 /// Create the protected folder with its explicit owner and DACL, or check an
@@ -453,6 +864,21 @@ fn check_protected_dir(dir: &Path) -> Result<(), String> {
     check_owner_and_dacl(&pin, &shown)
 }
 
+/// A well-known account's name with its SID, for messages.
+#[cfg(windows)]
+fn sid_name(sid: &str) -> String {
+    let name = match sid {
+        "S-1-1-0" => "Everyone",
+        "S-1-5-11" => "Authenticated Users",
+        "S-1-5-32-545" => "Users",
+        "S-1-5-4" => "INTERACTIVE",
+        "S-1-5-13" => "TERMINAL SERVER USER (a Windows compatibility group)",
+        "S-1-5-32-547" => "Power Users",
+        _ => return sid.to_string(),
+    };
+    format!("{name} ({sid})")
+}
+
 /// SIDs trusted to own or write protected data.
 #[cfg(windows)]
 const TRUSTED_SIDS: &[&str] = &[
@@ -467,14 +893,31 @@ const TRUSTED_SIDS: &[&str] = &[
 /// everyone has full control, so it fails.
 #[cfg(windows)]
 fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{
-        ConvertSidToStringSidW, GetSecurityInfo, SE_FILE_OBJECT,
-    };
-    use windows_sys::Win32::Security::{
-        ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSID,
-    };
-    const WRITE_BITS: u32 = 0x0000_0002 // write data / add file
+    let handle = pin.raw_handle().ok_or("not a host handle")?;
+    check_handle_owner_and_dacl(handle, shown, None)
+}
+
+/// [`check_owner_and_dacl`] on an open handle; `also` is one more SID
+/// trusted beside the administrator ones (the account's own folder).
+#[cfg(windows)]
+pub(crate) fn check_handle_owner_and_dacl(
+    handle: std::os::windows::io::RawHandle,
+    shown: &str,
+    also: Option<&str>,
+) -> Result<(), String> {
+    check_handle_security(handle, shown, also, 0)
+}
+
+/// [`check_handle_owner_and_dacl`], also refusing any untrusted entry that
+/// grants one of `also_bits` (for a secret, the right to read it).
+#[cfg(windows)]
+fn check_handle_security(
+    handle: std::os::windows::io::RawHandle,
+    shown: &str,
+    also: Option<&str>,
+    also_bits: u32,
+) -> Result<(), String> {
+    const FILE_WRITE_BITS: u32 = 0x0000_0002 // write data / add file
         | 0x0000_0004 // append data / add subfolder
         | 0x0000_0010 // write extended attributes
         | 0x0000_0040 // delete child
@@ -484,15 +927,80 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
         | 0x0008_0000 // write owner
         | 0x1000_0000 // generic all
         | 0x4000_0000; // generic write
-    const INHERIT_ONLY: u8 = 0x08;
-    let handle = pin.raw_handle().ok_or("not a host handle")?;
+    check_security(
+        handle,
+        windows_sys::Win32::Security::Authorization::SE_FILE_OBJECT,
+        shown,
+        FILE_WRITE_BITS | also_bits,
+        &|sid| also == Some(sid),
+        if also.is_some() {
+            "this account or an administrator account"
+        } else {
+            "an administrator account"
+        },
+    )
+}
+
+/// Security an administrator window requires of a registry key it changes
+/// (or of the nearest existing key above one it creates): owned by, and
+/// changeable only by, SYSTEM, Administrators, TrustedInstaller, or
+/// Windows' own service accounts; never by an account that programs
+/// running without elevation use.
+#[cfg(windows)]
+pub(crate) fn check_registry_key_security(
+    key: std::os::windows::io::RawHandle,
+    shown: &str,
+) -> Result<(), String> {
+    const KEY_WRITE_BITS: u32 = 0x0000_0002 // set value
+        | 0x0000_0004 // create subkey
+        | 0x0000_0020 // create link
+        | 0x0001_0000 // delete
+        | 0x0004_0000 // write DAC
+        | 0x0008_0000 // write owner
+        | 0x1000_0000 // generic all
+        | 0x4000_0000; // generic write
+    // LOCAL SERVICE, NETWORK SERVICE, and per-service SIDs (NT SERVICE\x)
+    // are Windows' own service identities. Nothing else is trusted: not
+    // even TERMINAL SERVER USER, which Windows' default security on App
+    // Paths, Uninstall, and SharedDLLs lets write, since Hivemend cannot
+    // show that no session ever carries it.
+    let service =
+        |sid: &str| sid == "S-1-5-19" || sid == "S-1-5-20" || sid.starts_with("S-1-5-80-");
+    check_security(
+        key,
+        windows_sys::Win32::Security::Authorization::SE_REGISTRY_KEY,
+        shown,
+        KEY_WRITE_BITS,
+        &service,
+        "an administrator or system account",
+    )
+}
+
+/// Owner must be trusted; every allow ACE that grants one of `write_bits`
+/// must name a trusted SID (or `extra`), or be CREATOR OWNER on an
+/// inherit-only ACE. A missing DACL means everyone has full control.
+#[cfg(windows)]
+fn check_security(
+    handle: std::os::windows::io::RawHandle,
+    object_type: windows_sys::Win32::Security::Authorization::SE_OBJECT_TYPE,
+    shown: &str,
+    write_bits: u32,
+    extra: &dyn Fn(&str) -> bool,
+    owner_should_be: &str,
+) -> Result<(), String> {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{ConvertSidToStringSidW, GetSecurityInfo};
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL, DACL_SECURITY_INFORMATION, GetAce, OWNER_SECURITY_INFORMATION, PSID,
+    };
+    let trusted = |sid: &str| TRUSTED_SIDS.contains(&sid) || extra(sid);
     let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd = std::ptr::null_mut();
     let rc = unsafe {
         GetSecurityInfo(
             handle as _,
-            SE_FILE_OBJECT,
+            object_type,
             OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
             &mut owner,
             std::ptr::null_mut(),
@@ -519,9 +1027,9 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
     };
     let result = (|| {
         let owner_sid = sid_text(owner);
-        if !TRUSTED_SIDS.contains(&owner_sid.as_str()) {
+        if !trusted(&owner_sid) {
             return Err(format!(
-                "{shown} is owned by {owner_sid}, not an administrator account"
+                "{shown} is owned by {owner_sid}, not {owner_should_be}"
             ));
         }
         if dacl.is_null() {
@@ -541,20 +1049,20 @@ fn check_owner_and_dacl(pin: &Pinned, shown: &str) -> Result<(), String> {
                 continue;
             }
             let mask = unsafe { *((ace as *const u8).add(4) as *const u32) };
-            if mask & WRITE_BITS == 0 {
+            if mask & write_bits == 0 {
                 continue;
             }
             // Plain and callback allow entries carry the SID right after the
             // mask; any other allow-type entry granting a write is refused.
             if header.AceType != 0 && header.AceType != 9 {
-                return Err(format!(
-                    "{shown} has an access entry Hive Mend cannot check"
-                ));
+                return Err(format!("{shown} has an access entry Hivemend cannot check"));
             }
             let sid = sid_text(unsafe { (ace as *mut u8).add(8) } as PSID);
-            let creator_owner = sid == "S-1-3-0" && header.AceFlags & INHERIT_ONLY != 0;
-            if !TRUSTED_SIDS.contains(&sid.as_str()) && !creator_owner {
-                return Err(format!("{shown} lets {sid} change it"));
+            // CREATOR OWNER only stands in for whoever creates a child; no
+            // token carries it, so it grants nothing on the object itself.
+            let creator_owner = sid == "S-1-3-0";
+            if !trusted(&sid) && !creator_owner {
+                return Err(format!("{shown} lets {} change it", sid_name(&sid)));
             }
         }
         Ok(())
@@ -590,6 +1098,62 @@ mod tests {
                 .collect(),
             ..BackupSummary::default()
         }
+    }
+
+    #[test]
+    fn each_window_restores_only_its_own_part_of_a_mixed_backup() {
+        let text = "Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n\r\n\
+            [HKEY_LOCAL_MACHINE\\SOFTWARE\\A]\r\n\"x\"=dword:00000001\r\n\r\n\
+            [HKEY_CURRENT_USER\\Software\\B]\r\n\"y\"=\"2\"\r\n\r\n\
+            [HKEY_USERS\\S-1-5-21-9\\Software\\C]\r\n\"z\"=\"3\"\r\n";
+        let parsed = crate::regfile::parse_backup(text).unwrap();
+        let (admin, admin_notes) = restore_scope(parsed.clone(), true);
+        assert!(
+            admin
+                .iter()
+                .all(|op| op.key().starts_with("HKEY_LOCAL_MACHINE"))
+        );
+        assert!(!admin.is_empty());
+        assert!(
+            admin_notes[0].contains("2 per-user keys"),
+            "{admin_notes:?}"
+        );
+        let (normal, normal_notes) = restore_scope(parsed, false);
+        assert!(
+            normal
+                .iter()
+                .all(|op| op.key().starts_with("HKEY_CURRENT_USER"))
+        );
+        assert!(!normal.is_empty());
+        assert!(
+            normal_notes[0].contains("need administrator rights"),
+            "{normal_notes:?}"
+        );
+    }
+
+    #[test]
+    fn a_file_too_large_to_copy_is_refused_before_reading() {
+        use crate::fs::{MAX_COPY_BYTES, copy_len};
+        let mut fs = MemoryFs::new();
+        fs.add_file_bytes(r"C:\big.lnk", vec![0; MAX_COPY_BYTES as usize + 1], None);
+        fs.add_file_bytes(r"C:\small.lnk", vec![0; 64], None);
+        assert!(copy_len(&fs.pin(r"C:\big.lnk").unwrap()).is_err());
+        assert_eq!(copy_len(&fs.pin(r"C:\small.lnk").unwrap()), Ok(64));
+    }
+
+    #[test]
+    fn the_fallback_data_folder_is_always_protected() {
+        // With no Local AppData, per-user files land in Temp\HiveMend; Temp
+        // cleaning must still refuse that folder.
+        let fs = MemoryFs::new();
+        assert!(user_dir(&fs).is_none());
+        let roots = data_roots(&fs);
+        let fallback = fallback_dir().display().to_string();
+        assert!(roots.contains(&fallback), "{roots:?}");
+        assert!(
+            user_file("settings.ini")
+                .starts_with(user_dir(&crate::fs::HostFs).unwrap_or_else(fallback_dir))
+        );
     }
 
     #[test]
@@ -637,7 +1201,9 @@ mod tests {
         let files = r"C:\ProgramData\HiveMend\backups\hive-mend-1-files";
         let desktop = r"C:\Users\me\Desktop";
         fs.add_file_bytes(backup, vec![1], None);
-        fs.add_file_bytes(&format!(r"{files}\0001-good.lnk"), b"good".to_vec(), None);
+        for name in ["0001-good", "0003-evil", "0005-x", "0006-y"] {
+            fs.add_file_bytes(&format!(r"{files}\{name}.lnk"), b"good".to_vec(), None);
+        }
         fs.add_file_bytes(r"C:\Users\me\secret.txt", b"secret".to_vec(), None);
         fs.add_file_bytes(&format!(r"{desktop}\present.lnk"), b"mine".to_vec(), None);
         fs.add_file_bytes(&format!(r"{files}\0004-present.lnk"), b"old".to_vec(), None);
@@ -658,51 +1224,237 @@ mod tests {
                 // Destination where repair never removes shortcuts: refused.
                 (
                     r"C:\Windows\System32\evil.dll",
-                    &format!(r"{files}\0001-good.lnk"),
+                    &format!(r"{files}\0003-evil.lnk"),
                 ),
                 // Already present: left alone, never overwritten.
                 (
                     &format!(r"{desktop}\present.lnk"),
                     &format!(r"{files}\0004-present.lnk"),
                 ),
-                // Spelled on the Desktop, really in System32: created, caught
-                // by its real path, and removed again.
+                // Spelled on the Desktop, really in System32: refused by its
+                // real path before anything is created.
                 (
                     &format!(r"{desktop}\sys\x.lnk"),
-                    &format!(r"{files}\0001-good.lnk"),
+                    &format!(r"{files}\0005-x.lnk"),
+                ),
+                // The same, with folders still to be made: none are made.
+                (
+                    &format!(r"{desktop}\sys\new\deeper\y.lnk"),
+                    &format!(r"{files}\0006-y.lnk"),
                 ),
             ]),
         );
         assert_eq!(restored, 1, "{errors:?}");
-        assert_eq!(errors.len(), 3, "{errors:?}");
+        assert_eq!(errors.len(), 5, "{errors:?}");
+        assert!(
+            !fs.exists(r"C:\Windows\System32\new"),
+            "a folder was made outside"
+        );
         assert_eq!(
             fs.read(&format!(r"{desktop}\good.lnk")),
             Some(b"good".to_vec())
         );
         assert!(!fs.exists(&format!(r"{desktop}\stolen.lnk")));
+        assert!(fs.exists(r"C:\Users\me\secret.txt"));
         assert!(!fs.exists(r"C:\Windows\System32\evil.dll"));
         assert!(!fs.exists(r"C:\Windows\System32\x.lnk"));
         assert_eq!(
             fs.read(&format!(r"{desktop}\present.lnk")),
             Some(b"mine".to_vec())
         );
+        // Every refused saved shortcut stays where it was.
+        for name in ["0003-evil", "0004-present", "0005-x", "0006-y"] {
+            assert!(fs.exists(&format!(r"{files}\{name}.lnk")), "{name}");
+        }
+        assert!(
+            errors[2].contains("stays at") && errors[2].contains("0004-present"),
+            "{errors:?}"
+        );
     }
 
     #[test]
-    fn every_data_folder_is_refused_for_shred_and_privacy_deletes() {
+    fn a_restored_shortcut_is_moved_back_whole_and_once() {
+        use crate::fs::MAX_COPY_BYTES;
         let mut fs = fs();
+        let backup = r"C:\ProgramData\HiveMend\backups\hive-mend-2.reg";
+        let files = r"C:\ProgramData\HiveMend\backups\hive-mend-2-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        // Larger than a copy may be, with a named data stream.
+        let big = vec![7u8; MAX_COPY_BYTES as usize + 10];
+        fs.add_file_bytes(&format!(r"{files}\0001-big.lnk"), big.clone(), None);
+        fs.add_stream(&format!(r"{files}\0001-big.lnk"));
+        // Its folder went away too: it is made again.
+        let deep = format!(r"{desktop}\Games\big.lnk");
+        // Nothing saved and nothing back: an error, not "already back".
+        let lost = format!(r"{desktop}\lost.lnk");
+        let list = summary(&[
+            (&deep, &format!(r"{files}\0001-big.lnk")),
+            (&lost, &format!(r"{files}\0002-lost.lnk")),
+        ]);
+        let (restored, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(restored, 1, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("0002-lost"), "{errors:?}");
+        assert_eq!(fs.read(&deep), Some(big));
+        assert_eq!(fs.named_streams(&deep), Ok(true));
+        // Moved, not copied: the backup no longer holds it.
+        assert!(!fs.exists(&format!(r"{files}\0001-big.lnk")));
+        // Running the restore again cannot verify the consumed archive from
+        // the destination alone, so it reports an unresolved recovery
+        // instead of a quiet success, and changes nothing.
+        let (again, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(again, 0);
+        assert_eq!(errors.len(), 2, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0001-big") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0002-lost")),
+            "{errors:?}"
+        );
+        assert!(fs.exists(&deep));
+    }
+
+    #[test]
+    fn a_missing_archive_is_never_reported_as_restored() {
+        // PV-03: a missing or unreadable saved copy plus anything at the
+        // destination is an unresolved recovery with a visible warning, never
+        // a completed restore. Nothing is overwritten, whatever is there.
+        let mut fs = fs();
+        let backup = r"C:\ProgramData\HiveMend\backups\hive-mend-9.reg";
+        let files = r"C:\ProgramData\HiveMend\backups\hive-mend-9-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        fs.add_dir(files);
+        // An unrelated file at the destination proves nothing about the
+        // missing archive.
+        fs.add_file_bytes(&format!(r"{desktop}\other.lnk"), b"mine".to_vec(), None);
+        // A directory at the destination is left alone too.
+        fs.add_dir(&format!(r"{desktop}\folder"));
+        // An unreadable saved copy: pinned as a reparse point, never as data.
+        fs.add_file_bytes(&format!(r"{desktop}\broken.lnk"), b"mine".to_vec(), None);
+        fs.add_other(&format!(r"{files}\0004-broken.lnk"));
+        let (restored, errors) = restore_files(
+            &mut fs,
+            backup,
+            &summary(&[
+                (
+                    &format!(r"{desktop}\other.lnk"),
+                    &format!(r"{files}\0001-other.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\folder"),
+                    &format!(r"{files}\0002-folder.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\gone.lnk"),
+                    &format!(r"{files}\0003-gone.lnk"),
+                ),
+                (
+                    &format!(r"{desktop}\broken.lnk"),
+                    &format!(r"{files}\0004-broken.lnk"),
+                ),
+            ]),
+        );
+        assert_eq!(restored, 0, "nothing verified, nothing claimed: {errors:?}");
+        assert_eq!(errors.len(), 4, "{errors:?}");
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0001-other") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|err| err.contains("0002-folder") && err.contains("left as it is")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0003-gone")),
+            "{errors:?}"
+        );
+        assert!(
+            errors.iter().any(|err| err.contains("0004-broken")),
+            "{errors:?}"
+        );
+        // Nothing overwritten, nothing created, nothing consumed.
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\other.lnk")),
+            Some(b"mine".to_vec())
+        );
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\broken.lnk")),
+            Some(b"mine".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{desktop}\gone.lnk")));
+        assert!(fs.is_dir(&format!(r"{desktop}\folder")));
+        // A genuine restore still works, and repeating it reports the now
+        // missing archive instead of silently claiming it again: the file
+        // put back keeps its data, with no duplicate.
+        fs.add_file_bytes(&format!(r"{files}\0005-real.lnk"), b"real".to_vec(), None);
+        let list = summary(&[(
+            &format!(r"{desktop}\real.lnk"),
+            &format!(r"{files}\0005-real.lnk"),
+        )]);
+        let (restored, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!((restored, errors.len()), (1, 0), "{errors:?}");
+        let (again, errors) = restore_files(&mut fs, backup, &list);
+        assert_eq!(again, 0);
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("0005-real") && errors[0].contains("left as it is"));
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\real.lnk")),
+            Some(b"real".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{files}\0005-real.lnk")));
+    }
+
+    #[test]
+    fn a_saved_shortcut_on_another_drive_stays_and_says_so() {
+        let mut fs = fs();
+        let backup = r"D:\HiveMend\backups\hive-mend-3.reg";
+        let files = r"D:\HiveMend\backups\hive-mend-3-files";
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(backup, vec![1], None);
+        fs.add_dir(desktop);
+        fs.add_file_bytes(&format!(r"{files}\0001-a.lnk"), b"a".to_vec(), None);
+        fs.set_other_volume(r"D:\");
+        let (restored, errors) = restore_files(
+            &mut fs,
+            backup,
+            &summary(&[(
+                &format!(r"{desktop}\a.lnk"),
+                &format!(r"{files}\0001-a.lnk"),
+            )]),
+        );
+        assert_eq!(restored, 0);
+        assert!(errors[0].contains("another drive"), "{errors:?}");
+        assert!(fs.exists(&format!(r"{files}\0001-a.lnk")));
+        assert!(!fs.exists(&format!(r"{desktop}\a.lnk")));
+    }
+
+    #[test]
+    fn every_data_folder_is_a_data_root() {
+        let fs = fs();
+        let roots = data_roots(&fs);
         for path in [
             format!(r"{LOCAL}\HiveMend\settings.ini"),
             r"C:\HiveMend\backups\old.reg".to_string(),
             r"C:\ProgramData\HiveMend\backups\new.reg".to_string(),
         ] {
-            fs.add_file_bytes(&path, vec![1], None);
-            assert!(
-                crate::pathutil::shred_allowed(&fs, &path).is_err(),
-                "{path}"
-            );
+            assert!(roots.iter().any(|root| path_under(&path, root)), "{path}");
         }
-        assert_eq!(data_roots(&fs).len(), 3);
+        // The legacy folder, Local AppData, ProgramData, and the Temp
+        // fallback for when Local AppData cannot be located.
+        assert_eq!(roots.len(), 4);
+        assert!(roots.contains(&fallback_dir().display().to_string()));
     }
 }
 
@@ -719,7 +1471,11 @@ mod live_tests {
         // a folder pre-created in ProgramData by another user would be.
         let dir = std::env::temp_dir().join(format!("hivemend-untrusted-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
-        let result = check_protected_dir(&dir);
+        // By its long name: TEMP can be an 8.3 spelling (a profile folder
+        // such as `name.COMPUTER`), which is refused before ownership is
+        // looked at.
+        let long = HostFs.pin(&dir.display().to_string()).unwrap().real_path;
+        let result = check_protected_dir(Path::new(&long));
         let _ = std::fs::remove_dir_all(&dir);
         if elevated() {
             // An elevated token may own it as Administrators; the Users
@@ -769,6 +1525,7 @@ mod live_tests {
         std::fs::create_dir_all(base.join("hm-files")).unwrap();
         std::fs::write(base.join("hm.reg"), b"x").unwrap();
         std::fs::write(base.join("hm-files").join("0001-a.lnk"), b"shortcut").unwrap();
+        std::fs::write(base.join("hm-files").join("0002-x.lnk"), b"shortcut").unwrap();
         let made = std::process::Command::new("cmd")
             .args(["/C", "mklink", "/J"])
             .arg(base.join("j"))
@@ -783,23 +1540,202 @@ mod live_tests {
         let good = base.join("restored.lnk").display().to_string();
         let bad = base.join("j").join("x.lnk").display().to_string();
         let copy = base.join("hm-files").join("0001-a.lnk");
+        let other = base.join("hm-files").join("0002-x.lnk");
         let summary = BackupSummary {
-            files: vec![(good.clone(), copy.clone()), (bad, copy)],
+            files: vec![(good.clone(), copy), (bad, other.clone())],
             ..BackupSummary::default()
         };
         let (restored, errors) = restore_files(&mut fs, &backup_real, &summary);
         let landed = elsewhere.join("x.lnk").exists();
+        let kept = other.exists();
         let good_bytes = std::fs::read(&good).ok();
         let _ = std::fs::remove_dir_all(&base);
         let _ = std::fs::remove_dir_all(&elsewhere);
         assert!(made.status.success());
         assert_eq!(restored, 1, "{errors:?}");
         assert_eq!(good_bytes, Some(b"shortcut".to_vec()));
+        // Refused either because the folder is a junction (it is never
+        // followed) or by its real path; never created outside first.
         assert!(
-            errors.iter().any(|err| err.contains("resolves to")),
+            errors
+                .iter()
+                .any(|err| err.contains("resolves to") || err.contains("link or junction")),
             "{errors:?}"
         );
-        assert!(!landed, "the misplaced file was not removed");
+        assert!(!landed, "a file landed outside its place");
+        assert!(kept, "a refused saved shortcut left the backup");
+    }
+
+    #[test]
+    fn live_a_shortcut_goes_back_whole_with_its_streams_and_any_size() {
+        // As repair leaves it: moved by handle into the backup's files
+        // folder. Larger than a copy may be, with a named stream, and its
+        // folder gone too.
+        let base = std::env::temp_dir().join(format!("hivemend-back-{}", std::process::id()));
+        let files = base.join("hm-files");
+        let place = base.join("Games");
+        std::fs::create_dir_all(&files).unwrap();
+        std::fs::create_dir_all(&place).unwrap();
+        std::fs::write(base.join("hm.reg"), b"x").unwrap();
+        let lnk = place.join("big.lnk");
+        let body: Vec<u8> = (0..crate::fs::MAX_COPY_BYTES as usize + 4096)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        std::fs::write(&lnk, &body).unwrap();
+        std::fs::write(format!("{}:notes", lnk.display()), b"hidden").unwrap();
+        let mut fs = HostFs;
+        let mut pin = fs.pin(&lnk.display().to_string()).unwrap();
+        fs.pin_acquire(&mut pin, Access::ReadDeleteExclusive)
+            .unwrap();
+        fs.pin_move_into(pin, &files.display().to_string(), "0001-big.lnk")
+            .unwrap();
+        std::fs::remove_dir(&place).unwrap();
+        // A second one whose place is taken again by something else.
+        let taken = base.join("taken.lnk");
+        std::fs::write(files.join("0002-taken.lnk"), b"saved").unwrap();
+        std::fs::write(&taken, b"new owner").unwrap();
+        let backup_real = fs
+            .pin(&base.join("hm.reg").display().to_string())
+            .unwrap()
+            .real_path;
+        let summary = BackupSummary {
+            files: vec![
+                (lnk.display().to_string(), files.join("0001-big.lnk")),
+                (taken.display().to_string(), files.join("0002-taken.lnk")),
+            ],
+            ..BackupSummary::default()
+        };
+        let (restored, errors) = restore_files(&mut fs, &backup_real, &summary);
+        let (again, errors_again) = restore_files(&mut fs, &backup_real, &summary);
+        let back = std::fs::read(&lnk).ok();
+        let stream = std::fs::read(format!("{}:notes", lnk.display())).ok();
+        let left_in_backup = files.join("0001-big.lnk").exists();
+        let taken_kept = std::fs::read(&taken).ok();
+        let saved_kept = std::fs::read(files.join("0002-taken.lnk")).ok();
+        let _ = std::fs::remove_dir_all(&base);
+        assert_eq!(restored, 1, "{errors:?}");
+        assert_eq!(errors.len(), 1, "{errors:?}");
+        assert!(errors[0].contains("already at that place"), "{errors:?}");
+        assert!(back.as_deref() == Some(&body[..]), "its data changed");
+        assert_eq!(
+            stream.as_deref(),
+            Some(&b"hidden"[..]),
+            "its stream was lost"
+        );
+        assert!(!left_in_backup, "moved back, not copied");
+        assert_eq!(taken_kept.as_deref(), Some(&b"new owner"[..]));
+        assert_eq!(saved_kept.as_deref(), Some(&b"saved"[..]));
+        // Again: neither is claimed. The consumed archive cannot be verified
+        // from the destination alone, so it is reported as an unresolved
+        // recovery; the conflict still reports, and nothing is overwritten
+        // or duplicated.
+        assert_eq!(again, 0);
+        assert_eq!(errors_again.len(), 2, "{errors_again:?}");
+        assert!(
+            errors_again
+                .iter()
+                .any(|err| err.contains("0001-big") && err.contains("left as it is")),
+            "{errors_again:?}"
+        );
+        assert!(
+            errors_again
+                .iter()
+                .any(|err| err.contains("already at that place")),
+            "{errors_again:?}"
+        );
+    }
+
+    #[test]
+    fn live_the_signature_is_hmac_sha256() {
+        // RFC 4231, test case 2.
+        let mac = signed::mac_of(b"Jefe", b"what do ya want for nothing?");
+        assert_eq!(
+            crate::backup::signature_text(&mac),
+            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843"
+        );
+    }
+
+    /// Runs only elevated (it skips otherwise), in a scratch protected
+    /// folder under ProgramData made exactly as the store is.
+    #[test]
+    fn live_elevated_only_a_signed_unchanged_backup_verifies() {
+        if !elevated() {
+            eprintln!("skipped: needs an elevated test run");
+            return;
+        }
+        let data = crate::fs::host_known_dir(KnownDir::ProgramData).unwrap();
+        let root = Path::new(&data).join(format!("HiveMendSigTest{}", std::process::id()));
+        let backups = root.join("backups");
+        let result = (|| -> Result<(), String> {
+            ensure_protected(&root)?;
+            ensure_protected(&backups)?;
+            let key = signed::key_in(&root)?;
+            // The same key comes back the second time.
+            assert_eq!(signed::key_in(&root)?, key);
+            let mut writer = crate::backup::BackupWriter::reserve(&backups, "signed")
+                .map_err(|err| err.to_string())?;
+            writer
+                .sign_with(Box::new(signed::Hmac::new(&key)?))
+                .map_err(|err| err.to_string())?;
+            writer
+                .append("Windows Registry Editor Version 5.00\r\n\r\n; Hive Mend backup.\r\n")
+                .map_err(|err| err.to_string())?;
+            writer
+                .append("\r\n[HKEY_LOCAL_MACHINE\\SOFTWARE\\HmSigTest]\r\n")
+                .map_err(|err| err.to_string())?;
+            let path = writer.path().to_path_buf();
+            drop(writer);
+            let mut fs = crate::fs::HostFs;
+            let real = fs
+                .pin(&path.display().to_string())
+                .map_err(|err| err.to_string())?
+                .real_path;
+            let bytes = std::fs::read(&path).map_err(|err| err.to_string())?;
+            // Unchanged: accepted.
+            signed::verify_in(&mut fs, &root, &real, &bytes)?;
+            // Unchanged: every byte is covered.
+            assert_eq!(
+                signed::verify_in(&mut fs, &root, &real, &bytes)?,
+                bytes.len()
+            );
+            // The last append changed: only the earlier, signed part counts.
+            let mut changed = bytes.clone();
+            *changed.last_mut().unwrap() ^= 1;
+            let covered = signed::verify_in(&mut fs, &root, &real, &changed)?;
+            assert!(covered < bytes.len(), "{covered}");
+            // A byte of the first append changed: nothing counts.
+            let mut early = bytes.clone();
+            early[4] ^= 1;
+            let err = signed::verify_in(&mut fs, &root, &real, &early).unwrap_err();
+            assert!(err.contains("does not match"), "{err}");
+            // A file with the marker that Hivemend did not write: refused.
+            let forged = backups.join("forged.reg");
+            std::fs::write(&forged, &bytes).map_err(|err| err.to_string())?;
+            let forged_real = fs
+                .pin(&forged.display().to_string())
+                .map_err(|err| err.to_string())?
+                .real_path;
+            let err = signed::verify_in(&mut fs, &root, &forged_real, &bytes).unwrap_err();
+            assert!(err.contains("no Hivemend signature"), "{err}");
+            // ...also with a made-up signature beside it.
+            std::fs::write(crate::backup::signature_path(&forged), "0".repeat(64))
+                .map_err(|err| err.to_string())?;
+            let err = signed::verify_in(&mut fs, &root, &forged_real, &bytes).unwrap_err();
+            assert!(err.contains("does not match"), "{err}");
+            // A key file anyone may read is refused.
+            let open_root = root.join("open");
+            ensure_protected(&open_root)?;
+            std::fs::write(open_root.join("backup.key"), [7u8; 32])
+                .map_err(|err| err.to_string())?;
+            let err = signed::key_in(&open_root).unwrap_err();
+            assert!(
+                err.contains("lets S-1-5-32-545") || err.contains("lets"),
+                "{err}"
+            );
+            Ok(())
+        })();
+        let _ = std::fs::remove_dir_all(&root);
+        result.expect("signed backup round trip");
     }
 
     /// Runs only elevated (it skips otherwise): creates a scratch protected

@@ -7,9 +7,9 @@
 //! engine never touches service keys; this module is the only pathway.
 
 use std::collections::BTreeMap;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
-use crate::backup::{BackupPlan, write_backup};
+use crate::backup::{BackupPlan, BackupWriter};
 use crate::model::Error;
 use crate::registry::{RegError, Registry};
 
@@ -226,7 +226,7 @@ impl ServiceStore for MemoryServiceStore {
     }
 }
 
-/// Services Hive Mend refuses to change or stop: the RPC and logon
+/// Services Hivemend refuses to change or stop: the RPC and logon
 /// core, the security and update stack, and session basics. Starting one
 /// is transient and stays allowed.
 pub const NEVER_TOUCH: &[&str] = &[
@@ -237,6 +237,12 @@ pub const NEVER_TOUCH: &[&str] = &[
     "WdNisSvc",
     "Sense",
     "MpsSvc",
+    // The firewall's filtering engine; the firewall and IPsec stop without it.
+    "BFE",
+    "SecurityHealthService",
+    "wscsvc",
+    // UAC elevation.
+    "Appinfo",
     "wuauserv",
     "BITS",
     "WaaSMedicSvc",
@@ -248,6 +254,13 @@ pub const NEVER_TOUCH: &[&str] = &[
     "Power",
     "ProfSvc",
     "Schedule",
+    "LSM",
+    "BrokerInfrastructure",
+    "SystemEventsBroker",
+    "CoreMessagingRegistrar",
+    "UserManager",
+    "gpsvc",
+    "Winmgmt",
 ];
 
 pub fn is_never_touch(name: &str) -> bool {
@@ -405,7 +418,7 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
     // The unified marker Restore validates, plus a line naming the kind.
     body.push_str("; Hive Mend backup.\r\n");
     body.push_str("; Hive Mend services backup.\r\n");
-    body.push_str("; Restore it from the Restore page in Hive Mend.\r\n");
+    body.push_str("; Restore it from the Restore page in Hivemend.\r\n");
     let mut unreadable = Vec::new();
     for name in names {
         let key = service_key(name);
@@ -422,6 +435,12 @@ pub fn export_start_backup(reg: &dyn Registry, names: &[String]) -> BackupPlan {
                         crate::model::ValueKind::Dword(data) => {
                             body.push_str(&format!("\r\n[{key}]\r\n"));
                             body.push_str(&format!("\"Start\"=dword:{data:08x}\r\n"));
+                            if delayed.is_none() {
+                                // Absent is part of the state: a change to
+                                // Automatic (Delayed) creates the flag, and
+                                // restoring must remove it again.
+                                body.push_str("\"DelayedAutostart\"=-\r\n");
+                            }
                             if let Some(delayed) = delayed {
                                 match &delayed.data {
                                     crate::model::ValueKind::Dword(data) => {
@@ -495,14 +514,14 @@ pub fn apply_start_changes(
     store: &mut dyn ServiceStore,
     reg: &dyn Registry,
     changes: &[ServiceChange],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<ServiceOutcome, Error> {
     let names: Vec<String> = changes.iter().map(|change| change.name.clone()).collect();
     let plan = export_start_backup(reg, &names);
-    write_backup(backup_file, &plan.body)?;
+    backup.append(&plan.body)?;
     let mut outcome = ServiceOutcome {
-        backup_file: backup_file.to_path_buf(),
+        backup_file: backup.path().to_path_buf(),
         ..ServiceOutcome::default()
     };
     let current = store.list()?;
@@ -525,7 +544,7 @@ pub fn apply_start_changes(
         };
         if matches!(change.to, StartType::Boot | StartType::System) {
             outcome.refused.push(format!(
-                "{}: Hive Mend never sets a Boot or System start",
+                "{}: Hivemend never sets a Boot or System start",
                 info.name
             ));
             progress(index + 1, changes.len());
@@ -796,6 +815,19 @@ mod tests {
     }
 
     #[test]
+    fn the_firewall_engine_and_uac_are_never_touched() {
+        for name in ["BFE", "bfe", "MpsSvc", "Appinfo", "wscsvc"] {
+            assert!(is_never_touch(name), "{name}");
+        }
+        for name in SUGGESTED.targets.iter().map(|target| target.name) {
+            assert!(
+                !is_never_touch(name),
+                "{name} is both suggested and protected"
+            );
+        }
+    }
+
+    #[test]
     fn start_backup_parses_machine_wide_and_flags_unreadable() {
         let mut reg = MemoryRegistry::new();
         reg.set_dword(&service_key("DiagTrack"), "Start", 2);
@@ -807,6 +839,14 @@ mod tests {
         );
         assert!(plan.body.contains("\"Start\"=dword:00000002"));
         assert!(plan.body.contains("\"DelayedAutostart\"=dword:00000001"));
+        // A service with no delay flag records its absence, so restoring
+        // after a change to Automatic (Delayed) removes the flag again.
+        let diag = plan
+            .body
+            .split("\r\n\r\n")
+            .find(|section| section.contains("DiagTrack"))
+            .unwrap();
+        assert!(diag.contains("\"DelayedAutostart\"=-"), "{diag}");
         // The exported services backup must be one Restore will accept.
         assert!(crate::backup::is_hive_mend_backup(&plan.body));
         assert_eq!(plan.unreadable.len(), 1);
@@ -814,7 +854,10 @@ mod tests {
         assert!(plan.covers(&service_key("DiagTrack")));
         let summary = BackupSummary::parse(&plan.body);
         assert_eq!(summary.keys, 2);
-        assert_eq!(summary.values, 3);
+        assert_eq!(
+            summary.values, 4,
+            "two Start values, a delay flag, and an absent delay flag"
+        );
         assert!(summary.machine_wide);
         assert!(summary.files.is_empty());
     }
@@ -866,7 +909,7 @@ mod tests {
         store.insert(info("Done", StartType::Manual, ServiceState::Stopped));
         store.insert(info("Odd", StartType::Automatic, ServiceState::Stopped));
         let reg = keyed_registry();
-        let backup = std::env::temp_dir().join("hive-mend-services-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-services-test");
         let changes = [
             change("Good", StartType::Manual),
             change("RpcSs", StartType::Manual),
@@ -875,7 +918,7 @@ mod tests {
             change("Missing", StartType::Manual),
         ];
         let outcome =
-            apply_start_changes(&mut store, &reg, &changes, &backup, &mut |_, _| {}).unwrap();
+            apply_start_changes(&mut store, &reg, &changes, &mut backup, &mut |_, _| {}).unwrap();
         assert_eq!(outcome.applied.len(), 1);
         assert!(outcome.applied[0].contains("Good display"));
         assert_eq!(outcome.already_correct, 1);
@@ -888,10 +931,10 @@ mod tests {
         assert!(outcome.errors.is_empty());
         assert_eq!(store.find("Good").unwrap().start, StartType::Manual);
         assert_eq!(store.find("RpcSs").unwrap().start, StartType::Automatic);
-        let text = crate::backup::read_backup(&backup).unwrap();
+        let text = crate::backup::read_backup(backup.path()).unwrap();
         assert!(text.contains("[HKEY_LOCAL_MACHINE\\SYSTEM\\CurrentControlSet\\Services\\Good]"));
         assert!(text.contains("\"Start\"=dword:00000002"));
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -899,19 +942,19 @@ mod tests {
         let mut store = MemoryServiceStore::new();
         store.insert(info("Good", StartType::Automatic, ServiceState::Stopped));
         let reg = keyed_registry();
-        let backup = std::env::temp_dir().join("hive-mend-services-boot-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-services-boot-test");
         let outcome = apply_start_changes(
             &mut store,
             &reg,
             &[change("Good", StartType::Boot)],
-            &backup,
+            &mut backup,
             &mut |_, _| {},
         )
         .unwrap();
         assert!(outcome.applied.is_empty());
         assert_eq!(outcome.refused.len(), 1);
         assert_eq!(store.find("Good").unwrap().start, StartType::Automatic);
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]

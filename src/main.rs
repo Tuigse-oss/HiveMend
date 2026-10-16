@@ -16,7 +16,7 @@ use std::time::SystemTime;
 
 #[derive(Parser)]
 #[command(
-    name = "hive-mend",
+    name = "hivemend",
     version,
     about = "Scan and repair stale registry entries on Windows 10 and 11"
 )]
@@ -33,13 +33,11 @@ enum Command {
     Scan(ScanArgs),
     /// Back up matching entries, then remove them.
     Repair(RepairArgs),
-    /// Merge a backup written by repair and put back its shortcut copies.
+    /// Merge a backup written by repair and move its saved shortcuts back.
     Restore {
         /// The .reg file in the backup folder.
         file: PathBuf,
     },
-    /// Overwrite files so they cannot be recovered, then delete them. Cannot be undone.
-    Shred(ShredArgs),
     /// List the registry hive files and their sizes. Reads only.
     Hives,
     /// Run the built-in sample hive. Useful off Windows.
@@ -93,19 +91,6 @@ struct RepairArgs {
     yes: bool,
 }
 
-#[derive(Args)]
-struct ShredArgs {
-    /// Files or folders to shred. Shredding cannot be undone.
-    #[arg(required = true)]
-    paths: Vec<PathBuf>,
-    /// Overwrite passes: 1, 3, or 7.
-    #[arg(long, default_value_t = 3)]
-    passes: u8,
-    /// Shred without asking. Without this, shred only prints the plan.
-    #[arg(long)]
-    yes: bool,
-}
-
 #[derive(Clone, Copy, ValueEnum)]
 enum Format {
     Text,
@@ -123,16 +108,40 @@ fn main() -> ExitCode {
     match real_main() {
         Ok(code) => code,
         Err(err) => {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
             ExitCode::from(1)
         }
     }
 }
 
+/// Write to the console Hivemend was started from. Output the launcher
+/// redirected to a file or pipe (`hivemend scan > out.txt` in cmd) stays
+/// redirected: attaching would otherwise replace those handles and the
+/// output would be lost.
 #[cfg(windows)]
 fn attach_parent_console() {
-    unsafe {
-        windows_sys::Win32::System::Console::AttachConsole(0xFFFFFFFF);
+    use windows_sys::Win32::Foundation::INVALID_HANDLE_VALUE;
+    use windows_sys::Win32::Storage::FileSystem::{FILE_TYPE_DISK, FILE_TYPE_PIPE, GetFileType};
+    use windows_sys::Win32::System::Console::{
+        ATTACH_PARENT_PROCESS, AttachConsole, GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE,
+        STD_OUTPUT_HANDLE, SetStdHandle,
+    };
+    let kinds = [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE];
+    let redirected = kinds.map(|kind| {
+        let handle = unsafe { GetStdHandle(kind) };
+        let real = !handle.is_null()
+            && handle != INVALID_HANDLE_VALUE
+            && matches!(
+                unsafe { GetFileType(handle) },
+                FILE_TYPE_DISK | FILE_TYPE_PIPE
+            );
+        real.then_some(handle)
+    });
+    unsafe { AttachConsole(ATTACH_PARENT_PROCESS) };
+    for (kind, handle) in kinds.into_iter().zip(redirected) {
+        if let Some(handle) = handle {
+            unsafe { SetStdHandle(kind, handle) };
+        }
     }
 }
 
@@ -156,7 +165,7 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
             let sample = hive_mend::sample_world();
             let engine = Engine::try_builtin()?;
             let report = scan(&engine, &sample.reg, &sample.fs, &ScanOptions::default());
-            print_text(&report);
+            print_text(&report, &[]);
             Ok(if report.findings.is_empty() {
                 ExitCode::SUCCESS
             } else {
@@ -164,42 +173,44 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
             })
         }
         Command::Restore { file } => restore_live(&file),
-        Command::Shred(args) => shred_live(&args),
         Command::Hives => hives_live(),
         Command::Scan(args) => {
             let engine = load_engine(&args.data)?;
             let opts = options(&args)?;
-            let report = scan_live(&engine, &opts, &args)?;
-            emit(&report, args.format);
-            Ok(if report.findings.is_empty() {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(2)
-            })
+            let (report, notes) = scan_live(&engine, &opts, &args)?;
+            emit(&report, &notes, args.format);
+            Ok(scan_exit(&report))
         }
         Command::Repair(args) => {
             let engine = load_engine(&args.scan.data)?;
             let opts = options(&args.scan)?;
             if !args.yes {
-                let report = scan_live(&engine, &opts, &args.scan)?;
-                emit(&report, args.scan.format);
+                let (report, notes) = scan_live(&engine, &opts, &args.scan)?;
+                emit(&report, &notes, args.scan.format);
                 let repairable = report
                     .findings
                     .iter()
                     .filter(|finding| finding.repairable())
                     .count();
-                println!(
+                // stderr, so JSON on stdout stays one document.
+                eprintln!(
                     "{repairable} entries can be repaired. Re-run with --yes to write a backup and apply it."
                 );
-                return Ok(if report.findings.is_empty() {
-                    ExitCode::SUCCESS
-                } else {
-                    ExitCode::from(2)
-                });
+                return Ok(scan_exit(&report));
             }
+            let protected = hive_mend::backups_dir().map_err(hive_mend::Error)?;
             let backup_dir = match &args.backup_dir {
+                // As administrator, the backup must go to the protected
+                // store: a folder a normal program can change could redirect
+                // the write, and an elevated restore reads only that store.
+                Some(dir) if hive_mend::elevated() && !same_dir(dir, &protected) => {
+                    return Err(hive_mend::Error(format!(
+                        "--backup-dir cannot be used as administrator; backups go to {}",
+                        protected.display()
+                    )));
+                }
                 Some(dir) => dir.clone(),
-                None => hive_mend::backups_dir().map_err(hive_mend::Error)?,
+                None => protected,
             };
             repair_live(&engine, &opts, &args.scan, &backup_dir)
         }
@@ -227,12 +238,42 @@ fn options(args: &ScanArgs) -> Result<ScanOptions, hive_mend::Error> {
     })
 }
 
-/// Drop ignored entries and anything outside `--match`.
-fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) {
-    if !args.no_ignore_list {
+/// Exit status: 0 for a complete scan with nothing found, 2 when there are
+/// findings, 3 when the scan could not read everything (or was stopped)
+/// and found nothing, so it cannot be called clean.
+fn scan_exit(report: &hive_mend::ScanReport) -> ExitCode {
+    if !report.findings.is_empty() {
+        ExitCode::from(2)
+    } else if scan_complete(report) {
+        ExitCode::SUCCESS
+    } else {
+        ExitCode::from(3)
+    }
+}
+
+fn scan_complete(report: &hive_mend::ScanReport) -> bool {
+    report.warnings.is_empty() && !report.canceled
+}
+
+fn same_dir(a: &std::path::Path, b: &std::path::Path) -> bool {
+    let a = a.display().to_string();
+    let b = b.display().to_string();
+    a.trim_end_matches(['\\', '/'])
+        .eq_ignore_ascii_case(b.trim_end_matches(['\\', '/']))
+}
+
+/// Drop ignored entries and anything outside `--match`. Returns notes for
+/// the reader, which are not scan problems.
+fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) -> Vec<String> {
+    let mut notes = Vec::new();
+    // As administrator, no per-user policy is read, the ignore list
+    // included: programs running without elevation can change it.
+    if !args.no_ignore_list && hive_mend::elevated() {
+        notes.push("the ignore list is not used as administrator".to_string());
+    } else if !args.no_ignore_list {
         let ignored = Exclusions::load(&hive_mend::exclusions_file()).filter(&mut report.findings);
         if ignored > 0 {
-            report.warnings.push(format!(
+            notes.push(format!(
                 "{ignored} ignored entries hidden (see --no-ignore-list)"
             ));
         }
@@ -247,25 +288,26 @@ fn narrow(report: &mut hive_mend::ScanReport, args: &ScanArgs) {
                     .is_some_and(|value| value.to_ascii_lowercase().contains(&needle))
         });
     }
+    notes
 }
 
 fn scan_live(
     engine: &Engine,
     opts: &ScanOptions,
     args: &ScanArgs,
-) -> Result<hive_mend::ScanReport, hive_mend::Error> {
+) -> Result<(hive_mend::ScanReport, Vec<String>), hive_mend::Error> {
     #[cfg(windows)]
     {
         let reg = WindowsRegistry;
         let mut report = scan(engine, &reg, &HostFs, opts);
-        narrow(&mut report, args);
-        Ok(report)
+        let notes = narrow(&mut report, args);
+        Ok((report, notes))
     }
     #[cfg(not(windows))]
     {
         let _ = (engine, opts, args, narrow);
         Err(hive_mend::Error(
-            "live registry scan needs Windows. Use `hive-mend demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
+            "live registry scan needs Windows. Use `hivemend demo` on this machine, or build with --target x86_64-pc-windows-msvc".into(),
         ))
     }
 }
@@ -280,35 +322,79 @@ fn repair_live(
     {
         let mut reg = WindowsRegistry;
         let mut report = scan(engine, &reg, &HostFs, opts);
-        narrow(&mut report, args);
-        print_text(&report);
+        let mut notes = narrow(&mut report, args);
+        // As administrator, per-user registry entries are left for a normal
+        // window: a program running without elevation can redirect them.
+        let mut per_user_left = 0;
+        if hive_mend::elevated() {
+            let before = report.findings.len();
+            report.findings.retain(|finding| !finding.per_user());
+            let left = before - report.findings.len();
+            per_user_left = left;
+            if left > 0 {
+                notes.push(format!(
+                    "{left} per-user entries left alone; repair them without administrator rights"
+                ));
+            }
+        }
+        let json = matches!(args.format, Format::Json);
+        if !json {
+            print_text(&report, &notes);
+        }
         // Reserve a unique, already-created backup file so a second repair in
         // the same second cannot overwrite this one's recovery record.
-        let backup_file = hive_mend::reserve_backup_path(backup_dir, SystemTime::now())?;
+        let mut backup = hive_mend::reserve_backup(backup_dir, SystemTime::now())?;
+        // As administrator the backup is signed, or nothing is changed.
+        if let Err(err) = hive_mend::sign_protected(&mut backup) {
+            backup.discard();
+            return Err(hive_mend::Error(format!(
+                "could not sign the backup, so nothing was changed: {err}"
+            )));
+        }
         let mut fs = HostFs;
-        let outcome = repair(&mut reg, &mut fs, &report.findings, &backup_file)?;
-        println!(
-            "backup {}  removed {}  already gone {}  left alone {}  errors {}",
-            outcome.backup_file.display(),
-            outcome.applied,
-            outcome.already_gone,
-            outcome.refused + outcome.not_backed_up,
-            outcome.errors.len()
-        );
+        let outcome = repair(&mut reg, &mut fs, &report.findings, &mut backup)?;
+        let report_only = report
+            .findings
+            .iter()
+            .filter(|finding| !finding.repairable())
+            .count();
+        let result = RepairResult {
+            backup: outcome.backup_file.display().to_string(),
+            removed: outcome.applied,
+            already_gone: outcome.already_gone,
+            left_alone: outcome.refused.saturating_sub(report_only)
+                + outcome.not_backed_up
+                + per_user_left,
+            per_user_left,
+            report_only,
+            needs_admin: outcome.denied,
+            errors: outcome.errors.clone(),
+            complete: scan_complete(&report),
+            warnings: report.warnings.clone(),
+            notes: notes.into_iter().chain(outcome.notes.clone()).collect(),
+        };
+        if json {
+            println!("{}", result.json());
+        } else {
+            println!(
+                "backup {}  removed {}  already gone {}  left alone {}  errors {}",
+                result.backup,
+                result.removed,
+                result.already_gone,
+                result.left_alone,
+                result.errors.len()
+            );
+        }
         if outcome.denied > 0 {
             eprintln!(
-                "hive-mend: {} entries need an elevated (Run as administrator) prompt",
+                "hivemend: {} entries need an elevated (Run as administrator) prompt",
                 outcome.denied
             );
         }
         for err in &outcome.errors {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
         }
-        Ok(if outcome.errors.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(1)
-        })
+        Ok(ExitCode::from(result.exit_code()))
     }
     #[cfg(not(windows))]
     {
@@ -330,7 +416,7 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
             file.display()
         );
         for err in &errors {
-            eprintln!("hive-mend: {err}");
+            eprintln!("hivemend: {err}");
         }
         Ok(if errors.is_empty() {
             ExitCode::SUCCESS
@@ -345,99 +431,6 @@ fn restore_live(file: &std::path::Path) -> Result<ExitCode, hive_mend::Error> {
             "restoring a registry backup needs Windows".into(),
         ))
     }
-}
-
-fn shred_live(args: &ShredArgs) -> Result<ExitCode, hive_mend::Error> {
-    use hive_mend::{
-        FileView, HostFs, ItemKind, ShredMethod, ShredOptions, ShredTarget, format_bytes,
-        shred_allowed, shred_paths,
-    };
-    let method = ShredMethod::from_passes(args.passes).ok_or_else(|| {
-        hive_mend::Error(format!("--passes must be 1, 3, or 7, not {}", args.passes))
-    })?;
-    let mut targets = Vec::new();
-    let mut refused = Vec::new();
-    for path in &args.paths {
-        let text = path.display().to_string();
-        match shred_allowed(&HostFs, &text) {
-            Ok(()) => targets.push(ShredTarget {
-                path: text.clone(),
-                is_dir: HostFs.kind_of(&text) == ItemKind::Dir,
-            }),
-            Err(reason) => refused.push(reason),
-        }
-    }
-    #[cfg(windows)]
-    {
-        let mut drives: Vec<String> = Vec::new();
-        for target in &targets {
-            let bytes = target.path.trim().as_bytes();
-            if bytes.len() > 2 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':' {
-                let drive = format!("{}:", bytes[0].to_ascii_uppercase() as char);
-                if !drives.contains(&drive) {
-                    drives.push(drive);
-                }
-            }
-        }
-        for drive in drives {
-            match hive_mend::volume_ssd(&drive) {
-                Some(true) => eprintln!(
-                    "warning: {drive} is a solid-state drive: shredded data may survive in spare blocks"
-                ),
-                None => eprintln!("warning: could not tell whether {drive} is solid-state"),
-                Some(false) => {}
-            }
-        }
-    }
-    if !args.yes {
-        for target in &targets {
-            println!(
-                "{}  {}",
-                if target.is_dir { "folder" } else { "file" },
-                target.path
-            );
-        }
-        for reason in &refused {
-            println!("refused  {reason}");
-        }
-        println!(
-            "{} items would be shredded with {} (cannot be undone). Re-run with --yes to shred.",
-            targets.len(),
-            method.label()
-        );
-        return Ok(if targets.is_empty() {
-            ExitCode::SUCCESS
-        } else {
-            ExitCode::from(2)
-        });
-    }
-    let opts = ShredOptions {
-        method,
-        rename: true,
-    };
-    let outcome = shred_paths(
-        &mut HostFs,
-        &targets,
-        &opts,
-        hive_mend::random_seed(),
-        &mut |_, _, _| true,
-    );
-    println!(
-        "shredded {} files ({})",
-        outcome.shredded,
-        format_bytes(outcome.bytes)
-    );
-    for reason in refused.iter().chain(outcome.refused.iter()) {
-        eprintln!("hive-mend: refused: {reason}");
-    }
-    for err in &outcome.errors {
-        eprintln!("hive-mend: {err}");
-    }
-    Ok(if outcome.errors.is_empty() {
-        ExitCode::SUCCESS
-    } else {
-        ExitCode::from(1)
-    })
 }
 
 fn hives_live() -> Result<ExitCode, hive_mend::Error> {
@@ -471,14 +464,14 @@ fn hives_live() -> Result<ExitCode, hive_mend::Error> {
     }
 }
 
-fn emit(report: &hive_mend::ScanReport, format: Format) {
+fn emit(report: &hive_mend::ScanReport, notes: &[String], format: Format) {
     match format {
-        Format::Text => print_text(report),
-        Format::Json => print_json(report),
+        Format::Text => print_text(report, notes),
+        Format::Json => println!("{}", report_json(report, notes)),
     }
 }
 
-fn print_text(report: &hive_mend::ScanReport) {
+fn print_text(report: &hive_mend::ScanReport, notes: &[String]) {
     if report.findings.is_empty() {
         println!("No stale entries.");
     }
@@ -508,34 +501,202 @@ fn print_text(report: &hive_mend::ScanReport) {
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
+    if !scan_complete(report) {
+        eprintln!("warning: the scan could not read everything, so it is incomplete");
+    }
+    for note in notes {
+        eprintln!("note: {note}");
+    }
 }
 
-fn print_json(report: &hive_mend::ScanReport) {
-    println!("[");
-    for (index, finding) in report.findings.iter().enumerate() {
-        let comma = if index + 1 == report.findings.len() {
-            ""
+/// What `repair --yes` did, for its output and exit status.
+#[cfg_attr(not(windows), allow(dead_code))]
+struct RepairResult {
+    backup: String,
+    removed: usize,
+    already_gone: usize,
+    /// Repairs requested but not done: refused, not backed up, changed
+    /// meanwhile, or per-user entries an administrator run leaves alone.
+    left_alone: usize,
+    per_user_left: usize,
+    /// Findings that only report and were never meant to change anything.
+    report_only: usize,
+    needs_admin: usize,
+    errors: Vec<String>,
+    complete: bool,
+    warnings: Vec<String>,
+    notes: Vec<String>,
+}
+
+#[cfg_attr(not(windows), allow(dead_code))]
+impl RepairResult {
+    fn json(&self) -> String {
+        let strings = |items: &[String]| {
+            items
+                .iter()
+                .map(|item| format!("\"{}\"", escape_json(item)))
+                .collect::<Vec<_>>()
+                .join(",")
+        };
+        format!(
+            "{{\"complete\":{},\"backup\":\"{}\",\"removed\":{},\"already_gone\":{},\"left_alone\":{},\"per_user_left\":{},\"report_only\":{},\"needs_admin\":{},\"errors\":[{}],\"warnings\":[{}],\"notes\":[{}]}}",
+            self.complete,
+            escape_json(&self.backup),
+            self.removed,
+            self.already_gone,
+            self.left_alone,
+            self.per_user_left,
+            self.report_only,
+            self.needs_admin,
+            strings(&self.errors),
+            strings(&self.warnings),
+            strings(&self.notes)
+        )
+    }
+
+    /// 1 on errors; 3 when the scan was incomplete or requested repairs
+    /// were left undone; 0 when everything requested was done.
+    fn exit_code(&self) -> u8 {
+        if !self.errors.is_empty() {
+            1
+        } else if !self.complete || self.left_alone > 0 {
+            3
         } else {
-            ","
+            0
+        }
+    }
+}
+
+/// One JSON document: whether the scan was complete, the findings, the
+/// scan's warnings, and notes.
+fn report_json(report: &hive_mend::ScanReport, notes: &[String]) -> String {
+    let strings = |items: &[String]| {
+        items
+            .iter()
+            .map(|item| format!("\"{}\"", escape_json(item)))
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let findings: Vec<String> = report
+        .findings
+        .iter()
+        .map(|finding| {
+            let repair = match &finding.repair {
+                Repair::None => "none",
+                Repair::DeleteValue { .. } => "delete-value",
+                Repair::DeleteKey { .. } => "delete-key",
+                Repair::DeleteFile { .. } => "delete-file",
+            };
+            format!(
+                "{{\"scanner\":\"{}\",\"name\":\"{}\",\"key\":\"{}\",\"value\":\"{}\",\"detail\":\"{}\",\"repair\":\"{repair}\"}}",
+                finding.scanner.code(),
+                escape_json(&finding.scanner_name),
+                escape_json(&finding.key),
+                escape_json(finding.value.as_deref().unwrap_or("")),
+                escape_json(&finding.detail),
+            )
+        })
+        .collect();
+    format!(
+        "{{\"complete\":{},\"findings\":[{}],\"warnings\":[{}],\"notes\":[{}]}}",
+        scan_complete(report),
+        findings.join(","),
+        strings(&report.warnings),
+        strings(notes)
+    )
+}
+
+/// A JSON string body: quotes, backslashes, and every control character
+/// escaped.
+fn escape_json(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    for ch in text.chars() {
+        match ch {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            ch if (ch as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", ch as u32)),
+            ch => out.push(ch),
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn repair_results_do_not_look_clean_when_work_was_left() {
+        let base = RepairResult {
+            backup: r"C:\b\hive-mend.reg".into(),
+            removed: 3,
+            already_gone: 0,
+            left_alone: 0,
+            per_user_left: 0,
+            report_only: 2,
+            needs_admin: 0,
+            errors: Vec::new(),
+            complete: true,
+            warnings: Vec::new(),
+            notes: Vec::new(),
         };
-        let repair = match &finding.repair {
-            Repair::None => "none",
-            Repair::DeleteValue { .. } => "delete-value",
-            Repair::DeleteKey { .. } => "delete-key",
-            Repair::DeleteFile { .. } => "delete-file",
+        assert_eq!(
+            base.exit_code(),
+            0,
+            "report-only findings are not left work"
+        );
+        let skipped = RepairResult {
+            left_alone: 4,
+            per_user_left: 4,
+            notes: vec!["4 per-user entries left alone".into()],
+            ..base
         };
-        println!(
-            "  {{\"scanner\":\"{}\",\"name\":\"{}\",\"key\":\"{}\",\"value\":\"{}\",\"detail\":\"{}\",\"repair\":\"{repair}\"}}{comma}",
-            finding.scanner.code(),
-            escape_json(&finding.scanner_name),
-            escape_json(&finding.key),
-            escape_json(finding.value.as_deref().unwrap_or("")),
-            escape_json(&finding.detail),
+        assert_eq!(skipped.exit_code(), 3);
+        let json = skipped.json();
+        assert!(json.contains("\"left_alone\":4") && json.contains("\"per_user_left\":4"));
+        assert!(json.contains("\"notes\":[\"4 per-user entries left alone\"]"));
+        let incomplete = RepairResult {
+            left_alone: 0,
+            complete: false,
+            warnings: vec!["HKLM\\X: access denied".into()],
+            ..skipped
+        };
+        assert_eq!(incomplete.exit_code(), 3);
+        assert!(incomplete.json().starts_with("{\"complete\":false,"));
+    }
+
+    #[test]
+    fn json_strings_escape_every_control_character() {
+        let text = "tab\there\nnew \"quoted\" back\\slash \u{1} bell\u{7} é";
+        let escaped = escape_json(text);
+        assert!(escaped.chars().all(|ch| (ch as u32) >= 0x20));
+        assert_eq!(
+            escaped,
+            "tab\\there\\nnew \\\"quoted\\\" back\\\\slash \\u0001 bell\\u0007 é"
         );
     }
-    println!("]");
-}
 
-fn escape_json(text: &str) -> String {
-    text.replace('\\', "\\\\").replace('"', "\\\"")
+    #[test]
+    fn an_incomplete_scan_is_not_reported_as_clean() {
+        let clean = hive_mend::ScanReport {
+            findings: Vec::new(),
+            warnings: Vec::new(),
+            canceled: false,
+        };
+        assert!(scan_complete(&clean));
+        assert!(report_json(&clean, &[]).starts_with("{\"complete\":true,"));
+        let unread = hive_mend::ScanReport {
+            findings: Vec::new(),
+            warnings: vec!["HKLM\\SOFTWARE\\X: access denied".into()],
+            canceled: false,
+        };
+        assert!(!scan_complete(&unread));
+        let json = report_json(&unread, &["1 ignored entries hidden".into()]);
+        assert!(json.starts_with("{\"complete\":false,"));
+        assert!(json.contains("\"warnings\":[\"HKLM\\\\SOFTWARE\\\\X: access denied\"]"));
+        assert!(json.contains("\"notes\":[\"1 ignored entries hidden\"]"));
+    }
 }

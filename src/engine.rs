@@ -1,13 +1,13 @@
 use std::path::Path;
 
-use crate::backup::{BackupPlan, export_backup, write_backup};
+use crate::backup::{BackupPlan, BackupWriter, export_backup, registry_sections};
 use crate::fs::{Access, FileView, ItemKind};
 use crate::ignore::{IgnoreDb, load_ignore_file};
 use crate::model::{Error, Finding, Repair, ScanOptions, ScannerId};
 use crate::pathutil::{
     canonical_path, file_delete_allowed, is_protected_key, key_delete_allowed, under_windows_dir,
 };
-use crate::registry::{RegError, Registry};
+use crate::registry::{RegError, RegTransaction, Registry};
 use crate::rules::{RuleSet, builtin_deep_roots, decode_text_owned, load_rules_file};
 use crate::scanners::{ScanCtx, run_scanner};
 
@@ -179,6 +179,7 @@ fn same_target(left: &Repair, right: &Repair) -> bool {
 mod tests {
     use super::*;
     use crate::fs::MemoryFs;
+    use crate::model::ValueKind;
     use crate::model::{RegValue, ScannerId};
     use crate::registry::MemoryRegistry;
 
@@ -204,6 +205,154 @@ mod tests {
         fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
             self.inner.delete_tree(path)
         }
+        fn begin(&mut self) -> Result<Box<dyn RegTransaction + '_>, RegError> {
+            let locked = self.locked.clone();
+            Ok(Box::new(crate::registry::DenyTx {
+                inner: self.inner.begin()?,
+                deny_subkeys: Some(locked),
+                deny_values: None,
+                deny_writes: None,
+            }))
+        }
+    }
+
+    #[test]
+    fn a_shortcut_with_extra_data_streams_is_not_removed() {
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        fs.add_file_bytes(&format!(r"{desktop}\plain.lnk"), b"lnk".to_vec(), None);
+        fs.add_file_bytes(&format!(r"{desktop}\streams.lnk"), b"lnk".to_vec(), None);
+        fs.add_stream(&format!(r"{desktop}\streams.lnk"));
+        fs.add_file_bytes(&format!(r"{desktop}\marked.lnk"), b"lnk".to_vec(), None);
+        fs.add_download_marker(&format!(r"{desktop}\marked.lnk"));
+        let copies = r"C:\Users\me\AppData\Local\HiveMend\backups\b-files";
+        let streams = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\streams.lnk"),
+            Some(&format!(r"{copies}\0001-streams.lnk")),
+        );
+        assert!(matches!(streams, Applied::NotBackedUp));
+        assert!(fs.exists(&format!(r"{desktop}\streams.lnk")));
+        // The download marker is a stream too: it would be lost.
+        let marked = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\marked.lnk"),
+            Some(&format!(r"{copies}\0003-marked.lnk")),
+        );
+        assert!(matches!(marked, Applied::NotBackedUp));
+        assert!(fs.exists(&format!(r"{desktop}\marked.lnk")));
+        // A backup folder on another drive cannot take it: it stays.
+        fs.add_file_bytes(&format!(r"{desktop}\far.lnk"), b"far".to_vec(), None);
+        fs.set_other_volume(r"D:\Backups");
+        let far = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\far.lnk"),
+            Some(r"D:\Backups\b-files\0004-far.lnk"),
+        );
+        assert!(matches!(far, Applied::NotBackedUp));
+        assert_eq!(
+            fs.read(&format!(r"{desktop}\far.lnk")),
+            Some(b"far".to_vec())
+        );
+        // A plain shortcut is moved into the backup, never deleted.
+        let plain = delete_file_pinned(
+            &mut fs,
+            &format!(r"{desktop}\plain.lnk"),
+            Some(&format!(r"{copies}\0002-plain.lnk")),
+        );
+        assert!(matches!(plain, Applied::Removed));
+        assert!(!fs.exists(&format!(r"{desktop}\plain.lnk")));
+        assert_eq!(
+            fs.read(&format!(r"{copies}\0002-plain.lnk")),
+            Some(b"lnk".to_vec())
+        );
+    }
+
+    #[test]
+    fn a_shortcut_renamed_after_pinning_is_left_alone_by_repair() {
+        // PV-01 through the production repair: the shortcut moves to another
+        // allowed place between the pin and the exclusive hold. The hold
+        // reports where it is now, which was never approved, so repair
+        // refuses it instead of archiving it from there.
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        let temp = r"C:\Users\me\AppData\Local\Temp";
+        fs.add_dir(temp);
+        fs.add_file_bytes(&format!(r"{desktop}\moved.lnk"), b"lnk".to_vec(), None);
+        fs.relocate_on_acquire(
+            &format!(r"{desktop}\moved.lnk"),
+            &format!(r"{temp}\moved.lnk"),
+        );
+        let mut reg = MemoryRegistry::new();
+        let mut backup = crate::backup::test_writer("hive-mend-relocated");
+        let finding = Finding {
+            scanner: ScannerId::TempShortcuts,
+            scanner_name: "Temp files".into(),
+            key: format!(r"{desktop}\moved.lnk"),
+            value: None,
+            detail: "temporary file".into(),
+            repair: Repair::DeleteFile {
+                path: format!(r"{desktop}\moved.lnk"),
+                keep_copy: true,
+            },
+        };
+        let outcome = repair(&mut reg, &mut fs, &[finding], &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert_eq!(outcome.applied, 0, "{outcome:?}");
+        assert_eq!(outcome.refused, 1, "{outcome:?}");
+        // Left alone where it is now, with its data; nothing was archived.
+        assert_eq!(
+            fs.read(&format!(r"{temp}\moved.lnk")),
+            Some(b"lnk".to_vec())
+        );
+        assert!(!fs.exists(&format!(r"{desktop}\moved.lnk")));
+    }
+
+    #[test]
+    fn a_shortcut_with_two_names_is_not_archived_by_repair() {
+        // PV-02 through the production repair: restore refuses a saved
+        // shortcut with more than one name, so repair refuses to archive
+        // one, whether the second name was there at the pin or appeared
+        // before the hold.
+        let mut fs = MemoryFs::with_windows_dirs();
+        let desktop = r"C:\Users\me\Desktop";
+        for name in ["plain.lnk", "linked.lnk", "late.lnk"] {
+            fs.add_file_bytes(&format!(r"{desktop}\{name}"), b"lnk".to_vec(), None);
+        }
+        fs.set_links(&format!(r"{desktop}\linked.lnk"), 2);
+        fs.relink_on_acquire(&format!(r"{desktop}\late.lnk"), 2);
+        let mut reg = MemoryRegistry::new();
+        let mut backup = crate::backup::test_writer("hive-mend-links");
+        let findings: Vec<Finding> = ["plain.lnk", "linked.lnk", "late.lnk"]
+            .iter()
+            .map(|name| {
+                let path = format!(r"{desktop}\{name}");
+                Finding {
+                    scanner: ScannerId::TempShortcuts,
+                    scanner_name: "Temp files".into(),
+                    key: path.clone(),
+                    value: None,
+                    detail: "temporary file".into(),
+                    repair: Repair::DeleteFile {
+                        path,
+                        keep_copy: true,
+                    },
+                }
+            })
+            .collect();
+        let outcome = repair(&mut reg, &mut fs, &findings, &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        assert_eq!(outcome.refused, 2, "{outcome:?}");
+        // Both names and their data remain; only the single-named file moved.
+        for name in ["linked.lnk", "late.lnk"] {
+            assert_eq!(
+                fs.read(&format!(r"{desktop}\{name}")),
+                Some(b"lnk".to_vec()),
+                "{name} was archived"
+            );
+        }
+        assert!(!fs.exists(&format!(r"{desktop}\plain.lnk")));
     }
 
     fn uninstall_finding(name: &str) -> Finding {
@@ -245,17 +394,14 @@ mod tests {
         fs.add_file_bytes(r"C:\Users\me\Documents\thesis.docx", vec![3; 4], None);
         fs.add_alias(&format!(r"{temp}\sys"), r"C:\Windows\System32");
         fs.add_alias(&format!(r"{temp}\docs"), r"C:\Users\me\Documents");
-        let backup = std::env::temp_dir().join(format!(
-            "hive-mend-pinned-delete-{}.reg",
-            std::process::id()
-        ));
+        let mut backup = crate::backup::test_writer("hive-mend-pinned-delete");
         let findings = [
             temp_file_finding(&format!(r"{temp}\real.tmp")),
             temp_file_finding(&format!(r"{temp}\sys\kernel.dll")),
             temp_file_finding(&format!(r"{temp}\docs\thesis.docx")),
         ];
-        let outcome = repair(&mut MemoryRegistry::new(), &mut fs, &findings, &backup).unwrap();
-        let _ = std::fs::remove_file(&backup);
+        let outcome = repair(&mut MemoryRegistry::new(), &mut fs, &findings, &mut backup).unwrap();
+        let _ = std::fs::remove_file(backup.path());
         assert_eq!(outcome.applied, 1);
         assert_eq!(outcome.refused, 2);
         assert!(!fs.exists(&format!(r"{temp}\real.tmp")));
@@ -264,6 +410,292 @@ mod tests {
             fs.read(r"C:\Users\me\Documents\thesis.docx"),
             Some(vec![3; 4])
         );
+    }
+
+    #[test]
+    fn a_registry_entry_changed_during_repair_is_not_removed() {
+        let base = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        reg.set_sz(&format!(r"{base}\Stale\Child"), "x", "1");
+        reg.set_sz(&format!(r"{base}\Other"), "DisplayName", "Other");
+        // Another program writes under Stale while the repair runs.
+        reg.changed_elsewhere.push(format!(r"{base}\Stale\Child"));
+        let mut backup = crate::backup::test_writer("hive-mend-tx-conflict");
+        let findings = [uninstall_finding("Stale"), uninstall_finding("Other")];
+        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup).unwrap();
+        assert_eq!(outcome.applied, 1, "{:?}", outcome.errors);
+        assert_eq!(outcome.errors.len(), 1);
+        assert!(
+            reg.subkeys(&format!(r"{base}\Stale")).is_ok(),
+            "a changed entry was removed"
+        );
+        assert!(reg.values(&format!(r"{base}\Other")).is_err());
+        let text = crate::backup::read_backup(backup.path()).unwrap();
+        assert!(text.contains("; entry 1\r\n"));
+        assert!(text.contains("; entry 1 was not removed"));
+        assert!(text.contains("; entry 2\r\n"));
+        assert!(!text.contains("; entry 2 was not removed"));
+        let _ = std::fs::remove_file(backup.path());
+    }
+
+    /// The real backup a mixed repair writes restores every registry entry
+    /// it removed, whether or not the file part was refused.
+    #[test]
+    fn a_mixed_repair_backup_restores_every_registry_entry() {
+        use crate::regfile::{RegOp, apply_ops, parse_backup};
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        for refuse_file in [false, true] {
+            let mut reg = MemoryRegistry::new();
+            reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+            reg.set(
+                &format!(r"{base}\Stale\Child"),
+                "raw",
+                ValueKind::Other {
+                    kind: 11,
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8],
+                },
+            );
+            let mut fs = MemoryFs::with_windows_dirs();
+            let shortcut = if refuse_file {
+                r"C:\Windows\old.lnk".to_string()
+            } else {
+                r"C:\Users\me\Desktop\old.lnk".to_string()
+            };
+            fs.add_file_bytes(&shortcut, b"lnk".to_vec(), None);
+            let temp = r"C:\Users\me\AppData\Local\Temp\x.tmp";
+            fs.add_file_bytes(temp, vec![0; 4], None);
+            let mut lnk = temp_file_finding(&shortcut);
+            lnk.repair = Repair::DeleteFile {
+                path: shortcut.clone(),
+                keep_copy: true,
+            };
+            let findings = [lnk, temp_file_finding(temp), uninstall_finding("Stale")];
+            let mut backup = crate::backup::test_writer("hive-mend-mixed");
+            let outcome = repair(&mut reg, &mut fs, &findings, &mut backup).unwrap();
+            let text = crate::backup::read_backup(backup.path()).unwrap();
+            let _ = std::fs::remove_file(backup.path());
+            assert!(
+                reg.subkeys(&format!(r"{base}\Stale")).is_err(),
+                "not removed"
+            );
+            assert!(text.contains("; Files"), "{text}");
+            let parsed = parse_backup(&text).unwrap();
+            assert!(parsed.unconfirmed.is_empty(), "{:?}", parsed.unconfirmed);
+            assert!(
+                parsed
+                    .ops
+                    .iter()
+                    .any(|op| matches!(op, RegOp::CreateKey(key) if key.ends_with(r"Stale\Child"))),
+                "{text}"
+            );
+            let summary = crate::backup::BackupSummary::parse(&text);
+            assert_eq!(summary.keys, 2, "the listing agrees with the restore");
+            let mut fresh = MemoryRegistry::new();
+            apply_ops(&mut fresh, &parsed.ops).unwrap();
+            assert_eq!(
+                fresh.values(&format!(r"{base}\Stale\Child")).unwrap()[0].data,
+                ValueKind::Other {
+                    kind: 11,
+                    bytes: vec![1, 2, 3, 4, 5, 6, 7, 8]
+                }
+            );
+            assert_eq!(
+                fresh.values(&format!(r"{base}\Stale")).unwrap()[0].data,
+                ValueKind::Sz("Stale".into())
+            );
+            assert_eq!(outcome.errors.len(), 0, "{:?}", outcome.errors);
+        }
+    }
+
+    /// At every size limit, each entry is either removed and confirmed, or
+    /// left exactly as it was: a limit never leaves a removal unconfirmed.
+    #[test]
+    fn no_size_limit_leaves_a_removal_unconfirmed() {
+        use crate::regfile::parse_backup;
+        struct Sum(u64);
+        impl crate::backup::RunningMac for Sum {
+            fn update(&mut self, bytes: &[u8]) -> Result<Vec<u8>, String> {
+                self.0 = bytes
+                    .iter()
+                    .fold(self.0, |sum, byte| sum + u64::from(*byte));
+                Ok(self.0.to_be_bytes().to_vec())
+            }
+        }
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let findings = [uninstall_finding("One"), uninstall_finding("Two")];
+        let mut checked = 0;
+        for signed in [false, true] {
+            for limit in (200..1600u64).step_by(7) {
+                let mut reg = MemoryRegistry::new();
+                reg.set_sz(&format!(r"{base}\One"), "DisplayName", "One");
+                reg.set_sz(&format!(r"{base}\Two"), "DisplayName", "Two");
+                let mut backup = crate::backup::test_writer("hive-mend-limits");
+                if signed {
+                    backup.sign_with(Box::new(Sum(0))).unwrap();
+                    // The signature limit is the tight one here.
+                    backup.limit_for_test(u64::MAX, limit / 2);
+                } else {
+                    backup.limit_for_test(limit, u64::MAX);
+                }
+                let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup);
+                let text = crate::backup::read_backup(backup.path()).unwrap_or_default();
+                let _ = std::fs::remove_file(backup.path());
+                let _ = std::fs::remove_file(crate::backup::signature_path(backup.path()));
+                let Ok(outcome) = outcome else {
+                    // Not even the header fitted: nothing may have changed.
+                    assert!(reg.values(&format!(r"{base}\One")).is_ok());
+                    continue;
+                };
+                let parsed = parse_backup(&text).unwrap();
+                assert!(parsed.unconfirmed.is_empty(), "limit {limit}: {text}");
+                for name in ["One", "Two"] {
+                    let gone = reg.values(&format!(r"{base}\{name}")).is_err();
+                    let restorable = parsed.ops.iter().any(|op| op.key().ends_with(name));
+                    assert_eq!(gone, restorable, "limit {limit} signed {signed}: {name}");
+                }
+                assert!(
+                    outcome
+                        .errors
+                        .iter()
+                        .all(|err| !err.contains("could not be completed")),
+                    "{:?}",
+                    outcome.errors
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 60);
+    }
+
+    #[test]
+    fn an_entry_without_its_removed_line_is_never_restored() {
+        use crate::regfile::parse_backup;
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        reg.set_sz(&format!(r"{base}\Other"), "DisplayName", "Other");
+        // Stale changes elsewhere, so its transaction aborts.
+        reg.changed_elsewhere.push(format!(r"{base}\Stale"));
+        let mut backup = crate::backup::test_writer("hive-mend-unconfirmed");
+        repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Stale"), uninstall_finding("Other")],
+            &mut backup,
+        )
+        .unwrap();
+        let text = crate::backup::read_backup(backup.path()).unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        // Even if the "was not removed" line had not been written (a run
+        // stopped there), entry 1 has no "removed" line: never restored.
+        let without_note = text.replace("; entry 1 was not removed\r\n", "");
+        for text in [&text, &without_note] {
+            let parsed = parse_backup(text).unwrap();
+            assert!(
+                parsed.ops.iter().all(|op| !op.key().ends_with("Stale")),
+                "an aborted entry would be restored"
+            );
+            assert!(parsed.ops.iter().any(|op| op.key().ends_with("Other")));
+        }
+        let parsed = parse_backup(&without_note).unwrap();
+        assert_eq!(parsed.unconfirmed.len(), 1, "it is listed for review");
+        // A save cut off after the last confirmed entry loses only the tail.
+        let cut = format!("{text}\r\n; entry 3\r\n[{base}\\Half]\r\n\"x\"=hex:01,02,\\");
+        let parsed = parse_backup(&cut).unwrap();
+        assert!(parsed.cut_off);
+        assert!(parsed.ops.iter().any(|op| op.key().ends_with("Other")));
+    }
+
+    #[test]
+    fn an_administrator_leaves_keys_others_can_change_alone() {
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Open"), "DisplayName", "Open");
+        reg.set_sz(&format!(r"{base}\Open\Deep"), "x", "1");
+        reg.set_sz(&format!(r"{base}\Closed"), "DisplayName", "Closed");
+        reg.untrusted.push(format!(r"{base}\Open\Deep"));
+        let mut backup = crate::backup::test_writer("hive-mend-untrusted");
+        let outcome = repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Open"), uninstall_finding("Closed")],
+            &mut backup,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert!(reg.values(&format!(r"{base}\Open\Deep")).is_ok(), "changed");
+        assert!(reg.values(&format!(r"{base}\Closed")).is_err());
+        assert_eq!(outcome.applied, 1);
+        // Left alone with its reason, not counted as a failure.
+        assert!(outcome.errors.is_empty(), "{:?}", outcome.errors);
+        assert_eq!(outcome.refused, 1);
+        assert!(
+            outcome.notes[0].contains("leaves it alone"),
+            "{:?}",
+            outcome.notes
+        );
+        // A restore into such a key changes nothing at all.
+        let ops = vec![
+            crate::regfile::RegOp::CreateKey(format!(r"{base}\New")),
+            crate::regfile::RegOp::CreateKey(format!(r"{base}\Open\Deep\Below")),
+        ];
+        assert!(crate::regfile::apply_ops(&mut reg, &ops).is_err());
+        assert!(reg.values(&format!(r"{base}\New")).is_err());
+    }
+
+    #[test]
+    fn a_key_that_appears_during_removal_stops_it() {
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Test";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Tree"), "x", "1");
+        {
+            let mut tx = reg.begin().unwrap();
+            let expected = vec![crate::pathutil::canonical_path(&format!(r"{base}\Tree"))];
+            // A child that was not there when the tree was recorded.
+            tx.set_value(&format!(r"{base}\Tree\Late"), "y", &ValueKind::Dword(1))
+                .unwrap();
+            assert!(
+                tx.delete_tree_exact(&format!(r"{base}\Tree"), &expected)
+                    .is_err()
+            );
+        }
+        assert!(reg.values(&format!(r"{base}\Tree")).is_ok());
+    }
+
+    #[test]
+    fn without_registry_transactions_nothing_is_removed() {
+        // A registry that cannot offer transactions: scan-only.
+        struct NoTx(MemoryRegistry);
+        impl Registry for NoTx {
+            fn subkeys(&self, path: &str) -> Result<Vec<String>, RegError> {
+                self.0.subkeys(path)
+            }
+            fn values(&self, path: &str) -> Result<Vec<RegValue>, RegError> {
+                self.0.values(path)
+            }
+            fn delete_value(&mut self, path: &str, name: &str) -> Result<(), RegError> {
+                self.0.delete_value(path, name)
+            }
+            fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
+                self.0.delete_tree(path)
+            }
+        }
+        let base = r"HKLM\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut inner = MemoryRegistry::new();
+        inner.set_sz(&format!(r"{base}\Stale"), "DisplayName", "Stale");
+        let mut reg = NoTx(inner);
+        let mut backup = crate::backup::test_writer("hive-mend-no-tx");
+        let outcome = repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[uninstall_finding("Stale")],
+            &mut backup,
+        )
+        .unwrap();
+        assert_eq!(outcome.applied, 0);
+        assert!(reg.0.values(&format!(r"{base}\Stale")).is_ok());
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -276,14 +708,14 @@ mod tests {
             inner,
             locked: canonical_path(&format!(r"{base}\Locked")),
         };
-        let backup = std::env::temp_dir().join("hive-mend-locked-test.reg");
+        let mut backup = crate::backup::test_writer("hive-mend-locked-test");
         let findings = [uninstall_finding("Readable"), uninstall_finding("Locked")];
-        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &backup).unwrap();
+        let outcome = repair(&mut reg, &mut MemoryFs::new(), &findings, &mut backup).unwrap();
         assert_eq!(outcome.applied, 1);
         assert_eq!(outcome.not_backed_up, 1);
         assert!(reg.inner.subkeys(&format!(r"{base}\Locked")).is_ok());
         assert!(reg.inner.values(&format!(r"{base}\Readable")).is_err());
-        let _ = std::fs::remove_file(&backup);
+        let _ = std::fs::remove_file(backup.path());
     }
 
     #[test]
@@ -348,6 +780,8 @@ pub struct RepairOutcome {
     /// without "Run as administrator". Also counted in `errors`.
     pub denied: usize,
     pub errors: Vec<String>,
+    /// Why entries were left alone, where that is worth saying.
+    pub notes: Vec<String>,
     /// Findings that are no longer a problem: removed or already gone.
     pub resolved: Vec<Finding>,
 }
@@ -362,32 +796,87 @@ pub fn repair(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     findings: &[Finding],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
 ) -> Result<RepairOutcome, Error> {
-    repair_with_progress(reg, fs, findings, backup_file, &mut |_, _| {})
+    repair_with_progress(reg, fs, findings, backup, &mut |_, _| {})
 }
 
-/// Writes the backup, then removes each finding the backup covers.
+/// Removes each finding, recording it in `backup` first.
 /// `progress(done, total)` runs after each finding.
 ///
-/// A value added between the backup read and its deletion would be removed
-/// without being in the backup; the window is milliseconds, and anything
-/// the backup could not read is skipped rather than deleted.
+/// Each registry finding is removed in its own registry transaction: its
+/// keys are touched first, its backup section is read through the
+/// transaction and flushed to disk, then it is deleted and committed. If
+/// anything else changes those keys meanwhile, the commit fails and nothing
+/// is removed. Where transactions are not available, registry findings are
+/// left alone (scan-only); there is no fallback to an ordinary delete.
 pub fn repair_with_progress(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
     findings: &[Finding],
-    backup_file: &Path,
+    backup: &mut BackupWriter,
     progress: &mut dyn FnMut(usize, usize),
 ) -> Result<RepairOutcome, Error> {
-    let plan = export_backup(reg, findings, backup_file);
-    write_backup(backup_file, &plan.body)?;
+    // The header and the shortcut copies' lines go first; registry entries
+    // are appended one by one as each is removed.
+    let files: Vec<Finding> = findings
+        .iter()
+        .filter(|finding| matches!(finding.repair, Repair::DeleteFile { .. }))
+        .cloned()
+        .collect();
+    let plan = export_backup(reg, &files, backup.path());
+    backup.append(&plan.body)?;
     let mut outcome = RepairOutcome {
-        backup_file: backup_file.to_path_buf(),
+        backup_file: backup.path().to_path_buf(),
         ..RepairOutcome::default()
     };
+    let mut stopped: Option<String> = None;
     for (index, finding) in findings.iter().enumerate() {
-        match apply(reg, fs, finding, &plan) {
+        if let Some(why) = stopped.take() {
+            // Everything after a failed backup write is left alone.
+            outcome.errors.push(why);
+            outcome.not_backed_up += findings.len() - index;
+            break;
+        }
+        let applied = match &finding.repair {
+            Repair::DeleteValue { key, .. } if is_protected_key(key) => Applied::Refused,
+            Repair::DeleteKey { key } if !key_delete_allowed(key) => Applied::Refused,
+            Repair::DeleteValue { .. } | Repair::DeleteKey { .. } => {
+                match delete_in_transaction(reg, &finding.repair, backup, index + 1) {
+                    Ok(Deleted::Removed) => Applied::Removed,
+                    Ok(Deleted::AlreadyGone) => Applied::AlreadyGone,
+                    Ok(Deleted::NotBackedUp) => Applied::NotBackedUp,
+                    Ok(Deleted::TooLarge) => {
+                        outcome.errors.push(format!(
+                            "{}: left alone; its backup would be larger than a restore accepts",
+                            finding.key
+                        ));
+                        Applied::NotBackedUp
+                    }
+                    Ok(Deleted::BackupFailed(why)) => {
+                        stopped = Some(format!(
+                            "the backup could not be written ({why}), so the repair stopped; nothing more was changed"
+                        ));
+                        Applied::NotBackedUp
+                    }
+                    Ok(Deleted::Untrusted(why)) => {
+                        outcome.notes.push(why);
+                        Applied::Refused
+                    }
+                    Ok(Deleted::RemovedUnconfirmed(why)) => {
+                        stopped = Some(format!(
+                            "{}: removed, but its backup record could not be completed ({why}); its saved data is in the backup as entry {}, which a restore lists but does not put back by itself. The repair stopped",
+                            finding.key,
+                            index + 1
+                        ));
+                        Applied::Removed
+                    }
+                    Err(err) => reg_result(Err(err)),
+                }
+            }
+            _ => apply(reg, fs, finding, &plan),
+        };
+        match applied {
             Applied::Removed => {
                 outcome.applied += 1;
                 outcome.resolved.push(finding.clone());
@@ -406,6 +895,9 @@ pub fn repair_with_progress(
             }
         }
         progress(index + 1, findings.len());
+    }
+    if let Some(why) = stopped {
+        outcome.errors.push(why);
     }
     Ok(outcome)
 }
@@ -433,6 +925,169 @@ fn reg_result(result: Result<(), RegError>) -> Applied {
     }
 }
 
+/// What one transactional registry removal did.
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum Deleted {
+    Removed,
+    AlreadyGone,
+    /// Its backup section could not be read in full, or would not restore;
+    /// nothing was removed.
+    NotBackedUp,
+    /// Its section would make the backup larger than a restore accepts;
+    /// nothing was removed.
+    TooLarge,
+    /// The backup could not be written; nothing was removed, and the job
+    /// stops here.
+    BackupFailed(String),
+    /// Removed, but the line confirming it could not be written, so a
+    /// restore will not put it back by itself; the job stops here.
+    RemovedUnconfirmed(String),
+    /// A key this window must not change (an administrator window and a key
+    /// standard accounts can change); left alone, with the reason.
+    Untrusted(String),
+}
+
+/// Remove one registry target (`DeleteKey` or `DeleteValue`) in its own
+/// transaction, recording it in `backup` as entry `entry`: touch every key
+/// it covers (refusing any an administrator must not change), export its
+/// section through the transaction, check that the section reads back as a
+/// restore would read it, append and flush it, delete exactly the keys
+/// touched, commit, and only then append `; entry N removed`. A restore
+/// puts back only confirmed entries, so a run that stops at any point
+/// never offers back data that was not removed. On any failure the
+/// transaction rolls back. Callers check their own safety rules
+/// (protected keys) before calling.
+pub(crate) fn delete_in_transaction(
+    reg: &mut dyn Registry,
+    repair: &Repair,
+    backup: &mut BackupWriter,
+    entry: usize,
+) -> Result<Deleted, RegError> {
+    let (key, tree) = match repair {
+        Repair::DeleteKey { key } => (key.as_str(), true),
+        Repair::DeleteValue { key, .. } => (key.as_str(), false),
+        Repair::DeleteFile { .. } | Repair::None => return Ok(Deleted::NotBackedUp),
+    };
+    if backup.has_failed() {
+        return Ok(Deleted::BackupFailed(
+            "an earlier write to the backup failed".into(),
+        ));
+    }
+    let mut tx = reg.begin()?;
+    let mut touched = Vec::new();
+    let mut untrusted = None;
+    match touch_all(&mut *tx, key, tree, 0, &mut touched, &mut untrusted) {
+        Ok(()) => {}
+        Err(_) if untrusted.is_some() => {
+            return Ok(Deleted::Untrusted(untrusted.unwrap_or_default()));
+        }
+        Err(RegError::NotFound) => return Ok(Deleted::AlreadyGone),
+        // Part of it cannot be read, so it could not be backed up anyway.
+        Err(_)
+            if !registry_sections(&*tx, std::slice::from_ref(repair))
+                .1
+                .is_empty() =>
+        {
+            return Ok(Deleted::NotBackedUp);
+        }
+        Err(err) => return Err(err),
+    }
+    let (section, unreadable) = registry_sections(&*tx, std::slice::from_ref(repair));
+    if !unreadable.is_empty() || !reads_back(&section) {
+        return Ok(Deleted::NotBackedUp);
+    }
+    // Room for the confirmation is reserved with the entry: an entry that
+    // could be removed but not then confirmed is never started.
+    let confirmation = format!("; entry {entry} removed\r\n");
+    match backup.append_reserving(&format!("\r\n; entry {entry}\r\n{section}"), &confirmation) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::FileTooLarge => {
+            return Ok(Deleted::TooLarge);
+        }
+        Err(err) => return Ok(Deleted::BackupFailed(err.to_string())),
+    }
+    let deleted = match repair {
+        Repair::DeleteKey { key } => tx.delete_tree_exact(key, &touched),
+        Repair::DeleteValue { key, name } => tx.delete_value(key, name),
+        Repair::DeleteFile { .. } | Repair::None => Ok(()),
+    };
+    // Lines saying an entry was not removed are only for people reading
+    // the file: an unconfirmed entry is never restored anyway.
+    let not_removed = |backup: &mut BackupWriter| {
+        let _ = backup.append(&format!("; entry {entry} was not removed\r\n"));
+    };
+    match deleted {
+        Ok(()) => {}
+        Err(RegError::NotFound) => {
+            not_removed(backup);
+            return Ok(Deleted::AlreadyGone);
+        }
+        Err(err) => {
+            not_removed(backup);
+            return Err(err);
+        }
+    }
+    if let Err(err) = tx.commit() {
+        not_removed(backup);
+        return Err(err);
+    }
+    match backup.append(&confirmation) {
+        Ok(()) => Ok(Deleted::Removed),
+        Err(err) => Ok(Deleted::RemovedUnconfirmed(err.to_string())),
+    }
+}
+
+/// True when `section` reads back, through the restore's own parser, as
+/// at least one change: the backup will put back what it is about to stand
+/// for.
+fn reads_back(section: &str) -> bool {
+    let probe = format!(
+        "Windows Registry Editor Version 5.00\r\n\r\n{}\r\n; entry 1\r\n{section}; entry 1 removed\r\n",
+        crate::regfile::FORMAT_2
+    );
+    crate::regfile::parse_backup(&probe)
+        .is_ok_and(|parsed| !parsed.ops.is_empty() && parsed.unconfirmed.is_empty())
+}
+
+/// Touch `key` and, for a tree, every key below it, so a change to any of
+/// them from elsewhere fails the transaction's commit; `touched` receives
+/// each key, the set the delete may remove and nothing more.
+fn touch_all(
+    tx: &mut dyn RegTransaction,
+    key: &str,
+    tree: bool,
+    depth: usize,
+    touched: &mut Vec<String>,
+    untrusted: &mut Option<String>,
+) -> Result<(), RegError> {
+    if depth > 512 {
+        return Err(RegError::Message(format!("{key} is nested too deeply")));
+    }
+    if let Err(err) = tx.require_trusted(key) {
+        let why = match &err {
+            RegError::Denied(why) | RegError::Message(why) => why.clone(),
+            RegError::NotFound => return Err(err),
+        };
+        *untrusted = Some(why);
+        return Err(err);
+    }
+    tx.touch(key)?;
+    touched.push(crate::pathutil::canonical_path(key));
+    if tree {
+        for child in tx.subkeys(key)? {
+            touch_all(
+                tx,
+                &format!("{key}\\{child}"),
+                true,
+                depth + 1,
+                touched,
+                untrusted,
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn apply(
     reg: &mut dyn Registry,
     fs: &mut dyn FileView,
@@ -441,23 +1096,10 @@ fn apply(
 ) -> Applied {
     match &finding.repair {
         Repair::None => Applied::Refused,
-        Repair::DeleteValue { key, name } => {
-            if is_protected_key(key) {
-                return Applied::Refused;
-            }
-            if !plan.covers(key) {
-                return Applied::NotBackedUp;
-            }
-            reg_result(reg.delete_value(key, name))
-        }
-        Repair::DeleteKey { key } => {
-            if !key_delete_allowed(key) {
-                return Applied::Refused;
-            }
-            if !plan.covers(key) {
-                return Applied::NotBackedUp;
-            }
-            reg_result(reg.delete_tree(key))
+        // Registry removals happen only in delete_in_transaction.
+        Repair::DeleteValue { .. } | Repair::DeleteKey { .. } => {
+            let _ = reg;
+            Applied::Refused
         }
         Repair::DeleteFile { path, keep_copy } => {
             if !file_delete_allowed(path) {
@@ -479,8 +1121,11 @@ fn apply(
 /// Delete a stale shortcut or temp file through one checked handle. The
 /// object is pinned first, the same rules are applied to the real path
 /// Windows reports for it (so a junction, link, or 8.3 name cannot carry the
-/// delete somewhere the spelling would never be allowed), and the copy and
-/// the delete both go through that handle.
+/// delete somewhere the spelling would never be allowed), then it is held
+/// exclusively and the rules run again on where the hold says it is now (so
+/// a rename after the first check, even to another allowed place, is left
+/// alone). The copy and the delete both go through that handle, and only a
+/// single-named shortcut is archived, as restore refuses any other.
 fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> Applied {
     let mut pin = match fs.pin(path) {
         Ok(pin) => pin,
@@ -493,23 +1138,57 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
     if pin.kind != ItemKind::File || !file_delete_allowed(&real) || under_windows_dir(&*fs, &real) {
         return Applied::Refused;
     }
+    // Everything taken exclusively, so nothing else can write, rename, or
+    // delete it while held, and its length, place, and names are read again
+    // through that hold.
     let access = if copy.is_some() {
-        Access::ReadDelete
+        Access::ReadDeleteExclusive
     } else {
-        Access::Delete
+        Access::DeleteExclusive
     };
     if let Err(err) = fs.pin_acquire(&mut pin, access) {
         return Applied::Failed {
-            denied: err.contains("os error 5"),
+            denied: err.contains("os error 5") || err.contains("os error 32"),
             message: err,
         };
     }
-    if let Some(copy) = copy
-        && let Err(err) = fs.pin_copy_to(&pin, copy)
+    // The hold reports where the file is now: a move after the first check,
+    // even to another place repair may touch, was never approved, so the
+    // file is left alone. The location decision stays valid until mutation.
+    if !pin.real_path.eq_ignore_ascii_case(&real)
+        || pin.kind != ItemKind::File
+        || !file_delete_allowed(&pin.real_path)
+        || under_windows_dir(&*fs, &pin.real_path)
     {
-        return Applied::Failed {
-            message: format!("could not save a copy first: {err}"),
-            denied: false,
+        return Applied::Refused;
+    }
+    // Restore only puts back a saved shortcut with a single name: a shortcut
+    // that gained another name before the hold is refused here, so a repair
+    // cannot archive what restore would not bring back.
+    if copy.is_some() && pin.links != 1 {
+        return Applied::Refused;
+    }
+    // A file with any named stream (the download marker included) is left
+    // alone, checked through the held handle. One added after this check
+    // still travels with it, into the backup and back on restore.
+    if copy.is_some() && fs.pin_named_streams(&pin) != Ok(false) {
+        return Applied::NotBackedUp;
+    }
+    // The shortcut itself goes into the backup, moved by this handle with
+    // all its data: nothing is deleted, and an interruption leaves it
+    // either where it was or in the backup. A backup folder on another
+    // drive cannot take it, and it stays.
+    if let Some(copy) = copy {
+        let (dir, name) = copy.rsplit_once('\\').unwrap_or(("", copy));
+        return match fs.pin_move_into(pin, dir, name) {
+            Ok(()) => Applied::Removed,
+            Err(err) if err.contains("os error 17") || err.contains("os error 183") => {
+                Applied::NotBackedUp
+            }
+            Err(err) => Applied::Failed {
+                denied: err.contains("os error 5") || err.contains("os error 32"),
+                message: err,
+            },
         };
     }
     match fs.pin_delete(pin) {
@@ -519,5 +1198,89 @@ fn delete_file_pinned(fs: &mut dyn FileView, path: &str, copy: Option<&str>) -> 
             denied: err.contains("os error 5"),
             message: err,
         },
+    }
+}
+
+/// Live Windows test: a stale-file repair whose path runs through a junction
+/// into System32 is refused by the object's real path. The target,
+/// ntoskrnl.exe, is owned by TrustedInstaller, so even an elevated run could
+/// not change it if the check regressed.
+#[cfg(all(test, windows))]
+mod live_tests {
+    use super::*;
+    use crate::fs::{HostFs, KnownDir, host_known_dir};
+    use crate::model::ScannerId;
+    use crate::registry::MemoryRegistry;
+
+    #[test]
+    fn live_a_temp_path_through_a_junction_into_system32_is_refused() {
+        let system = host_known_dir(KnownDir::System).unwrap();
+        let victim = Path::new(&system).join("ntoskrnl.exe");
+        let before = std::fs::metadata(&victim).expect("ntoskrnl.exe metadata");
+        let dir = std::env::temp_dir().join(format!("hivemend-junction-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = dir.join("j");
+        let made = std::process::Command::new("cmd")
+            .args(["/C", "mklink", "/J"])
+            .arg(&link)
+            .arg(&system)
+            .output()
+            .expect("run mklink");
+        let spelled = link.join("ntoskrnl.exe").display().to_string();
+        let finding = Finding {
+            scanner: ScannerId::TempShortcuts,
+            scanner_name: "Temp files".into(),
+            key: spelled.clone(),
+            value: None,
+            detail: "temporary file".into(),
+            repair: Repair::DeleteFile {
+                path: spelled,
+                keep_copy: false,
+            },
+        };
+        let mut backup = crate::backup::BackupWriter::reserve(&dir, "backup").unwrap();
+        let outcome = repair(
+            &mut MemoryRegistry::new(),
+            &mut HostFs,
+            std::slice::from_ref(&finding),
+            &mut backup,
+        );
+        // remove_dir_all removes the junction itself, never its target.
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(made.status.success(), "mklink /J failed: {made:?}");
+        let outcome = outcome.expect("repair runs");
+        assert_eq!(outcome.applied, 0);
+        assert_eq!(outcome.refused, 1, "errors: {:?}", outcome.errors);
+        let after = std::fs::metadata(&victim).unwrap();
+        assert_eq!(before.len(), after.len());
+        assert_eq!(before.modified().unwrap(), after.modified().unwrap());
+    }
+
+    #[test]
+    fn live_a_shortcut_with_two_names_is_not_archived() {
+        // PV-02 on NTFS through the production repair path: a stale
+        // shortcut with a second hard-link name is refused, never archived,
+        // since restore would not bring it back. Both names keep their data.
+        let dir = std::env::temp_dir().join(format!("hivemend-links-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let lnk = dir.join("old.lnk");
+        let alias = dir.join("alias.lnk");
+        let copy = dir.join("backup").join("0001-old.lnk");
+        std::fs::write(&lnk, b"lnk").unwrap();
+        std::fs::hard_link(&lnk, &alias).expect("a second hard-link name");
+        let mut fs = HostFs;
+        let outcome = delete_file_pinned(
+            &mut fs,
+            &lnk.display().to_string(),
+            Some(&copy.display().to_string()),
+        );
+        let kept = std::fs::read(&lnk).ok();
+        let alias_kept = std::fs::read(&alias).ok();
+        let archived = copy.exists();
+        let _ = std::fs::remove_dir_all(&dir);
+        assert!(matches!(outcome, Applied::Refused));
+        assert_eq!(kept.as_deref(), Some(&b"lnk"[..]));
+        assert_eq!(alias_kept.as_deref(), Some(&b"lnk"[..]));
+        assert!(!archived, "a refused shortcut reached the backup");
     }
 }
