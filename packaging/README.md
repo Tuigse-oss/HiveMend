@@ -17,17 +17,17 @@ python3 packaging/render.py 0.1.0 SHA256SUMS.txt out
 Each channel needs a repository variable (Settings > Secrets and variables >
 Actions > Variables) and a secret. Without the variable, its job is skipped.
 
-### Scoop: `PUBLISH_SCOOP=true`, secret `SCOOP_BUCKET_DEPLOY_KEY`
+### Scoop: `PUBLISH_SCOOP=true`, secret `SCOOP_BUCKET_TOKEN`
 
 The bucket is its own repository, `Tuigse-oss/scoop-hivemend`, so `main` here
-never needs a bot commit.
+never needs a bot commit. The organization does not allow deploy keys, so the
+workflow pushes with a fine-grained token limited to that one repository.
 
-1. Create `Tuigse-oss/scoop-hivemend` (public, with a README).
-2. Make a key pair: `ssh-keygen -t ed25519 -N "" -f scoop-deploy -C "hivemend packages"`.
-3. In the bucket repository, add `scoop-deploy.pub` under Settings > Deploy
-   keys with **Allow write access**.
-4. In this repository, add the contents of `scoop-deploy` as the secret
-   `SCOOP_BUCKET_DEPLOY_KEY`, then delete both key files.
+1. At GitHub > Settings > Developer settings > Fine-grained tokens, create a
+   token with resource owner **Tuigse-oss**, repository access **Only select
+   repositories: scoop-hivemend**, and permission **Contents: Read and write**.
+2. Add it to this repository as the secret `SCOOP_BUCKET_TOKEN`. When it
+   expires, make a new one the same way.
 
 Users install with:
 

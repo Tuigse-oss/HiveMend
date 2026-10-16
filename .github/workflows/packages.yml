@@ -3,7 +3,7 @@ name: packages
 # Publishes a release to Scoop, winget, and Chocolatey once it is published on
 # GitHub (drafts have no public download URLs). Each channel is switched on by
 # a repository variable, so one can be turned off without touching the rest:
-#   PUBLISH_SCOOP=true       needs secret SCOOP_BUCKET_DEPLOY_KEY
+#   PUBLISH_SCOOP=true       needs secret SCOOP_BUCKET_TOKEN
 #   PUBLISH_WINGET=true      needs secret WINGET_TOKEN
 #   PUBLISH_CHOCOLATEY=true  needs secret CHOCOLATEY_API_KEY
 on:
@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           repository: Tuigse-oss/scoop-hivemend
-          ssh-key: ${{ secrets.SCOOP_BUCKET_DEPLOY_KEY }}
+          token: ${{ secrets.SCOOP_BUCKET_TOKEN }}
           path: bucket-repo
       - name: Commit to the bucket
         working-directory: bucket-repo
