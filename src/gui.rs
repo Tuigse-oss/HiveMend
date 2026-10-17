@@ -22,13 +22,14 @@ use hive_mend::{
     BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
     HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
     RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
-    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, ThemeMode,
     WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes,
     backup_stores, backups_dir, backups_location, build_items, clean_with_progress,
     custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
     format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until, parse_custom,
-    plan_profile, preview_with, repair_with_progress, restore_backup, scan_with_progress,
-    settings_file, sort_services, start_services, still_reported, stop_services, user_dir,
+    plan_profile, preview_with, repair_with_progress, resolve_theme, restore_backup,
+    scan_with_progress, settings_file, sort_services, start_services, still_reported,
+    stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME,
@@ -50,15 +51,17 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT,
-    LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
-    LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR, NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS,
-    PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
+    HDI_TEXT, HDITEMW, HDM_GETITEMCOUNT, HDM_GETITEMRECT, HDM_GETITEMW, ICC_LISTVIEW_CLASSES,
+    ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_STATEIMAGEMASK,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_GETHEADER, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
+    LVM_SETTEXTCOLOR, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED,
+    LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR,
+    NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme,
+    WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -68,17 +71,18 @@ use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
     CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, HMENU, HTCLIENT,
-    IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
+    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
+    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW,
+    MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
+    MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW,
+    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
+    SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
+    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
     WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR,
-    WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    WM_ERASEBKGND, WM_GETFONT, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT,
+    WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WNDPROC,
+    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
+    WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_KILLFOCUS, BN_SETFOCUS, WM_ENDSESSION, WM_KEYDOWN, WM_QUERYENDSESSION,
@@ -180,26 +184,144 @@ const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
 const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
+/// Room for the Appearance block (heading plus theme pills) that sits
+/// between the subtitle and the scanner grid.
+const SETTINGS_SHIFT: i32 = 96;
 /// The restore-point checkbox sits under the scanner grid.
-const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6;
-const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52;
+const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6 + SETTINGS_SHIFT;
+const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52 + SETTINGS_SHIFT;
 
-/// The window background; cards and tiles sit on it as white surfaces.
-const BG: u32 = rgb(245, 247, 246);
-const SURFACE: u32 = rgb(255, 255, 255);
-const BORDER: u32 = rgb(222, 229, 224);
-/// The primary action colour (Scan now, the open page's marker).
-const ACCENT_GREEN: u32 = rgb(24, 122, 66);
-const ACCENT_GREEN_HOVER: u32 = rgb(16, 100, 52);
-/// Soft green fill for the open page and hovered tiles.
-const ACCENT_TINT: u32 = rgb(224, 240, 229);
-const HOVER_TINT: u32 = rgb(232, 238, 234);
-const SIDEBAR_BG: u32 = rgb(238, 242, 239);
-const INK: u32 = rgb(28, 28, 28);
-const MUTED: u32 = rgb(88, 98, 92);
-const LINK: u32 = rgb(22, 110, 56);
-/// Deep Celtic green, the theme colour shared with the icons in `art`.
-const THEME_INK: u32 = rgb(22, 86, 48);
+/// Every color the drawn UI paints. The window reads these through the
+/// active [`Theme`] instead of fixed constants, so one switch repaints
+/// everything; real controls (lists, buttons) follow through their own
+/// Explorer theme, and icons composite through transparency.
+#[derive(Clone, Copy)]
+struct Theme {
+    /// The window background; cards and tiles sit on it as surfaces.
+    bg: u32,
+    surface: u32,
+    border: u32,
+    /// The primary action colour (Scan now, the open page's marker).
+    accent: u32,
+    accent_hover: u32,
+    /// Soft green fill for the open page and hovered tiles.
+    accent_tint: u32,
+    hover_tint: u32,
+    sidebar: u32,
+    ink: u32,
+    muted: u32,
+    link: u32,
+    /// Deep Celtic green, the theme colour shared with the icons in `art`;
+    /// brightened for dark so headings survive the background.
+    theme_ink: u32,
+    dark: bool,
+}
+
+impl Theme {
+    const fn light() -> Self {
+        Self {
+            bg: rgb(245, 247, 246),
+            surface: rgb(255, 255, 255),
+            border: rgb(222, 229, 224),
+            accent: rgb(24, 122, 66),
+            accent_hover: rgb(16, 100, 52),
+            accent_tint: rgb(224, 240, 229),
+            hover_tint: rgb(232, 238, 234),
+            sidebar: rgb(238, 242, 239),
+            ink: rgb(28, 28, 28),
+            muted: rgb(88, 98, 92),
+            link: rgb(22, 110, 56),
+            theme_ink: rgb(22, 86, 48),
+            dark: false,
+        }
+    }
+
+    const fn dark() -> Self {
+        Self {
+            bg: rgb(14, 17, 15),
+            surface: rgb(26, 32, 28),
+            border: rgb(52, 64, 55),
+            accent: rgb(52, 168, 96),
+            accent_hover: rgb(66, 186, 110),
+            accent_tint: rgb(24, 54, 36),
+            hover_tint: rgb(32, 44, 36),
+            sidebar: rgb(11, 14, 12),
+            ink: rgb(170, 226, 170),
+            muted: rgb(130, 150, 135),
+            link: rgb(116, 204, 144),
+            theme_ink: rgb(126, 206, 154),
+            dark: true,
+        }
+    }
+
+    fn resolve(mode: hive_mend::ThemeMode) -> Self {
+        use hive_mend::ThemeMode::{Dark, Light, System};
+        match mode {
+            Light => Self::light(),
+            Dark => Self::dark(),
+            System => {
+                if system_wants_dark() {
+                    Self::dark()
+                } else {
+                    Self::light()
+                }
+            }
+        }
+    }
+}
+
+/// The theme default the installer wrote for this machine, if any. Only
+/// administrators can write `HKLM`, so a standard user cannot change what
+/// this returns; an invalid value is ignored, never a theme.
+#[cfg(windows)]
+fn machine_default() -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
+    let key = wide(r"SOFTWARE\TUIGSE\Hivemend");
+    let name = wide("Theme");
+    let mut text: [u16; 32] = [0; 32];
+    let mut size = (text.len() * 2) as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            key.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_REG_SZ,
+            std::ptr::null_mut(),
+            text.as_mut_ptr() as *mut _,
+            &mut size,
+        )
+    };
+    if ok != 0 {
+        return None;
+    }
+    let end = text
+        .iter()
+        .position(|cell| *cell == 0)
+        .unwrap_or(text.len());
+    ThemeMode::parse_any(&String::from_utf16_lossy(&text[..end]))
+}
+
+/// Whether Windows itself is set to dark app mode. A missing key means
+/// light, the Windows default.
+fn system_wants_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_DWORD, RegGetValueW};
+    let personalize = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = wide("AppsUseLightTheme");
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            personalize.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_DWORD,
+            std::ptr::null_mut(),
+            &mut value as *mut u32 as *mut _,
+            &mut size,
+        )
+    };
+    ok == 0 && value == 0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -316,6 +438,7 @@ enum SvcOp {
 #[derive(Clone, Copy)]
 enum Action {
     Page(Page),
+    Theme(ThemeMode),
     ScanAll,
     Optimize,
     ResetStats,
@@ -516,6 +639,7 @@ struct App {
     dpi: u32,
     fonts: Fonts,
     bg_brush: HBRUSH,
+    theme: Theme,
     /// Icons rendered by `art` at the pixel sizes drawn so far.
     art: HashMap<(Icon, i32), HBITMAP>,
     /// Anti-aliased corner sprites for rounded boxes, by radius and colours.
@@ -783,6 +907,14 @@ unsafe extern "system" fn wnd_proc(
                 app.invalidate();
                 0
             }
+            WM_SETTINGCHANGE => {
+                // Windows tells every top-level window when the app theme
+                // changes. Only System mode cares; a fixed choice stays put.
+                if app.settings.theme == ThemeMode::System {
+                    app.apply_theme();
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = point(lparam);
                 app.set_hover(app.spot_at(x, y));
@@ -838,7 +970,7 @@ unsafe extern "system" fn wnd_proc(
                 0
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                SetBkColor(wparam as HDC, BG);
+                SetBkColor(wparam as HDC, app.theme.bg);
                 app.bg_brush as LRESULT
             }
             WM_JOB_PROGRESS => {
@@ -940,6 +1072,7 @@ fn app_handles(msg: u32) -> bool {
             | WM_PAINT
             | WM_SIZE
             | WM_RELAYOUT
+            | WM_SETTINGCHANGE
             | WM_DPICHANGED
             | WM_MOUSEMOVE
             | WM_MOUSELEAVE
@@ -1171,17 +1304,25 @@ impl App {
         // An administrator window takes no policy from the per-user folder,
         // which programs running without elevation can change: it starts
         // from the built-in settings (restore points on) and never saves.
-        let settings = if elevated {
+        let mut settings = if elevated {
             Settings::default()
         } else {
             Settings::load(&settings_file())
         };
+        // Normal mode: an explicit per-user choice, then the machine
+        // default, then System. Administrator mode never reads the
+        // per-user folder at all, so it resolves from the machine default
+        // (an in-app pick still applies for that window, without saving).
+        let user = (!elevated && settings.theme_explicit).then_some(settings.theme);
+        settings.theme = resolve_theme(user, machine_default());
+        let theme = Theme::resolve(settings.theme);
         let mut app = Self {
             hwnd,
             page: Page::Status,
             dpi,
             fonts: make_fonts(dpi),
-            bg_brush: unsafe { CreateSolidBrush(BG) },
+            theme,
+            bg_brush: unsafe { CreateSolidBrush(theme.bg) },
             art: HashMap::new(),
             corners: HashMap::new(),
             hotspots: Vec::new(),
@@ -1297,6 +1438,7 @@ impl App {
             btn_priv_clean: std::ptr::null_mut(),
         };
         app.create_controls();
+        app.apply_theme();
         app
     }
 
@@ -1617,6 +1759,7 @@ impl App {
     fn perform(&mut self, action: Action) {
         match action {
             Action::Page(page) => self.go(page),
+            Action::Theme(mode) => self.set_theme(mode),
             Action::ScanAll => self.start_scan(self.settings.full_scan()),
             Action::Optimize => {
                 let scope = OPTIMIZE
@@ -4875,6 +5018,70 @@ impl App {
         let _ = self.settings.save(&settings_file());
     }
 
+    fn set_theme(&mut self, mode: ThemeMode) {
+        // Explicit, including System: the choice is saved (never from an
+        // administrator window) so it keeps overriding the machine
+        // default after a restart.
+        self.settings.theme = mode;
+        self.settings.theme_explicit = true;
+        self.save_settings();
+        self.apply_theme();
+    }
+
+    /// Re-resolve the palette and repaint everything for it: the brush the
+    /// real controls paint with, the title bar, the real controls'
+    /// Explorer theme, and the whole window.
+    fn apply_theme(&mut self) {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+        self.theme = Theme::resolve(self.settings.theme);
+        unsafe {
+            DeleteObject(self.bg_brush);
+            self.bg_brush = CreateSolidBrush(self.theme.bg);
+            let dark = self.theme.dark as i32;
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &dark as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            EnumChildWindows(self.hwnd, Some(theme_child), dark as LPARAM);
+            self.paint_lists();
+            self.invalidate();
+        }
+    }
+
+    /// Recolor every results list to the active theme. The Explorer visual
+    /// style alone leaves list rows white-on-dark-text on most Windows
+    /// builds, which is exactly the white rectangle behind text dark mode
+    /// must not show; explicit row colors follow the palette both ways.
+    fn paint_lists(&self) {
+        HEADER_BG.store(self.theme.surface, Ordering::Relaxed);
+        HEADER_INK.store(self.theme.ink, Ordering::Relaxed);
+        for list in [
+            self.list,
+            self.backup_list,
+            self.startup_list,
+            self.programs_list,
+            self.disk_list,
+            self.dup_list,
+            self.ignored_list,
+            self.svc_list,
+            self.svc_tune_list,
+            self.priv_list,
+        ] {
+            paint_list(list, self.theme);
+            unsafe {
+                let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
+                if !header.is_null() {
+                    theme_header(header, self.theme.dark);
+                }
+            }
+        }
+    }
+
     fn fill_ignored(&self) {
         unsafe { SendMessageW(self.ignored_list, LVM_DELETEALLITEMS, 0, 0) };
         for (row, entry) in self.exclusions.entries().iter().enumerate() {
@@ -5300,7 +5507,7 @@ impl App {
                     place(
                         *check,
                         left + column * column_w,
-                        self.s(BODY_Y + 34) + row * self.s(30),
+                        self.s(BODY_Y + SETTINGS_SHIFT + 34) + row * self.s(30),
                         column_w - self.s(12),
                         self.s(26),
                     );
@@ -5714,13 +5921,13 @@ impl App {
             let focused = self.focused_spot();
             self.hotspots.clear();
             self.texts.borrow_mut().clear();
-            fill(mem, rect, BG);
+            fill(mem, rect, self.theme.bg);
             self.draw_chrome(mem, rect, previous_hover);
             match self.page {
                 Page::Status => self.draw_status(mem, rect, previous_hover),
                 Page::Scan => self.draw_scan(mem, rect),
                 Page::Restore => self.draw_restore(mem, rect),
-                Page::Settings => self.draw_settings(mem, rect),
+                Page::Settings => self.draw_settings(mem, rect, previous_hover),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Startup => self.draw_startup(mem, rect),
                 Page::Programs => self.draw_programs(mem, rect),
@@ -5863,7 +6070,7 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            SURFACE,
+            self.theme.surface,
         );
         fill(
             hdc,
@@ -5873,14 +6080,14 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            BORDER,
+            self.theme.border,
         );
         let logo = self.s(30);
         self.draw_icon(hdc, Icon::Logo, self.s(20), (header - logo) / 2, logo);
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left: self.s(20) + logo + self.s(12),
                 top: 0,
@@ -5901,7 +6108,11 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            if help_lit { ACCENT_GREEN } else { MUTED },
+            if help_lit {
+                self.theme.accent
+            } else {
+                self.theme.muted
+            },
             help,
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
@@ -5917,11 +6128,19 @@ impl App {
                 right: right_edge,
                 bottom: header / 2 + self.s(12),
             };
-            self.panel(hdc, badge, self.s(12), ACCENT_TINT, ACCENT_TINT, 0, SURFACE);
+            self.panel(
+                hdc,
+                badge,
+                self.s(12),
+                self.theme.accent_tint,
+                self.theme.accent_tint,
+                0,
+                self.theme.surface,
+            );
             text(
                 hdc,
                 self.fonts.small,
-                THEME_INK,
+                self.theme.theme_ink,
                 badge,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5940,15 +6159,19 @@ impl App {
                 hdc,
                 link,
                 self.s(8),
-                if lit { ACCENT_TINT } else { SURFACE },
-                ACCENT_GREEN,
+                if lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                self.theme.accent,
                 1,
-                SURFACE,
+                self.theme.surface,
             );
             text(
                 hdc,
                 self.fonts.body,
-                ACCENT_GREEN,
+                self.theme.accent,
                 link,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5964,7 +6187,7 @@ impl App {
             right: self.s(SIDEBAR_W),
             bottom: rect.bottom,
         };
-        fill(hdc, side, SIDEBAR_BG);
+        fill(hdc, side, self.theme.sidebar);
         fill(
             hdc,
             RECT {
@@ -5973,7 +6196,7 @@ impl App {
                 right: side.right,
                 bottom: side.bottom,
             },
-            BORDER,
+            self.theme.border,
         );
         let mut y = header + self.s(14);
         for (label, page, icon) in NAV {
@@ -5986,8 +6209,12 @@ impl App {
             let selected = self.page == *page;
             let lit = lit(hover, item);
             if selected || lit {
-                let tint = if selected { ACCENT_TINT } else { HOVER_TINT };
-                self.panel(hdc, item, self.s(8), tint, tint, 0, SIDEBAR_BG);
+                let tint = if selected {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.hover_tint
+                };
+                self.panel(hdc, item, self.s(8), tint, tint, 0, self.theme.sidebar);
             }
             if selected {
                 let bar_h = self.s(16);
@@ -6000,10 +6227,10 @@ impl App {
                         bottom: item.top + (self.s(38) + bar_h) / 2,
                     },
                     self.s(2),
-                    ACCENT_GREEN,
-                    ACCENT_GREEN,
+                    self.theme.accent,
+                    self.theme.accent,
                     0,
-                    ACCENT_TINT,
+                    self.theme.accent_tint,
                 );
             }
             let icon_px = self.s(22);
@@ -6021,7 +6248,11 @@ impl App {
                 } else {
                     self.fonts.body
                 },
-                if selected { THEME_INK } else { INK },
+                if selected {
+                    self.theme.theme_ink
+                } else {
+                    self.theme.ink
+                },
                 RECT {
                     left: item.left + self.s(14) + icon_px + self.s(12),
                     top: item.top,
@@ -6050,7 +6281,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left: self.s(16),
                     top: y + self.s(8),
@@ -6186,7 +6417,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top,
@@ -6201,7 +6432,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.title,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: x,
                     top,
@@ -6229,7 +6460,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top,
@@ -6290,7 +6521,15 @@ impl App {
             right,
             bottom: y + self.s(120),
         };
-        self.panel(hdc, banner, self.s(10), SURFACE, BORDER, 1, BG);
+        self.panel(
+            hdc,
+            banner,
+            self.s(10),
+            self.theme.surface,
+            self.theme.border,
+            1,
+            self.theme.bg,
+        );
         let (badge, headline, detail) = self.status_text();
         let badge_px = self.s(72);
         self.draw_icon(
@@ -6310,7 +6549,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left: text_left,
                 top: banner.top + self.s(24),
@@ -6329,7 +6568,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             detail_rect,
             &detail,
             DT_WORDBREAK | DT_END_ELLIPSIS,
@@ -6347,15 +6586,23 @@ impl App {
         let fill_color = if disabled {
             rgb(160, 176, 166)
         } else if button_lit {
-            ACCENT_GREEN_HOVER
+            self.theme.accent_hover
         } else {
-            ACCENT_GREEN
+            self.theme.accent
         };
-        self.panel(hdc, button, self.s(8), fill_color, fill_color, 0, SURFACE);
+        self.panel(
+            hdc,
+            button,
+            self.s(8),
+            fill_color,
+            fill_color,
+            0,
+            self.theme.surface,
+        );
         text(
             hdc,
             self.fonts.body_bold,
-            SURFACE,
+            self.theme.surface,
             button,
             "Scan now",
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -6367,7 +6614,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -6411,10 +6658,18 @@ impl App {
                 hdc,
                 tile,
                 self.s(10),
-                if tile_lit { ACCENT_TINT } else { SURFACE },
-                if tile_lit { ACCENT_GREEN } else { BORDER },
+                if tile_lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                if tile_lit {
+                    self.theme.accent
+                } else {
+                    self.theme.border
+                },
                 1,
-                BG,
+                self.theme.bg,
             );
             let icon_px = self.s(40);
             self.draw_icon(
@@ -6427,7 +6682,11 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                if disabled { MUTED } else { INK },
+                if disabled {
+                    self.theme.muted
+                } else {
+                    self.theme.ink
+                },
                 RECT {
                     left: tile.left + self.s(6),
                     top: tile.top + self.s(10) + icon_px + self.s(6),
@@ -6453,7 +6712,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: y,
@@ -6484,7 +6743,11 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                if link_lit { ACCENT_GREEN_HOVER } else { LINK },
+                if link_lit {
+                    self.theme.accent_hover
+                } else {
+                    self.theme.link
+                },
                 link,
                 label,
                 DT_SINGLELINE,
@@ -6498,7 +6761,7 @@ impl App {
                         right: link.right,
                         bottom: link.bottom,
                     },
-                    ACCENT_GREEN_HOVER,
+                    self.theme.accent_hover,
                 );
             }
             self.spot(link, action, label);
@@ -6560,7 +6823,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6582,7 +6845,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: self.s(BODY_Y),
@@ -6605,7 +6868,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: self.s(CONTENT_X),
                 top: self.s(BODY_Y),
@@ -6628,7 +6891,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: self.s(CONTENT_X),
                 top: self.s(BODY_Y),
@@ -6674,14 +6937,22 @@ impl App {
         let roots = self.disk_roots.clone();
         for (index, (label, _)) in roots.iter().enumerate() {
             let selected = self.disk_root == Some(index);
-            x = self.pill(hdc, x, label, selected, hover, Action::DiskRoot(index));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DiskRoot(index),
+            );
         }
         if self.job == Job::Analyzing {
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 84),
@@ -6697,7 +6968,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6721,7 +6992,15 @@ impl App {
         let mut x = (right - widths + self.s(8)).max(x + self.s(16));
         for (label, view) in views {
             let selected = self.disk_view == view;
-            x = self.pill(hdc, x, label, selected, hover, Action::DiskView(view));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DiskView(view),
+            );
         }
     }
 
@@ -6741,7 +7020,15 @@ impl App {
         let roots = self.disk_roots.clone();
         for (index, (label, _)) in roots.iter().enumerate() {
             let selected = self.dup_root == Some(index);
-            x = self.pill(hdc, x, label, selected, hover, Action::DupRoot(index));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DupRoot(index),
+            );
         }
         let _ = x;
         if matches!(self.job, Job::Finding | Job::Recycling) {
@@ -6749,7 +7036,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 84),
@@ -6765,7 +7052,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6779,9 +7066,11 @@ impl App {
     }
 
     /// A rounded tab-like button; returns where the next one starts.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn pill(
         &mut self,
         hdc: HDC,
+        top: i32,
         x: i32,
         label: &str,
         selected: bool,
@@ -6791,9 +7080,9 @@ impl App {
         let size = measure(hdc, self.fonts.body_bold, label);
         let tab = RECT {
             left: x,
-            top: self.s(BODY_Y),
+            top: self.s(top),
             right: x + size.0 + self.s(28),
-            bottom: self.s(BODY_Y + 30),
+            bottom: self.s(top + 30),
         };
         let lit = lit(hover, tab);
         self.panel(
@@ -6801,24 +7090,28 @@ impl App {
             tab,
             self.s(14),
             if selected {
-                rgb(222, 240, 226)
+                self.theme.accent_tint
             } else if lit {
-                rgb(240, 247, 241)
+                self.theme.hover_tint
             } else {
-                rgb(249, 251, 249)
+                self.theme.surface
             },
             if selected {
-                rgb(46, 130, 76)
+                self.theme.accent
             } else {
-                rgb(184, 198, 188)
+                self.theme.border
             },
             1,
-            BG,
+            self.theme.bg,
         );
         text(
             hdc,
             self.fonts.body_bold,
-            if selected { THEME_INK } else { INK },
+            if selected {
+                self.theme.theme_ink
+            } else {
+                self.theme.ink
+            },
             tab,
             label,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
@@ -6837,7 +7130,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6878,24 +7171,28 @@ impl App {
                 tab,
                 self.s(14),
                 if selected {
-                    rgb(222, 240, 226)
+                    self.theme.accent_tint
                 } else if lit {
-                    rgb(240, 247, 241)
+                    self.theme.hover_tint
                 } else {
-                    rgb(249, 251, 249)
+                    self.theme.surface
                 },
                 if selected {
-                    rgb(46, 130, 76)
+                    self.theme.accent
                 } else {
-                    rgb(184, 198, 188)
+                    self.theme.border
                 },
                 1,
-                BG,
+                self.theme.bg,
             );
             text(
                 hdc,
                 self.fonts.body_bold,
-                if selected { THEME_INK } else { INK },
+                if selected {
+                    self.theme.theme_ink
+                } else {
+                    self.theme.ink
+                },
                 tab,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -6914,7 +7211,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: x + self.s(8),
                 top: self.s(BODY_Y),
@@ -6947,7 +7244,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left,
                         top: self.s(BODY_Y + 48),
@@ -6965,7 +7262,7 @@ impl App {
                 let y = paragraph(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     left,
                     width,
                     self.s(BODY_Y),
@@ -6974,7 +7271,7 @@ impl App {
                 paragraph(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     left,
                     width,
                     y + self.s(12),
@@ -6990,7 +7287,7 @@ impl App {
                     text(
                         hdc,
                         self.fonts.body,
-                        MUTED,
+                        self.theme.muted,
                         note,
                         &self.scan_note,
                         DT_SINGLELINE,
@@ -7012,7 +7309,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.small,
-                    MUTED,
+                    self.theme.muted,
                     RECT {
                         left,
                         top: self.s(BODY_Y - 6),
@@ -7051,7 +7348,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                THEME_INK,
+                self.theme.theme_ink,
                 RECT {
                     left: rect.right - self.s(160),
                     top: self.s(SUBTITLE_Y),
@@ -7064,7 +7361,7 @@ impl App {
         }
     }
 
-    unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT) {
+    unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Settings", None);
         self.subtitle(
             hdc,
@@ -7077,15 +7374,56 @@ impl App {
         );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
+        // Appearance leads the page so the switch is seen, not scrolled to:
+        // the ignored list below is an opaque real control that would cover
+        // anything drawn over its rows.
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: self.s(BODY_Y),
                 right,
                 bottom: self.s(BODY_Y + 28),
+            },
+            "Appearance",
+            DT_SINGLELINE,
+        );
+        self.say(
+            RECT {
+                left,
+                top: self.s(BODY_Y),
+                right: rect.right,
+                bottom: self.s(BODY_Y + 28),
+            },
+            "Appearance",
+        );
+        let mut x = left;
+        for (label, mode) in [
+            ("Light", ThemeMode::Light),
+            ("System", ThemeMode::System),
+            ("Dark", ThemeMode::Dark),
+        ] {
+            x = self.pill(
+                hdc,
+                BODY_Y + 38,
+                x,
+                label,
+                self.settings.theme == mode,
+                hover,
+                Action::Theme(mode),
+            );
+        }
+        text(
+            hdc,
+            self.fonts.heading,
+            self.theme.ink,
+            RECT {
+                left,
+                top: self.s(BODY_Y + SETTINGS_SHIFT),
+                right,
+                bottom: self.s(BODY_Y + 28 + SETTINGS_SHIFT),
             },
             "What Scan Your Registry checks",
             DT_SINGLELINE,
@@ -7094,7 +7432,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top,
@@ -7107,7 +7445,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: top + self.s(30),
@@ -7138,7 +7476,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7151,7 +7489,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7201,7 +7539,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7216,7 +7554,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7229,7 +7567,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7245,7 +7583,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7261,7 +7599,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: y,
@@ -7285,7 +7623,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body_bold,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left: x,
                         top: row,
@@ -7298,7 +7636,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left: x + self.s(150),
                         top: row,
@@ -7313,7 +7651,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7340,7 +7678,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7355,7 +7693,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: y,
@@ -7375,7 +7713,14 @@ impl App {
             right: left + size.0,
             bottom: y + size.1,
         };
-        text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.body,
+            self.theme.link,
+            link,
+            label,
+            DT_SINGLELINE,
+        );
         if lit(hover, link) {
             fill(
                 hdc,
@@ -7385,7 +7730,7 @@ impl App {
                     right: link.right,
                     bottom: link.bottom,
                 },
-                LINK,
+                self.theme.link,
             );
         }
         self.spot(link, Action::Refresh, label);
@@ -7407,7 +7752,7 @@ impl App {
         text(
             hdc,
             self.fonts.body_bold,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7420,7 +7765,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            INK,
+            self.theme.ink,
             RECT {
                 left: left + label_w,
                 top: y,
@@ -7448,10 +7793,10 @@ impl App {
             hdc,
             track,
             self.s(6),
-            rgb(236, 242, 238),
-            rgb(184, 198, 188),
+            self.theme.surface,
+            self.theme.border,
             1,
-            BG,
+            self.theme.bg,
         );
         let color = if used >= 90 {
             rgb(200, 60, 60)
@@ -7506,10 +7851,18 @@ impl App {
                 hdc,
                 tile,
                 self.s(10),
-                if lit { ACCENT_TINT } else { SURFACE },
-                if lit { ACCENT_GREEN } else { BORDER },
+                if lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                if lit {
+                    self.theme.accent
+                } else {
+                    self.theme.border
+                },
                 1,
-                BG,
+                self.theme.bg,
             );
             let icon_size = self.s(40);
             self.draw_icon(
@@ -7523,7 +7876,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                THEME_INK,
+                self.theme.theme_ink,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(4),
@@ -7536,7 +7889,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(26),
@@ -7582,7 +7935,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: rect.right - self.s(24) - icon_w - self.s(20),
                 top: emblem_top + icon_w + self.s(4),
@@ -7597,7 +7950,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.body,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7606,7 +7959,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.body_bold,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7615,7 +7968,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7632,19 +7985,27 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body,
-                THEME_INK,
+                self.theme.theme_ink,
                 left,
                 left + self.s(16),
                 y,
                 "\u{2022}",
             );
-            y = paragraph(hdc, self.fonts.body, INK, left + self.s(16), right, y, line) + gap / 2;
+            y = paragraph(
+                hdc,
+                self.fonts.body,
+                self.theme.ink,
+                left + self.s(16),
+                right,
+                y,
+                line,
+            ) + gap / 2;
         }
         y += gap * 2;
         y = paragraph(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7667,7 +8028,7 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 left,
                 left + self.s(190),
                 y,
@@ -7676,7 +8037,7 @@ impl App {
             y = paragraph(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 left + self.s(190),
                 right,
                 y,
@@ -7687,7 +8048,7 @@ impl App {
         paragraph(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             left,
             right,
             y,
@@ -8073,6 +8434,134 @@ fn edges(rect: RECT) -> Edges {
 /// what it draws, and transparent to the mouse, so clicks fall through to
 /// the drawn UI beneath. Keyboard focus, control names, and window rects
 /// (what UI Automation reports) are unaffected by either hiding.
+/// Point every real child control at the matching Explorer theme, so
+/// lists and buttons follow the page from light to dark and back.
+/// One listview's rows in the active theme: dark surface with readable
+/// text, or the light equivalents back. Called on every theme switch, so
+/// lists never keep the other mode's colors.
+fn paint_list(list: HWND, theme: Theme) {
+    unsafe {
+        SendMessageW(list, LVM_SETBKCOLOR, 0, theme.surface as isize);
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme.surface as isize);
+        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme.ink as isize);
+    }
+}
+
+/// Header faces painted by [`header_proc`]. Written on every theme switch
+/// so a repaint always finds current colors without touching the App.
+static HEADER_BG: AtomicU32 = AtomicU32::new(0x00FF_FFFF);
+static HEADER_INK: AtomicU32 = AtomicU32::new(0x0000_0000);
+
+/// Subclass a list header for dark paint, or restore its native window
+/// procedure for light. The header sends no custom-draw notification on
+/// some builds, so owning its WM_PAINT is the reliable path; the control
+/// itself stays a real header, keeping its accessibility names.
+unsafe fn theme_header(header: HWND, dark: bool) {
+    let current = GetWindowLongPtrW(header, GWLP_WNDPROC);
+    let ours = header_proc as *const () as usize as isize;
+    if dark {
+        if current != ours {
+            SetWindowLongPtrW(header, GWLP_USERDATA, current);
+            SetWindowLongPtrW(header, GWLP_WNDPROC, ours);
+        }
+        InvalidateRect(header, std::ptr::null(), 1);
+    } else if current == ours {
+        let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(header, GWLP_USERDATA));
+        SetWindowLongPtrW(
+            header,
+            GWLP_WNDPROC,
+            std::mem::transmute::<WNDPROC, isize>(old),
+        );
+        InvalidateRect(header, std::ptr::null(), 1);
+    }
+}
+
+unsafe extern "system" fn header_proc(
+    header: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_PAINT {
+        paint_dark_header(header);
+        return 0;
+    }
+    let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(header, GWLP_USERDATA));
+    match old {
+        Some(previous) => previous(header, msg, wparam, lparam),
+        None => DefWindowProcW(header, msg, wparam, lparam),
+    }
+}
+
+/// One dark header, painted synchronously in its own WM_PAINT: theme
+/// surface behind, theme ink ahead, titles read back from the header so
+/// columns never need a copy kept elsewhere.
+fn paint_dark_header(header: HWND) {
+    let bg = HEADER_BG.load(Ordering::Relaxed);
+    let ink = HEADER_INK.load(Ordering::Relaxed);
+    unsafe {
+        let mut saved: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(header, &mut saved);
+        let mut area: RECT = std::mem::zeroed();
+        GetClientRect(header, &mut area);
+        let brush = CreateSolidBrush(bg);
+        FillRect(hdc, &area, brush);
+        DeleteObject(brush);
+        let font = SendMessageW(header, WM_GETFONT, 0, 0);
+        let previous = if font != 0 {
+            SelectObject(hdc, font as *mut std::ffi::c_void)
+        } else {
+            std::ptr::null_mut()
+        };
+        SetTextColor(hdc, ink);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let columns = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
+        for index in 0..columns {
+            let mut cell: RECT = std::mem::zeroed();
+            SendMessageW(
+                header,
+                HDM_GETITEMRECT,
+                index as usize,
+                &mut cell as *mut _ as isize,
+            );
+            let mut text: [u16; 256] = [0; 256];
+            let mut column: HDITEMW = std::mem::zeroed();
+            column.mask = HDI_TEXT;
+            column.pszText = text.as_mut_ptr();
+            column.cchTextMax = text.len() as i32;
+            SendMessageW(
+                header,
+                HDM_GETITEMW,
+                index as usize,
+                &mut column as *mut _ as isize,
+            );
+            cell.left += 8;
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                -1,
+                &mut cell,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        if font != 0 {
+            SelectObject(hdc, previous);
+        }
+        EndPaint(header, &saved);
+    }
+}
+
+unsafe extern "system" fn theme_child(hwnd: HWND, dark: LPARAM) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::Foundation::TRUE;
+    let sub = if dark == 0 {
+        "Explorer"
+    } else {
+        "DarkMode_Explorer"
+    };
+    SetWindowTheme(hwnd, wide(sub).as_ptr(), std::ptr::null());
+    TRUE
+}
+
 fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
     use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
     use windows_sys::Win32::UI::WindowsAndMessaging::{

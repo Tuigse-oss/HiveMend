@@ -117,9 +117,37 @@ $running = Start-Hivemend $exe
 Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 Expect-Closed $running
+
+Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad values fail loudly'
+$themeKey = 'HKLM:\SOFTWARE\TUIGSE\Hivemend'
+function Theme-Default {
+  (Get-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue).Theme
+}
+# A rerun on the same machine starts clean; the next line then proves a
+# switchless install writes no default of its own.
+Remove-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue
+if ($null -ne (Theme-Default)) { throw "a fresh setup already left a theme default behind: '$(Theme-Default)'" }
+Install $New @('/ALLUSERS', '/Theme=Dark')
+if ((Theme-Default) -ne 'dark') { throw "expected machine theme default 'dark', found '$(Theme-Default)'" }
+Write-Host 'ok: /Theme=Dark wrote the machine default'
+Install $New @('/ALLUSERS')
+Expect-Installed machine $NewVersion | Out-Null
+if ((Theme-Default) -ne 'dark') { throw 'an upgrade without /Theme overwrote the machine default' }
+Write-Host 'ok: an upgrade without /Theme preserved the machine default'
+$bad = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
+if ($bad.ExitCode -eq 0) { throw '/Theme=Neon installed; it must fail instead' }
+Write-Host 'ok: /Theme=Neon failed loudly'
+if ((Theme-Default) -ne 'dark') { throw 'a rejected install damaged the machine default' }
+$mortal = Start-Process $New -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
+if ($mortal.ExitCode -eq 0) { throw 'per-user /Theme=Dark installed; it must fail instead' }
+Write-Host 'ok: per-user /Theme=Dark failed loudly (a per-user install cannot write the machine default)'
 Uninstall-All
 
 if (-not (Test-Path $marker)) { throw "uninstalling removed $data" }
 Remove-Item $marker
 Write-Host 'ok: data in %LOCALAPPDATA%\HiveMend kept'
+if ((Theme-Default) -ne 'dark') { throw 'uninstalling removed the machine theme default; it stays, like the per-user data' }
+Write-Host 'ok: uninstalling kept the machine theme default'
+# The suite cleans up after itself so a rerun starts clean.
+Remove-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue
 Write-Host 'All installer checks passed.'
