@@ -107,10 +107,25 @@ jobs:
       - name: Seed stale entries
         shell: pwsh
         run: tests\ui\seed.ps1
+      - name: Create a standard account with its own stale entry
+        # The runner is an administrator, so a window without administrator
+        # rights runs as this account. The runner VM is discarded afterwards.
+        shell: pwsh
+        run: |
+          $password = 'Hm1!' + [guid]::NewGuid().ToString('N').Substring(0, 20)
+          Write-Output "::add-mask::$password"
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser hmtest -Password $secure -PasswordNeverExpires | Out-Null
+          "HM_TEST_USER=hmtest" >> $env:GITHUB_ENV
+          "HM_TEST_PASSWORD=$password" >> $env:GITHUB_ENV
+          New-Item -ItemType Directory -Force C:\HivemendTest | Out-Null
+          Copy-Item tests\ui\seed.ps1 C:\HivemendTest\
+          $credential = New-Object Management.Automation.PSCredential('hmtest', $secure)
+          $seed = Start-Process powershell -Credential $credential -LoadUserProfile -Wait -PassThru `
+            -WorkingDirectory C:\HivemendTest `
+            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\HivemendTest\seed.ps1', '-UserOnly'
+          if ($seed.ExitCode -ne 0) { throw "seeding as hmtest failed ($($seed.ExitCode))" }
       - name: Run the UI tests
-        # The standard-user leg relaunches Hivemend with a basic-user
-        # token on the same desktop (runas /trustlevel:0x20000), so no
-        # second account, password, or profile is needed.
         run: python -I -u tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
       - name: Remove the seeded entries
         if: always()
