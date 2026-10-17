@@ -97,6 +97,8 @@ jobs:
     # Drives the window through Windows UI Automation, as a screen reader or
     # keyboard user would, against stale entries seeded for the test.
     runs-on: windows-latest
+    # A wedged UI Automation call must fail the job, not burn the 6 h quota.
+    timeout-minutes: 45
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

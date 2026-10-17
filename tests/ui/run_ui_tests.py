@@ -43,6 +43,22 @@ def shot(name):
     ImageGrab.grab().save(os.path.join(OUT, f"{step_number:02d}-{name}.png"))
 
 
+def log(msg):
+    # Heartbeats around the blocking calls below: if the log ever goes
+    # silent again, the last line names the exact call that stuck.
+    print(f"   [{time.strftime('%H:%M:%S')}] {msg}", flush=True)
+
+
+def kill(pid):
+    # taskkill has no Python-level timeout by default; a stuck one must fail
+    # the test instead of freezing the whole job past every other guard.
+    try:
+        subprocess.run(["taskkill", "/PID", str(pid), "/F"],
+                       capture_output=True, timeout=60)
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"taskkill hung for 60 s on pid {pid}")
+
+
 def wait_for(what, check, timeout=60.0, every=0.5):
     deadline = time.time() + timeout
     while True:
@@ -85,6 +101,7 @@ class Hivemend:
             # folded into a SecureString with plain .NET calls because the
             # ConvertTo-SecureString cmdlet fails to load on some machines
             # (CouldNotAutoloadMatchingModule).
+            log(f"starting {exe} as {user}")
             self.pid = int(powershell(
                 f"$s = New-Object Security.SecureString; "
                 f"$env:HM_TEST_PASSWORD.ToCharArray() | ForEach-Object {{ $s.AppendChar($_) }}; "
@@ -92,6 +109,7 @@ class Hivemend:
                 f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
                 f"-WorkingDirectory '{os.path.dirname(exe)}' -PassThru).Id"
             ))
+            log(f"launched pid {self.pid}; waiting for its window on this desktop")
             # The new process must own a window on THIS desktop: on another
             # window station, UI Automation calls below can block forever,
             # past every Python-level timeout, with no output at all.
@@ -129,9 +147,10 @@ class Hivemend:
 
         worker = threading.Thread(target=target, daemon=True)
         worker.start()
+        log(f"attaching UI Automation to pid {pid}")
         worker.join(timeout)
         if "uia" not in result:
-            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            kill(pid)
             raise AssertionError(
                 f"UI Automation could not reach pid {pid} within {timeout:.0f} s "
                 f"({result.get('error')!r}); the window is probably off-desktop"
@@ -220,7 +239,7 @@ class Hivemend:
         shot("results")
 
     def close(self):
-        subprocess.run(["taskkill", "/PID", str(self.pid), "/F"], capture_output=True)
+        kill(self.pid)
 
 
 def checked(app, run):
@@ -313,10 +332,12 @@ def main():
         folder = r"C:\HivemendTest"
         os.makedirs(folder, exist_ok=True)
         exe = shutil.copy(EXE, os.path.join(folder, "Hivemend.exe"))
+        log(f"copied the exe to {exe}; resolving {user}'s sid")
         sid = powershell(
             f"(New-Object Security.Principal.NTAccount('{user}'))"
             ".Translate([Security.Principal.SecurityIdentifier]).Value"
         )
+        log(f"sid {sid}; launching and attaching")
         checked(Hivemend(exe, user), lambda app: as_standard_user(app, sid))
     print("\nAll UI checks passed.")
 
