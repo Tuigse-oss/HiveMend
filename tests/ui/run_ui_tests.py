@@ -15,6 +15,7 @@ import os
 import shutil
 import subprocess
 import sys
+import threading
 import time
 import winreg
 
@@ -106,10 +107,36 @@ class Hivemend:
                     f"pid {self.pid} has no window on this desktop; "
                     "the standard-user checks need an interactive session"
                 )
-        self.uia = Application(backend="uia").connect(process=self.pid, timeout=30)
-        self.win32 = Application(backend="win32").connect(process=self.pid, timeout=30)
-        self.window = self.uia.window(title="Hivemend", control_type="Window")
-        self.window.wait("visible", timeout=30)
+        self.uia, self.win32, self.window = self._connect(self.pid)
+
+    @staticmethod
+    def _connect(pid, timeout=120.0):
+        """Attach UI Automation with a hard timeout. A window on another
+        desktop can block COM calls forever, past every in-call timeout,
+        with no output at all — so the attach runs on a worker thread that
+        is abandoned, never waited on past this point."""
+        result = {}
+
+        def target():
+            try:
+                uia = Application(backend="uia").connect(process=pid, timeout=30)
+                window = uia.window(title="Hivemend", control_type="Window")
+                window.wait("visible", timeout=30)
+                win32 = Application(backend="win32").connect(process=pid, timeout=30)
+                result.update(uia=uia, win32=win32, window=window)
+            except BaseException as e:
+                result["error"] = e
+
+        worker = threading.Thread(target=target, daemon=True)
+        worker.start()
+        worker.join(timeout)
+        if "uia" not in result:
+            subprocess.run(["taskkill", "/PID", str(pid), "/F"], capture_output=True)
+            raise AssertionError(
+                f"UI Automation could not reach pid {pid} within {timeout:.0f} s "
+                f"({result.get('error')!r}); the window is probably off-desktop"
+            )
+        return result["uia"], result["win32"], result["window"]
 
     # -- what a screen reader sees --------------------------------------
 
