@@ -4,15 +4,13 @@ through Windows UI Automation, and checks what it shows and does.
     python -I tests/ui/run_ui_tests.py path\\to\\Hivemend.exe [out-dir]
 
 Run from an administrator prompt after `tests/ui/seed.ps1`, on a machine you
-can test on. With HM_TEST_USER and HM_TEST_PASSWORD naming a standard
-account whose own registry was seeded (`seed.ps1 -UserOnly`, run as that
-account), it also repairs and restores that account's entry from a window
-without administrator rights. Screenshots of each step, and of any failure,
-go to out-dir (default: ui-test-output).
+can test on. It then relaunches Hivemend without administrator rights (same
+user, same desktop, restricted token) and repairs and restores that
+account's entry from the normal window. Screenshots of each step, and of
+any failure, go to out-dir (default: ui-test-output).
 """
 
 import os
-import shutil
 import subprocess
 import sys
 import time
@@ -73,39 +71,31 @@ def key_exists(hive, path):
 
 
 class Hivemend:
-    """A running Hivemend window, started as this account or another."""
+    """A running Hivemend window, elevated or restricted to basic user."""
 
-    def __init__(self, exe, user=None):
-        if user is None:
+    def __init__(self, exe, unelevated=False):
+        if not unelevated:
             self.pid = subprocess.Popen([exe]).pid
         else:
-            # Starts on this desktop as the other account, with its profile
-            # (and so its own part of the registry) loaded. The password is
-            # folded into a SecureString with plain .NET calls because the
-            # ConvertTo-SecureString cmdlet fails to load on some machines
-            # (CouldNotAutoloadMatchingModule), which then hung the suite.
-            self.pid = int(powershell(
-                f"$s = New-Object Security.SecureString; "
-                f"$env:HM_TEST_PASSWORD.ToCharArray() | ForEach-Object {{ $s.AppendChar($_) }}; "
-                f"$c = New-Object Management.Automation.PSCredential('{user}', $s); "
-                f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
-                f"-WorkingDirectory '{os.path.dirname(exe)}' -PassThru).Id"
-            ))
-            # The new process must own a window on THIS desktop: on another
-            # window station, UI Automation calls below can block forever,
-            # past every Python-level timeout, with no output at all.
-            def on_this_desktop():
-                handle = powershell(
-                    f"(Get-Process -Id {self.pid} -ErrorAction Stop).MainWindowHandle"
-                )
-                return handle != "0"
-            try:
-                wait_for("a window on this desktop", on_this_desktop, timeout=60)
-            except AssertionError:
-                raise AssertionError(
-                    f"pid {self.pid} has no window on this desktop; "
-                    "the standard-user checks need an interactive session"
-                )
+            # Relaunches on the same desktop with a basic-user token: no
+            # password, no second profile, and the window stays reachable
+            # to UI Automation. (Launching as another account instead put
+            # the window on another window station, where UI Automation
+            # calls block forever with no output at all.)
+            name = os.path.splitext(os.path.basename(exe))[0]
+            before = set(powershell(
+                f"(Get-Process {name} -ErrorAction SilentlyContinue).Id"
+            ).split())
+            powershell(f'runas /trustlevel:0x20000 "\\"{exe}\\""')
+            def visible():
+                for pid in powershell(
+                    f"(Get-Process {name} -ErrorAction SilentlyContinue | "
+                    f"Where-Object {{ $_.MainWindowHandle -ne 0 }}).Id"
+                ).split():
+                    if pid not in before:
+                        return int(pid)
+                return None
+            self.pid = wait_for("the unelevated window", visible, timeout=120)
         self.uia = Application(backend="uia").connect(process=self.pid, timeout=30)
         self.win32 = Application(backend="win32").connect(process=self.pid, timeout=30)
         self.window = self.uia.window(title="Hivemend", control_type="Window")
@@ -237,9 +227,11 @@ def as_administrator(app):
     assert locked[3] == "Protected, left alone (information)", locked
 
 
-def as_standard_user(app, user_hive):
+def as_standard_user(app):
+    # The seeded entry lives in this account's own hive: the administrator
+    # window above leaves it alone, the normal window below repairs it.
     entry = APP_PATHS + r"\hivemend-ci-user.exe"
-    assert key_exists(winreg.HKEY_USERS, f"{user_hive}\\{entry}"), "the account's entry was not seeded"
+    assert key_exists(winreg.HKEY_CURRENT_USER, entry), "the account's entry was not seeded"
 
     step("A normal window offers the account's own entry for repair")
     app.scan()
@@ -259,7 +251,7 @@ def as_standard_user(app, user_hive):
     text, box = app.answer_until("ok", "Repair finished", timeout=300)
     assert "Removed: 1" in text, text
     app.answer(box, "ok")
-    assert not key_exists(winreg.HKEY_USERS, f"{user_hive}\\{entry}"), "the repaired key is still there"
+    assert not key_exists(winreg.HKEY_CURRENT_USER, entry), "the repaired key is still there"
     assert not app.rows_for("hivemend-ci-user"), "the repaired entry is still listed"
     shot("repaired")
 
@@ -271,26 +263,13 @@ def as_standard_user(app, user_hive):
     app.press("Restore Selected Backup")
     text, box = app.answer_until("yes", "Restored", timeout=120)
     app.answer(box, "ok")
-    assert key_exists(winreg.HKEY_USERS, f"{user_hive}\\{entry}"), "the restore did not put the key back"
+    assert key_exists(winreg.HKEY_CURRENT_USER, entry), "the restore did not put the key back"
     shot("restored")
 
 
 def main():
     checked(Hivemend(EXE), as_administrator)
-
-    user = os.environ.get("HM_TEST_USER")
-    if not user or not os.environ.get("HM_TEST_PASSWORD"):
-        print("\nHM_TEST_USER is not set: skipping the standard-account checks.")
-    else:
-        # The other account needs a copy it can read and run.
-        folder = r"C:\HivemendTest"
-        os.makedirs(folder, exist_ok=True)
-        exe = shutil.copy(EXE, os.path.join(folder, "Hivemend.exe"))
-        sid = powershell(
-            f"(New-Object Security.Principal.NTAccount('{user}'))"
-            ".Translate([Security.Principal.SecurityIdentifier]).Value"
-        )
-        checked(Hivemend(exe, user), lambda app: as_standard_user(app, sid))
+    checked(Hivemend(EXE, unelevated=True), as_standard_user)
     print("\nAll UI checks passed.")
 
 
