@@ -77,3 +77,68 @@ Filename: "{app}\Hivemend.exe"; Description: "{cm:LaunchProgram,Hivemend}"; Flag
 
 ; Uninstalling leaves %LOCALAPPDATA%\HiveMend and the administrator backup
 ; store alone: they hold the registry backups a restore needs.
+
+[Code]
+const
+  ThemeKey = 'SOFTWARE\TUIGSE\Hivemend';
+  ThemeValue = 'Theme';
+
+{ A /Theme= switch seeds the machine theme default Hivemend starts from:
+  /Theme=Light, /Theme=System, or /Theme=Dark (any letter case). With no
+  switch Setup writes nothing, so an upgrade keeps the previous machine
+  default and a fresh install follows Windows. The per-user settings file
+  is never touched here; an in-app Appearance pick always wins over this
+  default, and uninstalling leaves both alone. }
+function ValidTheme(const S: String): Boolean;
+begin
+  Result :=
+    (CompareText(S, 'light') = 0) or
+    (CompareText(S, 'system') = 0) or
+    (CompareText(S, 'dark') = 0);
+end;
+
+{ Rejections happen in InitializeSetup, before anything is installed: a
+  late abort (for example in CurStepChanged under /VERYSILENT with
+  /SUPPRESSMSGBOXES) can still report exit code 0, which would look like
+  success to a package manager. An early refusal installs nothing, so the
+  installer checks below verify rejection by its effects, not its exit. }
+function InitializeSetup(): Boolean;
+var
+  Choice: String;
+begin
+  Result := True;
+  Choice := ExpandConstant('{param:Theme|}');
+  if Choice = '' then
+    Exit;
+  if not ValidTheme(Choice) then
+  begin
+    MsgBox(
+      'Invalid /Theme=' + Choice + '. Use /Theme=Light, /Theme=System, or /Theme=Dark.',
+      mbError, MB_OK);
+    Result := False;
+    Exit;
+  end;
+  { HKLM is administrator-only, which is also why a per-user install cannot
+    set a machine default: it says so instead of silently ignoring it. }
+  if not IsAdminInstallMode() then
+  begin
+    MsgBox(
+      '/Theme=' + Choice + ' needs an all-users (/ALLUSERS) install, which can write the machine default. ' +
+      'Install without /Theme and pick the theme in the app under Settings > Appearance instead.',
+      mbError, MB_OK);
+    Result := False;
+  end;
+end;
+
+procedure CurStepChanged(CurStep: TSetupStep);
+var
+  Choice: String;
+begin
+  if CurStep <> ssPostInstall then
+    Exit;
+  Choice := ExpandConstant('{param:Theme|}');
+  if (Choice <> '') and ValidTheme(Choice) and IsAdminInstallMode() then
+    if not RegWriteStringValue(HKLM64, ThemeKey, ThemeValue, Lowercase(Choice)) then
+      RaiseException(
+        'Could not save the machine theme default. An all-users install needs administrator rights.');
+end;

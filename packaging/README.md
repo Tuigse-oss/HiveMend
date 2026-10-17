@@ -30,11 +30,21 @@ Every channel upgrades by installing the new version over the old one:
 - Backups, settings, and the ignore list live in `%LOCALAPPDATA%\HiveMend`
   (and the administrator backup store), never in the install folder, so
   upgrades and uninstalls keep them.
+- The theme default lives in `HKLM\SOFTWARE\TUIGSE\Hivemend` (`Theme`) and
+  is only written when the installer gets a `/Theme=` switch; without one
+  any existing default is preserved, and System applies only when neither
+  a user choice nor a machine default exists. Uninstalling leaves the
+  default (like the per-user data). An in-app Appearance pick always wins
+  over it. Scoop and winget installs pass no switch, so they preserve
+  whatever default is there.
 
 CI checks this on every pull request (`installer\test-installer.ps1`): a
 per-user and an all-users install, an upgrade with Hivemend running, a
-reinstall, and an uninstall. A release build also upgrades from the last
-published release's installer.
+reinstall, and an uninstall, plus the `/Theme` seed/preserve/reject
+matrix. A release build also upgrades from the last published release's
+installer. The Chocolatey parameter logic is checked the same way
+(`installer\test-choco-params.ps1`), against stubs instead of a real
+install, so its validation is tested before publishing, not during it.
 
 Never change the `AppId` in `installer/hivemend.iss`: a new one would install
 next to the old version instead of replacing it.
@@ -84,4 +94,13 @@ Users install with `winget install TUIGSE.Hivemend`.
    the first one is reviewed by a person and can take a while.
 
 Users install with `choco install hivemend` (from an administrator prompt;
-Chocolatey installs for all users).
+Chocolatey installs for all users). A theme can be seeded with a package
+parameter, which forwards to the installer's `/Theme=` switch:
+
+```powershell
+choco install hivemend --params "/Theme:Dark"
+```
+
+`Light`, `System`, and `Dark` are accepted (any letter case); anything
+else fails the install. With no parameter, an upgrade keeps the previous
+machine default.

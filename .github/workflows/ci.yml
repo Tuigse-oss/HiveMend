@@ -91,6 +91,12 @@ jobs:
           installer\test-installer.ps1
           -Old installer-test\Hivemend-v0.0.1-x86_64-setup.exe -OldVersion 0.0.1
           -New installer-test\Hivemend-v0.0.2-x86_64-setup.exe -NewVersion 0.0.2
+      - name: Chocolatey parameter validation
+        # The install script is a release-time template (render.py fills the
+        # URLs), so its parameter logic is tested here against the stubs,
+        # before Chocolatey moderation ever sees it.
+        shell: pwsh
+        run: installer\test-choco-params.ps1 -Script packaging\chocolatey\tools\chocolateyinstall.ps1
 
   ui:
     name: ui (keyboard, screen reader, scan, repair, restore)
