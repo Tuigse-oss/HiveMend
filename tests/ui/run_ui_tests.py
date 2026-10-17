@@ -118,11 +118,11 @@ class Hivemend:
                 f"$c = New-Object Management.Automation.PSCredential('{user}', $s); "
                 # The launched window must not inherit this pipe: it would
                 # stay open after powershell exits and hang the read above
-                # forever, past every timeout, with no output at all.
+                # forever, past every timeout, with no output at all. Only
+                # stdout is redirected (the two streams must differ).
                 f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
                 f"-WorkingDirectory '{os.path.dirname(exe)}' "
-                f"-RedirectStandardOutput 'NUL' -RedirectStandardError 'NUL' "
-                f"-PassThru).Id"
+                f"-RedirectStandardOutput 'NUL' -PassThru).Id"
             ))
             log(f"launched pid {self.pid}; waiting for its window on this desktop")
             # The new process must own a window on THIS desktop: on another
