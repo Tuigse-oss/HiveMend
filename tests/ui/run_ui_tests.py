@@ -287,7 +287,7 @@ def as_administrator(app):
     step("An administrator window says what it will and will not change")
     _, user = app.row_for("hivemend-ci-user")
     print("   per-user:", user)
-    assert user[3] == "Fix from Hivemend without administrator rights", user
+    assert user[3] == "Fix from Hivemend started without administrator rights", user
     _, default = app.row_for("hivemend-ci-default")
     print("   App Paths, default permissions:", default)
     assert default[3] == "Protected, left alone (information)", default

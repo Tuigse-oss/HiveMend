@@ -2267,7 +2267,7 @@ impl App {
         match self.left_alone_why(finding) {
             _ if !finding.repairable() => {}
             Some(LeftAlone::NormalWindow) => {
-                return "Fix from Hivemend without administrator rights".into();
+                return "Fix from Hivemend started without administrator rights".into();
             }
             Some(LeftAlone::Protected(_)) => return "Protected, left alone (information)".into(),
             None => {}
@@ -8062,10 +8062,19 @@ fn edges(rect: RECT) -> Edges {
 }
 
 /// A stand-in control (see [`ID_ACCESS_BASE`]): hidden until placed, and
-/// with an empty window region so it never draws or takes mouse input.
+/// invisible afterwards two ways over. An empty window region alone proved
+/// unreliable: in 0.1.2 the controls painted anyway (gray static faces, a
+/// second Help button, eaten mouse clicks), so each one is also a layered
+/// window with constant zero alpha, which composes to nothing no matter
+/// what it draws, and transparent to the mouse, so clicks fall through to
+/// the drawn UI beneath. Keyboard focus, control names, and window rects
+/// (what UI Automation reports) are unaffected by either hiding.
 fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
     use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
-    use windows_sys::Win32::UI::WindowsAndMessaging::{BS_NOTIFY, BS_PUSHBUTTON};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{
+        BS_NOTIFY, BS_PUSHBUTTON, LWA_ALPHA, SetLayeredWindowAttributes, WS_EX_LAYERED,
+        WS_EX_TRANSPARENT,
+    };
     // SS_NOPREFIX: show "&" as itself in a status line.
     const SS_NOPREFIX: u32 = 0x80;
     let style = if button {
@@ -8075,7 +8084,7 @@ fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
     };
     unsafe {
         let control = CreateWindowExW(
-            0,
+            WS_EX_LAYERED | WS_EX_TRANSPARENT,
             wide(class).as_ptr(),
             std::ptr::null(),
             WS_CHILD | style,
@@ -8090,6 +8099,7 @@ fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
         );
         // The window owns the region from here on.
         SetWindowRgn(control, CreateRectRgn(0, 0, 0, 0), 0);
+        SetLayeredWindowAttributes(control, 0, 0, LWA_ALPHA);
         control
     }
 }
