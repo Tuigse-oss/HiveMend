@@ -317,17 +317,31 @@ def as_administrator(app):
     text, box = app.dialog()
     assert text.startswith("Start the uninstaller for Hivemend CI test program without administrator rights?"), text
     app.answer(box, "yes")
-    def medium_proof():
+    # Either the uninstaller records its integrity, or the desktop itself
+    # runs elevated (User Account Control off, as on hosted runners), where
+    # no medium token exists and the refusal is the honest answer.
+    def uninstall_outcome():
         try:
             with open(marker, "rb") as f:
                 contents = f.read().decode("utf-8", errors="replace")
         except OSError:
+            contents = ""
+        if contents:
+            print("   uninstaller integrity:", [line for line in contents.splitlines() if "Mandatory Level" in line])
+            return ("medium", contents)
+        try:
+            text, box = app.dialog(timeout=5)
+        except AssertionError:
             return None
-        print("   uninstaller integrity:", [line for line in contents.splitlines() if "Mandatory Level" in line])
-        return contents or None
-    proof = wait_for("the uninstaller to record its integrity", medium_proof, timeout=120, every=2)
-    assert "Medium Mandatory Level" in proof, proof
-    assert "High Mandatory Level" not in proof, proof
+        if "could not start the uninstaller" in text:
+            app.answer(box, "ok")
+            print("   no medium token here; the refusal stands:", text.splitlines()[0])
+            return ("refused", text)
+        raise AssertionError(f"unexpected dialog after uninstall: {text}")
+    outcome = wait_for("an uninstall outcome", uninstall_outcome, timeout=120, every=2)
+    if outcome[0] == "medium":
+        assert "Medium Mandatory Level" in outcome[1], outcome
+        assert "High Mandatory Level" not in outcome[1], outcome
 
 
 def as_standard_user(app, user_hive):
