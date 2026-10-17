@@ -118,7 +118,7 @@ Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 Expect-Closed $running
 
-Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad values fail loudly'
+Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad values change nothing'
 $themeKey = 'HKLM:\SOFTWARE\TUIGSE\Hivemend'
 function Theme-Default {
   (Get-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue).Theme
@@ -134,13 +134,28 @@ Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 if ((Theme-Default) -ne 'dark') { throw 'an upgrade without /Theme overwrote the machine default' }
 Write-Host 'ok: an upgrade without /Theme preserved the machine default'
-$bad = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
-if ($bad.ExitCode -eq 0) { throw '/Theme=Neon installed; it must fail instead' }
-Write-Host 'ok: /Theme=Neon failed loudly'
+# A rejected switch must change nothing. Exit codes cannot prove that: a
+# late silent abort can still report 0, so the probes use the OLD version,
+# where a mistaken success would visibly downgrade or add an install. The
+# codes are logged for diagnosis, never asserted. The sleeps give a
+# mistaken install time to show itself; a refusal is instant.
+$bad = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
+Write-Host "note: /Theme=Neon setup exited $($bad.ExitCode)"
+Start-Sleep -Seconds 30
+$still = @(Installs)
+if ($still.Count -ne 1 -or $still[0].Scope -ne 'machine' -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
+  throw 'a rejected /Theme=Neon changed the install (downgraded or duplicated)'
+}
 if ((Theme-Default) -ne 'dark') { throw 'a rejected install damaged the machine default' }
-$mortal = Start-Process $New -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
-if ($mortal.ExitCode -eq 0) { throw 'per-user /Theme=Dark installed; it must fail instead' }
-Write-Host 'ok: per-user /Theme=Dark failed loudly (a per-user install cannot write the machine default)'
+Write-Host 'ok: /Theme=Neon changed nothing (no downgrade, default intact)'
+$mortal = Start-Process $Old -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
+Write-Host "note: per-user /Theme=Dark setup exited $($mortal.ExitCode)"
+Start-Sleep -Seconds 30
+if (@(Installs).Count -ne 1) { throw 'a rejected per-user /Theme added an install' }
+if ((Theme-Default) -ne 'dark') { throw 'a rejected per-user install damaged the machine default' }
+Write-Host 'ok: per-user /Theme=Dark changed nothing (no second install, default intact)'
+Install $New @('/ALLUSERS')
+Expect-Installed machine $NewVersion | Out-Null
 Uninstall-All
 
 if (-not (Test-Path $marker)) { throw "uninstalling removed $data" }
