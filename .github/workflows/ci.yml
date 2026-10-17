@@ -114,12 +114,13 @@ jobs:
         run: |
           $password = 'Hm1!' + [guid]::NewGuid().ToString('N').Substring(0, 20)
           Write-Output "::add-mask::$password"
-          net user hmtest $password /add | Out-Null
+          $secure = ConvertTo-SecureString $password -AsPlainText -Force
+          New-LocalUser hmtest -Password $secure -PasswordNeverExpires | Out-Null
           "HM_TEST_USER=hmtest" >> $env:GITHUB_ENV
           "HM_TEST_PASSWORD=$password" >> $env:GITHUB_ENV
           New-Item -ItemType Directory -Force C:\HivemendTest | Out-Null
           Copy-Item tests\ui\seed.ps1 C:\HivemendTest\
-          $credential = New-Object Management.Automation.PSCredential('hmtest', (ConvertTo-SecureString $password -AsPlainText -Force))
+          $credential = New-Object Management.Automation.PSCredential('hmtest', $secure)
           $seed = Start-Process powershell -Credential $credential -LoadUserProfile -Wait -PassThru `
             -WorkingDirectory C:\HivemendTest `
             -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\HivemendTest\seed.ps1', '-UserOnly'
