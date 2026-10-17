@@ -91,6 +91,21 @@ class Hivemend:
                 f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
                 f"-WorkingDirectory '{os.path.dirname(exe)}' -PassThru).Id"
             ))
+            # The new process must own a window on THIS desktop: on another
+            # window station, UI Automation calls below can block forever,
+            # past every Python-level timeout, with no output at all.
+            def on_this_desktop():
+                handle = powershell(
+                    f"(Get-Process -Id {self.pid} -ErrorAction Stop).MainWindowHandle"
+                )
+                return handle != "0"
+            try:
+                wait_for("a window on this desktop", on_this_desktop, timeout=60)
+            except AssertionError:
+                raise AssertionError(
+                    f"pid {self.pid} has no window on this desktop; "
+                    "the standard-user checks need an interactive session"
+                )
         self.uia = Application(backend="uia").connect(process=self.pid, timeout=30)
         self.win32 = Application(backend="win32").connect(process=self.pid, timeout=30)
         self.window = self.uia.window(title="Hivemend", control_type="Window")

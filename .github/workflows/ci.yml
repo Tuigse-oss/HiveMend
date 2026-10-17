@@ -126,7 +126,7 @@ jobs:
             -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\HivemendTest\seed.ps1', '-UserOnly'
           if ($seed.ExitCode -ne 0) { throw "seeding as hmtest failed ($($seed.ExitCode))" }
       - name: Run the UI tests
-        run: python -I tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
+        run: python -I -u tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
       - name: Remove the seeded entries
         if: always()
         shell: pwsh
