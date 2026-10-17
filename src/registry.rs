@@ -135,6 +135,9 @@ pub struct MemoryRegistry {
     /// Test hook: path prefixes that open another key, as WOW64 shared keys
     /// do (`from`, `to`).
     pub aliases: Vec<(String, String)>,
+    /// Test hook: keys locked down inside an `untrusted` subtree, which an
+    /// administrator transaction accepts after all.
+    pub trusted_exact: Vec<String>,
 }
 
 impl MemoryRegistry {
@@ -272,7 +275,7 @@ impl Registry for MemoryRegistry {
     }
 
     fn check_trusted(&self, key: &str) -> Result<(), RegError> {
-        memory_trusted(&self.untrusted, key)
+        memory_trusted(self, key)
     }
 
     fn identity(&self, path: &str) -> Option<String> {
@@ -317,9 +320,16 @@ impl Registry for MemoryTransaction<'_> {
 
 /// The test hook behind `require_trusted` and `check_trusted`: refuse `key`
 /// when it is at or below one of the `untrusted` roots.
-fn memory_trusted(untrusted: &[String], key: &str) -> Result<(), RegError> {
+fn memory_trusted(reg: &MemoryRegistry, key: &str) -> Result<(), RegError> {
     let key = canonical_path(key);
-    if untrusted.iter().any(|root| {
+    if reg
+        .trusted_exact
+        .iter()
+        .any(|exact| canonical_path(exact).eq_ignore_ascii_case(&key))
+    {
+        return Ok(());
+    }
+    if reg.untrusted.iter().any(|root| {
         let root = canonical_path(root);
         key.eq_ignore_ascii_case(&root)
             || key
@@ -335,7 +345,7 @@ fn memory_trusted(untrusted: &[String], key: &str) -> Result<(), RegError> {
 
 impl RegTransaction for MemoryTransaction<'_> {
     fn require_trusted(&self, key: &str) -> Result<(), RegError> {
-        memory_trusted(&self.work.untrusted, key)
+        memory_trusted(&self.work, key)
     }
 
     fn touch(&mut self, key: &str) -> Result<(), RegError> {
