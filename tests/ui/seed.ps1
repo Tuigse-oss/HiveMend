@@ -37,3 +37,16 @@ foreach ($entry in $entries) {
   Write-Host "seeded $($entry.Key) -> $($entry.Target)"
 }
 if (-not $UserOnly -and (Test-Path 'C:\HivemendCI')) { Remove-Item 'C:\HivemendCI' -Recurse -Force }
+if (-not $UserOnly) {
+  # A machine-wide program whose uninstaller proves an administrator window
+  # starts it without administrator rights: it records its own integrity.
+  $program = 'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall\HivemendCI-Test'
+  if (Test-Path $program) { Remove-Item $program -Recurse -Force }
+  if (-not $Remove) {
+    New-Item $program -Force | Out-Null
+    Set-ItemProperty $program 'DisplayName' 'Hivemend CI test program'
+    Set-ItemProperty $program 'UninstallString' 'cmd /c whoami /groups > C:\HivemendTest\uninstall-medium.txt'
+    Write-Host "seeded $program"
+  }
+  Remove-Item 'C:\HivemendTest\uninstall-medium.txt' -Force -ErrorAction SilentlyContinue
+}

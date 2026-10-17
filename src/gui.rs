@@ -31,7 +31,8 @@ use hive_mend::{
     settings_file, sort_services, start_services, still_reported, stop_services, user_dir,
 };
 use windows_sys::Win32::Foundation::{
-    FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME, WPARAM,
+    CloseHandle, FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME,
+    WPARAM,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BeginPaint, BitBlt, ClientToScreen, CreateCompatibleBitmap, CreateCompatibleDC, CreateFontW,
@@ -640,15 +641,7 @@ struct App {
     btn_priv_clean: HWND,
 }
 
-/// Set by [`run`] when Hivemend was started to open on the Programs page.
-static OPEN_PROGRAMS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// The command-line flag [`start_unelevated`] passes so the new window opens
-/// on Programs.
-pub const PROGRAMS_FLAG: &str = "--programs";
-
-pub fn run(open_programs: bool) -> std::process::ExitCode {
-    OPEN_PROGRAMS.store(open_programs, std::sync::atomic::Ordering::Relaxed);
+pub fn run() -> std::process::ExitCode {
     unsafe {
         let icc = INITCOMMONCONTROLSEX {
             dwSize: std::mem::size_of::<INITCOMMONCONTROLSEX>() as u32,
@@ -729,9 +722,6 @@ unsafe extern "system" fn wnd_proc(
         let app = &mut *window_app(hwnd);
         app.sync_controls();
         app.refresh_backups();
-        if OPEN_PROGRAMS.load(std::sync::atomic::Ordering::Relaxed) {
-            app.go(Page::Programs);
-        }
         drop(_guard);
         flush_deferred(hwnd);
         return 0;
@@ -3686,32 +3676,11 @@ impl App {
         let Some(program) = self.programs.get(row).cloned() else {
             return;
         };
-        // An administrator window never starts uninstallers: one started
-        // from here would run with administrator rights, whatever wrote it.
-        // Instead it opens Hivemend without administrator rights on this
-        // page; from there the uninstaller asks for rights itself.
-        if self.elevated {
-            let question = format!(
-                "Uninstallers are started from Hivemend without administrator rights, so a program's uninstaller never gets them unless it asks Windows itself.\n\nOpen Hivemend without administrator rights on the Programs page to uninstall {}? This window closes.",
-                program.name
-            );
-            if !self.confirm(&question, Redo::Uninstall(row)) {
-                return;
-            }
-            match start_unelevated(&exe_path(), PROGRAMS_FLAG) {
-                Ok(()) => unsafe {
-                    PostMessageW(self.hwnd, WM_CLOSE, 0, 0);
-                },
-                Err(err) => self.message(
-                    &format!(
-                        "Hivemend could not open a window without administrator rights: {err}.\n\nClose this window and start Hivemend normally, or use Settings > Apps > Installed apps."
-                    ),
-                    MB_ICONWARNING,
-                ),
-            }
-            return;
-        }
-        let launch = match hive_mend::uninstall_launch(&HostFs, &program.uninstall, self.elevated) {
+        // The launch below never inherits this window's rights: without
+        // elevation there are none to inherit, and with elevation the
+        // uninstaller is started with this account's own medium token, so
+        // the trusted-path check has nothing to refuse in either case.
+        let launch = match hive_mend::uninstall_launch(&HostFs, &program.uninstall, false) {
             Ok(launch) => launch,
             Err(err) => {
                 self.message(
@@ -3724,6 +3693,41 @@ impl App {
                 return;
             }
         };
+        // An administrator window never lends its rights to an uninstaller:
+        // one started from here would run with administrator rights,
+        // whatever wrote it. Instead the uninstaller is started directly
+        // with this account's own medium token; if it needs more, it asks
+        // Windows itself.
+        if self.elevated {
+            let question = format!(
+                "Start the uninstaller for {} without administrator rights?\n\n{} {}\n\nThis runs the program's own uninstaller with no administrator rights from Hivemend. If it needs them, it asks Windows itself. Most ask before removing anything, but a silent one (such as /S) removes the program right away. Programs are not backed up.",
+                program.name, launch.exe, launch.params
+            );
+            if !self.confirm(&question, Redo::Uninstall(row)) {
+                return;
+            }
+            let dir = std::path::Path::new(&launch.exe)
+                .parent()
+                .map(std::path::Path::to_path_buf);
+            let params = (!launch.params.is_empty()).then_some(launch.params.as_str());
+            match start_medium(&launch.exe, params, dir.as_deref()) {
+                Ok(()) => {
+                    self.programs_note = format!(
+                        "Started the uninstaller for {} without administrator rights. Click Refresh when it finishes.",
+                        program.name
+                    );
+                    self.invalidate();
+                }
+                Err(err) => self.message(
+                    &format!(
+                        "Hivemend could not start the uninstaller for {} without administrator rights: {err}.\n\nOpen Hivemend without administrator rights and try there, or try Settings > Apps > Installed apps instead.",
+                        program.name
+                    ),
+                    MB_ICONWARNING,
+                ),
+            }
+            return;
+        }
         let question = format!(
             "Start the uninstaller for {}?\n\n{} {}\n\nThis runs the program's own uninstaller with the command it registered. Most ask before removing anything, but a silent one (such as /S) removes the program right away. Programs are not backed up.",
             program.name, launch.exe, launch.params
@@ -8621,27 +8625,31 @@ fn open_in_regedit(hwnd: HWND, key: &str, elevated: bool) {
 /// every normal window of this account runs with. Refused when the shell
 /// belongs to another account or itself runs with administrator rights (User
 /// Account Control off), where no such token exists.
-fn start_unelevated(exe: &Path, args: &str) -> Result<(), String> {
-    use windows_sys::Win32::Foundation::{CloseHandle, HANDLE};
+struct Owned(HANDLE);
+
+impl Drop for Owned {
+    fn drop(&mut self) {
+        if !self.0.is_null() {
+            unsafe { CloseHandle(self.0) };
+        }
+    }
+}
+
+/// A primary token for this account without administrator rights, borrowed
+/// from the Windows desktop's own process. Fails where no such token
+/// exists: another account's desktop, or a desktop that itself runs with
+/// administrator rights because User Account Control is off.
+fn medium_token() -> Result<Owned, String> {
     use windows_sys::Win32::Security::{
         DuplicateTokenEx, EqualSid, GetTokenInformation, SecurityImpersonation,
         TOKEN_ADJUST_DEFAULT, TOKEN_ADJUST_SESSIONID, TOKEN_ASSIGN_PRIMARY, TOKEN_DUPLICATE,
         TOKEN_ELEVATION, TOKEN_QUERY, TOKEN_USER, TokenElevation, TokenPrimary, TokenUser,
     };
     use windows_sys::Win32::System::Threading::{
-        CreateProcessWithTokenW, GetCurrentProcess, OpenProcess, OpenProcessToken,
-        PROCESS_INFORMATION, PROCESS_QUERY_LIMITED_INFORMATION, STARTUPINFOW,
+        GetCurrentProcess, OpenProcess, OpenProcessToken, PROCESS_QUERY_LIMITED_INFORMATION,
     };
     use windows_sys::Win32::UI::WindowsAndMessaging::{GetShellWindow, GetWindowThreadProcessId};
 
-    struct Owned(HANDLE);
-    impl Drop for Owned {
-        fn drop(&mut self) {
-            if !self.0.is_null() {
-                unsafe { CloseHandle(self.0) };
-            }
-        }
-    }
     let failed = |what: &str| format!("{what} failed ({})", std::io::Error::last_os_error());
     // TOKEN_USER is followed by its SID; 256 bytes hold any SID.
     let user_of = |token: HANDLE| -> Result<Vec<u64>, String> {
@@ -8729,10 +8737,32 @@ fn start_unelevated(exe: &Path, args: &str) -> Result<(), String> {
     {
         return Err(failed("DuplicateTokenEx"));
     }
-    let application = wide(&exe.display().to_string());
-    let mut command_line = wide(&format!("\"{}\" {args}", exe.display()));
+    Ok(token)
+}
+
+/// Start a program with this account's own medium token, so an
+/// administrator window can run an uninstaller without lending it its
+/// rights. The program starts in its own folder, shown normally.
+fn start_medium(
+    exe: &str,
+    params: Option<&str>,
+    dir: Option<&std::path::Path>,
+) -> Result<(), String> {
+    use windows_sys::Win32::System::Threading::{
+        CreateProcessWithTokenW, PROCESS_INFORMATION, STARTF_USESHOWWINDOW, STARTUPINFOW,
+    };
+    let failed = |what: &str| format!("{what} failed ({})", std::io::Error::last_os_error());
+    let token = medium_token()?;
+    let application = wide(exe);
+    let mut command_line = match params {
+        Some(params) => wide(&format!("\"{exe}\" {params}")),
+        None => wide(&format!("\"{exe}\"")),
+    };
+    let dir = dir.map(|dir| wide(&dir.display().to_string()));
     let startup = STARTUPINFOW {
         cb: std::mem::size_of::<STARTUPINFOW>() as u32,
+        dwFlags: STARTF_USESHOWWINDOW,
+        wShowWindow: SW_SHOWNORMAL as u16,
         ..unsafe { std::mem::zeroed() }
     };
     let mut started: PROCESS_INFORMATION = unsafe { std::mem::zeroed() };
@@ -8744,7 +8774,7 @@ fn start_unelevated(exe: &Path, args: &str) -> Result<(), String> {
             command_line.as_mut_ptr(),
             0,
             std::ptr::null(),
-            std::ptr::null(),
+            dir.as_ref().map_or(std::ptr::null(), |dir| dir.as_ptr()),
             &startup,
             &mut started,
         )

@@ -29,6 +29,7 @@ os.makedirs(OUT, exist_ok=True)
 APP_PATHS = r"Software\Microsoft\Windows\CurrentVersion\App Paths"
 FINDINGS_LIST = 2000
 BACKUPS_LIST = 2002
+PROGRAMS_LIST = 2011
 
 step_number = 0
 
@@ -243,6 +244,10 @@ class Hivemend:
         return [(i, cells) for i, cells in self.findings()[1]
                 if any(marker in cell for cell in cells)]
 
+    def programs(self):
+        lv = self.win32.window(title="Hivemend").child_window(control_id=PROGRAMS_LIST).wrapper_object()
+        return lv, [(i, lv.get_item(i, 0).text()) for i in range(lv.item_count())]
+
     def row_for(self, marker):
         rows = self.rows_for(marker)
         assert len(rows) == 1, f"{marker} is listed {len(rows)} times: {rows}"
@@ -296,6 +301,47 @@ def as_administrator(app):
     # Removing it could not be undone: a restore would have to write into
     # App Paths, which standard accounts can change.
     assert locked[3] == "Protected, left alone (information)", locked
+
+    step("An administrator window starts an uninstaller without its rights")
+    marker = r"C:\HivemendTest\uninstall-medium.txt"
+    if os.path.exists(marker):
+        os.remove(marker)
+    app.go("^6", "Programs")
+    def test_program():
+        lv, rows = app.programs()
+        found = next((row for row, name in rows if "Hivemend CI test program" in name), None)
+        return (lv, found) if found is not None else None
+    lv, row = wait_for("the test program row", test_program, timeout=120, every=2)
+    lv.select(row)
+    app.press("Uninstall")
+    text, box = app.dialog()
+    assert text.startswith("Start the uninstaller for Hivemend CI test program without administrator rights?"), text
+    app.answer(box, "yes")
+    # Either the uninstaller records its integrity, or the desktop itself
+    # runs elevated (User Account Control off, as on hosted runners), where
+    # no medium token exists and the refusal is the honest answer.
+    def uninstall_outcome():
+        try:
+            with open(marker, "rb") as f:
+                contents = f.read().decode("utf-8", errors="replace")
+        except OSError:
+            contents = ""
+        if contents:
+            print("   uninstaller integrity:", [line for line in contents.splitlines() if "Mandatory Level" in line])
+            return ("medium", contents)
+        try:
+            text, box = app.dialog(timeout=5)
+        except AssertionError:
+            return None
+        if "could not start the uninstaller" in text:
+            app.answer(box, "ok")
+            print("   no medium token here; the refusal stands:", text.splitlines()[0])
+            return ("refused", text)
+        raise AssertionError(f"unexpected dialog after uninstall: {text}")
+    outcome = wait_for("an uninstall outcome", uninstall_outcome, timeout=120, every=2)
+    if outcome[0] == "medium":
+        assert "Medium Mandatory Level" in outcome[1], outcome
+        assert "High Mandatory Level" not in outcome[1], outcome
 
 
 def as_standard_user(app, user_hive):

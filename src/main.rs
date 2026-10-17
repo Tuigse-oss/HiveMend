@@ -101,13 +101,7 @@ fn main() -> ExitCode {
     hive_mend::adopt_legacy_settings();
     #[cfg(windows)]
     if std::env::args().len() <= 1 {
-        return gui::run(false);
-    }
-    // An administrator window hands an uninstall to a normal window this way.
-    #[cfg(windows)]
-    if std::env::args().len() == 2 && std::env::args().nth(1).as_deref() == Some(gui::PROGRAMS_FLAG)
-    {
-        return gui::run(true);
+        return gui::run();
     }
     #[cfg(windows)]
     attach_parent_console();
