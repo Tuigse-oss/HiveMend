@@ -266,6 +266,24 @@ Monitor, Tools, Settings, and About.
   launches them.
 - The header Help link opens About, which explains the safety rules.
 
+### Keyboard and screen reader
+
+The window never needs a mouse. `Ctrl+1` through `Ctrl+9` jump to the
+first nine rail pages in order: Home, Scan, Restore, Privacy, Startup,
+Programs, Disk Space, Duplicates, and Services. `Tab` walks the sidebar
+first, then the page's buttons, then the remaining controls; `Enter` or
+`Space` presses the focused one and `Esc` backs out. Where a page moves
+through rows, `Enter` opens the highlighted one and `Backspace` goes up.
+
+Screen readers hear the same window a sighted user sees: every drawn
+button and link has a real, named control behind it, and every status
+line has a text control, all exposed through Windows UI Automation with
+their names and places. The page buttons, `Scan now`, the tick counts,
+and the message boxes all announce themselves, so a scan, a repair, and
+a restore can each be done by keyboard and hearing alone. The automated
+UI tests drive this same interface: they press the buttons by their
+accessible names and read the dialogs back.
+
 ### A tour of the window
 
 Every screenshot below is the real app on Windows 11 at 1040x720.
