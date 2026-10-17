@@ -138,12 +138,66 @@ pub fn scan_with_progress(
             && left.value == right.value
             && left.detail == right.detail
     });
+    merge_duplicates(reg, &mut findings);
     progress(chosen.len(), chosen.len(), "");
     ScanReport {
         findings,
         warnings,
         canceled: false,
     }
+}
+
+/// One row per thing to fix. Drops a finding whose repair changes the same
+/// registry key or value as another's (the same key reached through both
+/// registry views, as a WOW64 shared key is, or reported by two scanners),
+/// keeping the native path, and a finding inside a key another finding
+/// removes whole, which that removal already fixes.
+pub fn merge_duplicates(reg: &dyn Registry, findings: &mut Vec<Finding>) {
+    let target = |finding: &Finding| -> Option<(String, Option<String>, bool)> {
+        let (key, value, whole) = match &finding.repair {
+            Repair::DeleteKey { key } => (key, None, true),
+            Repair::DeleteValue { key, name } => (key, Some(name.to_ascii_lowercase()), false),
+            Repair::DeleteFile { .. } | Repair::None => return None,
+        };
+        let identity = reg.identity(key)?.to_ascii_lowercase();
+        Some((identity, value, whole))
+    };
+    let targets: Vec<_> = findings.iter().map(target).collect();
+    let removed_whole: Vec<&String> = targets
+        .iter()
+        .flatten()
+        .filter(|(_, _, whole)| *whole)
+        .map(|(identity, _, _)| identity)
+        .collect();
+    // Native paths first, so they are the ones kept.
+    let mut order: Vec<usize> = (0..findings.len()).collect();
+    order.sort_by_key(|&index| {
+        findings[index]
+            .key
+            .to_ascii_lowercase()
+            .contains("\\wow6432node\\")
+    });
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let mut keep = vec![true; findings.len()];
+    for index in order {
+        let Some((identity, value, whole)) = &targets[index] else {
+            continue;
+        };
+        let inside_removed = removed_whole.iter().any(|parent| {
+            identity.starts_with(&format!("{parent}\\")) || (!whole && identity == *parent)
+        });
+        let entry = (identity.clone(), value.clone());
+        if inside_removed || seen.contains(&entry) {
+            keep[index] = false;
+        } else {
+            seen.push(entry);
+        }
+    }
+    let mut index = 0;
+    findings.retain(|_| {
+        index += 1;
+        keep[index - 1]
+    });
 }
 
 /// The selected findings that a fresh scan still reports. Anything fixed,
@@ -608,6 +662,76 @@ mod tests {
     }
 
     #[test]
+    fn one_row_per_thing_to_fix() {
+        let native = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+        let wow =
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths";
+        let mut reg = MemoryRegistry::new();
+        // App Paths is one key in both registry views.
+        reg.aliases.push((wow.into(), native.into()));
+        let key_finding = |scanner: ScannerId, key: String| Finding {
+            scanner,
+            scanner_name: "test".into(),
+            key: key.clone(),
+            value: None,
+            detail: "missing".into(),
+            repair: Repair::DeleteKey { key },
+        };
+        let value_finding = |scanner: ScannerId, key: String, name: &str| Finding {
+            scanner,
+            scanner_name: "test".into(),
+            key: key.clone(),
+            value: Some(name.into()),
+            detail: "missing".into(),
+            repair: Repair::DeleteValue {
+                key,
+                name: name.into(),
+            },
+        };
+        let gone = format!(r"{native}\gone.exe");
+        let gone_wow = format!(r"{wow}\gone.exe");
+        let other = format!(r"{native}\other.exe");
+        let mut findings = vec![
+            // The 32-bit view's copy of the same key comes first...
+            key_finding(ScannerId::SoftwareLocations, gone_wow.clone()),
+            key_finding(ScannerId::SoftwareLocations, gone.clone()),
+            // ...a value of that key, through either view, from Deep Scan...
+            value_finding(ScannerId::DeepScan, gone_wow, ""),
+            value_finding(ScannerId::DeepScan, gone.clone(), "Path"),
+            // ...and a value of a key nothing removes, reported twice.
+            value_finding(ScannerId::DeepScan, other.clone(), ""),
+            value_finding(ScannerId::SoftwareLocations, other.clone(), ""),
+            // Report-only and file findings are left as they are.
+            Finding {
+                repair: Repair::None,
+                ..key_finding(ScannerId::RegistryIntegrity, gone.clone())
+            },
+            temp_file_finding(r"C:\Users\me\AppData\Local\Temp\old.tmp"),
+        ];
+        merge_duplicates(&reg, &mut findings);
+        let rows: Vec<(String, Option<String>, bool)> = findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.key.clone(),
+                    finding.value.clone(),
+                    finding.repairable(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                // The native path is kept.
+                (gone.clone(), None, true),
+                (other, Some(String::new()), true),
+                (gone, None, false),
+                (r"C:\Users\me\AppData\Local\Temp\old.tmp".into(), None, true),
+            ]
+        );
+    }
+
+    #[test]
     fn what_a_window_leaves_alone_is_forecast_before_repair() {
         let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
         let mut reg = MemoryRegistry::new();
@@ -657,6 +781,52 @@ mod tests {
         // Report-only findings and files are not forecast here.
         assert_eq!(left_alone_here(&reg, &report_only, true), None);
         assert_eq!(left_alone_here(&reg, &file, true), None);
+    }
+
+    #[test]
+    fn a_key_is_not_removed_where_a_restore_could_not_put_it_back() {
+        // App Paths itself is open to standard accounts; one entry in it is
+        // locked down. Removing the entry whole would need a restore to
+        // write into App Paths, which an administrator window refuses.
+        let base = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall";
+        let mut reg = MemoryRegistry::new();
+        reg.set_sz(&format!(r"{base}\Locked"), "DisplayName", "Locked");
+        reg.set_sz(&format!(r"{base}\Locked"), "DisplayIcon", r"C:\gone.ico");
+        reg.untrusted.push(base.to_string());
+        reg.trusted_exact.push(format!(r"{base}\Locked"));
+        let whole = uninstall_finding("Locked");
+        let value = Finding {
+            value: Some("DisplayIcon".into()),
+            repair: Repair::DeleteValue {
+                key: format!(r"{base}\Locked"),
+                name: "DisplayIcon".into(),
+            },
+            ..uninstall_finding("Locked")
+        };
+        assert!(matches!(
+            left_alone_here(&reg, &whole, true),
+            Some(LeftAlone::Protected(why)) if why.contains("could not put")
+        ));
+        assert_eq!(left_alone_here(&reg, &value, true), None);
+
+        let mut backup = crate::backup::test_writer("hive-mend-parent");
+        let outcome = repair(
+            &mut reg,
+            &mut MemoryFs::new(),
+            &[whole.clone(), value],
+            &mut backup,
+        )
+        .unwrap();
+        let _ = std::fs::remove_file(backup.path());
+        assert_eq!(outcome.refused_findings, vec![whole]);
+        assert_eq!(outcome.applied, 1, "{outcome:?}");
+        let names: Vec<String> = reg
+            .values(&format!(r"{base}\Locked"))
+            .unwrap()
+            .into_iter()
+            .map(|value| value.name)
+            .collect();
+        assert_eq!(names, vec!["DisplayName".to_string()]);
     }
 
     #[test]
@@ -849,6 +1019,20 @@ impl RepairOutcome {
     }
 }
 
+/// Why removing `key` whole could not be undone from this window: its
+/// parent, where a restore would re-create it, is one the window must not
+/// change. `check` is that window's trust check.
+fn parent_untrusted(check: impl Fn(&str) -> Result<(), RegError>, key: &str) -> Option<String> {
+    let key = canonical_path(key);
+    let (parent, _) = key.rsplit_once('\\')?;
+    match check(parent) {
+        Ok(()) | Err(RegError::NotFound) => None,
+        Err(RegError::Denied(why) | RegError::Message(why)) => Some(format!(
+            "{why}; a restore could not put {key} back there, so it is not removed"
+        )),
+    }
+}
+
 /// Why a window leaves a finding alone without trying to repair it.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum LeftAlone {
@@ -879,6 +1063,11 @@ pub fn left_alone_here(reg: &dyn Registry, finding: &Finding, elevated: bool) ->
     }
     if finding.per_user() {
         return Some(LeftAlone::NormalWindow);
+    }
+    if matches!(finding.repair, Repair::DeleteKey { .. })
+        && let Some(why) = parent_untrusted(|parent| reg.check_trusted(parent), key)
+    {
+        return Some(LeftAlone::Protected(why));
     }
     match reg.check_trusted(key) {
         Ok(()) | Err(RegError::NotFound) => None,
@@ -1073,6 +1262,12 @@ pub(crate) fn delete_in_transaction(
         ));
     }
     let mut tx = reg.begin()?;
+    // A restore re-creates a removed key inside its parent and refuses a
+    // parent this window must not change, so such a key is not removed:
+    // every repair stays one a restore can undo.
+    if tree && let Some(why) = parent_untrusted(|parent| tx.require_trusted(parent), key) {
+        return Ok(Deleted::Untrusted(why));
+    }
     let mut touched = Vec::new();
     let mut untrusted = None;
     match touch_all(&mut *tx, key, tree, 0, &mut touched, &mut untrusted) {

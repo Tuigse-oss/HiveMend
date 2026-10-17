@@ -79,7 +79,9 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
     WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
-use windows_sys::Win32::UI::WindowsAndMessaging::{WM_ENDSESSION, WM_QUERYENDSESSION};
+use windows_sys::Win32::UI::WindowsAndMessaging::{
+    BN_KILLFOCUS, BN_SETFOCUS, WM_ENDSESSION, WM_KEYDOWN, WM_QUERYENDSESSION,
+};
 
 const WM_JOB_PROGRESS: u32 = WM_APP + 1;
 const WM_JOB_DONE: u32 = WM_APP + 2;
@@ -91,6 +93,19 @@ const WM_REDO: u32 = WM_APP + 4;
 const WM_MENU_PICKED: u32 = WM_APP + 5;
 /// The backup list was read in the background.
 const WM_BACKUPS_READY: u32 = WM_APP + 6;
+/// Ctrl+1 to Ctrl+9: go to that sidebar page (wParam is the NAV index).
+const WM_SHORTCUT: u32 = WM_APP + 7;
+
+/// Stand-ins that make the drawn parts of the window reachable by keyboard,
+/// screen readers, and UI automation: a real, named control over each drawn
+/// button or link, and a static control over each drawn status line. Each
+/// has an empty window region, so it draws nothing and takes no mouse
+/// clicks, but it can be focused with Tab, pressed with Enter or Space, and
+/// reports its name and place. See [`App::sync_access`].
+const ID_ACCESS_BASE: u16 = 3000;
+const ACCESS_POOL: usize = 64;
+const ID_TEXT_BASE: u16 = 3100;
+const TEXT_POOL: usize = 16;
 
 // Control ids. 1 and 2 are IDOK and IDCANCEL, which IsDialogMessage sends for
 // Enter and Esc.
@@ -321,6 +336,8 @@ impl Action {
 struct HotSpot {
     rect: RECT,
     action: Action,
+    /// What it says, for keyboard and screen-reader users.
+    name: String,
 }
 
 enum JobResult {
@@ -503,6 +520,14 @@ struct App {
     /// Anti-aliased corner sprites for rounded boxes, by radius and colours.
     corners: HashMap<(i32, u32, u32, i32, u32), HBITMAP>,
     hotspots: Vec<HotSpot>,
+    /// Stand-in buttons for `hotspots`, in the same order, and what each
+    /// was last set to (name, place, enabled) or `None` when hidden.
+    access: Vec<HWND>,
+    access_shown: Vec<Option<(String, Edges, bool)>>,
+    /// Status lines drawn in the last paint, and their stand-in statics.
+    texts: std::cell::RefCell<Vec<(RECT, String)>>,
+    text_ctls: Vec<HWND>,
+    text_shown: Vec<Option<(String, Edges)>>,
     hover: Option<usize>,
     tracking: bool,
     elevated: bool,
@@ -669,6 +694,16 @@ pub fn run(open_programs: bool) -> std::process::ExitCode {
         SendMessageW(hwnd, WM_SETICON, ICON_SMALL as usize, small as isize);
         let mut msg: MSG = std::mem::zeroed();
         while GetMessageW(&mut msg, std::ptr::null_mut(), 0, 0) > 0 {
+            // Ctrl+1 to Ctrl+9 open the first nine sidebar pages.
+            if msg.message == WM_KEYDOWN
+                && windows_sys::Win32::UI::Input::KeyboardAndMouse::GetKeyState(
+                    windows_sys::Win32::UI::Input::KeyboardAndMouse::VK_CONTROL as i32,
+                ) < 0
+                && (0x31..=0x39).contains(&msg.wParam)
+            {
+                PostMessageW(hwnd, WM_SHORTCUT, msg.wParam - 0x31, 0);
+                continue;
+            }
             if IsDialogMessageW(hwnd, &msg) == 0 {
                 TranslateMessage(&msg);
                 DispatchMessageW(&msg);
@@ -851,6 +886,12 @@ unsafe extern "system" fn wnd_proc(
                 }
                 0
             }
+            WM_SHORTCUT => {
+                if let Some((_, page, _)) = NAV.get(wparam) {
+                    app.go(*page);
+                }
+                0
+            }
             WM_MENU_PICKED => {
                 if let Some(picked) = lock(&PICKED).pop_front() {
                     app.menu_picked(picked);
@@ -924,6 +965,7 @@ fn app_handles(msg: u32) -> bool {
             | WM_BACKUPS_READY
             | WM_REDO
             | WM_MENU_PICKED
+            | WM_SHORTCUT
             | WM_CLOSE
             | WM_QUERYENDSESSION
             | WM_ENDSESSION
@@ -1153,6 +1195,11 @@ impl App {
             art: HashMap::new(),
             corners: HashMap::new(),
             hotspots: Vec::new(),
+            access: Vec::new(),
+            access_shown: Vec::new(),
+            texts: std::cell::RefCell::new(Vec::new()),
+            text_ctls: Vec::new(),
+            text_shown: Vec::new(),
             hover: None,
             tracking: false,
             elevated,
@@ -1265,6 +1312,16 @@ impl App {
 
     fn create_controls(&mut self) {
         let hwnd = self.hwnd;
+        // Created first, so the Tab order starts with them: the sidebar,
+        // then the page's drawn buttons, then its ordinary controls.
+        self.access = (0..ACCESS_POOL)
+            .map(|i| stand_in(hwnd, "BUTTON", ID_ACCESS_BASE + i as u16, true))
+            .collect();
+        self.access_shown = vec![None; ACCESS_POOL];
+        self.text_ctls = (0..TEXT_POOL)
+            .map(|i| stand_in(hwnd, "STATIC", ID_TEXT_BASE + i as u16, false))
+            .collect();
+        self.text_shown = vec![None; TEXT_POOL];
         self.list = list_view(
             hwnd,
             ID_FINDINGS,
@@ -1668,6 +1725,18 @@ impl App {
 
     fn command(&mut self, id: u16, code: u16) {
         const BN_CLICKED: u16 = 0;
+        if (ID_ACCESS_BASE..ID_ACCESS_BASE + ACCESS_POOL as u16).contains(&id) {
+            let index = (id - ID_ACCESS_BASE) as usize;
+            match code as u32 {
+                BN_SETFOCUS | BN_KILLFOCUS => self.invalidate(),
+                _ if code == BN_CLICKED && self.spot_enabled(index) => {
+                    let action = self.hotspots[index].action;
+                    self.perform(action);
+                }
+                _ => {}
+            }
+            return;
+        }
         if (ID_SCANNER_BASE..ID_SCANNER_BASE + SCANNERS.len() as u16).contains(&id) {
             if code == BN_CLICKED {
                 let index = (id - ID_SCANNER_BASE) as usize;
@@ -5638,7 +5707,9 @@ impl App {
                 .hover
                 .and_then(|i| self.hotspots.get(i))
                 .map(|s| s.rect);
+            let focused = self.focused_spot();
             self.hotspots.clear();
+            self.texts.borrow_mut().clear();
             fill(mem, rect, BG);
             self.draw_chrome(mem, rect, previous_hover);
             match self.page {
@@ -5659,16 +5730,122 @@ impl App {
             if let Some(prev) = previous_hover {
                 self.hover = self.hotspots.iter().position(|spot| same(spot.rect, prev));
             }
+            // Where the keyboard is: a focus outline around that button.
+            if let Some(spot) = focused.and_then(|index| self.hotspots.get(index)) {
+                let gap = self.s(3);
+                let ring = RECT {
+                    left: spot.rect.left - gap,
+                    top: spot.rect.top - gap,
+                    right: spot.rect.right + gap,
+                    bottom: spot.rect.bottom + gap,
+                };
+                windows_sys::Win32::Graphics::Gdi::DrawFocusRect(mem, &ring);
+            }
             BitBlt(hdc, 0, 0, rect.right, rect.bottom, mem, 0, 0, SRCCOPY);
             SelectObject(mem, old);
             DeleteObject(bitmap);
             DeleteDC(mem);
             EndPaint(self.hwnd, &ps);
         }
+        self.sync_access();
     }
 
-    fn spot(&mut self, rect: RECT, action: Action) {
-        self.hotspots.push(HotSpot { rect, action });
+    fn spot(&mut self, rect: RECT, action: Action, name: &str) {
+        self.hotspots.push(HotSpot {
+            rect,
+            action,
+            name: name.to_string(),
+        });
+    }
+
+    /// Record a drawn status line for screen readers and UI automation.
+    fn say(&self, rect: RECT, line: &str) {
+        if !line.is_empty() {
+            self.texts.borrow_mut().push((rect, line.to_string()));
+        }
+    }
+
+    /// Point the stand-in controls at what the last paint drew: one button
+    /// per hotspot, one static per status line, the rest hidden. Only what
+    /// changed is touched, so this settles after one pass.
+    fn sync_access(&mut self) {
+        use windows_sys::Win32::UI::Input::KeyboardAndMouse::{EnableWindow, GetFocus, SetFocus};
+        use windows_sys::Win32::UI::WindowsAndMessaging::{
+            SW_HIDE, SWP_NOACTIVATE, SWP_NOZORDER, SWP_SHOWWINDOW, SetWindowPos, SetWindowTextW,
+            ShowWindow,
+        };
+        let place = |control: HWND, (left, top, right, bottom): Edges| unsafe {
+            SetWindowPos(
+                control,
+                std::ptr::null_mut(),
+                left,
+                top,
+                right - left,
+                bottom - top,
+                SWP_NOZORDER | SWP_NOACTIVATE | SWP_SHOWWINDOW,
+            );
+        };
+        let focus = unsafe { GetFocus() };
+        let mut lost_focus = false;
+        for (index, &control) in self.access.iter().enumerate() {
+            let want = self.hotspots.get(index).map(|spot| {
+                let mut name = spot.name.clone();
+                if matches!(spot.action, Action::Page(page) if page == self.page) {
+                    name.push_str(", current page");
+                }
+                (name, edges(spot.rect), self.spot_enabled(index))
+            });
+            if want == self.access_shown[index] {
+                continue;
+            }
+            unsafe {
+                match &want {
+                    Some((name, rect, enabled)) => {
+                        SetWindowTextW(control, wide(name).as_ptr());
+                        EnableWindow(control, *enabled as i32);
+                        place(control, *rect);
+                        lost_focus |= control == focus && !*enabled;
+                    }
+                    None => {
+                        ShowWindow(control, SW_HIDE);
+                        lost_focus |= control == focus;
+                    }
+                }
+            }
+            self.access_shown[index] = want;
+        }
+        let texts = self.texts.borrow().clone();
+        for (index, &control) in self.text_ctls.iter().enumerate() {
+            let want = texts
+                .get(index)
+                .map(|(rect, line)| (line.clone(), edges(*rect)));
+            if want == self.text_shown[index] {
+                continue;
+            }
+            unsafe {
+                match &want {
+                    Some((line, rect)) => {
+                        SetWindowTextW(control, wide(line).as_ptr());
+                        place(control, *rect);
+                    }
+                    None => {
+                        ShowWindow(control, SW_HIDE);
+                    }
+                }
+            }
+            self.text_shown[index] = want;
+        }
+        // Focus on a stand-in that went away returns to the window, so the
+        // keyboard is never stranded on nothing.
+        if lost_focus {
+            unsafe { SetFocus(self.hwnd) };
+        }
+    }
+
+    /// The stand-in button that has keyboard focus, as a hotspot index.
+    fn focused_spot(&self) -> Option<usize> {
+        let focus = unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetFocus() };
+        self.access.iter().position(|&control| control == focus)
     }
 
     unsafe fn draw_chrome(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
@@ -5725,7 +5902,7 @@ impl App {
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
         );
-        self.spot(help, Action::Page(Page::About));
+        self.spot(help, Action::Page(Page::About), "Help");
         let right_edge = help.left - self.s(20);
         if self.elevated {
             let label = "Administrator";
@@ -5772,7 +5949,7 @@ impl App {
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
             );
-            self.spot(link, Action::Elevate);
+            self.spot(link, Action::Elevate, label);
         }
 
         // The navigation rail: icon and label per page; the open page gets
@@ -5850,7 +6027,7 @@ impl App {
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS,
             );
-            self.spot(item, Action::Page(*page));
+            self.spot(item, Action::Page(*page), label);
             y += self.s(40);
         }
         if self.busy() {
@@ -5989,6 +6166,19 @@ impl App {
         let left = self.s(CONTENT_X);
         let top = self.s(TITLE_Y);
         let size = measure(hdc, self.fonts.title, title);
+        let spoken = match accent {
+            Some(accent) => format!("{title} {accent}"),
+            None => title.to_string(),
+        };
+        self.say(
+            RECT {
+                left,
+                top,
+                right: rect.right,
+                bottom: top + self.s(40),
+            },
+            &spoken,
+        );
         text(
             hdc,
             self.fonts.title,
@@ -6023,6 +6213,15 @@ impl App {
     unsafe fn subtitle(&self, hdc: HDC, rect: RECT, line: &str) {
         let left = self.s(CONTENT_X);
         let top = self.s(SUBTITLE_Y);
+        self.say(
+            RECT {
+                left,
+                top,
+                right: rect.right - self.s(24),
+                bottom: top + self.s(26),
+            },
+            line,
+        );
         text(
             hdc,
             self.fonts.body,
@@ -6117,18 +6316,27 @@ impl App {
             &headline,
             DT_SINGLELINE | DT_END_ELLIPSIS,
         );
+        let detail_rect = RECT {
+            left: text_left,
+            top: banner.top + self.s(64),
+            right: button.left - self.s(16),
+            bottom: banner.bottom - self.s(12),
+        };
         text(
             hdc,
             self.fonts.body,
             MUTED,
-            RECT {
-                left: text_left,
-                top: banner.top + self.s(64),
-                right: button.left - self.s(16),
-                bottom: banner.bottom - self.s(12),
-            },
+            detail_rect,
             &detail,
             DT_WORDBREAK | DT_END_ELLIPSIS,
+        );
+        // Read as one line: the status, then what it means.
+        self.say(
+            RECT {
+                top: banner.top + self.s(24),
+                ..detail_rect
+            },
+            &format!("{headline}. {detail}"),
         );
         let disabled = self.busy();
         let button_lit = !disabled && lit(hover, button);
@@ -6148,7 +6356,7 @@ impl App {
             "Scan now",
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
         );
-        self.spot(button, Action::ScanAll);
+        self.spot(button, Action::ScanAll, "Scan now");
         y = banner.bottom + self.s(22);
 
         // Tools grid.
@@ -6225,7 +6433,7 @@ impl App {
                 label,
                 DT_SINGLELINE | DT_CENTER | DT_END_ELLIPSIS,
             );
-            self.spot(tile, action);
+            self.spot(tile, action, label);
         }
         y += tile_h * 3 + gap * 2 + self.s(18);
 
@@ -6289,7 +6497,7 @@ impl App {
                     ACCENT_GREEN_HOVER,
                 );
             }
-            self.spot(link, action);
+            self.spot(link, action, label);
             x = link.right + self.s(20);
         }
     }
@@ -6611,7 +6819,7 @@ impl App {
             label,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
         );
-        self.spot(tab, action);
+        self.spot(tab, action, label);
         tab.right + self.s(8)
     }
 
@@ -6688,7 +6896,7 @@ impl App {
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
             );
-            self.spot(tab, Action::SvcView(view));
+            self.spot(tab, Action::SvcView(view), label);
             x = tab.right + self.s(8);
         }
         let hint = match self.svc_view {
@@ -6769,19 +6977,21 @@ impl App {
                     "After the scan you choose what to repair. Every repair saves a backup first, so it can be undone on the Restore page.",
                 );
                 if !self.scan_note.is_empty() {
+                    let note = RECT {
+                        left,
+                        top: self.s(BODY_Y + 180),
+                        right,
+                        bottom: self.s(BODY_Y + 206),
+                    };
                     text(
                         hdc,
                         self.fonts.body,
                         MUTED,
-                        RECT {
-                            left,
-                            top: self.s(BODY_Y + 180),
-                            right,
-                            bottom: self.s(BODY_Y + 206),
-                        },
+                        note,
                         &self.scan_note,
                         DT_SINGLELINE,
                     );
+                    self.say(note, &self.scan_note);
                 }
             }
             _ => {
@@ -6789,7 +6999,7 @@ impl App {
                 let line = if self.findings.is_empty() {
                     "Your registry is clean. There is nothing to repair.".to_string()
                 } else if self.scan_note.is_empty() {
-                    format!("{} problems found.", self.findings.len())
+                    format!("{} problems found.", self.finding_counts().0)
                 } else {
                     self.scan_note.clone()
                 };
@@ -7174,7 +7384,7 @@ impl App {
                 LINK,
             );
         }
-        self.spot(link, Action::Refresh);
+        self.spot(link, Action::Refresh, label);
     }
 
     /// Label, value line, and usage bar. Returns the y below the meter.
@@ -7332,7 +7542,7 @@ impl App {
                 tool.description,
                 DT_SINGLELINE | DT_END_ELLIPSIS,
             );
-            self.spot(tile, Action::OpenTool(index));
+            self.spot(tile, Action::OpenTool(index), tool.name);
         }
     }
 
@@ -7841,6 +8051,46 @@ fn delete_fonts(fonts: &Fonts) {
         fonts.small,
     ] {
         unsafe { DeleteObject(font) };
+    }
+}
+
+/// A rectangle as comparable numbers: left, top, right, bottom.
+type Edges = (i32, i32, i32, i32);
+
+fn edges(rect: RECT) -> Edges {
+    (rect.left, rect.top, rect.right, rect.bottom)
+}
+
+/// A stand-in control (see [`ID_ACCESS_BASE`]): hidden until placed, and
+/// with an empty window region so it never draws or takes mouse input.
+fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
+    use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
+    use windows_sys::Win32::UI::WindowsAndMessaging::{BS_NOTIFY, BS_PUSHBUTTON};
+    // SS_NOPREFIX: show "&" as itself in a status line.
+    const SS_NOPREFIX: u32 = 0x80;
+    let style = if button {
+        WS_TABSTOP | (BS_PUSHBUTTON | BS_NOTIFY) as u32
+    } else {
+        SS_NOPREFIX
+    };
+    unsafe {
+        let control = CreateWindowExW(
+            0,
+            wide(class).as_ptr(),
+            std::ptr::null(),
+            WS_CHILD | style,
+            0,
+            0,
+            0,
+            0,
+            parent,
+            id as usize as HMENU,
+            GetModuleHandleW(std::ptr::null()),
+            std::ptr::null(),
+        );
+        // The window owns the region from here on.
+        SetWindowRgn(control, CreateRectRgn(0, 0, 0, 0), 0);
+        control
     }
 }
 

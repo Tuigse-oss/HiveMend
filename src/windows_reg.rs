@@ -356,6 +356,11 @@ impl Registry for WindowsRegistry {
         require_trusted_key(key)
     }
 
+    fn identity(&self, path: &str) -> Option<String> {
+        let opened = open(path, false).ok()?;
+        key_name(opened.key)
+    }
+
     fn delete_tree(&mut self, path: &str) -> Result<(), RegError> {
         delete_tree_checked(path, None)
     }
