@@ -181,6 +181,12 @@ def run(app):
     assert user[3] == "Fix from Hivemend without administrator rights", user
     _, _, default = app.row_for("hivemend-ci-default")
     print("   default permissions:", default)
+    # Windows lets standard accounts' sessions change App Paths by default,
+    # so an administrator window leaves it alone.
+    assert default[3] == "Protected, left alone (information)", default
+    for marker in ["hivemend-ci-user", "hivemend-ci-default", "hivemend-ci-fixable"]:
+        rows = [cells for _, cells in app.findings()[1] if any(marker in c for c in cells)]
+        assert len(rows) == 1, f"{marker} is listed {len(rows)} times: {rows}"
     _, fixable_row, fixable = app.row_for("hivemend-ci-fixable")
     print("   admin-only:", fixable)
     assert fixable[3].startswith("Delete key"), fixable

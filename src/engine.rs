@@ -138,12 +138,66 @@ pub fn scan_with_progress(
             && left.value == right.value
             && left.detail == right.detail
     });
+    merge_duplicates(reg, &mut findings);
     progress(chosen.len(), chosen.len(), "");
     ScanReport {
         findings,
         warnings,
         canceled: false,
     }
+}
+
+/// One row per thing to fix. Drops a finding whose repair changes the same
+/// registry key or value as another's (the same key reached through both
+/// registry views, as a WOW64 shared key is, or reported by two scanners),
+/// keeping the native path, and a finding inside a key another finding
+/// removes whole, which that removal already fixes.
+pub fn merge_duplicates(reg: &dyn Registry, findings: &mut Vec<Finding>) {
+    let target = |finding: &Finding| -> Option<(String, Option<String>, bool)> {
+        let (key, value, whole) = match &finding.repair {
+            Repair::DeleteKey { key } => (key, None, true),
+            Repair::DeleteValue { key, name } => (key, Some(name.to_ascii_lowercase()), false),
+            Repair::DeleteFile { .. } | Repair::None => return None,
+        };
+        let identity = reg.identity(key)?.to_ascii_lowercase();
+        Some((identity, value, whole))
+    };
+    let targets: Vec<_> = findings.iter().map(target).collect();
+    let removed_whole: Vec<&String> = targets
+        .iter()
+        .flatten()
+        .filter(|(_, _, whole)| *whole)
+        .map(|(identity, _, _)| identity)
+        .collect();
+    // Native paths first, so they are the ones kept.
+    let mut order: Vec<usize> = (0..findings.len()).collect();
+    order.sort_by_key(|&index| {
+        findings[index]
+            .key
+            .to_ascii_lowercase()
+            .contains("\\wow6432node\\")
+    });
+    let mut seen: Vec<(String, Option<String>)> = Vec::new();
+    let mut keep = vec![true; findings.len()];
+    for index in order {
+        let Some((identity, value, whole)) = &targets[index] else {
+            continue;
+        };
+        let inside_removed = removed_whole.iter().any(|parent| {
+            identity.starts_with(&format!("{parent}\\")) || (!whole && identity == *parent)
+        });
+        let entry = (identity.clone(), value.clone());
+        if inside_removed || seen.contains(&entry) {
+            keep[index] = false;
+        } else {
+            seen.push(entry);
+        }
+    }
+    let mut index = 0;
+    findings.retain(|_| {
+        index += 1;
+        keep[index - 1]
+    });
 }
 
 /// The selected findings that a fresh scan still reports. Anything fixed,
@@ -605,6 +659,76 @@ mod tests {
         let parsed = parse_backup(&cut).unwrap();
         assert!(parsed.cut_off);
         assert!(parsed.ops.iter().any(|op| op.key().ends_with("Other")));
+    }
+
+    #[test]
+    fn one_row_per_thing_to_fix() {
+        let native = r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths";
+        let wow =
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\App Paths";
+        let mut reg = MemoryRegistry::new();
+        // App Paths is one key in both registry views.
+        reg.aliases.push((wow.into(), native.into()));
+        let key_finding = |scanner: ScannerId, key: String| Finding {
+            scanner,
+            scanner_name: "test".into(),
+            key: key.clone(),
+            value: None,
+            detail: "missing".into(),
+            repair: Repair::DeleteKey { key },
+        };
+        let value_finding = |scanner: ScannerId, key: String, name: &str| Finding {
+            scanner,
+            scanner_name: "test".into(),
+            key: key.clone(),
+            value: Some(name.into()),
+            detail: "missing".into(),
+            repair: Repair::DeleteValue {
+                key,
+                name: name.into(),
+            },
+        };
+        let gone = format!(r"{native}\gone.exe");
+        let gone_wow = format!(r"{wow}\gone.exe");
+        let other = format!(r"{native}\other.exe");
+        let mut findings = vec![
+            // The 32-bit view's copy of the same key comes first...
+            key_finding(ScannerId::SoftwareLocations, gone_wow.clone()),
+            key_finding(ScannerId::SoftwareLocations, gone.clone()),
+            // ...a value of that key, through either view, from Deep Scan...
+            value_finding(ScannerId::DeepScan, gone_wow, ""),
+            value_finding(ScannerId::DeepScan, gone.clone(), "Path"),
+            // ...and a value of a key nothing removes, reported twice.
+            value_finding(ScannerId::DeepScan, other.clone(), ""),
+            value_finding(ScannerId::SoftwareLocations, other.clone(), ""),
+            // Report-only and file findings are left as they are.
+            Finding {
+                repair: Repair::None,
+                ..key_finding(ScannerId::RegistryIntegrity, gone.clone())
+            },
+            temp_file_finding(r"C:\Users\me\AppData\Local\Temp\old.tmp"),
+        ];
+        merge_duplicates(&reg, &mut findings);
+        let rows: Vec<(String, Option<String>, bool)> = findings
+            .iter()
+            .map(|finding| {
+                (
+                    finding.key.clone(),
+                    finding.value.clone(),
+                    finding.repairable(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            rows,
+            vec![
+                // The native path is kept.
+                (gone.clone(), None, true),
+                (other, Some(String::new()), true),
+                (gone, None, false),
+                (r"C:\Users\me\AppData\Local\Temp\old.tmp".into(), None, true),
+            ]
+        );
     }
 
     #[test]

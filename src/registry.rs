@@ -45,6 +45,12 @@ pub trait Registry {
         let _ = key;
         Ok(())
     }
+    /// The key's identity: one name for every path that opens the same key,
+    /// such as a WOW64 shared key reached through `WOW6432Node`. `None`
+    /// when it cannot be opened.
+    fn identity(&self, path: &str) -> Option<String> {
+        Some(canonical_path(path))
+    }
 }
 
 /// A registry transaction. Its reads see its own changes; nothing it writes
@@ -126,6 +132,9 @@ pub struct MemoryRegistry {
     /// Test hook: keys (and everything below) that programs running without
     /// elevation could change, which an administrator transaction refuses.
     pub untrusted: Vec<String>,
+    /// Test hook: path prefixes that open another key, as WOW64 shared keys
+    /// do (`from`, `to`).
+    pub aliases: Vec<(String, String)>,
 }
 
 impl MemoryRegistry {
@@ -264,6 +273,19 @@ impl Registry for MemoryRegistry {
 
     fn check_trusted(&self, key: &str) -> Result<(), RegError> {
         memory_trusted(&self.untrusted, key)
+    }
+
+    fn identity(&self, path: &str) -> Option<String> {
+        let path = canonical_path(path);
+        let lower = path.to_ascii_lowercase();
+        for (from, to) in &self.aliases {
+            let from = canonical_path(from);
+            let prefix = from.to_ascii_lowercase();
+            if lower == prefix || lower.starts_with(&format!("{prefix}\\")) {
+                return Some(format!("{}{}", canonical_path(to), &path[from.len()..]));
+            }
+        }
+        Some(path)
     }
 }
 
