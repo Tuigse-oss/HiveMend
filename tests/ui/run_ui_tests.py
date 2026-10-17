@@ -53,10 +53,15 @@ def wait_for(what, check, timeout=60.0, every=0.5):
         time.sleep(every)
 
 
-def powershell(command):
-    return subprocess.check_output(
-        ["powershell", "-NoProfile", "-NonInteractive", "-Command", command], text=True
-    ).strip()
+def powershell(command, timeout=120.0):
+    try:
+        return subprocess.check_output(
+            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+            text=True,
+            timeout=timeout,
+        ).strip()
+    except subprocess.TimeoutExpired:
+        raise AssertionError(f"powershell hung for {timeout:.0f} s: {command[:80]}...")
 
 
 def key_exists(hive, path):
@@ -75,10 +80,14 @@ class Hivemend:
             self.pid = subprocess.Popen([exe]).pid
         else:
             # Starts on this desktop as the other account, with its profile
-            # (and so its own part of the registry) loaded.
+            # (and so its own part of the registry) loaded. The password is
+            # folded into a SecureString with plain .NET calls because the
+            # ConvertTo-SecureString cmdlet fails to load on some machines
+            # (CouldNotAutoloadMatchingModule), which then hung the suite.
             self.pid = int(powershell(
-                f"$c = New-Object Management.Automation.PSCredential('{user}', "
-                f"(ConvertTo-SecureString $env:HM_TEST_PASSWORD -AsPlainText -Force)); "
+                f"$s = New-Object Security.SecureString; "
+                f"$env:HM_TEST_PASSWORD.ToCharArray() | ForEach-Object {{ $s.AppendChar($_) }}; "
+                f"$c = New-Object Management.Automation.PSCredential('{user}', $s); "
                 f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
                 f"-WorkingDirectory '{os.path.dirname(exe)}' -PassThru).Id"
             ))
