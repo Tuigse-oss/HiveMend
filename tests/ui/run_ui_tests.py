@@ -86,7 +86,7 @@ class Hivemend:
             before = set(powershell(
                 f"(Get-Process {name} -ErrorAction SilentlyContinue).Id"
             ).split())
-            powershell(f'runas /trustlevel:0x20000 "\\"{exe}\\""')
+            powershell(f'runas /trustlevel:0x20000 "{exe}"')
             def visible():
                 for pid in powershell(
                     f"(Get-Process {name} -ErrorAction SilentlyContinue | "
