@@ -71,14 +71,24 @@ def wait_for(what, check, timeout=60.0, every=0.5):
 
 
 def powershell(command, timeout=120.0):
+    proc = subprocess.Popen(
+        ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
+        stdout=subprocess.PIPE,
+        text=True,
+    )
     try:
-        return subprocess.check_output(
-            ["powershell", "-NoProfile", "-NonInteractive", "-Command", command],
-            text=True,
-            timeout=timeout,
-        ).strip()
+        out, _ = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
+        # Never drain the pipe after killing: a launched child may have
+        # inherited it and keep it open forever, which would hang the
+        # second read past every timeout with no output at all.
+        proc.kill()
+        proc.stdout.close()
+        proc.wait()
         raise AssertionError(f"powershell hung for {timeout:.0f} s: {command[:80]}...")
+    if proc.returncode != 0:
+        raise subprocess.CalledProcessError(proc.returncode, command, output=out)
+    return out.strip()
 
 
 def key_exists(hive, path):
@@ -106,8 +116,13 @@ class Hivemend:
                 f"$s = New-Object Security.SecureString; "
                 f"$env:HM_TEST_PASSWORD.ToCharArray() | ForEach-Object {{ $s.AppendChar($_) }}; "
                 f"$c = New-Object Management.Automation.PSCredential('{user}', $s); "
+                # The launched window must not inherit this pipe: it would
+                # stay open after powershell exits and hang the read above
+                # forever, past every timeout, with no output at all.
                 f"(Start-Process '{exe}' -Credential $c -LoadUserProfile "
-                f"-WorkingDirectory '{os.path.dirname(exe)}' -PassThru).Id"
+                f"-WorkingDirectory '{os.path.dirname(exe)}' "
+                f"-RedirectStandardOutput 'NUL' -RedirectStandardError 'NUL' "
+                f"-PassThru).Id"
             ))
             log(f"launched pid {self.pid}; waiting for its window on this desktop")
             # The new process must own a window on THIS desktop: on another
