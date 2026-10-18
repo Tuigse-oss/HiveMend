@@ -301,9 +301,7 @@ fn machine_default_at(
         // A plain window trusts the installer path and reads it directly.
         let subkey = wide(path);
         let mut key = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key)
-        };
+        let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
         if status != 0 || key.is_null() {
             return None;
         }
@@ -313,9 +311,7 @@ fn machine_default_at(
         }
         return mode;
     }
-    let Some(leaf) = open_validated_chain(root, path) else {
-        return None;
-    };
+    let leaf = open_validated_chain(root, path)?;
     let mode = read_theme_value(leaf);
     unsafe {
         RegCloseKey(leaf);
@@ -378,43 +374,6 @@ fn key_is_link(key: windows_sys::Win32::System::Registry::HKEY) -> Result<bool, 
         return Err(status);
     }
     Ok(info[1] & REG_FLAG_LINK != 0)
-}
-
-/// Whether the named child of an open parent is a link, opened without
-/// following it. A missing child is not a link; any other failure to
-/// determine is an error, never a trusted `false`: the caller refuses
-/// whatever it cannot verify.
-#[cfg(windows)]
-fn component_is_link(
-    parent: windows_sys::Win32::System::Registry::HKEY,
-    name: &str,
-) -> Result<bool, u32> {
-    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
-    use windows_sys::Win32::System::Registry::{
-        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
-    };
-    let child = wide(name);
-    let mut key = std::ptr::null_mut();
-    let opened = unsafe {
-        RegOpenKeyExW(
-            parent,
-            child.as_ptr(),
-            REG_OPTION_OPEN_LINK,
-            KEY_QUERY_VALUE,
-            &mut key,
-        )
-    };
-    if opened != 0 || key.is_null() {
-        if opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND {
-            return Ok(false);
-        }
-        return Err(opened);
-    }
-    let link = key_is_link(key).map_err(|status| status as u32);
-    unsafe {
-        RegCloseKey(key);
-    }
-    link
 }
 
 /// Open the leaf of `path` under `root` for an elevated trust check.
@@ -9704,7 +9663,12 @@ mod tests {
     /// bug read the mask one byte in; only a live descriptor catches that.
     #[cfg(windows)]
     unsafe fn acl_for(entries: &[(i32, u32, bool)]) -> Vec<u8> {
-        acl_for_ex(&entries.iter().map(|(k, m, a)| (*k, *m, *a, 0u32)).collect::<Vec<_>>())
+        acl_for_ex(
+            &entries
+                .iter()
+                .map(|(k, m, a)| (*k, *m, *a, 0u32))
+                .collect::<Vec<_>>(),
+        )
     }
 
     /// Like [`acl_for`], with explicit ACE flags per entry (for example
@@ -9984,9 +9948,8 @@ mod tests {
             return None;
         }
         let bytes = buffer[0] as usize;
-        let units = unsafe {
-            std::slice::from_raw_parts(buffer.as_ptr().add(1) as *const u16, bytes / 2)
-        };
+        let units =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(1) as *const u16, bytes / 2) };
         String::from_utf16(units).ok()
     }
 
@@ -10147,7 +10110,8 @@ mod tests {
     ) -> windows_sys::Win32::System::Registry::HKEY {
         use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegOpenKeyExW};
         let mut key = std::ptr::null_mut();
-        let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, access, &mut key) };
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, access, &mut key) };
         assert_eq!(status, 0, "opening fixture {path} failed");
         assert!(!key.is_null());
         key
@@ -10193,6 +10157,44 @@ mod tests {
         unsafe {
             RegCloseKey(key);
         }
+    }
+
+    /// Whether the named child of an open parent is a link, opened
+    /// without following it. A missing child is not a link; any other
+    /// failure to determine is an error, never a trusted `false` (the
+    /// production chain refuses whatever it cannot verify). Test-only:
+    /// the chain inlines its own opens because it keeps the handles.
+    #[cfg(windows)]
+    fn component_is_link(
+        parent: windows_sys::Win32::System::Registry::HKEY,
+        name: &str,
+    ) -> Result<bool, u32> {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+        use windows_sys::Win32::System::Registry::{
+            KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+        };
+        let child = wide(name);
+        let mut key = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                child.as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
+        if opened != 0 || key.is_null() {
+            if opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND {
+                return Ok(false);
+            }
+            return Err(opened);
+        }
+        let link = key_is_link(key).map_err(|status| status as u32);
+        unsafe {
+            RegCloseKey(key);
+        }
+        link
     }
 
     /// The link probe distinguishes three states: a link, a verifiable
@@ -10241,9 +10243,8 @@ mod tests {
         let denied_leaf = denied_path.rsplit_once('\\').unwrap().1.to_string();
         const WRITE_DAC: u32 = 0x0004_0000;
         const READ_CONTROL: u32 = 0x0002_0000;
-        let held = unsafe {
-            open_fixture_key(&denied_path, KEY_QUERY_VALUE | READ_CONTROL | WRITE_DAC)
-        };
+        let held =
+            unsafe { open_fixture_key(&denied_path, KEY_QUERY_VALUE | READ_CONTROL | WRITE_DAC) };
         unsafe {
             use windows_sys::Win32::Security::WinBuiltinUsersSid;
             const GENERIC_ALL: u32 = 0x1000_0000;
@@ -10306,8 +10307,7 @@ mod tests {
             REG_OPTION_CREATE_LINK, REG_OPTION_VOLATILE, RegCloseKey, RegCreateKeyExW,
             RegSetValueExW,
         };
-        let native =
-            unsafe { kernel_key_name(target) }.expect("kernel name for the link target");
+        let native = unsafe { kernel_key_name(target) }.expect("kernel name for the link target");
         // Length-delimited, no terminator: MS-RRP requires the target
         // object name without a trailing NUL.
         let units: Vec<u16> = native.encode_utf16().collect();
@@ -10357,9 +10357,8 @@ mod tests {
     unsafe fn link_resolves(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
         use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
         let mut probe = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut probe)
-        };
+        let status =
+            unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut probe) };
         if status == 0 && !probe.is_null() {
             unsafe {
                 RegCloseKey(probe);
@@ -10392,7 +10391,9 @@ mod tests {
             lock_fixture_store(&format!(r"Software\HivemendAncTarget{pid}"));
             lock_fixture_store(&target_leaf);
         }
-        guard.targets.push(format!(r"Software\HivemendAncTarget{pid}"));
+        guard
+            .targets
+            .push(format!(r"Software\HivemendAncTarget{pid}"));
         // The stepping-stone parent is an ordinary key.
         let stone = format!(r"Software\HivemendAncStone{pid}");
         unsafe { fixture_theme_key(&format!("HivemendAncStone{pid}"), "dark") };
@@ -10502,7 +10503,10 @@ mod tests {
         let target_leaf = target_path.rsplit_once('\\').unwrap().1;
         assert_eq!(component_is_link(software, link_leaf), Ok(true));
         assert_eq!(component_is_link(software, target_leaf), Ok(false));
-        assert_eq!(component_is_link(software, "HivemendLinkMissing"), Ok(false));
+        assert_eq!(
+            component_is_link(software, "HivemendLinkMissing"),
+            Ok(false)
+        );
         unsafe {
             RegCloseKey(software);
         }
@@ -10512,7 +10516,10 @@ mod tests {
             machine_default_at(HKEY_CURRENT_USER, &target_path, false),
             Some(ThemeMode::Dark)
         );
-        assert_eq!(machine_default_at(HKEY_CURRENT_USER, &link_path, true), None);
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &link_path, true),
+            None
+        );
         if machine_default_at(HKEY_CURRENT_USER, &target_path, true) == Some(ThemeMode::Dark)
             && unsafe { link_resolves(HKEY_CURRENT_USER, &link_path) }
         {

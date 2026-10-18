@@ -145,7 +145,7 @@ var
   an existing hostile grant, so the store must be verified first. }
 function ThemeStoreReady(var Detail: String): Boolean;
 var
-  Script, Out: String;
+  Script, VerdictFile: String;
   Code: Integer;
   Ran: Boolean;
 begin
@@ -157,11 +157,11 @@ begin
     Detail := 'validation did not run';
     ExtractTemporaryFile('validate-theme-store.ps1');
     Script := ExpandConstant('{tmp}\validate-theme-store.ps1');
-    Out := ExpandConstant('{tmp}\theme-store-verdict.txt');
+    VerdictFile := ExpandConstant('{tmp}\theme-store-verdict.txt');
     Ran := Exec('powershell.exe',
-      '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + Out + '"',
+      '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + VerdictFile + '"',
       '', SW_HIDE, ewWaitUntilTerminated, Code);
-    if Ran and (Code = 0) and LoadStringFromFile(Out, Detail) then
+    if Ran and (Code = 0) and LoadStringFromFile(VerdictFile, Detail) then
       ThemeStoreVerdict := Trim(Detail)
     else
       ThemeStoreVerdict := 'UNKNOWN|validation did not run';
