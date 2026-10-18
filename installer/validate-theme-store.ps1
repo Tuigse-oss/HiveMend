@@ -28,9 +28,10 @@ public static class RegLinkProbe {
 '@
 
 
-# 0x80000002 written decimal: PowerShell parses the hex literal as a
-# negative Int32 and refuses the UIntPtr cast.
-$HKEY_LOCAL_MACHINE = [UIntPtr]2147483650
+# HKEY_LOCAL_MACHINE (0x80000002): PowerShell parses the hex literal
+# as a negative Int32 and will not cast Int32/Int64 to UIntPtr, so the
+# constructor takes an explicit unsigned value instead.
+$HKEY_LOCAL_MACHINE = [UIntPtr]::new([uint64]2147483650)
 $OPEN_LINK = 8
 $QUERY = 1
 $NOT_FOUND = 2
