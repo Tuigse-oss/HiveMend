@@ -99,10 +99,10 @@ end;
 
 function GetCommandLineW: String; external 'GetCommandLineW@kernel32.dll stdcall';
 
-{ Whether /Theme was passed at all, separately from its value. The {param}
-  default cannot tell an explicitly empty switch (/Theme=) from an absent
-  one, and only absence means "preserve the default". Tokens are matched
-  whole so values like /DIR=C:\Themes can never count. }
+// Whether /Theme was passed at all, separately from its value. The param
+// default cannot tell an explicitly empty switch (/Theme=) from an absent
+// one, and only absence means "preserve the default". Tokens are matched
+// whole so values like /DIR=C:\Themes can never count.
 function ThemeSwitchPresent: Boolean;
 var
   Line, Token: String;
