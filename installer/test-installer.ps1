@@ -6,14 +6,17 @@
 #
 # Run it on a Windows machine you can install software on, from an
 # administrator prompt (the all-users steps need it). Old and New may be the
-# same file to check a reinstall.
+# same file to check a reinstall. ThemeProbe defaults to New; CI may pass an
+# older build of the current source to make an erroneous downgrade visible.
 param(
   [Parameter(Mandatory)] [string] $Old,
   [Parameter(Mandatory)] [string] $OldVersion,
   [Parameter(Mandatory)] [string] $New,
-  [Parameter(Mandatory)] [string] $NewVersion
+  [Parameter(Mandatory)] [string] $NewVersion,
+  [string] $ThemeProbe
 )
 $ErrorActionPreference = 'Stop'
+if (!$ThemeProbe) { $ThemeProbe = $New }
 
 # The Add/Remove Programs key Inno Setup writes for the installer's AppId.
 $keyName = '{6F1C2A4E-8B3D-4E7A-9C51-2D8E0B7F4A93}_is1'
@@ -231,15 +234,14 @@ Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 if ((Theme-Default) -ne 'dark') { throw 'an upgrade without /Theme overwrote the machine default' }
 Write-Host 'ok: an upgrade without /Theme preserved the machine default'
-# A rejected switch must change nothing. Exit codes cannot prove that: a
-# late silent abort can still report 0, so the probes use the OLD version,
-# where a mistaken success would visibly downgrade or add an install. The
-# codes are logged for diagnosis, never asserted. The sleeps give a
-# mistaken install time to show itself; a refusal is instant.
-# Both halves of the failure contract are asserted: a nonzero status and
-# unchanged installation state. The sleeps give a mistaken install time to
-# show itself; a refusal is instant.
-$bad = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
+# Validate the current switch contract with the candidate, not a published
+# predecessor that may predate /Theme and silently ignore unknown switches.
+# CI supplies an older-version build of the current source as ThemeProbe so
+# an accidental success also exposes a downgrade. In both modes, assert a
+# nonzero refusal and unchanged install/theme state. The sleeps give an
+# erroneous installation time to show itself.
+Write-Host "Theme refusal probe: $ThemeProbe"
+$bad = Start-Process $ThemeProbe -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
 if ($bad.ExitCode -eq 0) { throw '/Theme=Neon reported success; a refusal must fail' }
 Write-Host "ok: /Theme=Neon exited $($bad.ExitCode)"
 Start-Sleep -Seconds 30
@@ -249,7 +251,7 @@ if ($still.Count -ne 1 -or $still[0].Scope -ne 'machine' -or $still[0].Entry.Dis
 }
 if ((Theme-Default) -ne 'dark') { throw 'a rejected install damaged the machine default' }
 Write-Host 'ok: /Theme=Neon changed nothing (no downgrade, default intact)'
-$empty = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=')) -Wait -PassThru
+$empty = Start-Process $ThemeProbe -ArgumentList ($silent + @('/ALLUSERS', '/Theme=')) -Wait -PassThru
 if ($empty.ExitCode -eq 0) { throw 'an empty /Theme= reported success; only absence preserves the default' }
 Write-Host "ok: empty /Theme= exited $($empty.ExitCode)"
 Start-Sleep -Seconds 30
@@ -259,7 +261,7 @@ if ($still.Count -ne 1 -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
 }
 if ((Theme-Default) -ne 'dark') { throw 'an empty /Theme= damaged the machine default' }
 Write-Host 'ok: empty /Theme= changed nothing (no downgrade, default intact)'
-$sentinel = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=__ABSENT__')) -Wait -PassThru
+$sentinel = Start-Process $ThemeProbe -ArgumentList ($silent + @('/ALLUSERS', '/Theme=__ABSENT__')) -Wait -PassThru
 if ($sentinel.ExitCode -eq 0) { throw 'the former absence marker as /Theme= reported success; every supplied value is validated' }
 Write-Host "ok: former sentinel exited $($sentinel.ExitCode)"
 Start-Sleep -Seconds 30
@@ -269,7 +271,7 @@ if ($still.Count -ne 1 -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
 }
 if ((Theme-Default) -ne 'dark') { throw 'a rejected former sentinel damaged the machine default' }
 Write-Host 'ok: former sentinel changed nothing (no downgrade, default intact)'
-$mortal = Start-Process $Old -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
+$mortal = Start-Process $ThemeProbe -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
 if ($mortal.ExitCode -eq 0) { throw 'per-user /Theme=Dark reported success; it must fail instead' }
 Write-Host "ok: per-user /Theme=Dark exited $($mortal.ExitCode)"
 Start-Sleep -Seconds 30
