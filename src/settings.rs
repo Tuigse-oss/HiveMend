@@ -50,9 +50,11 @@ pub fn resolve_theme(user: Option<ThemeMode>, machine: Option<ThemeMode>) -> The
 
 /// A broad interactive identity that must never hold write access to the
 /// protected machine theme store. The native layer strips entries for
-/// trusted system principals (SYSTEM, Administrators) before building
-/// this list, and the owner is checked separately, so every entry here
-/// names an untrusted principal: a deny for one never blesses the store.
+/// trusted system principals (SYSTEM, Administrators) and for CREATOR
+/// OWNER (safe only because the owner is verified first, so it can only
+/// empower SYSTEM or Administrators) before building this list, and the
+/// owner is checked separately, so every entry here names an untrusted
+/// principal: a deny for one never blesses the store.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BroadSid {
     Everyone,

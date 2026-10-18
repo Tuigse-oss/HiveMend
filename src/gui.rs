@@ -518,17 +518,20 @@ unsafe fn owner_trusted(owner: windows_sys::Win32::Security::PSID) -> bool {
 
 /// Whether a live DACL (not a pre-decoded list) grants no untrusted
 /// principal store-changing access. Entries for trusted system
-/// principals (SYSTEM, Administrators) are removed here, and the owner
-/// is checked by the caller, so the pure policy sees only untrusted
-/// principals and any store-changing allow refuses the store. Split from
-/// the registry lookup so tests can feed real descriptors built in
-/// memory, exercising retrieval and decoding as well as the pure policy.
+/// principals (SYSTEM, Administrators) and for CREATOR OWNER are
+/// removed here; the latter is safe only because the caller checks the
+/// owner first, so it can only empower SYSTEM or Administrators. The
+/// owner is checked by the caller, so the pure policy sees only
+/// untrusted principals and any store-changing allow refuses the store.
+/// Split from the registry lookup so tests can feed real descriptors
+/// built in memory, exercising retrieval and decoding as well as the
+/// pure policy.
 #[cfg(windows)]
 unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce,
         GetAclInformation, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid,
-        WinBuiltinUsersSid, WinInteractiveSid, WinLocalSystemSid, WinWorldSid,
+        WinBuiltinUsersSid, WinCreatorOwnerSid, WinInteractiveSid, WinLocalSystemSid, WinWorldSid,
     };
     // winnt.h ACE types, absent from windows-sys as constants.
     const ALLOWED: u8 = 0;
@@ -542,13 +545,15 @@ unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
     let mut interactive = [0u32; 17];
     let mut system = [0u32; 17];
     let mut admins = [0u32; 17];
-    let mut known: [(i32, *mut std::ffi::c_void); 6] = [
+    let mut creator_owner = [0u32; 17];
+    let mut known: [(i32, *mut std::ffi::c_void); 7] = [
         (WinWorldSid, world.as_mut_ptr() as *mut _),
         (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
         (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
         (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
         (WinLocalSystemSid, system.as_mut_ptr() as *mut _),
         (WinBuiltinAdministratorsSid, admins.as_mut_ptr() as *mut _),
+        (WinCreatorOwnerSid, creator_owner.as_mut_ptr() as *mut _),
     ];
     for (kind, slot) in &mut known {
         let mut length = 68u32;
@@ -611,12 +616,19 @@ unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
             let sid = unsafe { entry.as_ptr().byte_add(8) as *const _ };
             // Trusted system trustees are removed before the pure check:
             // their full-control ACEs are the normal shape of a protected
-            // key. Every remaining SID is an untrusted principal, so the
-            // pure policy refuses any store-changing allow from it and
-            // ignores denies (they never bless the store).
+            // key. CREATOR OWNER is removed on the same basis by coupling:
+            // its ACEs grant rights to the object's owner, and the caller
+            // ([`store_protected_for`]) verifies that owner is SYSTEM or
+            // Administrators before this walk runs, so a Creator-Owner
+            // grant can only empower a trusted principal. Standard stock
+            // keys (HKLM\SOFTWARE carries one) would otherwise fail every
+            // clean store. Every remaining SID is an untrusted principal,
+            // so the pure policy refuses any store-changing allow from it
+            // and ignores denies (they never bless the store).
             let trusted_system = unsafe {
                 EqualSid(sid as *mut _, system.as_ptr() as *mut _) != 0
                     || EqualSid(sid as *mut _, admins.as_ptr() as *mut _) != 0
+                    || EqualSid(sid as *mut _, creator_owner.as_ptr() as *mut _) != 0
             };
             if trusted_system {
                 continue;
@@ -9726,12 +9738,15 @@ mod tests {
     /// SYSTEM and Administrators full-control ACEs are the normal shape of
     /// a protected key: they are removed before the policy check, so the
     /// store stays trusted. Any other full-control grant refuses it.
+    /// CREATOR OWNER is removed with them: its ACEs empower the object's
+    /// owner, verified separately, which is what makes stock keys with a
+    /// Creator-Owner full grant acceptable.
     #[cfg(windows)]
     #[test]
     fn trusted_system_entries_are_removed_before_the_policy_check() {
         use windows_sys::Win32::Security::{
             ACL, WinBuiltinAdministratorsSid, WinBuiltinGuestsSid, WinBuiltinUsersSid,
-            WinLocalSystemSid,
+            WinCreatorOwnerSid, WinLocalSystemSid,
         };
         use windows_sys::Win32::System::Registry::KEY_READ;
         const GENERIC_ALL: u32 = 0x1000_0000;
@@ -9740,6 +9755,7 @@ mod tests {
             acl_for(&[
                 (WinLocalSystemSid, GENERIC_ALL, true),
                 (WinBuiltinAdministratorsSid, GENERIC_ALL, true),
+                (WinCreatorOwnerSid, GENERIC_ALL, true),
                 (WinBuiltinUsersSid, KEY_READ, true),
             ])
         };

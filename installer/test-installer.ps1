@@ -189,11 +189,14 @@ if (@('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM') -notcontains $acl.Owner) 
 $storeWrite = 0x2 -bor 0x4 -bor 0x20 -bor 0x10000 -bor 0x40000 -bor 0x80000
 $systemWriters = @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')
 $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+# CREATOR OWNER empowers the owner, verified trusted just above, same
+# coupling as the runtime and installer policies.
 $exposed = @($acl.Access | Where-Object {
   $_.AccessControlType -eq 'Allow' `
   -and ($_.RegistryRights.value__ -band $storeWrite) -ne 0 `
   -and ($_.PropagationFlags -band $inheritOnly) -eq 0 `
-  -and $systemWriters -notcontains $_.IdentityReference.Value
+  -and $systemWriters -notcontains $_.IdentityReference.Value `
+  -and 'CREATOR OWNER' -ne $_.IdentityReference.Value
 })
 if ($exposed.Count -ne 0) {
   throw "machine theme store grants store-changing rights to untrusted identities: $($exposed.IdentityReference.Value -join ', ')"

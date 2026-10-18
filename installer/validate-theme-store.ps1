@@ -74,6 +74,11 @@ $trustedWriters = @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')
 # an otherwise protected store; a standard user cannot become a
 # creator-owner under a key they cannot write, so it grants them nothing.
 $inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
+# CREATOR OWNER grants empower the object's owner, which is verified
+# trusted just above in the same object pass, so they can only benefit
+# SYSTEM or Administrators. Stock keys (HKLM\SOFTWARE) carry such a
+# grant; without this coupling every clean store would fail.
+$creatorOwner = 'CREATOR OWNER'
 
 function Open-NoFollow([UIntPtr]$parent, [string]$name) {
     $child = [UIntPtr]::Zero
@@ -118,6 +123,7 @@ function Test-StoreObject([string]$path) {
             if (($ace.RegistryRights.value__ -band $storeWrite) -eq 0) { continue }
             if (($ace.PropagationFlags -band $inheritOnly) -ne 0) { continue }
             if ($trustedWriters -contains $ace.IdentityReference.Value) { continue }
+            if ($creatorOwner -eq $ace.IdentityReference.Value) { continue }
             if ($parent -ne $HKEY_LOCAL_MACHINE) { [void][RegLinkProbe]::RegCloseKey($parent) }
             return "store-changing grant to $($ace.IdentityReference.Value) on $full [rights=$($ace.RegistryRights) inherit=$($ace.InheritanceFlags)/$($ace.PropagationFlags) sddl=$($acl.Sddl)]"
         }
