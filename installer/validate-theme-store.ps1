@@ -119,7 +119,7 @@ function Test-StoreObject([string]$path) {
             if (($ace.PropagationFlags -band $inheritOnly) -ne 0) { continue }
             if ($trustedWriters -contains $ace.IdentityReference.Value) { continue }
             if ($parent -ne $HKEY_LOCAL_MACHINE) { [void][RegLinkProbe]::RegCloseKey($parent) }
-            return "store-changing grant to $($ace.IdentityReference.Value) on $full"
+            return "store-changing grant to $($ace.IdentityReference.Value) on $full [rights=$($ace.RegistryRights) inherit=$($ace.InheritanceFlags)/$($ace.PropagationFlags) sddl=$($acl.Sddl)]"
         }
         $next = Open-NoFollow $parent ([string]$part)
         if ($parent -ne $HKEY_LOCAL_MACHINE) { [void][RegLinkProbe]::RegCloseKey($parent) }
