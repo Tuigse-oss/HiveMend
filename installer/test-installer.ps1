@@ -335,7 +335,7 @@ public static class FixtureLink {
   $disp = 0
   $createLink = 2
   $volatile = 1
-  $rc = [FixtureLink]::RegCreateKeyEx([UIntPtr]0x80000002, 'SOFTWARE\TUIGSE\Hivemend', [IntPtr]::Zero, $null,
+  $rc = [FixtureLink]::RegCreateKeyEx([UIntPtr]2147483650, 'SOFTWARE\TUIGSE\Hivemend', [IntPtr]::Zero, $null,
     ($createLink -bor $volatile), 0x22, [IntPtr]::Zero, [ref]$link, [ref]$disp)
   if ($rc -ne 0) { throw "link creation failed ($rc)" }
   # MS-RRP: length-delimited target without a terminator.

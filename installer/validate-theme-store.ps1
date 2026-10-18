@@ -25,9 +25,12 @@ public static class RegLinkProbe {
     [DllImport("advapi32.dll")]
     public static extern int RegCloseKey(UIntPtr hKey);
 }
-'@ | Out-Null
+'@
 
-$HKEY_LOCAL_MACHINE = [UIntPtr]0x80000002
+
+# 0x80000002 written decimal: PowerShell parses the hex literal as a
+# negative Int32 and refuses the UIntPtr cast.
+$HKEY_LOCAL_MACHINE = [UIntPtr]2147483650
 $OPEN_LINK = 8
 $QUERY = 1
 $NOT_FOUND = 2
