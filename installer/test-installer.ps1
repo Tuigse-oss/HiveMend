@@ -130,7 +130,26 @@ if ($null -ne (Theme-Default)) { throw "a switchless install wrote a theme defau
 Write-Host 'ok: a switchless install wrote no machine default'
 
 Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad values change nothing'
-Install $New @('/ALLUSERS', '/Theme=Dark')
+# Runs the validation script straight from the repo (bypassing the
+# installer's extraction) so a refusal can be diagnosed: if this says
+# ABSENT/PROTECTED while Setup refuses, the failure is in the
+# installer's script handling, not the store.
+function Show-Validation {
+  $out = Join-Path ([IO.Path]::GetTempPath()) 'theme-store-direct-verdict.txt'
+  Remove-Item $out -ErrorAction SilentlyContinue
+  $script = Join-Path $PSScriptRoot 'validate-theme-store.ps1'
+  $proc = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+    '-File', $script, '-OutFile', $out) -Wait -PassThru
+  $verdict = '(no verdict file)'
+  if (Test-Path $out) { $verdict = (Get-Content $out -Raw).Trim() }
+  Write-Host "direct validation: exit $($proc.ExitCode), $verdict"
+}
+$seed = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Dark')) -Wait -PassThru
+if ($seed.ExitCode -ne 0) {
+  Show-Validation
+  throw "expected /Theme=Dark to seed the machine default, setup exited with $($seed.ExitCode)"
+}
+Expect-Installed machine $NewVersion | Out-Null
 if ((Theme-Default) -ne 'dark') { throw "expected machine theme default 'dark', found '$(Theme-Default)'" }
 Write-Host 'ok: /Theme=Dark wrote the machine default'
 # The seeded store must be protected: a trusted-system owner and no
