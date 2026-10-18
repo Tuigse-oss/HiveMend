@@ -142,10 +142,9 @@ function Show-Validation {
   Remove-Item $out -ErrorAction SilentlyContinue
   Remove-Item $err -ErrorAction SilentlyContinue
   $script = Join-Path $PSScriptRoot 'validate-theme-store.ps1'
-  # Same engine order as the installer: pwsh first (some hosts cannot
-  # load the Security module under 5.1), powershell as fallback.
+  # Match the installer: use Windows PowerShell by absolute system path.
   $proc = $null
-  foreach ($engine in @('pwsh.exe', 'powershell.exe')) {
+  foreach ($engine in @((Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'))) {
     try {
       $proc = Start-Process $engine -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', $script, '-OutFile', $out) -Wait -PassThru -ErrorAction Stop `
@@ -219,6 +218,10 @@ function Invoke-MachineTheme {
   if ($null -eq $content) { return '' }
   return $content.Trim()
 }
+$lookupElevated = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole(
+  [Security.Principal.WindowsBuiltInRole]::Administrator)
+if (!$lookupElevated) { throw 'production machine-theme acceptance must run elevated' }
+Write-Host "machine-theme executable SHA256: $((Get-FileHash -LiteralPath $exe -Algorithm SHA256).Hash.ToLowerInvariant()); elevated=$lookupElevated"
 $accepted = Invoke-MachineTheme
 if ($accepted -ne 'dark') {
   throw "an elevated app lookup refused the seeded store (got '$accepted'); the installer must seed stores the app accepts"
@@ -297,7 +300,8 @@ function Assert-Refused([string]$case, [int]$exitCode, [string]$before) {
   Write-Host "ok: an elevated app lookup refuses the hostile store ($case)"
 }
 function Add-StoreRule([string]$identity, [string]$rights) {
-  $rule = New-Object System.Security.AccessControl.RegistryAccessRule($identity, $rights, 'Allow')
+  $sid = [System.Security.Principal.SecurityIdentifier]::new($identity)
+  $rule = [System.Security.AccessControl.RegistryAccessRule]::new($sid, $rights, 'Allow')
   $acl = Get-Acl -Path $themeKey
   $acl.AddAccessRule($rule)
   Set-Acl -Path $themeKey -AclObject $acl
@@ -309,39 +313,35 @@ function Remove-StoreRule($rule) {
   Set-Acl -Path $themeKey -AclObject $acl
 }
 Set-ItemProperty -Path $themeKey -Name Theme -Value 'light'
-$rule = Add-StoreRule 'BUILTIN\Users' 'SetValue'
+$rule = Add-StoreRule ([Security.Principal.WindowsIdentity]::GetCurrent().User.Value) 'SetValue'
 $before = Store-Sddl
 $run = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Dark')) -Wait -PassThru
 Assert-Refused 'direct standard-user write' $run.ExitCode $before
 Remove-StoreRule $rule
-$grule = Add-StoreRule 'BUILTIN\Guests' 'SetValue, CreateSubKey'
+# An arbitrary SID exercises the all-trustee rule without creating a local group.
+$grule = Add-StoreRule 'S-1-5-21-12345-23456-34567-45678' 'SetValue, CreateSubKey'
 $before = Store-Sddl
 $run = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Dark')) -Wait -PassThru
-Assert-Refused 'custom-group write' $run.ExitCode $before
+Assert-Refused 'arbitrary trustee write' $run.ExitCode $before
 Remove-StoreRule $grule
-# Untrusted ownership: giving the store away must refuse the install.
-# Restoring needs the same privilege, so both directions are attempted
-# and a blocked attempt is reported loudly instead of asserted.
-$ownerFixture = $false
+# Use a real individual SID that can own the object. BUILTIN\Users is
+# not an assignable owner on ordinary tokens and only produced a skip.
+$ownerBefore = (Get-Acl -Path $themeKey).Sddl
 try {
   $acl = Get-Acl -Path $themeKey
-  $acl.SetOwner([System.Security.Principal.NTAccount]'BUILTIN\Users')
+  $individual = [Security.Principal.WindowsIdentity]::GetCurrent().User
+  $acl.SetOwner($individual)
   Set-Acl -Path $themeKey -AclObject $acl
-  $ownerFixture = ((Get-Acl -Path $themeKey).Owner -eq 'BUILTIN\Users')
-} catch {
-  Write-Host "NOTE: this host cannot transfer store ownership ($($_.Exception.Message)); skipping the owner fixture"
-}
-if ($ownerFixture) {
+  if ((Get-Acl -Path $themeKey).GetOwner([Security.Principal.SecurityIdentifier]).Value -ne $individual.Value) {
+    throw 'the untrusted individual-owner fixture was not established'
+  }
   $before = Store-Sddl
   $run = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Dark')) -Wait -PassThru
   Assert-Refused 'untrusted ownership' $run.ExitCode $before
-  try {
-    $acl = Get-Acl -Path $themeKey
-    $acl.SetOwner([System.Security.Principal.NTAccount]'BUILTIN\Administrators')
-    Set-Acl -Path $themeKey -AclObject $acl
-  } catch {
-    throw "could not restore store ownership after the fixture ($($_.Exception.Message))"
-  }
+} finally {
+  $restore = [Security.AccessControl.RegistrySecurity]::new()
+  $restore.SetSecurityDescriptorSddlForm($ownerBefore)
+  Set-Acl -Path $themeKey -AclObject $restore
 }
 # A redirected leaf: the store path itself is a link. The validation
 # probe finds the marker without following, so resolution never
@@ -362,7 +362,9 @@ public static class FixtureLink {
     [DllImport("advapi32.dll")]
     public static extern int RegCloseKey(UIntPtr hKey);
     [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
-    public static extern int RegDeleteKeyEx(UIntPtr hKey, string subKey, int access, int reserved);
+    public static extern int RegOpenKeyEx(UIntPtr hKey, string subKey, int options, int access, out UIntPtr key);
+    [DllImport("ntdll.dll")]
+    public static extern int NtDeleteKey(UIntPtr key);
 }
 '@ | Out-Null
   Remove-Item -Path $themeKey -Recurse -Force
@@ -392,13 +394,22 @@ if ($linkFixture) {
     throw 'a refused redirected install changed the install (downgraded or duplicated)'
   }
   Write-Host 'ok: redirected store refused, install untouched'
-  # Delete by parent-relative name without opening the leaf: opening a
-  # link follows it, so .NET's DeleteSubKey (which opens the child first)
-  # and any recursive deleter would walk into the target. RegDeleteKeyEx
-  # removes the link object itself, never its target.
-  $rc = [FixtureLink]::RegDeleteKeyEx([UIntPtr]::new([uint64]2147483650), 'SOFTWARE\TUIGSE\Hivemend', 0x100, 0)
-  if ($rc -ne 0) { throw "the link fixture survived cleanup (delete exited $rc)" }
-  if (Test-Path $themeKey) { throw 'the link fixture survived cleanup' }
+  # Open the link object without following, then delete that exact handle.
+  # RegDeleteKeyEx was rejected on native Windows 10; never substitute a
+  # recursive pathname deletion, which could enter the target.
+  $key = [UIntPtr]::Zero
+  $rc = [FixtureLink]::RegOpenKeyEx([UIntPtr]::new([uint64]2147483650),
+    'SOFTWARE\TUIGSE\Hivemend', 8, 0x10101, [ref]$key)
+  if ($rc -ne 0) { throw "cannot open fixture link for no-follow cleanup ($rc)" }
+  try {
+    $rc = [FixtureLink]::NtDeleteKey($key)
+    if ($rc -lt 0) { throw "fixture link deletion failed (NTSTATUS $rc)" }
+  } finally { [void][FixtureLink]::RegCloseKey($key) }
+  $probe = [UIntPtr]::Zero
+  $rc = [FixtureLink]::RegOpenKeyEx([UIntPtr]::new([uint64]2147483650),
+    'SOFTWARE\TUIGSE\Hivemend', 8, 0x101, [ref]$probe)
+  if ($probe -ne [UIntPtr]::Zero) { [void][FixtureLink]::RegCloseKey($probe) }
+  if ($rc -ne 2) { throw "the link fixture was not proven removed (status $rc)" }
   Write-Host 'ok: link fixture removed without touching its target'
   New-Item -Path $themeKey -Force | Out-Null
 }

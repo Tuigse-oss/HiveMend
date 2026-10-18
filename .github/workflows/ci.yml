@@ -88,6 +88,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $iscc /DAppVersion=0.0.2 /DOutputDir=..\installer-test installer\hivemend.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Disposable protected-store writer checks
+        shell: powershell
+        run: installer\test-theme-store.ps1
+      - name: Qualify valid protected registry links
+        shell: pwsh
+        run: cargo +1.99.0 test --locked --bin Hivemend protected_link_paths_require_guard_and_verified_cleanup -- --ignored --nocapture
       - name: Install, upgrade, and uninstall
         shell: pwsh
         run: >
@@ -136,6 +142,9 @@ jobs:
             -WorkingDirectory C:\HivemendTest `
             -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\HivemendTest\seed.ps1', '-UserOnly'
           if ($seed.ExitCode -ne 0) { throw "seeding as hmtest failed ($($seed.ExitCode))" }
+      - name: Qualify theme headers and minimum-size Settings
+        shell: powershell
+        run: tests\ui\qualify-theme.ps1 -Exe target\debug\Hivemend.exe -OutDir theme-ui-output
       - name: Run the UI tests
         run: python -I -u tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
       - name: Remove the seeded entries
@@ -146,4 +155,6 @@ jobs:
         if: always()
         with:
           name: ui-test-screenshots
-          path: ui-test-output
+          path: |
+            ui-test-output
+            theme-ui-output

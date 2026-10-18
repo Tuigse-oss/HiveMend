@@ -79,20 +79,7 @@ Filename: "{app}\Hivemend.exe"; Description: "{cm:LaunchProgram,Hivemend}"; Flag
 ; Uninstalling leaves %LOCALAPPDATA%\HiveMend and the administrator backup
 ; store alone: they hold the registry backups a restore needs.
 
-[Registry]
-; Establishes the protected theme store when a /Theme switch is given:
-; administrators and SYSTEM hold full control, standard users read. This
-; runs before the post-install value write below. Permissions are only
-; granted, never scrubbed: a pre-existing hostile grant is left alone
-; here and refused at runtime instead. No unins flags, so the key (and
-; the default) survives uninstall, as the installer matrix verifies.
-Root: HKLM64; Subkey: "SOFTWARE\TUIGSE\Hivemend"; ValueType: none; Permissions: admins-full system-full users-read; Check: ThemeStoreEntryAllowed
-
 [Code]
-const
-  ThemeKey = 'SOFTWARE\TUIGSE\Hivemend';
-  ThemeValue = 'Theme';
-
 { A /Theme= switch seeds the machine theme default Hivemend starts from:
   /Theme=Light, /Theme=System, or /Theme=Dark (any letter case). With no
   switch Setup writes nothing, so an upgrade keeps the previous machine
@@ -140,28 +127,31 @@ var
 
 { Runs installer/validate-theme-store.ps1 once and caches its verdict
   (ABSENT|... or PROTECTED|...). Anything else, including a validation
-  that could not run, refuses the install before any permissions or
-  value mutation: Inno Permissions only grant rights and cannot scrub
-  an existing hostile grant, so the store must be verified first. }
-{ Runs one validation engine. The caller tries pwsh first: some hosts
-  cannot load the Security module under Windows PowerShell 5.1, while
-  pwsh is absent on others, so launch failure (not a verdict) falls
-  through to the other engine. }
-function RunValidationEngine(const Engine, Script, VerdictFile: String; var Code: Integer): Boolean;
+  that could not run, refuses the install before any registry mutation.
+  The write mode always checks again and
+  uses its retained leaf handle; it never uses the cached verdict. }
+{ Use the Windows engine by absolute system path. No executable lookup
+  through the elevated process's working directory or PATH. }
+function RunValidationEngine(const Script, VerdictFile, Choice: String; var Code: Integer): Boolean;
+var
+  Args: String;
 begin
-  Result := Exec(Engine,
-    '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + VerdictFile + '"',
-    '', SW_HIDE, ewWaitUntilTerminated, Code);
+  Args := '-NoProfile -NonInteractive -ExecutionPolicy Bypass -File "' + Script +
+    '" -OutFile "' + VerdictFile + '"';
+  if Choice <> '' then
+    Args := Args + ' -Theme "' + Choice + '"';
+  Result := Exec(ExpandConstant('{sys}\WindowsPowerShell\v1.0\powershell.exe'),
+    Args, '', SW_HIDE, ewWaitUntilTerminated, Code);
 end;
 
-function ThemeStoreReady(var Detail: String): Boolean;
+function ThemeStoreReady(const Choice: String; var Detail: String): Boolean;
 var
   Script, VerdictFile: String;
   Loaded: AnsiString;
   Code: Integer;
   Ran: Boolean;
 begin
-  if ThemeStoreVerdict <> '' then
+  if (Choice = '') and (ThemeStoreVerdict <> '') then
   begin
     Detail := ThemeStoreVerdict;
   end
@@ -170,27 +160,18 @@ begin
     ExtractTemporaryFile('validate-theme-store.ps1');
     Script := ExpandConstant('{tmp}\validate-theme-store.ps1');
     VerdictFile := ExpandConstant('{tmp}\theme-store-verdict.txt');
-    Ran := RunValidationEngine('pwsh.exe', Script, VerdictFile, Code);
-    if not Ran then
-      Ran := RunValidationEngine('powershell.exe', Script, VerdictFile, Code);
+    DeleteFile(VerdictFile);
+    Ran := RunValidationEngine(Script, VerdictFile, Choice, Code);
     if Ran and (Code = 0) and LoadStringFromFile(VerdictFile, Loaded) then
       ThemeStoreVerdict := Trim(Loaded)
     else
       ThemeStoreVerdict := 'UNKNOWN|validation did not run';
     Detail := ThemeStoreVerdict;
   end;
-  Result := (Copy(Detail, 1, 7) = 'ABSENT|') or (Copy(Detail, 1, 10) = 'PROTECTED|');
-end;
-
-{ The [Registry] lock entry and the value write below only run for a
-  validated store. InitializeSetup already refuses anything else, so
-  this is a second lock on the same cached verdict, never a new check
-  with new dialogs. }
-function ThemeStoreEntryAllowed(): Boolean;
-var
-  Detail: String;
-begin
-  Result := ThemeSupplied() and ThemeStoreReady(Detail);
+  if Choice = '' then
+    Result := (Copy(Detail, 1, 7) = 'ABSENT|') or (Copy(Detail, 1, 10) = 'PROTECTED|')
+  else
+    Result := Copy(Detail, 1, 8) = 'WRITTEN|';
 end;
 
 function InitializeSetup(): Boolean;
@@ -230,7 +211,7 @@ begin
   { A hostile or uncheckable existing store refuses the whole install:
     writing a value (or adding grants) into a store an untrusted
     principal controls is pointless, and the app would ignore it. }
-  if not ThemeStoreReady(Detail) then
+  if not ThemeStoreReady('', Detail) then
   begin
     if not WizardSilent() then
       MsgBox(
@@ -242,15 +223,17 @@ begin
   end;
 end;
 
-procedure CurStepChanged(CurStep: TSetupStep);
+{ Before file installation, repeat validation and perform secure creation and
+  the value write in one helper process, using retained validated handles.
+  A refusal returns a PrepareToInstall error, so Setup reports failure. }
+function PrepareToInstall(var NeedsRestart: Boolean): String;
 var
-  Choice: String;
+  Detail, Choice: String;
 begin
-  if CurStep <> ssPostInstall then
+  Result := '';
+  if not ThemeSupplied() then
     Exit;
-  Choice := ExpandConstant('{param:Theme|}');
-  if (Choice <> '') and ValidTheme(Choice) and IsAdminInstallMode() and ThemeStoreEntryAllowed() then
-    if not RegWriteStringValue(HKLM64, ThemeKey, ThemeValue, Lowercase(Choice)) then
-      RaiseException(
-        'Could not save the machine theme default. An all-users install needs administrator rights.');
+  Choice := Lowercase(ExpandConstant('{param:Theme|}'));
+  if not ThemeStoreReady(Choice, Detail) then
+    Result := 'Could not establish the protected machine theme store: ' + Detail;
 end;

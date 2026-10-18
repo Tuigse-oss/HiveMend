@@ -373,6 +373,9 @@ fn key_is_link(key: windows_sys::Win32::System::Registry::HKEY) -> Result<bool, 
     if status < 0 {
         return Err(status);
     }
+    if got < 8 {
+        return Err(-1);
+    }
     Ok(info[1] & REG_FLAG_LINK != 0)
 }
 
@@ -391,6 +394,17 @@ fn open_validated_chain(
     root: windows_sys::Win32::System::Registry::HKEY,
     path: &str,
 ) -> Option<windows_sys::Win32::System::Registry::HKEY> {
+    open_validated_chain_with_link_check(root, path, key_is_link)
+}
+
+/// Keep the native walk and handle lifecycle identical under deterministic
+/// link-query failures. Production always supplies `key_is_link` above.
+#[cfg(windows)]
+fn open_validated_chain_with_link_check(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+    mut link_check: impl FnMut(windows_sys::Win32::System::Registry::HKEY) -> Result<bool, i32>,
+) -> Option<windows_sys::Win32::System::Registry::HKEY> {
     use windows_sys::Win32::System::Registry::{
         KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
     };
@@ -398,6 +412,9 @@ fn open_validated_chain(
     // check; windows-sys only names it under FileSystem, and borrowing
     // that name for a registry mask would mislead.
     const READ_CONTROL: u32 = 0x0002_0000;
+    if path.split('\\').any(str::is_empty) {
+        return None;
+    }
     let mut parent = root;
     let mut owns_parent = false;
     let mut components = path.split('\\').peekable();
@@ -423,7 +440,7 @@ fn open_validated_chain(
         // The no-follow handle is the link object itself when the
         // component is a link, so the kernel flags decide, and the
         // descriptor below belongs to the exact object being validated.
-        let verified = key_is_link(child).is_ok_and(|link| !link) && store_protected_for(child);
+        let verified = link_check(child).is_ok_and(|link| !link) && store_protected_for(child);
         if owns_parent {
             unsafe {
                 RegCloseKey(parent);
@@ -10080,32 +10097,33 @@ mod tests {
             }
         }
 
-        /// Remove everything and prove the targets are gone. Link
-        /// survival is reported, not asserted: deleting links needs a
-        /// cooperating environment, and a stuck link must not mask the
-        /// behavioral verdicts above it.
+        /// A surviving or uncheckable fixture fails qualification.
         fn verify_cleaned(&self) {
+            use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
             use windows_sys::Win32::System::Registry::{
-                KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+                KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
             };
             self.remove_all();
-            for target in &self.targets {
+            for path in self.links.iter().chain(self.targets.iter()) {
                 let mut probe = std::ptr::null_mut();
                 let status = unsafe {
                     RegOpenKeyExW(
                         self.root,
-                        wide(target).as_ptr(),
-                        0,
+                        wide(path).as_ptr(),
+                        REG_OPTION_OPEN_LINK,
                         KEY_QUERY_VALUE,
                         &mut probe,
                     )
                 };
-                assert_ne!(status, 0, "fixture target survived cleanup: {target}");
                 if !probe.is_null() {
                     unsafe {
                         RegCloseKey(probe);
                     }
                 }
+                assert!(
+                    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND,
+                    "fixture not proven removed: {path} (status {status})"
+                );
             }
         }
     }
@@ -10144,13 +10162,15 @@ mod tests {
         entries: &[(i32, u32, bool)],
     ) {
         use windows_sys::Win32::Security::Authorization::{SE_REGISTRY_KEY, SetSecurityInfo};
-        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
         let dacl = unsafe { acl_for(entries) };
         let status = unsafe {
             SetSecurityInfo(
                 key as *mut _,
                 SE_REGISTRY_KEY,
-                DACL_SECURITY_INFORMATION,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                 std::ptr::null_mut(),
                 std::ptr::null_mut(),
                 dacl.as_ptr() as *const _,
@@ -10404,8 +10424,8 @@ mod tests {
         let target_leaf = format!(r"Software\HivemendAncTarget{pid}\Leaf");
         unsafe { fixture_theme_key(&format!("HivemendAncTarget{pid}\\Leaf"), "dark") };
         unsafe {
-            lock_fixture_store(&format!(r"Software\HivemendAncTarget{pid}"));
             lock_fixture_store(&target_leaf);
+            lock_fixture_store(&format!(r"Software\HivemendAncTarget{pid}"));
         }
         guard
             .targets
@@ -10416,7 +10436,8 @@ mod tests {
         guard.targets.push(stone.clone());
         let link_path = format!(r"{stone}\Link");
         // Open the target for its kernel name, then link to it.
-        let target_key = unsafe { open_fixture_key(&target_leaf, KEY_QUERY_VALUE) };
+        let target_parent = target_leaf.rsplit_once('\\').unwrap().0;
+        let target_key = unsafe { open_fixture_key(target_parent, KEY_QUERY_VALUE) };
         let created = unsafe { create_fixture_link(&link_path, target_key) };
         unsafe {
             RegCloseKey(target_key);
@@ -10550,6 +10571,130 @@ mod tests {
             eprintln!(
                 "NOTE: no full link contrast here (target unaccepted or link unresolvable in this environment); refusal holds by detection plus fail-closed open"
             );
+        }
+        guard.verify_cleaned();
+    }
+
+    /// Explicit qualification: no conditional success when link resolution or
+    /// trusted ownership is unavailable. Run elevated on disposable Windows.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated Windows token and resolvable registry links"]
+    fn protected_link_paths_require_guard_and_verified_cleanup() {
+        use windows_sys::Win32::Security::Authorization::{SE_REGISTRY_KEY, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, OWNER_SECURITY_INFORMATION, WinBuiltinAdministratorsSid,
+        };
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_ALL_ACCESS, RegCloseKey,
+        };
+        let name = format!("HivemendQualifiedLink{}", std::process::id());
+        let base_path = format!(r"Software\{name}");
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        // Register before setup so assertion unwinding also removes the tree.
+        guard.targets.push(base_path.clone());
+        unsafe { fixture_theme_key(&format!(r"{name}\Target\Leaf"), "dark") };
+        let mut admins = [0u32; 17];
+        let mut length = 68;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    admins.as_mut_ptr() as *mut _,
+                    &mut length,
+                )
+            },
+            0
+        );
+        // Secure children first: replacing a parent ACL removes inherited
+        // grants from children that have not yet received their own DACL.
+        for suffix in [r"\Target\Leaf", r"\Target", ""] {
+            let path = format!("{base_path}{suffix}");
+            let key = unsafe { open_fixture_key(&path, KEY_ALL_ACCESS) };
+            let status = unsafe {
+                SetSecurityInfo(
+                    key,
+                    SE_REGISTRY_KEY,
+                    OWNER_SECURITY_INFORMATION,
+                    admins.as_mut_ptr() as *mut _,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            unsafe {
+                RegCloseKey(key);
+            }
+            assert_eq!(status, 0, "qualification requires trusted ownership");
+            unsafe { lock_fixture_store(&path) };
+        }
+        let base = unsafe { open_fixture_key(&base_path, KEY_ALL_ACCESS) };
+        assert!(store_protected_for(base));
+        assert_eq!(
+            machine_default_at(base, r"Target\Leaf", true),
+            Some(ThemeMode::Dark)
+        );
+        // Every ordinary protected component is also checked under a forced
+        // identity-query error. This cannot pass through incidental ownership
+        // refusal: the same chain was accepted immediately above.
+        for fail_at in 1..=2 {
+            let mut checks = 0;
+            let result = open_validated_chain_with_link_check(base, r"Target\Leaf", |key| {
+                checks += 1;
+                if checks == fail_at {
+                    Err(0xC000_0022u32 as i32)
+                } else {
+                    key_is_link(key)
+                }
+            });
+            assert!(result.is_none());
+            assert_eq!(checks, fail_at);
+        }
+        for (link_name, target, lookup) in [
+            ("LeafLink", r"Target\Leaf", "LeafLink"),
+            ("AncestorLink", "Target", r"AncestorLink\Leaf"),
+        ] {
+            let target_key =
+                unsafe { open_fixture_key(&format!(r"{base_path}\{target}"), KEY_ALL_ACCESS) };
+            let link_path = format!(r"{base_path}\{link_name}");
+            // Register before writing the target, so a failed set cleans the link.
+            guard.links.push(link_path.clone());
+            let status = unsafe { create_fixture_link(&link_path, target_key) };
+            unsafe {
+                RegCloseKey(target_key);
+            }
+            assert_eq!(status, 0, "qualification requires link creation");
+            assert_eq!(component_is_link(base, link_name), Ok(true));
+            assert!(
+                unsafe { link_resolves(base, lookup) },
+                "ordinary resolution required"
+            );
+            assert_eq!(
+                machine_default_at(base, lookup, false),
+                Some(ThemeMode::Dark)
+            );
+            assert_eq!(machine_default_at(base, lookup, true), None);
+            let mut checks = 0;
+            let unknown = open_validated_chain_with_link_check(base, lookup, |_| {
+                checks += 1;
+                Err(0xC000_0022u32 as i32) // deterministic STATUS_ACCESS_DENIED
+            });
+            assert!(unknown.is_none());
+            assert_eq!(
+                checks, 1,
+                "the failed check must run on the no-follow handle"
+            );
+            assert_eq!(
+                machine_default_at(base, lookup, false),
+                Some(ThemeMode::Dark)
+            );
+            eprintln!(
+                "qualified {link_name}: ordinary=dark, injected link-query error=STATUS_ACCESS_DENIED, elevated chain=refused"
+            );
+        }
+        unsafe {
+            RegCloseKey(base);
         }
         guard.verify_cleaned();
     }
