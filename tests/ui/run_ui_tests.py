@@ -333,6 +333,11 @@ def as_administrator(app):
             text, box = app.dialog(timeout=5)
         except AssertionError:
             return None
+        if not text:
+            # The dialog is tearing down or painting; retry until it has
+            # words or the wait times out, instead of failing on one
+            # mid-close read.
+            return None
         if "could not start the uninstaller" in text:
             app.answer(box, "ok")
             print("   no medium token here; the refusal stands:", text.splitlines()[0])
