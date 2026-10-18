@@ -146,6 +146,7 @@ var
 function ThemeStoreReady(var Detail: String): Boolean;
 var
   Script, VerdictFile: String;
+  Loaded: AnsiString;
   Code: Integer;
   Ran: Boolean;
 begin
@@ -161,8 +162,8 @@ begin
     Ran := Exec('powershell.exe',
       '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + VerdictFile + '"',
       '', SW_HIDE, ewWaitUntilTerminated, Code);
-    if Ran and (Code = 0) and LoadStringFromFile(VerdictFile, Detail) then
-      ThemeStoreVerdict := Trim(Detail)
+    if Ran and (Code = 0) and LoadStringFromFile(VerdictFile, Loaded) then
+      ThemeStoreVerdict := Trim(Loaded)
     else
       ThemeStoreVerdict := 'UNKNOWN|validation did not run';
     Detail := ThemeStoreVerdict;
