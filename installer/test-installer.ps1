@@ -203,7 +203,19 @@ if ($exposed.Count -ne 0) {
 }
 Write-Host 'ok: /Theme=Dark established a protected store (owner and DACL)'
 $exe = Expect-Installed machine $NewVersion
-$accepted = & $exe machine-theme
+# The app is a GUI-subsystem binary, which PowerShell's call operator
+# does not wait for (it would close the pipe before the app writes), so
+# the lookup runs waited with redirected output instead.
+function Invoke-MachineTheme {
+  $out = Join-Path ([IO.Path]::GetTempPath()) 'machine-theme-out.txt'
+  Remove-Item $out -ErrorAction SilentlyContinue
+  $proc = Start-Process $exe -ArgumentList 'machine-theme' -Wait -PassThru -NoNewWindow `
+    -RedirectStandardOutput $out -RedirectStandardError (Join-Path ([IO.Path]::GetTempPath()) 'machine-theme-err.txt')
+  if ($proc.ExitCode -ne 0) { throw "machine-theme exited with $($proc.ExitCode)" }
+  if (!(Test-Path $out)) { return '' }
+  return (Get-Content $out -Raw).Trim()
+}
+$accepted = Invoke-MachineTheme
 if ($accepted -ne 'dark') {
   throw "an elevated app lookup refused the seeded store (got '$accepted'); the installer must seed stores the app accepts"
 }
@@ -274,7 +286,7 @@ function Assert-Refused([string]$case, [int]$exitCode, [string]$before) {
   if ((Theme-Default) -ne 'light') { throw "a refused hostile install ($case) changed the theme value" }
   if ((Store-Sddl) -ne $before) { throw "a refused hostile install ($case) changed the store permissions" }
   Write-Host "ok: hostile store ($case) refused, install/value/permissions untouched"
-  $refused = & $exe machine-theme
+  $refused = Invoke-MachineTheme
   if ($null -ne $refused -and $refused -ne '') {
     throw "an elevated app lookup accepted a hostile store ($case, got '$refused')"
   }
