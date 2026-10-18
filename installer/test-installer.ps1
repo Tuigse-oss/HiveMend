@@ -135,14 +135,23 @@ Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad value
 # ABSENT/PROTECTED while Setup refuses, the failure is in the
 # installer's script handling, not the store.
 function Show-Validation {
-  $out = Join-Path ([IO.Path]::GetTempPath()) 'theme-store-direct-verdict.txt'
+  $dir = Join-Path ([IO.Path]::GetTempPath()) 'theme-validate-diag'
+  New-Item -ItemType Directory -Force $dir | Out-Null
+  $out = Join-Path $dir 'verdict.txt'
+  $err = Join-Path $dir 'stderr.txt'
   Remove-Item $out -ErrorAction SilentlyContinue
+  Remove-Item $err -ErrorAction SilentlyContinue
   $script = Join-Path $PSScriptRoot 'validate-theme-store.ps1'
   $proc = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', $script, '-OutFile', $out) -Wait -PassThru
+    '-File', $script, '-OutFile', $out) -Wait -PassThru `
+    -RedirectStandardError $err -RedirectStandardOutput (Join-Path $dir 'stdout.txt')
   $verdict = '(no verdict file)'
   if (Test-Path $out) { $verdict = (Get-Content $out -Raw).Trim() }
   Write-Host "direct validation: exit $($proc.ExitCode), $verdict"
+  if (Test-Path $err) {
+    $text = (Get-Content $err -Raw).Trim()
+    if ($text -ne '') { Write-Host "validation stderr: $text" }
+  }
 }
 $seed = Start-Process $New -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Dark')) -Wait -PassThru
 if ($seed.ExitCode -ne 0) {
