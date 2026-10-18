@@ -19,17 +19,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::art::Icon;
 use hive_mend::{
-    BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
-    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
+    BackupInfo, BackupInventory, BackupSummary, BroadSid, CleanOutcome, Engine, Exclusions,
+    Finding, HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
     RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
-    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, ThemeMode,
-    WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes,
-    backup_stores, backups_dir, backups_location, build_items, clean_with_progress,
-    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
-    format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until, parse_custom,
-    plan_profile, preview_with, repair_with_progress, resolve_theme, restore_backup,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, StoreAce,
+    ThemeMode, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets,
+    apply_start_changes, backup_stores, backups_dir, backups_location, build_items,
+    clean_with_progress, custom_privacy_file, decode_text_owned, exclusions_file, expand_target,
+    format_bytes, format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until,
+    parse_custom, plan_profile, preview_with, repair_with_progress, resolve_theme, restore_backup,
     scan_with_progress, settings_file, sort_services, start_services, still_reported,
-    stop_services, user_dir,
+    stop_services, store_trusted, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME,
@@ -70,19 +70,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW,
-    HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW,
-    MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED,
-    MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW,
-    PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER,
-    SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow,
-    TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_GETFONT, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT,
-    WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SIZE, WNDCLASSW, WNDPROC,
-    WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP,
-    WS_VISIBLE, WS_VSCROLL,
+    CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow,
+    LoadCursorW, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+    MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow,
+    PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+    SWP_NOZORDER, SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETFONT, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SIZE,
+    WNDCLASSW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_KILLFOCUS, BN_SETFOCUS, WM_ENDSESSION, WM_KEYDOWN, WM_QUERYENDSESSION,
@@ -184,9 +184,11 @@ const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
 const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
-/// Room for the Appearance block (heading plus theme pills) that sits
-/// between the subtitle and the scanner grid.
-const SETTINGS_SHIFT: i32 = 96;
+/// Room for the Appearance block that sits between the subtitle and the
+/// scanner grid. Heading and pills share one row so the shift stays
+/// small: at the minimum window size every pixel of it comes out of the
+/// ignored-entries list below.
+const SETTINGS_SHIFT: i32 = 38;
 /// The restore-point checkbox sits under the scanner grid.
 const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6 + SETTINGS_SHIFT;
 const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52 + SETTINGS_SHIFT;
@@ -270,11 +272,23 @@ impl Theme {
     }
 }
 
-/// The theme default the installer wrote for this machine, if any. Only
-/// administrators can write `HKLM`, so a standard user cannot change what
-/// this returns; an invalid value is ignored, never a theme.
+/// The theme default the installer wrote for this machine, if any. An
+/// invalid value is ignored, never a theme. In an administrator window the
+/// store itself must additionally prove protected (see
+/// [`machine_trusted`]): a permissive key lets a standard user steer an
+/// elevated window's appearance, so an untrusted store reads as absent.
 #[cfg(windows)]
-fn machine_default() -> Option<ThemeMode> {
+fn machine_default(elevated: bool) -> Option<ThemeMode> {
+    let mode = read_machine_value()?;
+    if elevated && !machine_trusted() {
+        return None;
+    }
+    Some(mode)
+}
+
+/// The raw installed default, without any trust check.
+#[cfg(windows)]
+fn read_machine_value() -> Option<ThemeMode> {
     use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
     let key = wide(r"SOFTWARE\TUIGSE\Hivemend");
     let name = wide("Theme");
@@ -299,6 +313,121 @@ fn machine_default() -> Option<ThemeMode> {
         .position(|cell| *cell == 0)
         .unwrap_or(text.len());
     ThemeMode::parse_any(&String::from_utf16_lossy(&text[..end]))
+}
+
+/// Whether the machine theme store keeps broad interactive identities
+/// without write access. A plain `HKLM` pathname is not the guarantee: an
+/// ancestor replaced with permissive inheritance (or an administrative
+/// customization) reaches this key through the inherited DACL, which the
+/// effective descriptor below includes. Any API failure reads as
+/// untrusted, falling back to System. Registry links are a residual: only
+/// an administrator can plant one, and one already owns this boundary.
+#[cfg(windows)]
+fn machine_trusted() -> bool {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_REGISTRY_KEY};
+    use windows_sys::Win32::Security::{
+        ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
+        WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid, WinWorldSid,
+    };
+    // winnt.h ACE types, absent from windows-sys as constants.
+    const ALLOWED: u8 = 0;
+    const DENIED: u8 = 1;
+    const ALLOWED_CALLBACK: u8 = 9;
+    const DENIED_CALLBACK: u8 = 10;
+    // Buffers big enough for any well-known SID (SECURITY_MAX_SID_SIZE).
+    let mut world = [0u32; 17];
+    let mut users = [0u32; 17];
+    let mut auth = [0u32; 17];
+    let mut interactive = [0u32; 17];
+    let mut known: [(i32, *mut std::ffi::c_void); 4] = [
+        (WinWorldSid, world.as_mut_ptr() as *mut _),
+        (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
+        (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
+        (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
+    ];
+    for (kind, slot) in &mut known {
+        let mut length = 68u32;
+        if unsafe { CreateWellKnownSid(*kind, std::ptr::null_mut(), *slot, &mut length) } == 0 {
+            return false;
+        }
+    }
+    let path = wide(r"MACHINE\SOFTWARE\TUIGSE\Hivemend");
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetNamedSecurityInfoW(
+            path.as_ptr(),
+            SE_REGISTRY_KEY,
+            DACL_SECURITY_INFORMATION,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    if status != 0 || dacl.is_null() {
+        if !sd.is_null() {
+            unsafe {
+                LocalFree(sd as *mut _);
+            }
+        }
+        return false;
+    }
+    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    let mut aces = Vec::new();
+    if ok != 0 {
+        for index in 0..info.AceCount {
+            let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
+                continue;
+            }
+            let ace_type = unsafe { *(raw as *const u8) };
+            let allow = match ace_type {
+                ALLOWED | ALLOWED_CALLBACK => true,
+                DENIED | DENIED_CALLBACK => false,
+                _ => continue,
+            };
+            let mask = unsafe { *(raw as *const u32).byte_add(4) };
+            let sid = unsafe { (raw as *const u8).byte_add(8) as *const _ };
+            let broad = unsafe {
+                if EqualSid(sid as *mut _, world.as_ptr() as *mut _) != 0 {
+                    BroadSid::Everyone
+                } else if EqualSid(sid as *mut _, users.as_ptr() as *mut _) != 0 {
+                    BroadSid::Users
+                } else if EqualSid(sid as *mut _, auth.as_ptr() as *mut _) != 0 {
+                    BroadSid::Authenticated
+                } else if EqualSid(sid as *mut _, interactive.as_ptr() as *mut _) != 0 {
+                    BroadSid::Interactive
+                } else {
+                    BroadSid::Other
+                }
+            };
+            aces.push(StoreAce {
+                sid: broad,
+                allow,
+                mask,
+            });
+        }
+    }
+    unsafe {
+        LocalFree(sd as *mut _);
+    }
+    // No DACL at all means nothing restricts the key.
+    if info.AceCount == 0 {
+        return false;
+    }
+    store_trusted(&aces)
 }
 
 /// Whether Windows itself is set to dark app mode. A missing key means
@@ -1314,7 +1443,7 @@ impl App {
         // per-user folder at all, so it resolves from the machine default
         // (an in-app pick still applies for that window, without saving).
         let user = (!elevated && settings.theme_explicit).then_some(settings.theme);
-        settings.theme = resolve_theme(user, machine_default());
+        settings.theme = resolve_theme(user, machine_default(elevated));
         let theme = Theme::resolve(settings.theme);
         let mut app = Self {
             hwnd,
@@ -5527,7 +5656,7 @@ impl App {
                     left,
                     ignored_top,
                     width,
-                    (button_y - self.s(14) - ignored_top).max(self.s(60)),
+                    ignored_list_room(bottom, self.dpi),
                 );
                 place(self.btn_unignore, left, button_y, self.s(220), button_h);
                 unsafe {
@@ -7376,7 +7505,8 @@ impl App {
         let right = rect.right - self.s(24);
         // Appearance leads the page so the switch is seen, not scrolled to:
         // the ignored list below is an opaque real control that would cover
-        // anything drawn over its rows.
+        // anything drawn over its rows. Heading and pills share one row to
+        // keep the shift (and the space taken from the list) small.
         text(
             hdc,
             self.fonts.heading,
@@ -7399,7 +7529,7 @@ impl App {
             },
             "Appearance",
         );
-        let mut x = left;
+        let mut x = left + self.s(150);
         for (label, mode) in [
             ("Light", ThemeMode::Light),
             ("System", ThemeMode::System),
@@ -7407,7 +7537,7 @@ impl App {
         ] {
             x = self.pill(
                 hdc,
-                BODY_Y + 38,
+                BODY_Y,
                 x,
                 label,
                 self.settings.theme == mode,
@@ -8436,6 +8566,17 @@ fn edges(rect: RECT) -> Edges {
 /// (what UI Automation reports) are unaffected by either hiding.
 /// Point every real child control at the matching Explorer theme, so
 /// lists and buttons follow the page from light to dark and back.
+/// Usable height for the ignored-entries list: the room between its fixed
+/// top and the bottom-anchored Unignore button, never negative. Clamping
+/// (rather than a fixed minimum height) keeps the list from overlapping
+/// the button in short windows; a short list still scrolls, so every row
+/// stays reachable by mouse and keyboard.
+fn ignored_list_room(client_bottom: i32, dpi: u32) -> i32 {
+    let top = scale(SETTINGS_IGNORED_Y + 62, dpi);
+    let button = client_bottom - scale(48, dpi);
+    (button - scale(14, dpi) - top).max(0)
+}
+
 /// One listview's rows in the active theme: dark surface with readable
 /// text, or the light equivalents back. Called on every theme switch, so
 /// lists never keep the other mode's colors.
@@ -8486,9 +8627,12 @@ unsafe extern "system" fn header_proc(
         paint_dark_header(header);
         return 0;
     }
+    // Never invoke the saved value directly: a window procedure token is
+    // only guaranteed callable through the system's dispatcher (an ANSI/
+    // Unicode thunk, for example, is not a plain function address).
     let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(header, GWLP_USERDATA));
     match old {
-        Some(previous) => previous(header, msg, wparam, lparam),
+        Some(_) => CallWindowProcW(old, header, msg, wparam, lparam),
         None => DefWindowProcW(header, msg, wparam, lparam),
     }
 }
@@ -9452,5 +9596,50 @@ mod tests {
         assert_eq!(nested_reply(WM_JOB_DONE).1, NestedReply::Handled);
         assert_eq!(nested_reply(WM_SIZE).1, NestedReply::Default);
         assert_eq!(nested_reply(WM_SYSCOMMAND), (0, NestedReply::Default));
+    }
+
+    #[test]
+    fn settings_list_and_button_never_overlap_at_minimum_sizes() {
+        // The minimum outer size scales with DPI (900x660 logical), so the
+        // tightest supported client area is a frame below that. At every
+        // DPI the list bottom must stay at or above the button top, and
+        // the list must keep a visible, scrollable height.
+        for dpi in [96, 144, 192] {
+            let client = scale(660, dpi) - scale(52, dpi);
+            let top = scale(SETTINGS_IGNORED_Y + 62, dpi);
+            let button = client - scale(48, dpi);
+            let room = ignored_list_room(client, dpi);
+            assert!(room > 0, "dpi {dpi}: no visible list");
+            assert!(top + room <= button, "dpi {dpi}: list overlaps button");
+        }
+        // Below the minimum the list yields instead of overlapping.
+        assert_eq!(ignored_list_room(400, 96), 0);
+    }
+
+    #[test]
+    fn saved_window_procedures_go_through_the_system_dispatcher() {
+        // A value read back from GWLP_WNDPROC is only guaranteed callable
+        // through CallWindowProcW (an ANSI/Unicode thunk is not a plain
+        // function address), so invoking it directly is a crash condition.
+        // This gate fails if header_proc ever goes back to calling the
+        // saved procedure value as a function.
+        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui.rs");
+        let text = std::fs::read_to_string(&source).expect("own source stays readable");
+        assert!(
+            text.contains("CallWindowProcW(old, header, msg, wparam, lparam)"),
+            "header_proc must dispatch through CallWindowProcW"
+        );
+        // Line-scoped so this very assertion (which names the pattern)
+        // cannot trip the gate itself.
+        for (index, line) in text.lines().enumerate() {
+            if line.contains("text.contains") || line.contains("line.contains") {
+                continue;
+            }
+            assert!(
+                !line.contains("=> previous("),
+                "line {} invokes a saved procedure value directly",
+                index + 1
+            );
+        }
     }
 }

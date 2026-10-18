@@ -48,6 +48,56 @@ pub fn resolve_theme(user: Option<ThemeMode>, machine: Option<ThemeMode>) -> The
     user.or(machine).unwrap_or(ThemeMode::System)
 }
 
+/// A broad interactive identity that must never hold write access to the
+/// protected machine theme store. Anything else (Administrators, SYSTEM,
+/// the installer's own entries) is outside this check.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum BroadSid {
+    Everyone,
+    Users,
+    Authenticated,
+    Interactive,
+    Other,
+}
+
+/// One DACL entry that matters to the trust check.
+pub struct StoreAce {
+    pub sid: BroadSid,
+    pub allow: bool,
+    pub mask: u32,
+}
+
+/// Rights that let a broad identity change or replace the machine theme:
+/// writing values, creating subkeys, deleting the key, taking ownership,
+/// or changing its DACL. Generic-all/write imply them.
+const STORE_WRITE_MASK: u32 = 0x0000_0002 // KEY_SET_VALUE
+    | 0x0000_0004 // KEY_CREATE_SUB_KEY
+    | 0x0001_0000 // DELETE
+    | 0x0004_0000 // WRITE_DAC
+    | 0x0008_0000 // WRITE_OWNER
+    | 0x4000_0000 // GENERIC_WRITE
+    | 0x1000_0000; // GENERIC_ALL
+
+/// Whether a machine theme store's DACL keeps broad interactive SIDs
+/// without write access. Evaluated the way Windows composes rights: denies
+/// remove granted bits. Pure, so the trust boundary is unit-testable
+/// without a registry.
+pub fn store_trusted(aces: &[StoreAce]) -> bool {
+    let mut granted = 0u32;
+    let mut denied = 0u32;
+    for ace in aces {
+        if ace.sid == BroadSid::Other {
+            continue;
+        }
+        if ace.allow {
+            granted |= ace.mask;
+        } else {
+            denied |= ace.mask;
+        }
+    }
+    granted & STORE_WRITE_MASK & !denied == 0
+}
+
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct Settings {
     /// Scanners left out of a full scan. Every scanner, Deep Scan included,
@@ -138,9 +188,11 @@ impl Settings {
                 self.privacy_ticked.join(",")
             ));
         }
-        // An explicit System is saved too: it must keep overriding the
-        // machine default after a restart.
-        if self.theme != ThemeMode::System || self.theme_explicit {
+        // Only an explicit Appearance choice is saved. The in-memory theme
+        // may hold a resolved machine default, which must never be written:
+        // reloading it would mark it explicit and freeze out later
+        // machine-default changes the user never overrode.
+        if self.theme_explicit {
             text.push_str(&format!("theme={}\r\n", self.theme.code()));
         }
         text
@@ -177,9 +229,12 @@ mod tests {
 
     #[test]
     fn theme_round_trip() {
+        // Saving models an explicit Appearance pick: set_theme always
+        // marks the choice explicit before saving.
         let mut settings = Settings::default();
         assert_eq!(settings.theme, ThemeMode::System);
         settings.theme = ThemeMode::Dark;
+        settings.theme_explicit = true;
         assert_eq!(Settings::parse(&settings.to_text()).theme, ThemeMode::Dark);
         settings.theme = ThemeMode::Light;
         assert_eq!(Settings::parse(&settings.to_text()).theme, ThemeMode::Light);
@@ -195,6 +250,88 @@ mod tests {
         assert_eq!(ThemeMode::parse_any(""), None);
         assert_eq!(ThemeMode::parse_any("neon"), None);
         assert_eq!(ThemeMode::parse_any("darkmode"), None);
+    }
+
+    #[test]
+    fn an_inherited_machine_theme_is_never_saved() {
+        use ThemeMode::{Dark, Light};
+        // A normal window with no explicit choice resolves the machine
+        // default into memory (mirroring App::new), then saves unrelated
+        // settings. No theme line may appear; after a reload and a machine
+        // change, the new default must win.
+        for machine in [Light, Dark] {
+            let settings = Settings {
+                theme: resolve_theme(None, Some(machine)),
+                last_scan: "now".into(),
+                ..Settings::default()
+            };
+            let text = settings.to_text();
+            assert!(
+                !text.contains("theme="),
+                "inherited {machine:?} leaked: {text}"
+            );
+            let again = Settings::parse(&text);
+            assert!(!again.theme_explicit);
+            let other = if machine == Dark { Light } else { Dark };
+            assert_eq!(resolve_theme(None, Some(other)), other);
+            assert_eq!(
+                resolve_theme(again.theme_explicit.then_some(again.theme), Some(other)),
+                other
+            );
+        }
+    }
+
+    #[test]
+    fn machine_store_trust_matrix() {
+        use BroadSid::{Authenticated, Everyone, Interactive, Other, Users};
+        let read = |sid| StoreAce {
+            sid,
+            allow: true,
+            mask: 0x0002_0001, // KEY_QUERY_VALUE | READ_CONTROL
+        };
+        // A normal installer key: admins own it, everyone reads.
+        assert!(store_trusted(&[read(Everyone), read(Users), read(Other)]));
+        // Any broad write bit fails the store, whatever the spelling.
+        for sid in [Everyone, Users, Authenticated, Interactive] {
+            assert!(
+                !store_trusted(&[
+                    read(Other),
+                    StoreAce {
+                        sid,
+                        allow: true,
+                        mask: 0x0000_0002,
+                    }
+                ]),
+                "{sid:?} write must fail"
+            );
+            assert!(
+                !store_trusted(&[StoreAce {
+                    sid,
+                    allow: true,
+                    mask: 0x1000_0000,
+                }]),
+                "{sid:?} generic-all must fail"
+            );
+        }
+        // A deny removes the granted bit again.
+        assert!(store_trusted(&[
+            StoreAce {
+                sid: Users,
+                allow: true,
+                mask: 0x0000_0002
+            },
+            StoreAce {
+                sid: Users,
+                allow: false,
+                mask: 0x0000_0002
+            },
+        ]));
+        // Non-broad identities are outside the check.
+        assert!(store_trusted(&[StoreAce {
+            sid: Other,
+            allow: true,
+            mask: 0x1000_0000,
+        }]));
     }
 
     #[test]

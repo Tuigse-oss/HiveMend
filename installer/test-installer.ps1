@@ -23,6 +23,12 @@ $roots = [ordered]@{
 }
 $silent = @('/VERYSILENT', '/SUPPRESSMSGBOXES', '/NORESTART', '/SP-')
 
+# The machine theme default the installer's /Theme switch seeds.
+$themeKey = 'HKLM:\SOFTWARE\TUIGSE\Hivemend'
+function Theme-Default {
+  (Get-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue).Theme
+}
+
 function Install([string] $setup, [string[]] $scope) {
   $process = Start-Process $setup -ArgumentList ($silent + $scope) -Wait -PassThru
   if ($process.ExitCode -ne 0) {
@@ -114,19 +120,16 @@ Write-Host '== All-users install and upgrade (Chocolatey, winget scope machine)'
 Install $Old @('/ALLUSERS')
 $exe = Expect-Installed machine $OldVersion
 $running = Start-Hivemend $exe
+# The fixture is cleared BEFORE the no-switch upgrade below, so the
+# absence assertion after it observes the installer, not the cleanup.
+Remove-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue
 Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 Expect-Closed $running
+if ($null -ne (Theme-Default)) { throw "a switchless install wrote a theme default: '$(Theme-Default)'" }
+Write-Host 'ok: a switchless install wrote no machine default'
 
 Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad values change nothing'
-$themeKey = 'HKLM:\SOFTWARE\TUIGSE\Hivemend'
-function Theme-Default {
-  (Get-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue).Theme
-}
-# A rerun on the same machine starts clean; the next line then proves a
-# switchless install writes no default of its own.
-Remove-ItemProperty -Path $themeKey -Name Theme -ErrorAction SilentlyContinue
-if ($null -ne (Theme-Default)) { throw "a fresh setup already left a theme default behind: '$(Theme-Default)'" }
 Install $New @('/ALLUSERS', '/Theme=Dark')
 if ((Theme-Default) -ne 'dark') { throw "expected machine theme default 'dark', found '$(Theme-Default)'" }
 Write-Host 'ok: /Theme=Dark wrote the machine default'
@@ -139,8 +142,12 @@ Write-Host 'ok: an upgrade without /Theme preserved the machine default'
 # where a mistaken success would visibly downgrade or add an install. The
 # codes are logged for diagnosis, never asserted. The sleeps give a
 # mistaken install time to show itself; a refusal is instant.
+# Both halves of the failure contract are asserted: a nonzero status and
+# unchanged installation state. The sleeps give a mistaken install time to
+# show itself; a refusal is instant.
 $bad = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=Neon')) -Wait -PassThru
-Write-Host "note: /Theme=Neon setup exited $($bad.ExitCode)"
+if ($bad.ExitCode -eq 0) { throw '/Theme=Neon reported success; a refusal must fail' }
+Write-Host "ok: /Theme=Neon exited $($bad.ExitCode)"
 Start-Sleep -Seconds 30
 $still = @(Installs)
 if ($still.Count -ne 1 -or $still[0].Scope -ne 'machine' -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
@@ -148,8 +155,19 @@ if ($still.Count -ne 1 -or $still[0].Scope -ne 'machine' -or $still[0].Entry.Dis
 }
 if ((Theme-Default) -ne 'dark') { throw 'a rejected install damaged the machine default' }
 Write-Host 'ok: /Theme=Neon changed nothing (no downgrade, default intact)'
+$empty = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=')) -Wait -PassThru
+if ($empty.ExitCode -eq 0) { throw 'an empty /Theme= reported success; only absence preserves the default' }
+Write-Host "ok: empty /Theme= exited $($empty.ExitCode)"
+Start-Sleep -Seconds 30
+$still = @(Installs)
+if ($still.Count -ne 1 -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
+  throw 'an empty /Theme= changed the install'
+}
+if ((Theme-Default) -ne 'dark') { throw 'an empty /Theme= damaged the machine default' }
+Write-Host 'ok: empty /Theme= changed nothing (no downgrade, default intact)'
 $mortal = Start-Process $Old -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
-Write-Host "note: per-user /Theme=Dark setup exited $($mortal.ExitCode)"
+if ($mortal.ExitCode -eq 0) { throw 'per-user /Theme=Dark reported success; it must fail instead' }
+Write-Host "ok: per-user /Theme=Dark exited $($mortal.ExitCode)"
 Start-Sleep -Seconds 30
 if (@(Installs).Count -ne 1) { throw 'a rejected per-user /Theme added an install' }
 if ((Theme-Default) -ne 'dark') { throw 'a rejected per-user install damaged the machine default' }

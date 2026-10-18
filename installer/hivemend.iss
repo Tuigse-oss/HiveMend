@@ -97,6 +97,51 @@ begin
     (CompareText(S, 'dark') = 0);
 end;
 
+function GetCommandLineW: String; external 'GetCommandLineW@kernel32.dll stdcall';
+
+{ Whether /Theme was passed at all, separately from its value. The {param}
+  default cannot tell an explicitly empty switch (/Theme=) from an absent
+  one, and only absence means "preserve the default". Tokens are matched
+  whole so values like /DIR=C:\Themes can never count. }
+function ThemeSwitchPresent: Boolean;
+var
+  Line, Token: String;
+  P, Start: Integer;
+begin
+  Result := False;
+  Line := Uppercase(GetCommandLineW);
+  P := 1;
+  while P <= Length(Line) do
+  begin
+    while (P <= Length(Line)) and (Line[P] = ' ') do
+      Inc(P);
+    if P > Length(Line) then
+      Break;
+    if Line[P] = '"' then
+    begin
+      Inc(P);
+      Start := P;
+      while (P <= Length(Line)) and (Line[P] <> '"') do
+        Inc(P);
+      Token := Copy(Line, Start, P - Start);
+      if P <= Length(Line) then
+        Inc(P);
+    end
+    else
+    begin
+      Start := P;
+      while (P <= Length(Line)) and (Line[P] <> ' ') do
+        Inc(P);
+      Token := Copy(Line, Start, P - Start);
+    end;
+    if (Token = '/THEME') or (Copy(Token, 1, 7) = '/THEME=') then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
+
 { Rejections happen in InitializeSetup, before anything is installed: a
   late abort (for example in CurStepChanged under /VERYSILENT with
   /SUPPRESSMSGBOXES) can still report exit code 0, which would look like
@@ -107,9 +152,9 @@ var
   Choice: String;
 begin
   Result := True;
-  Choice := ExpandConstant('{param:Theme|}');
-  if Choice = '' then
+  if not ThemeSwitchPresent then
     Exit;
+  Choice := ExpandConstant('{param:Theme|}');
   { A silent refusal shows no dialog: there is nobody to click it, and a
     stuck Setup would hang a package manager (or CI) forever. The refusal
     still installs nothing, which the installer checks verify by effects. }
