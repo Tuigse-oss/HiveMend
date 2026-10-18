@@ -274,99 +274,249 @@ impl Theme {
 
 /// The theme default the installer wrote for this machine, if any. An
 /// invalid value is ignored, never a theme. In an administrator window the
-/// store itself must additionally prove protected (see
-/// [`machine_trusted`]): a permissive key lets a standard user steer an
-/// elevated window's appearance, so an untrusted store reads as absent.
+/// value is only accepted from a verified protected store: a permissive
+/// key lets a standard user steer an elevated window's appearance, so an
+/// untrusted store reads as absent.
 #[cfg(windows)]
 fn machine_default(elevated: bool) -> Option<ThemeMode> {
-    let mode = read_machine_value()?;
-    if elevated && !machine_trusted() {
-        return None;
-    }
-    Some(mode)
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    machine_default_at(HKEY_LOCAL_MACHINE, r"SOFTWARE\TUIGSE\Hivemend", elevated)
 }
 
-/// The raw installed default, without any trust check.
+/// The same lookup against an arbitrary root, so tests can exercise the
+/// production open-validate-read path on disposable fixture keys. The key
+/// is opened once and the value is read through that same handle after
+/// validation: the name is never re-resolved between the trust check and
+/// the read, so a swapped object cannot slip a value past the check.
 #[cfg(windows)]
-fn read_machine_value() -> Option<ThemeMode> {
-    use windows_sys::Win32::System::Registry::{HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ, RegGetValueW};
-    let key = wide(r"SOFTWARE\TUIGSE\Hivemend");
+fn machine_default_at(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+    elevated: bool,
+) -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+    // READ_CONTROL (0x20000) so the same handle can carry the security
+    // check; windows-sys only names it under FileSystem, and borrowing
+    // that name for a registry mask would mislead.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let subkey = wide(path);
+    let mut key = std::ptr::null_mut();
+    let status = unsafe {
+        RegOpenKeyExW(
+            root,
+            subkey.as_ptr(),
+            0,
+            KEY_QUERY_VALUE | READ_CONTROL,
+            &mut key,
+        )
+    };
+    if status != 0 || key.is_null() {
+        return None;
+    }
+    // A plain window trusts the installer path; an elevated one validates
+    // the exact open object (and its ancestry) before the value is read.
+    let trusted = !elevated
+        || (!is_registry_link(root, path)
+            && store_protected_for(key)
+            && ancestors_protected(root, path));
+    let mode = if trusted { read_theme_value(key) } else { None };
+    unsafe {
+        RegCloseKey(key);
+    }
+    mode
+}
+
+/// The installed default through an open key handle. Only `REG_SZ`
+/// counts; anything else (including an overlong value) is ignored, never
+/// a theme.
+#[cfg(windows)]
+fn read_theme_value(key: windows_sys::Win32::System::Registry::HKEY) -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::{REG_SZ, RegQueryValueExW};
     let name = wide("Theme");
+    let mut kind = 0u32;
     let mut text: [u16; 32] = [0; 32];
     let mut size = (text.len() * 2) as u32;
-    let ok = unsafe {
-        RegGetValueW(
-            HKEY_LOCAL_MACHINE,
-            key.as_ptr(),
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
             name.as_ptr(),
-            RRF_RT_REG_SZ,
-            std::ptr::null_mut(),
-            text.as_mut_ptr() as *mut _,
+            std::ptr::null(),
+            &mut kind,
+            text.as_mut_ptr() as *mut u8,
             &mut size,
         )
     };
-    if ok != 0 {
+    if status != 0 || kind != REG_SZ {
         return None;
     }
-    let end = text
+    let used = (size as usize / 2).min(text.len());
+    let end = text[..used]
         .iter()
         .position(|cell| *cell == 0)
-        .unwrap_or(text.len());
+        .unwrap_or(used);
     ThemeMode::parse_any(&String::from_utf16_lossy(&text[..end]))
 }
 
-/// Whether the machine theme store keeps broad interactive identities
-/// without write access. A plain `HKLM` pathname is not the guarantee: an
-/// ancestor replaced with permissive inheritance (or an administrative
-/// customization) reaches this key through the inherited DACL, which the
-/// effective descriptor below includes. Any API failure reads as
-/// untrusted, falling back to System. Registry links are a residual: only
-/// an administrator can plant one, and one already owns this boundary.
+/// Whether the path resolves to a registry link. A link would redirect
+/// the open above to a key these checks never saw; planting one already
+/// needs an administrator, but a pre-existing link must still refuse
+/// rather than read through. Any query failure other than "no such
+/// value" also refuses: an unchecked object is never trusted.
 #[cfg(windows)]
-fn machine_trusted() -> bool {
+fn is_registry_link(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
+    use windows_sys::Win32::System::Registry::{
+        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegOpenKeyExW, RegQueryValueExW,
+    };
+    let subkey = wide(path);
+    let mut link = std::ptr::null_mut();
+    let opened = unsafe {
+        RegOpenKeyExW(
+            root,
+            subkey.as_ptr(),
+            REG_OPTION_OPEN_LINK,
+            KEY_QUERY_VALUE,
+            &mut link,
+        )
+    };
+    if opened != 0 || link.is_null() {
+        return false;
+    }
+    let marker = wide("SymbolicLinkValue");
+    let mut size = 0u32;
+    let probed = unsafe {
+        RegQueryValueExW(
+            link,
+            marker.as_ptr(),
+            std::ptr::null(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            &mut size,
+        )
+    };
+    unsafe {
+        windows_sys::Win32::System::Registry::RegCloseKey(link);
+    }
+    probed != ERROR_FILE_NOT_FOUND
+}
+
+/// Whether the exact open object is a protected store: a trusted system
+/// owner (an untrusted owner rewrites the DACL at will) and a DACL that
+/// grants no untrusted principal store-changing access. The descriptor
+/// comes from the open handle, never from a re-resolved name. Any API
+/// failure reads as untrusted, falling back to System.
+#[cfg(windows)]
+fn store_protected_for(key: windows_sys::Win32::System::Registry::HKEY) -> bool {
     use windows_sys::Win32::Foundation::LocalFree;
-    use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_REGISTRY_KEY};
-    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
-    let path = wide(r"MACHINE\SOFTWARE\TUIGSE\Hivemend");
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_REGISTRY_KEY};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let mut owner: PSID = std::ptr::null_mut();
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
     let status = unsafe {
-        GetNamedSecurityInfoW(
-            path.as_ptr(),
+        GetSecurityInfo(
+            key,
             SE_REGISTRY_KEY,
-            DACL_SECURITY_INFORMATION,
-            std::ptr::null_mut(),
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
             std::ptr::null_mut(),
             &mut dacl,
             std::ptr::null_mut(),
             &mut sd,
         )
     };
-    if status != 0 || dacl.is_null() {
-        if !sd.is_null() {
-            unsafe {
-                LocalFree(sd as *mut _);
-            }
+    // The owner and DACL pointers borrow the returned descriptor: only
+    // the descriptor itself is freed, and only after the verdict below
+    // has finished reading through them.
+    let trusted = status == 0
+        && !owner.is_null()
+        && !dacl.is_null()
+        && unsafe { owner_trusted(owner) && dacl_trusted(dacl) };
+    if !sd.is_null() {
+        unsafe {
+            LocalFree(sd as *mut _);
         }
-        return false;
-    }
-    let trusted = unsafe { dacl_trusted(dacl) };
-    unsafe {
-        LocalFree(sd as *mut _);
     }
     trusted
 }
 
-/// Whether a live DACL (not a pre-decoded list) keeps broad identities
-/// without write access. Split from the registry lookup so tests can feed
-/// real descriptors built in memory, exercising retrieval and decoding as
-/// well as the pure policy.
+/// Whether the key's owner is a trusted system principal. Ownership
+/// implies unrestricted DACL control, so anything else (including the
+/// interactive user owning their own hive keys) refuses the store.
+#[cfg(windows)]
+unsafe fn owner_trusted(owner: windows_sys::Win32::Security::PSID) -> bool {
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    let mut system = [0u32; 17];
+    let mut admins = [0u32; 17];
+    for (kind, slot) in [
+        (WinLocalSystemSid, system.as_mut_ptr() as *mut _),
+        (WinBuiltinAdministratorsSid, admins.as_mut_ptr() as *mut _),
+    ] {
+        let mut length = 68u32;
+        if unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), slot, &mut length) } == 0 {
+            return false;
+        }
+    }
+    unsafe {
+        EqualSid(owner as *mut _, system.as_ptr() as *mut _) != 0
+            || EqualSid(owner as *mut _, admins.as_ptr() as *mut _) != 0
+    }
+}
+
+/// Whether every ancestor up to (but excluding) the root is itself a
+/// protected store. A user-writable ancestor lets a standard account
+/// delete and recreate the leaf with a strict DACL but a chosen value,
+/// which the leaf check alone would accept.
+#[cfg(windows)]
+fn ancestors_protected(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
+    use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let mut offset = 0;
+    while let Some(sep) = path[offset..].find('\\') {
+        let ancestor = &path[..offset + sep];
+        let subkey = wide(ancestor);
+        let mut key = std::ptr::null_mut();
+        let status = unsafe {
+            RegOpenKeyExW(
+                root,
+                subkey.as_ptr(),
+                0,
+                KEY_QUERY_VALUE | READ_CONTROL,
+                &mut key,
+            )
+        };
+        if status != 0 || key.is_null() {
+            return false;
+        }
+        let trusted = store_protected_for(key);
+        unsafe {
+            RegCloseKey(key);
+        }
+        if !trusted {
+            return false;
+        }
+        offset += sep + 1;
+    }
+    true
+}
+
+/// Whether a live DACL (not a pre-decoded list) grants no untrusted
+/// principal store-changing access. Entries for trusted system
+/// principals (SYSTEM, Administrators) are removed here, and the owner
+/// is checked by the caller, so the pure policy sees only untrusted
+/// principals and any store-changing allow refuses the store. Split from
+/// the registry lookup so tests can feed real descriptors built in
+/// memory, exercising retrieval and decoding as well as the pure policy.
 #[cfg(windows)]
 unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
     use windows_sys::Win32::Security::{
         ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce,
-        GetAclInformation, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid,
-        WinWorldSid,
+        GetAclInformation, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid,
+        WinBuiltinUsersSid, WinInteractiveSid, WinLocalSystemSid, WinWorldSid,
     };
     // winnt.h ACE types, absent from windows-sys as constants.
     const ALLOWED: u8 = 0;
@@ -378,11 +528,15 @@ unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
     let mut users = [0u32; 17];
     let mut auth = [0u32; 17];
     let mut interactive = [0u32; 17];
-    let mut known: [(i32, *mut std::ffi::c_void); 4] = [
+    let mut system = [0u32; 17];
+    let mut admins = [0u32; 17];
+    let mut known: [(i32, *mut std::ffi::c_void); 6] = [
         (WinWorldSid, world.as_mut_ptr() as *mut _),
         (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
         (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
         (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
+        (WinLocalSystemSid, system.as_mut_ptr() as *mut _),
+        (WinBuiltinAdministratorsSid, admins.as_mut_ptr() as *mut _),
     ];
     for (kind, slot) in &mut known {
         let mut length = 68u32;
@@ -431,6 +585,18 @@ unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
             // would need 4 here and misleads; see the review finding).
             let mask = unsafe { entry.cast::<u32>().as_ptr().add(1).read() };
             let sid = unsafe { entry.as_ptr().byte_add(8) as *const _ };
+            // Trusted system trustees are removed before the pure check:
+            // their full-control ACEs are the normal shape of a protected
+            // key. Every remaining SID is an untrusted principal, so the
+            // pure policy refuses any store-changing allow from it and
+            // ignores denies (they never bless the store).
+            let trusted_system = unsafe {
+                EqualSid(sid as *mut _, system.as_ptr() as *mut _) != 0
+                    || EqualSid(sid as *mut _, admins.as_ptr() as *mut _) != 0
+            };
+            if trusted_system {
+                continue;
+            }
             let broad = unsafe {
                 if EqualSid(sid as *mut _, world.as_ptr() as *mut _) != 0 {
                     BroadSid::Everyone
@@ -9467,33 +9633,38 @@ fn exe_path() -> PathBuf {
 mod tests {
     use super::*;
 
-    /// A real in-memory DACL with one Users ACE, decoded through the same
-    /// retrieval path the registry lookup uses. The prior offset bug read
-    /// the mask one byte in; only a live descriptor catches that.
+    /// A real in-memory DACL with the given well-known-SID entries,
+    /// decoded through the same retrieval path the registry lookup uses.
+    /// Each entry is (SID kind, access mask, allow?). The prior offset
+    /// bug read the mask one byte in; only a live descriptor catches that.
     #[cfg(windows)]
-    unsafe fn users_acl(mask: u32) -> Vec<u8> {
+    unsafe fn acl_for(entries: &[(i32, u32, bool)]) -> Vec<u8> {
         use windows_sys::Win32::Security::{
-            ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl,
-            WinBuiltinUsersSid,
+            ACL_REVISION, AddAccessAllowedAce, AddAccessDeniedAce, CreateWellKnownSid,
+            InitializeAcl,
         };
-        let mut sid = [0u32; 17];
-        let mut length = 68u32;
-        assert_ne!(
-            CreateWellKnownSid(
-                WinBuiltinUsersSid,
-                std::ptr::null_mut(),
-                sid.as_mut_ptr() as *mut _,
-                &mut length
-            ),
-            0
-        );
-        let mut buffer = vec![0u8; 256];
+        let mut buffer = vec![0u8; 512];
         let pacl = buffer.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
-        assert_ne!(InitializeAcl(pacl, 256, ACL_REVISION), 0);
-        assert_ne!(
-            AddAccessAllowedAce(pacl, ACL_REVISION, mask, sid.as_mut_ptr() as *mut _),
-            0
-        );
+        assert_ne!(InitializeAcl(pacl, 512, ACL_REVISION), 0);
+        for (kind, mask, allow) in entries {
+            let mut sid = [0u32; 17];
+            let mut length = 68u32;
+            assert_ne!(
+                CreateWellKnownSid(
+                    *kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr() as *mut _,
+                    &mut length
+                ),
+                0
+            );
+            let added = if *allow {
+                AddAccessAllowedAce(pacl, ACL_REVISION, *mask, sid.as_mut_ptr() as *mut _)
+            } else {
+                AddAccessDeniedAce(pacl, ACL_REVISION, *mask, sid.as_mut_ptr() as *mut _)
+            };
+            assert_ne!(added, 0);
+        }
         buffer
     }
 
@@ -9502,12 +9673,325 @@ mod tests {
     #[cfg(windows)]
     #[test]
     fn live_dacl_decode_trusts_read_only_users_and_refuses_write() {
-        use windows_sys::Win32::Security::ACL;
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
         use windows_sys::Win32::System::Registry::{KEY_READ, KEY_WRITE};
-        let read = unsafe { users_acl(KEY_READ) };
+        let read = unsafe { acl_for(&[(WinBuiltinUsersSid, KEY_READ, true)]) };
         assert!(unsafe { dacl_trusted(read.as_ptr() as *const ACL) });
-        let write = unsafe { users_acl(KEY_WRITE) };
+        let write = unsafe { acl_for(&[(WinBuiltinUsersSid, KEY_WRITE, true)]) };
         assert!(!unsafe { dacl_trusted(write.as_ptr() as *const ACL) });
+    }
+
+    /// SYSTEM and Administrators full-control ACEs are the normal shape of
+    /// a protected key: they are removed before the policy check, so the
+    /// store stays trusted. Any other full-control grant refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_system_entries_are_removed_before_the_policy_check() {
+        use windows_sys::Win32::Security::{
+            ACL, WinBuiltinAdministratorsSid, WinBuiltinGuestsSid, WinBuiltinUsersSid,
+            WinLocalSystemSid,
+        };
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const KEY_SET_VALUE: u32 = 0x0000_0002;
+        let protected_shape = unsafe {
+            acl_for(&[
+                (WinLocalSystemSid, GENERIC_ALL, true),
+                (WinBuiltinAdministratorsSid, GENERIC_ALL, true),
+                (WinBuiltinUsersSid, KEY_READ, true),
+            ])
+        };
+        assert!(unsafe { dacl_trusted(protected_shape.as_ptr() as *const ACL) });
+        // A custom group (here Guests) with a value write is untrusted,
+        // even beside a system full-control entry.
+        let guest_write = unsafe {
+            acl_for(&[
+                (WinLocalSystemSid, GENERIC_ALL, true),
+                (WinBuiltinGuestsSid, KEY_SET_VALUE, true),
+            ])
+        };
+        assert!(!unsafe { dacl_trusted(guest_write.as_ptr() as *const ACL) });
+    }
+
+    /// A deny never blesses the store: allow-then-deny stays refused,
+    /// because a global mask subtraction cannot prove the deny actually
+    /// blocks the relevant access.
+    #[cfg(windows)]
+    #[test]
+    fn deny_never_blesses_the_store() {
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
+        const KEY_SET_VALUE: u32 = 0x0000_0002;
+        let allow_then_deny = unsafe {
+            acl_for(&[
+                (WinBuiltinUsersSid, KEY_SET_VALUE, true),
+                (WinBuiltinUsersSid, KEY_SET_VALUE, false),
+            ])
+        };
+        assert!(!unsafe { dacl_trusted(allow_then_deny.as_ptr() as *const ACL) });
+    }
+
+    /// The owner check runs on production well-known SIDs: SYSTEM and
+    /// Administrators own a protected store, anything else refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn owner_check_accepts_only_trusted_system_principals() {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+        };
+        unsafe fn well_known(kind: i32) -> [u32; 17] {
+            let mut sid = [0u32; 17];
+            let mut length = 68u32;
+            assert_ne!(
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr() as *mut _,
+                    &mut length
+                ),
+                0
+            );
+            sid
+        }
+        assert!(unsafe { owner_trusted(well_known(WinLocalSystemSid).as_ptr() as *mut _) });
+        assert!(unsafe {
+            owner_trusted(well_known(WinBuiltinAdministratorsSid).as_ptr() as *mut _)
+        });
+        assert!(!unsafe { owner_trusted(well_known(WinBuiltinUsersSid).as_ptr() as *mut _) });
+    }
+
+    /// A disposable per-user fixture key with a Theme value, written and
+    /// removed by the test. Returns its subkey path.
+    #[cfg(windows)]
+    unsafe fn fixture_theme_key(name: &str, value: &str) -> String {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_SZ, RegCloseKey,
+            RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+        };
+        let path = format!(r"Software\{name}");
+        let subkey = wide(&path);
+        // A crashed earlier run must not turn this into an open-existing
+        // assertion below.
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
+        }
+        let mut key = std::ptr::null_mut();
+        let mut disposition = 0u32;
+        assert_eq!(
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut key,
+                &mut disposition,
+            ),
+            0
+        );
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let entry = wide("Theme");
+        let data = wide(value);
+        assert_eq!(
+            RegSetValueExW(
+                key,
+                entry.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                (data.len() * 2) as u32,
+            ),
+            0
+        );
+        unsafe {
+            RegCloseKey(key);
+        }
+        path
+    }
+
+    /// The full production path on a user-owned fixture: a plain window
+    /// reads the value, an elevated one refuses the store (the owner is
+    /// the interactive user, not a trusted system principal), and the
+    /// direct handle check agrees. No name is re-resolved between the
+    /// check and the read.
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_fixture_is_refused_when_elevated() {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegDeleteTreeW, RegOpenKeyExW,
+        };
+        let path = unsafe {
+            fixture_theme_key(
+                &format!("HivemendTrustOwnerProbe{}", std::process::id()),
+                "dark",
+            )
+        };
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &path, false),
+            Some(ThemeMode::Dark)
+        );
+        assert_eq!(machine_default_at(HKEY_CURRENT_USER, &path, true), None);
+        // The owner's verdict through the open handle, directly. The
+        // handle needs READ_CONTROL or the descriptor query fails.
+        const READ_CONTROL: u32 = 0x0002_0000;
+        let subkey = wide(&path);
+        let mut key = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE | READ_CONTROL,
+                    &mut key,
+                )
+            },
+            0
+        );
+        assert!(!store_protected_for(key));
+        unsafe {
+            RegCloseKey(key);
+            RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
+        }
+    }
+
+    /// The current user's SID in string form, for link targets below.
+    #[cfg(windows)]
+    unsafe fn current_user_sid_string() -> Option<String> {
+        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
+        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
+        use windows_sys::Win32::Security::{
+            GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
+        };
+        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
+        let mut token = std::ptr::null_mut();
+        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+            return None;
+        }
+        let mut needed = 0u32;
+        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
+        let mut buffer = vec![0u8; needed as usize];
+        let ok = unsafe {
+            GetTokenInformation(
+                token,
+                TokenUser,
+                buffer.as_mut_ptr() as *mut _,
+                needed,
+                &mut needed,
+            )
+        };
+        unsafe { CloseHandle(token) };
+        if ok == 0 {
+            return None;
+        }
+        let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
+        let mut text: *mut u16 = std::ptr::null_mut();
+        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 || text.is_null() {
+            return None;
+        }
+        let mut length = 0;
+        while unsafe { *text.add(length) } != 0 {
+            length += 1;
+        }
+        let string = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
+        unsafe { LocalFree(text as *mut _) };
+        Some(string)
+    }
+
+    /// A link is detected by opening it without following, and an
+    /// elevated window refuses the linked path. Whether the OS resolves
+    /// the follow-through open is environment-dependent (restricted
+    /// tokens may refuse it), so the test asserts the security property
+    /// rather than the follow: detection is deterministic, and refusal
+    /// holds whether following succeeds (the check fires) or fails (the
+    /// open itself fails closed). The target fixture stays directly
+    /// readable, proving only the link stands in the way.
+    /// Link creation without sufficient rights reports the skip instead
+    /// of asserting on an unbuilt fixture.
+    #[cfg(windows)]
+    #[test]
+    fn linked_fixture_is_refused_when_elevated() {
+        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_CREATE_LINK, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_LINK,
+            REG_OPTION_CREATE_LINK, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+        };
+        // Process-id names: a failed run's leftovers can never collide
+        // with (or block) a later run.
+        let target_path = unsafe {
+            fixture_theme_key(
+                &format!("HivemendTrustLinkTarget{}", std::process::id()),
+                "dark",
+            )
+        };
+        let Some(sid) = (unsafe { current_user_sid_string() }) else {
+            eprintln!("SKIP: cannot read the current user SID");
+            return;
+        };
+        let link_path = format!(r"Software\HivemendTrustLink{}", std::process::id());
+        let link_subkey = wide(&link_path);
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, link_subkey.as_ptr());
+        }
+        let mut link = std::ptr::null_mut();
+        let mut disposition = 0u32;
+        let created = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                link_subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_CREATE_LINK,
+                KEY_CREATE_LINK | KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut link,
+                &mut disposition,
+            )
+        };
+        if created == ERROR_ACCESS_DENIED {
+            eprintln!("SKIP: link creation needs elevation");
+            unsafe {
+                RegDeleteTreeW(HKEY_CURRENT_USER, wide(&target_path).as_ptr());
+            }
+            return;
+        }
+        assert_eq!(created, 0);
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let marker = wide("SymbolicLinkValue");
+        let target = wide(&format!(r"\Registry\User\{sid}\{target_path}"));
+        assert_eq!(
+            unsafe {
+                RegSetValueExW(
+                    link,
+                    marker.as_ptr(),
+                    0,
+                    REG_LINK,
+                    target.as_ptr() as *const u8,
+                    (target.len() * 2) as u32,
+                )
+            },
+            0
+        );
+        unsafe { RegCloseKey(link) };
+        // Detection works with no following involved, on any host.
+        assert!(is_registry_link(HKEY_CURRENT_USER, &link_path));
+        assert!(!is_registry_link(HKEY_CURRENT_USER, &target_path));
+        // The fixture itself reads plainly; the linked path never yields
+        // a value to an elevated window, whether following succeeds (the
+        // check fires) or fails (the open fails closed).
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &target_path, false),
+            Some(ThemeMode::Dark)
+        );
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &link_path, true),
+            None
+        );
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, link_subkey.as_ptr());
+            RegDeleteTreeW(HKEY_CURRENT_USER, wide(&target_path).as_ptr());
+        }
     }
 
     /// Counts every look at the per-user files and gives fixed contents.

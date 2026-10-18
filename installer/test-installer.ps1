@@ -133,6 +133,26 @@ Write-Host '== /Theme seeds the machine default, upgrades preserve it, bad value
 Install $New @('/ALLUSERS', '/Theme=Dark')
 if ((Theme-Default) -ne 'dark') { throw "expected machine theme default 'dark', found '$(Theme-Default)'" }
 Write-Host 'ok: /Theme=Dark wrote the machine default'
+# The seeded store must be protected: a trusted-system owner and no
+# store-changing grant to a broad interactive identity. Numeric rights
+# (not enum names) so FullControl and generic mappings cannot hide a
+# write bit. The app refuses anything else at runtime; this asserts the
+# installer established the locked shape it promises.
+$acl = Get-Acl -Path 'HKLM:\SOFTWARE\TUIGSE\Hivemend'
+if (@('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM') -notcontains $acl.Owner) {
+  throw "machine theme store owned by '$($acl.Owner)', expected Administrators or SYSTEM"
+}
+$storeWrite = 0x2 -bor 0x4 -bor 0x20 -bor 0x10000 -bor 0x40000 -bor 0x80000
+$broad = @('Everyone', 'BUILTIN\Users', 'NT AUTHORITY\Authenticated Users', 'NT AUTHORITY\Interactive')
+$exposed = @($acl.Access | Where-Object {
+  $_.AccessControlType -eq 'Allow' `
+  -and ($_.RegistryRights.value__ -band $storeWrite) -ne 0 `
+  -and $broad -contains $_.IdentityReference.Value
+})
+if ($exposed.Count -ne 0) {
+  throw "machine theme store grants store-changing rights to untrusted identities: $($exposed.IdentityReference.Value -join ', ')"
+}
+Write-Host 'ok: /Theme=Dark established a protected store (owner and DACL)'
 Install $New @('/ALLUSERS')
 Expect-Installed machine $NewVersion | Out-Null
 if ((Theme-Default) -ne 'dark') { throw 'an upgrade without /Theme overwrote the machine default' }

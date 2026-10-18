@@ -84,7 +84,9 @@ pub use services::{
     refuse_start, refuse_stop, service_key, sort_services, start_services, stop_services,
     tuneup_allowed,
 };
-pub use settings::{BroadSid, Settings, StoreAce, ThemeMode, resolve_theme, store_trusted};
+pub use settings::{
+    BroadSid, STORE_WRITE_MASK, Settings, StoreAce, ThemeMode, resolve_theme, store_trusted,
+};
 pub use startup::{
     StartupItem, StartupOutcome, StartupScope, approved_bytes, filetime_now, list_startup,
     set_startup, startup_backup,

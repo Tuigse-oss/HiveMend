@@ -78,6 +78,15 @@ Filename: "{app}\Hivemend.exe"; Description: "{cm:LaunchProgram,Hivemend}"; Flag
 ; Uninstalling leaves %LOCALAPPDATA%\HiveMend and the administrator backup
 ; store alone: they hold the registry backups a restore needs.
 
+[Registry]
+; Establishes the protected theme store when a /Theme switch is given:
+; administrators and SYSTEM hold full control, standard users read. This
+; runs before the post-install value write below. Permissions are only
+; granted, never scrubbed: a pre-existing hostile grant is left alone
+; here and refused at runtime instead. No unins flags, so the key (and
+; the default) survives uninstall, as the installer matrix verifies.
+Root: HKLM64; Subkey: "SOFTWARE\TUIGSE\Hivemend"; ValueType: none; Permissions: admins-full system-full users-read; Check: ThemeSupplied
+
 [Code]
 const
   ThemeKey = 'SOFTWARE\TUIGSE\Hivemend';
