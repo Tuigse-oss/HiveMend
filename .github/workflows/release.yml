@@ -57,6 +57,20 @@ jobs:
       # Embeds the dependency list in the exe, so the shipped binary itself can
       # be checked against RustSec later with `cargo audit bin`.
       - run: cargo +1.99.0 auditable build --locked --release --target x86_64-pc-windows-msvc
+      - name: Verify the program reports the release version
+        shell: pwsh
+        run: |
+          $exe = (Resolve-Path target/x86_64-pc-windows-msvc/release/Hivemend.exe).Path
+          $probe = Start-Process -FilePath $exe -ArgumentList '--version' -Wait -PassThru `
+            -RedirectStandardOutput version.txt -RedirectStandardError version-stderr.txt
+          $actual = (Get-Content version.txt -Raw).Trim()
+          $expected = "hivemend $env:VERSION"
+          if ($probe.ExitCode -ne 0 -or $actual -ne $expected) {
+            Get-Content version-stderr.txt
+            throw "Program version '$actual' does not match '$expected' (exit $($probe.ExitCode))"
+          }
+          Write-Host "ok: packaged program reports $actual"
+          Get-FileHash -LiteralPath $exe -Algorithm SHA256
       - name: Package
         shell: bash
         # The program ships with its licenses and the third-party notices the
