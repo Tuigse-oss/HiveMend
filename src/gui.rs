@@ -19,16 +19,17 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use hive_mend::art::Icon;
 use hive_mend::{
-    BackupInfo, BackupInventory, BackupSummary, CleanOutcome, Engine, Exclusions, Finding,
-    HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
+    BackupInfo, BackupInventory, BackupSummary, BroadSid, CleanOutcome, Engine, Exclusions,
+    Finding, HiveEntry, HostFs, ItemOutcome, LEGACY_DIR, LeftAlone, Preview, PrivacyItem, Repair,
     RepairOutcome, SUGGESTED, ScanOptions, ScanReport, ScannerId, ScmServiceStore, ServiceChange,
-    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store,
-    WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets, apply_start_changes,
-    backup_stores, backups_dir, backups_location, build_items, clean_with_progress,
-    custom_privacy_file, decode_text_owned, exclusions_file, expand_target, format_bytes,
-    format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until, parse_custom,
-    plan_profile, preview_with, repair_with_progress, restore_backup, scan_with_progress,
-    settings_file, sort_services, start_services, still_reported, stop_services, user_dir,
+    ServiceInfo, ServiceOutcome, ServiceState, ServiceStore, Settings, StartType, Store, StoreAce,
+    ThemeMode, WINDOWS_TOOLS, WindowsProcessList, WindowsRegistry, WindowsSystemTargets,
+    apply_start_changes, backup_stores, backups_dir, backups_location, build_items,
+    clean_with_progress, custom_privacy_file, decode_text_owned, exclusions_file, expand_target,
+    format_bytes, format_uptime, gather_hives, gather_snapshot, group_digits, list_backups_until,
+    parse_custom, plan_profile, preview_with, repair_with_progress, resolve_theme, restore_backup,
+    scan_with_progress, settings_file, sort_services, start_services, still_reported,
+    stop_services, store_trusted, user_dir,
 };
 use windows_sys::Win32::Foundation::{
     CloseHandle, FILETIME, GlobalFree, HANDLE, HWND, LPARAM, LRESULT, POINT, RECT, SYSTEMTIME,
@@ -50,15 +51,17 @@ use windows_sys::Win32::System::SystemInformation::GetLocalTime;
 use windows_sys::Win32::System::Time::{FileTimeToSystemTime, SystemTimeToTzSpecificLocalTime};
 use windows_sys::Win32::UI::Controls::WM_MOUSELEAVE;
 use windows_sys::Win32::UI::Controls::{
-    ICC_LISTVIEW_CLASSES, ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX,
-    InitCommonControlsEx, LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT,
-    LVIS_STATEIMAGEMASK, LVITEMW, LVM_DELETEALLITEMS, LVM_GETITEMCOUNT, LVM_GETITEMRECT,
-    LVM_GETNEXTITEM, LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETCOLUMNWIDTH,
-    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVN_ITEMCHANGED,
-    LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED, LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER,
-    LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP, LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS,
-    LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR, NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS,
-    PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme, WC_LISTVIEWW,
+    HDI_TEXT, HDITEMW, HDM_GETITEMCOUNT, HDM_GETITEMRECT, HDM_GETITEMW, ICC_LISTVIEW_CLASSES,
+    ICC_PROGRESS_CLASS, ICC_STANDARD_CLASSES, INITCOMMONCONTROLSEX, InitCommonControlsEx,
+    LVCF_TEXT, LVCF_WIDTH, LVCOLUMNW, LVIF_PARAM, LVIF_STATE, LVIF_TEXT, LVIS_STATEIMAGEMASK,
+    LVITEMW, LVM_DELETEALLITEMS, LVM_GETHEADER, LVM_GETITEMCOUNT, LVM_GETITEMRECT, LVM_GETNEXTITEM,
+    LVM_INSERTCOLUMNW, LVM_INSERTITEMW, LVM_SETBKCOLOR, LVM_SETCOLUMNWIDTH,
+    LVM_SETEXTENDEDLISTVIEWSTYLE, LVM_SETITEMSTATE, LVM_SETITEMTEXTW, LVM_SETTEXTBKCOLOR,
+    LVM_SETTEXTCOLOR, LVN_ITEMCHANGED, LVN_ITEMCHANGING, LVN_KEYDOWN, LVNI_SELECTED,
+    LVS_EX_CHECKBOXES, LVS_EX_DOUBLEBUFFER, LVS_EX_FULLROWSELECT, LVS_EX_LABELTIP,
+    LVS_NOSORTHEADER, LVS_REPORT, LVS_SHOWSELALWAYS, LVS_SINGLESEL, NM_DBLCLK, NM_RETURN, NMHDR,
+    NMLISTVIEW, NMLVKEYDOWN, PBM_SETPOS, PBM_SETRANGE32, PROGRESS_CLASSW, SetWindowTheme,
+    WC_LISTVIEWW,
 };
 use windows_sys::Win32::UI::HiDpi::{GetDpiForSystem, GetDpiForWindow};
 use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
@@ -67,18 +70,19 @@ use windows_sys::Win32::UI::Input::KeyboardAndMouse::{
 use windows_sys::Win32::UI::Shell::{IsUserAnAdmin, ShellExecuteW};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     AppendMenuW, BM_GETCHECK, BM_SETCHECK, BS_AUTOCHECKBOX, BS_PUSHBUTTON, CW_USEDEFAULT,
-    CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow, DispatchMessageW,
-    GWLP_USERDATA, GetClientRect, GetCursorPos, GetMessageW, GetWindowLongPtrW, HMENU, HTCLIENT,
-    IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow, LoadCursorW, MB_DEFBUTTON2,
-    MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK, MB_YESNO, MF_GRAYED, MF_SEPARATOR,
-    MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow, PostMessageW, PostQuitMessage,
-    RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE, SWP_NOZORDER, SendMessageW,
-    SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW, ShowWindow, TPM_RETURNCMD,
-    TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE, WM_COMMAND,
-    WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY, WM_DPICHANGED,
-    WM_ERASEBKGND, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE, WM_NOTIFY, WM_PAINT, WM_SETCURSOR,
-    WM_SETFONT, WM_SETREDRAW, WM_SIZE, WNDCLASSW, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN,
-    WS_EX_CONTROLPARENT, WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
+    CallWindowProcW, CreatePopupMenu, CreateWindowExW, DefWindowProcW, DestroyMenu, DestroyWindow,
+    DispatchMessageW, GWLP_USERDATA, GWLP_WNDPROC, GetClientRect, GetCursorPos, GetMessageW,
+    GetWindowLongPtrW, HMENU, HTCLIENT, IDC_ARROW, IDC_HAND, IDYES, IsDialogMessageW, IsWindow,
+    LoadCursorW, MB_DEFBUTTON2, MB_ICONINFORMATION, MB_ICONQUESTION, MB_ICONWARNING, MB_OK,
+    MB_YESNO, MF_GRAYED, MF_SEPARATOR, MF_STRING, MINMAXINFO, MSG, MessageBoxW, MoveWindow,
+    PostMessageW, PostQuitMessage, RegisterClassW, SW_HIDE, SW_SHOW, SW_SHOWNORMAL, SWP_NOACTIVATE,
+    SWP_NOZORDER, SendMessageW, SetCursor, SetWindowLongPtrW, SetWindowPos, SetWindowTextW,
+    ShowWindow, TPM_RETURNCMD, TPM_RIGHTBUTTON, TrackPopupMenu, TranslateMessage, WM_APP, WM_CLOSE,
+    WM_COMMAND, WM_CONTEXTMENU, WM_CREATE, WM_CTLCOLORBTN, WM_CTLCOLORSTATIC, WM_DESTROY,
+    WM_DPICHANGED, WM_ERASEBKGND, WM_GETFONT, WM_GETMINMAXINFO, WM_LBUTTONUP, WM_MOUSEMOVE,
+    WM_NOTIFY, WM_PAINT, WM_SETCURSOR, WM_SETFONT, WM_SETREDRAW, WM_SETTINGCHANGE, WM_SIZE,
+    WNDCLASSW, WNDPROC, WS_BORDER, WS_CHILD, WS_CLIPCHILDREN, WS_EX_CONTROLPARENT,
+    WS_OVERLAPPEDWINDOW, WS_TABSTOP, WS_VISIBLE, WS_VSCROLL,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     BN_KILLFOCUS, BN_SETFOCUS, WM_ENDSESSION, WM_KEYDOWN, WM_QUERYENDSESSION,
@@ -180,26 +184,520 @@ const SUBTITLE_Y: i32 = HEADER_H + 52;
 /// Where page content starts, below the title and subtitle.
 const BODY_Y: i32 = HEADER_H + 90;
 const LIST_Y: i32 = BODY_Y + 22;
+/// Room for the Appearance block that sits between the subtitle and the
+/// scanner grid. Heading and pills share one row so the shift stays
+/// small: at the minimum window size every pixel of it comes out of the
+/// ignored-entries list below.
+const SETTINGS_SHIFT: i32 = 38;
 /// The restore-point checkbox sits under the scanner grid.
-const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6;
-const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52;
+const SETTINGS_RESTORE_POINT_Y: i32 = BODY_Y + 34 + 6 * 30 + 6 + SETTINGS_SHIFT;
+const SETTINGS_IGNORED_Y: i32 = BODY_Y + 34 + 6 * 30 + 52 + SETTINGS_SHIFT;
 
-/// The window background; cards and tiles sit on it as white surfaces.
-const BG: u32 = rgb(245, 247, 246);
-const SURFACE: u32 = rgb(255, 255, 255);
-const BORDER: u32 = rgb(222, 229, 224);
-/// The primary action colour (Scan now, the open page's marker).
-const ACCENT_GREEN: u32 = rgb(24, 122, 66);
-const ACCENT_GREEN_HOVER: u32 = rgb(16, 100, 52);
-/// Soft green fill for the open page and hovered tiles.
-const ACCENT_TINT: u32 = rgb(224, 240, 229);
-const HOVER_TINT: u32 = rgb(232, 238, 234);
-const SIDEBAR_BG: u32 = rgb(238, 242, 239);
-const INK: u32 = rgb(28, 28, 28);
-const MUTED: u32 = rgb(88, 98, 92);
-const LINK: u32 = rgb(22, 110, 56);
-/// Deep Celtic green, the theme colour shared with the icons in `art`.
-const THEME_INK: u32 = rgb(22, 86, 48);
+/// Every color the drawn UI paints. The window reads these through the
+/// active [`Theme`] instead of fixed constants, so one switch repaints
+/// everything; real controls (lists, buttons) follow through their own
+/// Explorer theme, and icons composite through transparency.
+#[derive(Clone, Copy)]
+struct Theme {
+    /// The window background; cards and tiles sit on it as surfaces.
+    bg: u32,
+    surface: u32,
+    border: u32,
+    /// The primary action colour (Scan now, the open page's marker).
+    accent: u32,
+    accent_hover: u32,
+    /// Soft green fill for the open page and hovered tiles.
+    accent_tint: u32,
+    hover_tint: u32,
+    sidebar: u32,
+    ink: u32,
+    muted: u32,
+    link: u32,
+    /// Deep Celtic green, the theme colour shared with the icons in `art`;
+    /// brightened for dark so headings survive the background.
+    theme_ink: u32,
+    dark: bool,
+}
+
+impl Theme {
+    const fn light() -> Self {
+        Self {
+            bg: rgb(245, 247, 246),
+            surface: rgb(255, 255, 255),
+            border: rgb(222, 229, 224),
+            accent: rgb(24, 122, 66),
+            accent_hover: rgb(16, 100, 52),
+            accent_tint: rgb(224, 240, 229),
+            hover_tint: rgb(232, 238, 234),
+            sidebar: rgb(238, 242, 239),
+            ink: rgb(28, 28, 28),
+            muted: rgb(88, 98, 92),
+            link: rgb(22, 110, 56),
+            theme_ink: rgb(22, 86, 48),
+            dark: false,
+        }
+    }
+
+    const fn dark() -> Self {
+        Self {
+            bg: rgb(14, 17, 15),
+            surface: rgb(26, 32, 28),
+            border: rgb(52, 64, 55),
+            accent: rgb(52, 168, 96),
+            accent_hover: rgb(66, 186, 110),
+            accent_tint: rgb(24, 54, 36),
+            hover_tint: rgb(32, 44, 36),
+            sidebar: rgb(11, 14, 12),
+            ink: rgb(170, 226, 170),
+            muted: rgb(130, 150, 135),
+            link: rgb(116, 204, 144),
+            theme_ink: rgb(126, 206, 154),
+            dark: true,
+        }
+    }
+
+    fn resolve(mode: hive_mend::ThemeMode) -> Self {
+        use hive_mend::ThemeMode::{Dark, Light, System};
+        match mode {
+            Light => Self::light(),
+            Dark => Self::dark(),
+            System => {
+                if system_wants_dark() {
+                    Self::dark()
+                } else {
+                    Self::light()
+                }
+            }
+        }
+    }
+}
+
+/// The theme default the installer wrote for this machine, if any. An
+/// invalid value is ignored, never a theme. In an administrator window the
+/// value is only accepted from a verified protected store: a permissive
+/// key lets a standard user steer an elevated window's appearance, so an
+/// untrusted store reads as absent.
+#[cfg(windows)]
+pub(crate) fn machine_default(elevated: bool) -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
+    machine_default_at(HKEY_LOCAL_MACHINE, r"SOFTWARE\TUIGSE\Hivemend", elevated)
+}
+
+/// The same lookup against an arbitrary root, so tests can exercise the
+/// production open-validate-read path on disposable fixture keys. An
+/// elevated lookup walks every path component without following links
+/// (see [`open_validated_chain`]) and reads the value through the
+/// retained validated leaf handle: no name is re-resolved between the
+/// trust checks and the read, so a swapped object cannot slip a value
+/// past them.
+#[cfg(windows)]
+fn machine_default_at(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+    elevated: bool,
+) -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+    if !elevated {
+        // A plain window trusts the installer path and reads it directly.
+        let subkey = wide(path);
+        let mut key = std::ptr::null_mut();
+        let status = unsafe { RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key) };
+        if status != 0 || key.is_null() {
+            return None;
+        }
+        let mode = read_theme_value(key);
+        unsafe {
+            RegCloseKey(key);
+        }
+        return mode;
+    }
+    let leaf = open_validated_chain(root, path)?;
+    let mode = read_theme_value(leaf);
+    unsafe {
+        RegCloseKey(leaf);
+    }
+    mode
+}
+
+/// The installed default through an open key handle. Only `REG_SZ`
+/// counts; anything else (including an overlong value) is ignored, never
+/// a theme.
+#[cfg(windows)]
+fn read_theme_value(key: windows_sys::Win32::System::Registry::HKEY) -> Option<ThemeMode> {
+    use windows_sys::Win32::System::Registry::{REG_SZ, RegQueryValueExW};
+    let name = wide("Theme");
+    let mut kind = 0u32;
+    let mut text: [u16; 32] = [0; 32];
+    let mut size = (text.len() * 2) as u32;
+    let status = unsafe {
+        RegQueryValueExW(
+            key,
+            name.as_ptr(),
+            std::ptr::null(),
+            &mut kind,
+            text.as_mut_ptr() as *mut u8,
+            &mut size,
+        )
+    };
+    if status != 0 || kind != REG_SZ {
+        return None;
+    }
+    let used = (size as usize / 2).min(text.len());
+    let end = text[..used]
+        .iter()
+        .position(|cell| *cell == 0)
+        .unwrap_or(used);
+    ThemeMode::parse_any(&String::from_utf16_lossy(&text[..end]))
+}
+
+/// Whether an open key is a registry link, from the kernel's key flags
+/// rather than from a value anyone could write: a `SymbolicLinkValue`
+/// sitting on a normal key proves nothing, while the flags cannot be
+/// spoofed. Mirrors the maintenance registry's link check.
+#[cfg(windows)]
+fn key_is_link(key: windows_sys::Win32::System::Registry::HKEY) -> Result<bool, i32> {
+    use windows_sys::Wdk::System::Registry::{KeyFlagsInformation, NtQueryKey};
+    // REG_FLAG_LINK from winnt.h, absent from windows-sys as a constant.
+    const REG_FLAG_LINK: u32 = 0x2;
+    let mut info = [0u32; 3];
+    let mut got = 0u32;
+    let status = unsafe {
+        NtQueryKey(
+            key as _,
+            KeyFlagsInformation,
+            info.as_mut_ptr() as *mut _,
+            std::mem::size_of_val(&info) as u32,
+            &mut got,
+        )
+    };
+    if status < 0 {
+        return Err(status);
+    }
+    if got < 8 {
+        return Err(-1);
+    }
+    Ok(info[1] & REG_FLAG_LINK != 0)
+}
+
+/// Open the leaf of `path` under `root` for an elevated trust check.
+/// Every component is opened relative to its retained validated parent
+/// with no-follow semantics; links are refused, and every component's
+/// owner and DACL must pass [`store_protected_for`] (a user-writable
+/// ancestor would let a standard account delete and recreate the leaf
+/// with a strict DACL but a chosen value). Missing, link, untrusted, or
+/// uncheckable components all yield no handle: failed verification never
+/// grants trust. The caller reads through the returned handle and closes
+/// it. Mirrors the maintenance registry's component walk, with trust
+/// validation at every step instead of system-link crossing.
+#[cfg(windows)]
+fn open_validated_chain(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+) -> Option<windows_sys::Win32::System::Registry::HKEY> {
+    open_validated_chain_with_link_check(root, path, key_is_link)
+}
+
+/// Keep the native walk and handle lifecycle identical under deterministic
+/// link-query failures. Production always supplies `key_is_link` above.
+#[cfg(windows)]
+fn open_validated_chain_with_link_check(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+    mut link_check: impl FnMut(windows_sys::Win32::System::Registry::HKEY) -> Result<bool, i32>,
+) -> Option<windows_sys::Win32::System::Registry::HKEY> {
+    use windows_sys::Win32::System::Registry::{
+        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+    };
+    // READ_CONTROL (0x20000) so each handle can carry its own security
+    // check; windows-sys only names it under FileSystem, and borrowing
+    // that name for a registry mask would mislead.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    if path.split('\\').any(str::is_empty) {
+        return None;
+    }
+    let mut parent = root;
+    let mut owns_parent = false;
+    let mut components = path.split('\\').peekable();
+    while let Some(name) = components.next() {
+        let mut child = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                wide(name).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE | READ_CONTROL,
+                &mut child,
+            )
+        };
+        if opened != 0 || child.is_null() {
+            if owns_parent {
+                unsafe {
+                    RegCloseKey(parent);
+                }
+            }
+            return None;
+        }
+        // The no-follow handle is the link object itself when the
+        // component is a link, so the kernel flags decide, and the
+        // descriptor below belongs to the exact object being validated.
+        let verified = link_check(child).is_ok_and(|link| !link) && store_protected_for(child);
+        if owns_parent {
+            unsafe {
+                RegCloseKey(parent);
+            }
+        }
+        if !verified {
+            unsafe {
+                RegCloseKey(child);
+            }
+            return None;
+        }
+        parent = child;
+        owns_parent = true;
+        if components.peek().is_none() {
+            return Some(child);
+        }
+    }
+    if owns_parent {
+        unsafe {
+            RegCloseKey(parent);
+        }
+    }
+    None
+}
+
+/// Whether the exact open object is a protected store: a trusted system
+/// owner (an untrusted owner rewrites the DACL at will) and a DACL that
+/// grants no untrusted principal store-changing access. The descriptor
+/// comes from the open handle, never from a re-resolved name. Any API
+/// failure reads as untrusted, falling back to System.
+#[cfg(windows)]
+fn store_protected_for(key: windows_sys::Win32::System::Registry::HKEY) -> bool {
+    use windows_sys::Win32::Foundation::LocalFree;
+    use windows_sys::Win32::Security::Authorization::{GetSecurityInfo, SE_REGISTRY_KEY};
+    use windows_sys::Win32::Security::{
+        ACL, DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR, PSID,
+    };
+    let mut owner: PSID = std::ptr::null_mut();
+    let mut dacl: *mut ACL = std::ptr::null_mut();
+    let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+    let status = unsafe {
+        GetSecurityInfo(
+            key,
+            SE_REGISTRY_KEY,
+            OWNER_SECURITY_INFORMATION | DACL_SECURITY_INFORMATION,
+            &mut owner,
+            std::ptr::null_mut(),
+            &mut dacl,
+            std::ptr::null_mut(),
+            &mut sd,
+        )
+    };
+    // The owner and DACL pointers borrow the returned descriptor: only
+    // the descriptor itself is freed, and only after the verdict below
+    // has finished reading through them.
+    let trusted = status == 0
+        && !owner.is_null()
+        && !dacl.is_null()
+        && unsafe { owner_trusted(owner) && dacl_trusted(dacl) };
+    if !sd.is_null() {
+        unsafe {
+            LocalFree(sd as *mut _);
+        }
+    }
+    trusted
+}
+
+/// Whether the key's owner is a trusted system principal. Ownership
+/// implies unrestricted DACL control, so anything else (including the
+/// interactive user owning their own hive keys) refuses the store.
+#[cfg(windows)]
+unsafe fn owner_trusted(owner: windows_sys::Win32::Security::PSID) -> bool {
+    use windows_sys::Win32::Security::{
+        CreateWellKnownSid, EqualSid, WinBuiltinAdministratorsSid, WinLocalSystemSid,
+    };
+    let mut system = [0u32; 17];
+    let mut admins = [0u32; 17];
+    for (kind, slot) in [
+        (WinLocalSystemSid, system.as_mut_ptr() as *mut _),
+        (WinBuiltinAdministratorsSid, admins.as_mut_ptr() as *mut _),
+    ] {
+        let mut length = 68u32;
+        if unsafe { CreateWellKnownSid(kind, std::ptr::null_mut(), slot, &mut length) } == 0 {
+            return false;
+        }
+    }
+    unsafe {
+        EqualSid(owner as *mut _, system.as_ptr() as *mut _) != 0
+            || EqualSid(owner as *mut _, admins.as_ptr() as *mut _) != 0
+    }
+}
+
+/// Whether a live DACL (not a pre-decoded list) grants no untrusted
+/// principal store-changing access. Entries for trusted system
+/// principals (SYSTEM, Administrators) and for CREATOR OWNER are
+/// removed here; the latter is safe only because the caller checks the
+/// owner first, so it can only empower SYSTEM or Administrators. The
+/// owner is checked by the caller, so the pure policy sees only
+/// untrusted principals and any store-changing allow refuses the store.
+/// Split from the registry lookup so tests can feed real descriptors
+/// built in memory, exercising retrieval and decoding as well as the
+/// pure policy.
+#[cfg(windows)]
+unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce,
+        GetAclInformation, WinAuthenticatedUserSid, WinBuiltinAdministratorsSid,
+        WinBuiltinUsersSid, WinCreatorOwnerSid, WinInteractiveSid, WinLocalSystemSid, WinWorldSid,
+    };
+    // winnt.h ACE types, absent from windows-sys as constants.
+    const ALLOWED: u8 = 0;
+    const DENIED: u8 = 1;
+    const ALLOWED_CALLBACK: u8 = 9;
+    const DENIED_CALLBACK: u8 = 10;
+    // Buffers big enough for any well-known SID (SECURITY_MAX_SID_SIZE).
+    let mut world = [0u32; 17];
+    let mut users = [0u32; 17];
+    let mut auth = [0u32; 17];
+    let mut interactive = [0u32; 17];
+    let mut system = [0u32; 17];
+    let mut admins = [0u32; 17];
+    let mut creator_owner = [0u32; 17];
+    let mut known: [(i32, *mut std::ffi::c_void); 7] = [
+        (WinWorldSid, world.as_mut_ptr() as *mut _),
+        (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
+        (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
+        (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
+        (WinLocalSystemSid, system.as_mut_ptr() as *mut _),
+        (WinBuiltinAdministratorsSid, admins.as_mut_ptr() as *mut _),
+        (WinCreatorOwnerSid, creator_owner.as_mut_ptr() as *mut _),
+    ];
+    for (kind, slot) in &mut known {
+        let mut length = 68u32;
+        if unsafe { CreateWellKnownSid(*kind, std::ptr::null_mut(), *slot, &mut length) } == 0 {
+            return false;
+        }
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
+    let ok = unsafe {
+        GetAclInformation(
+            dacl,
+            &mut info as *mut _ as *mut _,
+            std::mem::size_of::<ACL_SIZE_INFORMATION>() as u32,
+            AclSizeInformation,
+        )
+    };
+    let mut aces = Vec::new();
+    if ok != 0 {
+        for index in 0..info.AceCount {
+            let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
+                continue;
+            }
+            // NonNull is the non-null proof; the alignment and size checks
+            // below make every subsequent field read land inside the entry
+            // the API just handed over.
+            let Some(entry) = std::ptr::NonNull::new(raw) else {
+                continue;
+            };
+            if !(entry.as_ptr() as usize).is_multiple_of(4) {
+                continue;
+            }
+            let head = unsafe { entry.cast::<ACE_HEADER>().as_ref() };
+            if (head.AceSize as usize)
+                < std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()
+            {
+                continue;
+            }
+            let allow = match head.AceType {
+                ALLOWED | ALLOWED_CALLBACK => true,
+                DENIED | DENIED_CALLBACK => false,
+                _ => continue,
+            };
+            // An inherit-only ACE does not apply to the key itself
+            // (Windows ignores it when checking access to this object),
+            // so skipping it is faithful, not lenient: it typically
+            // carries a broad full-control grant meant for subkeys
+            // (such as CREATOR OWNER on HKLM\SOFTWARE), which must not
+            // fail an otherwise protected store. The flags byte is the
+            // second byte of the ACE header.
+            let flags = unsafe { entry.cast::<u8>().as_ptr().add(1).read() };
+            const INHERIT_ONLY: u8 = 0x8;
+            if flags & INHERIT_ONLY != 0 {
+                continue;
+            }
+            // add(1) steps one u32: the mask lives at byte offset 4, right
+            // after the 4-byte ACE header (byte_add counts bytes, so it
+            // would need 4 here and misleads; see the review finding).
+            let mask = unsafe { entry.cast::<u32>().as_ptr().add(1).read() };
+            let sid = unsafe { entry.as_ptr().byte_add(8) as *const _ };
+            // Trusted system trustees are removed before the pure check:
+            // their full-control ACEs are the normal shape of a protected
+            // key. CREATOR OWNER is removed on the same basis by coupling:
+            // its ACEs grant rights to the object's owner, and the caller
+            // ([`store_protected_for`]) verifies that owner is SYSTEM or
+            // Administrators before this walk runs, so a Creator-Owner
+            // grant can only empower a trusted principal. Standard stock
+            // keys (HKLM\SOFTWARE carries one) would otherwise fail every
+            // clean store. Every remaining SID is an untrusted principal,
+            // so the pure policy refuses any store-changing allow from it
+            // and ignores denies (they never bless the store).
+            let trusted_system = unsafe {
+                EqualSid(sid as *mut _, system.as_ptr() as *mut _) != 0
+                    || EqualSid(sid as *mut _, admins.as_ptr() as *mut _) != 0
+                    || EqualSid(sid as *mut _, creator_owner.as_ptr() as *mut _) != 0
+            };
+            if trusted_system {
+                continue;
+            }
+            let broad = unsafe {
+                if EqualSid(sid as *mut _, world.as_ptr() as *mut _) != 0 {
+                    BroadSid::Everyone
+                } else if EqualSid(sid as *mut _, users.as_ptr() as *mut _) != 0 {
+                    BroadSid::Users
+                } else if EqualSid(sid as *mut _, auth.as_ptr() as *mut _) != 0 {
+                    BroadSid::Authenticated
+                } else if EqualSid(sid as *mut _, interactive.as_ptr() as *mut _) != 0 {
+                    BroadSid::Interactive
+                } else {
+                    BroadSid::Other
+                }
+            };
+            aces.push(StoreAce {
+                sid: broad,
+                allow,
+                mask,
+            });
+        }
+    }
+    // No DACL at all means nothing restricts the key.
+    if info.AceCount == 0 {
+        return false;
+    }
+    store_trusted(&aces)
+}
+
+/// Whether Windows itself is set to dark app mode. A missing key means
+/// light, the Windows default.
+fn system_wants_dark() -> bool {
+    use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RRF_RT_DWORD, RegGetValueW};
+    let personalize = wide(r"Software\Microsoft\Windows\CurrentVersion\Themes\Personalize");
+    let name = wide("AppsUseLightTheme");
+    let mut value = 1u32;
+    let mut size = std::mem::size_of::<u32>() as u32;
+    let ok = unsafe {
+        RegGetValueW(
+            HKEY_CURRENT_USER,
+            personalize.as_ptr(),
+            name.as_ptr(),
+            RRF_RT_DWORD,
+            std::ptr::null_mut(),
+            &mut value as *mut u32 as *mut _,
+            &mut size,
+        )
+    };
+    ok == 0 && value == 0
+}
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Page {
@@ -316,6 +814,7 @@ enum SvcOp {
 #[derive(Clone, Copy)]
 enum Action {
     Page(Page),
+    Theme(ThemeMode),
     ScanAll,
     Optimize,
     ResetStats,
@@ -516,6 +1015,7 @@ struct App {
     dpi: u32,
     fonts: Fonts,
     bg_brush: HBRUSH,
+    theme: Theme,
     /// Icons rendered by `art` at the pixel sizes drawn so far.
     art: HashMap<(Icon, i32), HBITMAP>,
     /// Anti-aliased corner sprites for rounded boxes, by radius and colours.
@@ -783,6 +1283,14 @@ unsafe extern "system" fn wnd_proc(
                 app.invalidate();
                 0
             }
+            WM_SETTINGCHANGE => {
+                // Windows tells every top-level window when the app theme
+                // changes. Only System mode cares; a fixed choice stays put.
+                if app.settings.theme == ThemeMode::System {
+                    app.apply_theme();
+                }
+                DefWindowProcW(hwnd, msg, wparam, lparam)
+            }
             WM_MOUSEMOVE => {
                 let (x, y) = point(lparam);
                 app.set_hover(app.spot_at(x, y));
@@ -838,7 +1346,7 @@ unsafe extern "system" fn wnd_proc(
                 0
             }
             WM_CTLCOLORSTATIC | WM_CTLCOLORBTN => {
-                SetBkColor(wparam as HDC, BG);
+                SetBkColor(wparam as HDC, app.theme.bg);
                 app.bg_brush as LRESULT
             }
             WM_JOB_PROGRESS => {
@@ -940,6 +1448,7 @@ fn app_handles(msg: u32) -> bool {
             | WM_PAINT
             | WM_SIZE
             | WM_RELAYOUT
+            | WM_SETTINGCHANGE
             | WM_DPICHANGED
             | WM_MOUSEMOVE
             | WM_MOUSELEAVE
@@ -1171,17 +1680,25 @@ impl App {
         // An administrator window takes no policy from the per-user folder,
         // which programs running without elevation can change: it starts
         // from the built-in settings (restore points on) and never saves.
-        let settings = if elevated {
+        let mut settings = if elevated {
             Settings::default()
         } else {
             Settings::load(&settings_file())
         };
+        // Normal mode: an explicit per-user choice, then the machine
+        // default, then System. Administrator mode never reads the
+        // per-user folder at all, so it resolves from the machine default
+        // (an in-app pick still applies for that window, without saving).
+        let user = (!elevated && settings.theme_explicit).then_some(settings.theme);
+        settings.theme = resolve_theme(user, machine_default(elevated));
+        let theme = Theme::resolve(settings.theme);
         let mut app = Self {
             hwnd,
             page: Page::Status,
             dpi,
             fonts: make_fonts(dpi),
-            bg_brush: unsafe { CreateSolidBrush(BG) },
+            theme,
+            bg_brush: unsafe { CreateSolidBrush(theme.bg) },
             art: HashMap::new(),
             corners: HashMap::new(),
             hotspots: Vec::new(),
@@ -1297,6 +1814,7 @@ impl App {
             btn_priv_clean: std::ptr::null_mut(),
         };
         app.create_controls();
+        app.apply_theme();
         app
     }
 
@@ -1617,6 +2135,7 @@ impl App {
     fn perform(&mut self, action: Action) {
         match action {
             Action::Page(page) => self.go(page),
+            Action::Theme(mode) => self.set_theme(mode),
             Action::ScanAll => self.start_scan(self.settings.full_scan()),
             Action::Optimize => {
                 let scope = OPTIMIZE
@@ -4875,6 +5394,70 @@ impl App {
         let _ = self.settings.save(&settings_file());
     }
 
+    fn set_theme(&mut self, mode: ThemeMode) {
+        // Explicit, including System: the choice is saved (never from an
+        // administrator window) so it keeps overriding the machine
+        // default after a restart.
+        self.settings.theme = mode;
+        self.settings.theme_explicit = true;
+        self.save_settings();
+        self.apply_theme();
+    }
+
+    /// Re-resolve the palette and repaint everything for it: the brush the
+    /// real controls paint with, the title bar, the real controls'
+    /// Explorer theme, and the whole window.
+    fn apply_theme(&mut self) {
+        use windows_sys::Win32::Graphics::Dwm::{
+            DWMWA_USE_IMMERSIVE_DARK_MODE, DwmSetWindowAttribute,
+        };
+        use windows_sys::Win32::UI::WindowsAndMessaging::EnumChildWindows;
+        self.theme = Theme::resolve(self.settings.theme);
+        unsafe {
+            DeleteObject(self.bg_brush);
+            self.bg_brush = CreateSolidBrush(self.theme.bg);
+            let dark = self.theme.dark as i32;
+            DwmSetWindowAttribute(
+                self.hwnd,
+                DWMWA_USE_IMMERSIVE_DARK_MODE as u32,
+                &dark as *const i32 as *const std::ffi::c_void,
+                std::mem::size_of::<i32>() as u32,
+            );
+            EnumChildWindows(self.hwnd, Some(theme_child), dark as LPARAM);
+            self.paint_lists();
+            self.invalidate();
+        }
+    }
+
+    /// Recolor every results list to the active theme. The Explorer visual
+    /// style alone leaves list rows white-on-dark-text on most Windows
+    /// builds, which is exactly the white rectangle behind text dark mode
+    /// must not show; explicit row colors follow the palette both ways.
+    fn paint_lists(&self) {
+        HEADER_BG.store(self.theme.surface, Ordering::Relaxed);
+        HEADER_INK.store(self.theme.ink, Ordering::Relaxed);
+        for list in [
+            self.list,
+            self.backup_list,
+            self.startup_list,
+            self.programs_list,
+            self.disk_list,
+            self.dup_list,
+            self.ignored_list,
+            self.svc_list,
+            self.svc_tune_list,
+            self.priv_list,
+        ] {
+            paint_list(list, self.theme);
+            unsafe {
+                let header = SendMessageW(list, LVM_GETHEADER, 0, 0) as HWND;
+                if !header.is_null() {
+                    theme_header(header, self.theme.dark);
+                }
+            }
+        }
+    }
+
     fn fill_ignored(&self) {
         unsafe { SendMessageW(self.ignored_list, LVM_DELETEALLITEMS, 0, 0) };
         for (row, entry) in self.exclusions.entries().iter().enumerate() {
@@ -5300,7 +5883,7 @@ impl App {
                     place(
                         *check,
                         left + column * column_w,
-                        self.s(BODY_Y + 34) + row * self.s(30),
+                        self.s(BODY_Y + SETTINGS_SHIFT + 34) + row * self.s(30),
                         column_w - self.s(12),
                         self.s(26),
                     );
@@ -5320,7 +5903,7 @@ impl App {
                     left,
                     ignored_top,
                     width,
-                    (button_y - self.s(14) - ignored_top).max(self.s(60)),
+                    ignored_list_room(bottom, self.dpi),
                 );
                 place(self.btn_unignore, left, button_y, self.s(220), button_h);
                 unsafe {
@@ -5714,13 +6297,13 @@ impl App {
             let focused = self.focused_spot();
             self.hotspots.clear();
             self.texts.borrow_mut().clear();
-            fill(mem, rect, BG);
+            fill(mem, rect, self.theme.bg);
             self.draw_chrome(mem, rect, previous_hover);
             match self.page {
                 Page::Status => self.draw_status(mem, rect, previous_hover),
                 Page::Scan => self.draw_scan(mem, rect),
                 Page::Restore => self.draw_restore(mem, rect),
-                Page::Settings => self.draw_settings(mem, rect),
+                Page::Settings => self.draw_settings(mem, rect, previous_hover),
                 Page::Services => self.draw_services(mem, rect, previous_hover),
                 Page::Startup => self.draw_startup(mem, rect),
                 Page::Programs => self.draw_programs(mem, rect),
@@ -5863,7 +6446,7 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            SURFACE,
+            self.theme.surface,
         );
         fill(
             hdc,
@@ -5873,14 +6456,14 @@ impl App {
                 right: rect.right,
                 bottom: header,
             },
-            BORDER,
+            self.theme.border,
         );
         let logo = self.s(30);
         self.draw_icon(hdc, Icon::Logo, self.s(20), (header - logo) / 2, logo);
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left: self.s(20) + logo + self.s(12),
                 top: 0,
@@ -5901,7 +6484,11 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            if help_lit { ACCENT_GREEN } else { MUTED },
+            if help_lit {
+                self.theme.accent
+            } else {
+                self.theme.muted
+            },
             help,
             "Help",
             DT_SINGLELINE | DT_VCENTER | DT_RIGHT,
@@ -5917,11 +6504,19 @@ impl App {
                 right: right_edge,
                 bottom: header / 2 + self.s(12),
             };
-            self.panel(hdc, badge, self.s(12), ACCENT_TINT, ACCENT_TINT, 0, SURFACE);
+            self.panel(
+                hdc,
+                badge,
+                self.s(12),
+                self.theme.accent_tint,
+                self.theme.accent_tint,
+                0,
+                self.theme.surface,
+            );
             text(
                 hdc,
                 self.fonts.small,
-                THEME_INK,
+                self.theme.theme_ink,
                 badge,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5940,15 +6535,19 @@ impl App {
                 hdc,
                 link,
                 self.s(8),
-                if lit { ACCENT_TINT } else { SURFACE },
-                ACCENT_GREEN,
+                if lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                self.theme.accent,
                 1,
-                SURFACE,
+                self.theme.surface,
             );
             text(
                 hdc,
                 self.fonts.body,
-                ACCENT_GREEN,
+                self.theme.accent,
                 link,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -5964,7 +6563,7 @@ impl App {
             right: self.s(SIDEBAR_W),
             bottom: rect.bottom,
         };
-        fill(hdc, side, SIDEBAR_BG);
+        fill(hdc, side, self.theme.sidebar);
         fill(
             hdc,
             RECT {
@@ -5973,7 +6572,7 @@ impl App {
                 right: side.right,
                 bottom: side.bottom,
             },
-            BORDER,
+            self.theme.border,
         );
         let mut y = header + self.s(14);
         for (label, page, icon) in NAV {
@@ -5986,8 +6585,12 @@ impl App {
             let selected = self.page == *page;
             let lit = lit(hover, item);
             if selected || lit {
-                let tint = if selected { ACCENT_TINT } else { HOVER_TINT };
-                self.panel(hdc, item, self.s(8), tint, tint, 0, SIDEBAR_BG);
+                let tint = if selected {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.hover_tint
+                };
+                self.panel(hdc, item, self.s(8), tint, tint, 0, self.theme.sidebar);
             }
             if selected {
                 let bar_h = self.s(16);
@@ -6000,10 +6603,10 @@ impl App {
                         bottom: item.top + (self.s(38) + bar_h) / 2,
                     },
                     self.s(2),
-                    ACCENT_GREEN,
-                    ACCENT_GREEN,
+                    self.theme.accent,
+                    self.theme.accent,
                     0,
-                    ACCENT_TINT,
+                    self.theme.accent_tint,
                 );
             }
             let icon_px = self.s(22);
@@ -6021,7 +6624,11 @@ impl App {
                 } else {
                     self.fonts.body
                 },
-                if selected { THEME_INK } else { INK },
+                if selected {
+                    self.theme.theme_ink
+                } else {
+                    self.theme.ink
+                },
                 RECT {
                     left: item.left + self.s(14) + icon_px + self.s(12),
                     top: item.top,
@@ -6050,7 +6657,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left: self.s(16),
                     top: y + self.s(8),
@@ -6186,7 +6793,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top,
@@ -6201,7 +6808,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.title,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: x,
                     top,
@@ -6229,7 +6836,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top,
@@ -6290,7 +6897,15 @@ impl App {
             right,
             bottom: y + self.s(120),
         };
-        self.panel(hdc, banner, self.s(10), SURFACE, BORDER, 1, BG);
+        self.panel(
+            hdc,
+            banner,
+            self.s(10),
+            self.theme.surface,
+            self.theme.border,
+            1,
+            self.theme.bg,
+        );
         let (badge, headline, detail) = self.status_text();
         let badge_px = self.s(72);
         self.draw_icon(
@@ -6310,7 +6925,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left: text_left,
                 top: banner.top + self.s(24),
@@ -6329,7 +6944,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             detail_rect,
             &detail,
             DT_WORDBREAK | DT_END_ELLIPSIS,
@@ -6347,15 +6962,23 @@ impl App {
         let fill_color = if disabled {
             rgb(160, 176, 166)
         } else if button_lit {
-            ACCENT_GREEN_HOVER
+            self.theme.accent_hover
         } else {
-            ACCENT_GREEN
+            self.theme.accent
         };
-        self.panel(hdc, button, self.s(8), fill_color, fill_color, 0, SURFACE);
+        self.panel(
+            hdc,
+            button,
+            self.s(8),
+            fill_color,
+            fill_color,
+            0,
+            self.theme.surface,
+        );
         text(
             hdc,
             self.fonts.body_bold,
-            SURFACE,
+            self.theme.surface,
             button,
             "Scan now",
             DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -6367,7 +6990,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -6411,10 +7034,18 @@ impl App {
                 hdc,
                 tile,
                 self.s(10),
-                if tile_lit { ACCENT_TINT } else { SURFACE },
-                if tile_lit { ACCENT_GREEN } else { BORDER },
+                if tile_lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                if tile_lit {
+                    self.theme.accent
+                } else {
+                    self.theme.border
+                },
                 1,
-                BG,
+                self.theme.bg,
             );
             let icon_px = self.s(40);
             self.draw_icon(
@@ -6427,7 +7058,11 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                if disabled { MUTED } else { INK },
+                if disabled {
+                    self.theme.muted
+                } else {
+                    self.theme.ink
+                },
                 RECT {
                     left: tile.left + self.s(6),
                     top: tile.top + self.s(10) + icon_px + self.s(6),
@@ -6453,7 +7088,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: y,
@@ -6484,7 +7119,11 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                if link_lit { ACCENT_GREEN_HOVER } else { LINK },
+                if link_lit {
+                    self.theme.accent_hover
+                } else {
+                    self.theme.link
+                },
                 link,
                 label,
                 DT_SINGLELINE,
@@ -6498,7 +7137,7 @@ impl App {
                         right: link.right,
                         bottom: link.bottom,
                     },
-                    ACCENT_GREEN_HOVER,
+                    self.theme.accent_hover,
                 );
             }
             self.spot(link, action, label);
@@ -6560,7 +7199,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6582,7 +7221,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: self.s(BODY_Y),
@@ -6605,7 +7244,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: self.s(CONTENT_X),
                 top: self.s(BODY_Y),
@@ -6628,7 +7267,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: self.s(CONTENT_X),
                 top: self.s(BODY_Y),
@@ -6674,14 +7313,22 @@ impl App {
         let roots = self.disk_roots.clone();
         for (index, (label, _)) in roots.iter().enumerate() {
             let selected = self.disk_root == Some(index);
-            x = self.pill(hdc, x, label, selected, hover, Action::DiskRoot(index));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DiskRoot(index),
+            );
         }
         if self.job == Job::Analyzing {
             let text_line = PROGRESS.lock().map(|p| p.text.clone()).unwrap_or_default();
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 84),
@@ -6697,7 +7344,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6721,7 +7368,15 @@ impl App {
         let mut x = (right - widths + self.s(8)).max(x + self.s(16));
         for (label, view) in views {
             let selected = self.disk_view == view;
-            x = self.pill(hdc, x, label, selected, hover, Action::DiskView(view));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DiskView(view),
+            );
         }
     }
 
@@ -6741,7 +7396,15 @@ impl App {
         let roots = self.disk_roots.clone();
         for (index, (label, _)) in roots.iter().enumerate() {
             let selected = self.dup_root == Some(index);
-            x = self.pill(hdc, x, label, selected, hover, Action::DupRoot(index));
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                selected,
+                hover,
+                Action::DupRoot(index),
+            );
         }
         let _ = x;
         if matches!(self.job, Job::Finding | Job::Recycling) {
@@ -6749,7 +7412,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 84),
@@ -6765,7 +7428,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6779,9 +7442,11 @@ impl App {
     }
 
     /// A rounded tab-like button; returns where the next one starts.
+    #[allow(clippy::too_many_arguments)]
     unsafe fn pill(
         &mut self,
         hdc: HDC,
+        top: i32,
         x: i32,
         label: &str,
         selected: bool,
@@ -6791,9 +7456,9 @@ impl App {
         let size = measure(hdc, self.fonts.body_bold, label);
         let tab = RECT {
             left: x,
-            top: self.s(BODY_Y),
+            top: self.s(top),
             right: x + size.0 + self.s(28),
-            bottom: self.s(BODY_Y + 30),
+            bottom: self.s(top + 30),
         };
         let lit = lit(hover, tab);
         self.panel(
@@ -6801,24 +7466,28 @@ impl App {
             tab,
             self.s(14),
             if selected {
-                rgb(222, 240, 226)
+                self.theme.accent_tint
             } else if lit {
-                rgb(240, 247, 241)
+                self.theme.hover_tint
             } else {
-                rgb(249, 251, 249)
+                self.theme.surface
             },
             if selected {
-                rgb(46, 130, 76)
+                self.theme.accent
             } else {
-                rgb(184, 198, 188)
+                self.theme.border
             },
             1,
-            BG,
+            self.theme.bg,
         );
         text(
             hdc,
             self.fonts.body_bold,
-            if selected { THEME_INK } else { INK },
+            if selected {
+                self.theme.theme_ink
+            } else {
+                self.theme.ink
+            },
             tab,
             label,
             DT_SINGLELINE | DT_VCENTER | DT_CENTER | DT_NOPREFIX,
@@ -6837,7 +7506,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: self.s(BODY_Y + 48),
@@ -6878,24 +7547,28 @@ impl App {
                 tab,
                 self.s(14),
                 if selected {
-                    rgb(222, 240, 226)
+                    self.theme.accent_tint
                 } else if lit {
-                    rgb(240, 247, 241)
+                    self.theme.hover_tint
                 } else {
-                    rgb(249, 251, 249)
+                    self.theme.surface
                 },
                 if selected {
-                    rgb(46, 130, 76)
+                    self.theme.accent
                 } else {
-                    rgb(184, 198, 188)
+                    self.theme.border
                 },
                 1,
-                BG,
+                self.theme.bg,
             );
             text(
                 hdc,
                 self.fonts.body_bold,
-                if selected { THEME_INK } else { INK },
+                if selected {
+                    self.theme.theme_ink
+                } else {
+                    self.theme.ink
+                },
                 tab,
                 label,
                 DT_SINGLELINE | DT_VCENTER | DT_CENTER,
@@ -6914,7 +7587,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: x + self.s(8),
                 top: self.s(BODY_Y),
@@ -6947,7 +7620,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left,
                         top: self.s(BODY_Y + 48),
@@ -6965,7 +7638,7 @@ impl App {
                 let y = paragraph(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     left,
                     width,
                     self.s(BODY_Y),
@@ -6974,7 +7647,7 @@ impl App {
                 paragraph(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     left,
                     width,
                     y + self.s(12),
@@ -6990,7 +7663,7 @@ impl App {
                     text(
                         hdc,
                         self.fonts.body,
-                        MUTED,
+                        self.theme.muted,
                         note,
                         &self.scan_note,
                         DT_SINGLELINE,
@@ -7012,7 +7685,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.small,
-                    MUTED,
+                    self.theme.muted,
                     RECT {
                         left,
                         top: self.s(BODY_Y - 6),
@@ -7051,7 +7724,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                THEME_INK,
+                self.theme.theme_ink,
                 RECT {
                     left: rect.right - self.s(160),
                     top: self.s(SUBTITLE_Y),
@@ -7064,7 +7737,7 @@ impl App {
         }
     }
 
-    unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT) {
+    unsafe fn draw_settings(&mut self, hdc: HDC, rect: RECT, hover: Option<RECT>) {
         self.heading(hdc, rect, "Settings", None);
         self.subtitle(
             hdc,
@@ -7077,15 +7750,57 @@ impl App {
         );
         let left = self.s(CONTENT_X);
         let right = rect.right - self.s(24);
+        // Appearance leads the page so the switch is seen, not scrolled to:
+        // the ignored list below is an opaque real control that would cover
+        // anything drawn over its rows. Heading and pills share one row to
+        // keep the shift (and the space taken from the list) small.
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: self.s(BODY_Y),
                 right,
                 bottom: self.s(BODY_Y + 28),
+            },
+            "Appearance",
+            DT_SINGLELINE,
+        );
+        self.say(
+            RECT {
+                left,
+                top: self.s(BODY_Y),
+                right: rect.right,
+                bottom: self.s(BODY_Y + 28),
+            },
+            "Appearance",
+        );
+        let mut x = left + self.s(150);
+        for (label, mode) in [
+            ("Light", ThemeMode::Light),
+            ("System", ThemeMode::System),
+            ("Dark", ThemeMode::Dark),
+        ] {
+            x = self.pill(
+                hdc,
+                BODY_Y,
+                x,
+                label,
+                self.settings.theme == mode,
+                hover,
+                Action::Theme(mode),
+            );
+        }
+        text(
+            hdc,
+            self.fonts.heading,
+            self.theme.ink,
+            RECT {
+                left,
+                top: self.s(BODY_Y + SETTINGS_SHIFT),
+                right,
+                bottom: self.s(BODY_Y + 28 + SETTINGS_SHIFT),
             },
             "What Scan Your Registry checks",
             DT_SINGLELINE,
@@ -7094,7 +7809,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top,
@@ -7107,7 +7822,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: top + self.s(30),
@@ -7138,7 +7853,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7151,7 +7866,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7201,7 +7916,7 @@ impl App {
         text(
             hdc,
             self.fonts.title,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7216,7 +7931,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7229,7 +7944,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7245,7 +7960,7 @@ impl App {
         text(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7261,7 +7976,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left,
                     top: y,
@@ -7285,7 +8000,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body_bold,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left: x,
                         top: row,
@@ -7298,7 +8013,7 @@ impl App {
                 text(
                     hdc,
                     self.fonts.body,
-                    INK,
+                    self.theme.ink,
                     RECT {
                         left: x + self.s(150),
                         top: row,
@@ -7313,7 +8028,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 RECT {
                     left,
                     top: y,
@@ -7340,7 +8055,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 RECT {
                     left: left + label_w,
                     top: y,
@@ -7355,7 +8070,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left,
                 top: y,
@@ -7375,7 +8090,14 @@ impl App {
             right: left + size.0,
             bottom: y + size.1,
         };
-        text(hdc, self.fonts.body, LINK, link, label, DT_SINGLELINE);
+        text(
+            hdc,
+            self.fonts.body,
+            self.theme.link,
+            link,
+            label,
+            DT_SINGLELINE,
+        );
         if lit(hover, link) {
             fill(
                 hdc,
@@ -7385,7 +8107,7 @@ impl App {
                     right: link.right,
                     bottom: link.bottom,
                 },
-                LINK,
+                self.theme.link,
             );
         }
         self.spot(link, Action::Refresh, label);
@@ -7407,7 +8129,7 @@ impl App {
         text(
             hdc,
             self.fonts.body_bold,
-            INK,
+            self.theme.ink,
             RECT {
                 left,
                 top: y,
@@ -7420,7 +8142,7 @@ impl App {
         text(
             hdc,
             self.fonts.body,
-            INK,
+            self.theme.ink,
             RECT {
                 left: left + label_w,
                 top: y,
@@ -7448,10 +8170,10 @@ impl App {
             hdc,
             track,
             self.s(6),
-            rgb(236, 242, 238),
-            rgb(184, 198, 188),
+            self.theme.surface,
+            self.theme.border,
             1,
-            BG,
+            self.theme.bg,
         );
         let color = if used >= 90 {
             rgb(200, 60, 60)
@@ -7506,10 +8228,18 @@ impl App {
                 hdc,
                 tile,
                 self.s(10),
-                if lit { ACCENT_TINT } else { SURFACE },
-                if lit { ACCENT_GREEN } else { BORDER },
+                if lit {
+                    self.theme.accent_tint
+                } else {
+                    self.theme.surface
+                },
+                if lit {
+                    self.theme.accent
+                } else {
+                    self.theme.border
+                },
                 1,
-                BG,
+                self.theme.bg,
             );
             let icon_size = self.s(40);
             self.draw_icon(
@@ -7523,7 +8253,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.body_bold,
-                THEME_INK,
+                self.theme.theme_ink,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(4),
@@ -7536,7 +8266,7 @@ impl App {
             text(
                 hdc,
                 self.fonts.small,
-                MUTED,
+                self.theme.muted,
                 RECT {
                     left: text_left,
                     top: tile.top + self.s(26),
@@ -7582,7 +8312,7 @@ impl App {
         text(
             hdc,
             self.fonts.small,
-            MUTED,
+            self.theme.muted,
             RECT {
                 left: rect.right - self.s(24) - icon_w - self.s(20),
                 top: emblem_top + icon_w + self.s(4),
@@ -7597,7 +8327,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.body,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7606,7 +8336,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.body_bold,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7615,7 +8345,7 @@ impl App {
         y = paragraph(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7632,19 +8362,27 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body,
-                THEME_INK,
+                self.theme.theme_ink,
                 left,
                 left + self.s(16),
                 y,
                 "\u{2022}",
             );
-            y = paragraph(hdc, self.fonts.body, INK, left + self.s(16), right, y, line) + gap / 2;
+            y = paragraph(
+                hdc,
+                self.fonts.body,
+                self.theme.ink,
+                left + self.s(16),
+                right,
+                y,
+                line,
+            ) + gap / 2;
         }
         y += gap * 2;
         y = paragraph(
             hdc,
             self.fonts.heading,
-            INK,
+            self.theme.ink,
             left,
             right,
             y,
@@ -7667,7 +8405,7 @@ impl App {
             paragraph(
                 hdc,
                 self.fonts.body_bold,
-                INK,
+                self.theme.ink,
                 left,
                 left + self.s(190),
                 y,
@@ -7676,7 +8414,7 @@ impl App {
             y = paragraph(
                 hdc,
                 self.fonts.body,
-                INK,
+                self.theme.ink,
                 left + self.s(190),
                 right,
                 y,
@@ -7687,7 +8425,7 @@ impl App {
         paragraph(
             hdc,
             self.fonts.body,
-            MUTED,
+            self.theme.muted,
             left,
             right,
             y,
@@ -8073,6 +8811,148 @@ fn edges(rect: RECT) -> Edges {
 /// what it draws, and transparent to the mouse, so clicks fall through to
 /// the drawn UI beneath. Keyboard focus, control names, and window rects
 /// (what UI Automation reports) are unaffected by either hiding.
+/// Point every real child control at the matching Explorer theme, so
+/// lists and buttons follow the page from light to dark and back.
+/// Usable height for the ignored-entries list: the room between its fixed
+/// top and the bottom-anchored Unignore button, never negative. Clamping
+/// (rather than a fixed minimum height) keeps the list from overlapping
+/// the button in short windows; a short list still scrolls, so every row
+/// stays reachable by mouse and keyboard.
+fn ignored_list_room(client_bottom: i32, dpi: u32) -> i32 {
+    let top = scale(SETTINGS_IGNORED_Y + 62, dpi);
+    let button = client_bottom - scale(48, dpi);
+    (button - scale(14, dpi) - top).max(0)
+}
+
+/// One listview's rows in the active theme: dark surface with readable
+/// text, or the light equivalents back. Called on every theme switch, so
+/// lists never keep the other mode's colors.
+fn paint_list(list: HWND, theme: Theme) {
+    unsafe {
+        SendMessageW(list, LVM_SETBKCOLOR, 0, theme.surface as isize);
+        SendMessageW(list, LVM_SETTEXTBKCOLOR, 0, theme.surface as isize);
+        SendMessageW(list, LVM_SETTEXTCOLOR, 0, theme.ink as isize);
+    }
+}
+
+/// Header faces painted by [`header_proc`]. Written on every theme switch
+/// so a repaint always finds current colors without touching the App.
+static HEADER_BG: AtomicU32 = AtomicU32::new(0x00FF_FFFF);
+static HEADER_INK: AtomicU32 = AtomicU32::new(0x0000_0000);
+
+/// Subclass a list header for dark paint, or restore its native window
+/// procedure for light. The header sends no custom-draw notification on
+/// some builds, so owning its WM_PAINT is the reliable path; the control
+/// itself stays a real header, keeping its accessibility names.
+unsafe fn theme_header(header: HWND, dark: bool) {
+    let current = GetWindowLongPtrW(header, GWLP_WNDPROC);
+    let ours = header_proc as *const () as usize as isize;
+    if dark {
+        if current != ours {
+            SetWindowLongPtrW(header, GWLP_USERDATA, current);
+            SetWindowLongPtrW(header, GWLP_WNDPROC, ours);
+        }
+        InvalidateRect(header, std::ptr::null(), 1);
+    } else if current == ours {
+        let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(header, GWLP_USERDATA));
+        SetWindowLongPtrW(
+            header,
+            GWLP_WNDPROC,
+            std::mem::transmute::<WNDPROC, isize>(old),
+        );
+        InvalidateRect(header, std::ptr::null(), 1);
+    }
+}
+
+unsafe extern "system" fn header_proc(
+    header: HWND,
+    msg: u32,
+    wparam: WPARAM,
+    lparam: LPARAM,
+) -> LRESULT {
+    if msg == WM_PAINT {
+        paint_dark_header(header);
+        return 0;
+    }
+    // Never invoke the saved value directly: a window procedure token is
+    // only guaranteed callable through the system's dispatcher (an ANSI/
+    // Unicode thunk, for example, is not a plain function address).
+    let old: WNDPROC = std::mem::transmute(GetWindowLongPtrW(header, GWLP_USERDATA));
+    match old {
+        Some(_) => CallWindowProcW(old, header, msg, wparam, lparam),
+        None => DefWindowProcW(header, msg, wparam, lparam),
+    }
+}
+
+/// One dark header, painted synchronously in its own WM_PAINT: theme
+/// surface behind, theme ink ahead, titles read back from the header so
+/// columns never need a copy kept elsewhere.
+fn paint_dark_header(header: HWND) {
+    let bg = HEADER_BG.load(Ordering::Relaxed);
+    let ink = HEADER_INK.load(Ordering::Relaxed);
+    unsafe {
+        let mut saved: PAINTSTRUCT = std::mem::zeroed();
+        let hdc = BeginPaint(header, &mut saved);
+        let mut area: RECT = std::mem::zeroed();
+        GetClientRect(header, &mut area);
+        let brush = CreateSolidBrush(bg);
+        FillRect(hdc, &area, brush);
+        DeleteObject(brush);
+        let font = SendMessageW(header, WM_GETFONT, 0, 0);
+        let previous = if font != 0 {
+            SelectObject(hdc, font as *mut std::ffi::c_void)
+        } else {
+            std::ptr::null_mut()
+        };
+        SetTextColor(hdc, ink);
+        SetBkMode(hdc, TRANSPARENT as i32);
+        let columns = SendMessageW(header, HDM_GETITEMCOUNT, 0, 0);
+        for index in 0..columns {
+            let mut cell: RECT = std::mem::zeroed();
+            SendMessageW(
+                header,
+                HDM_GETITEMRECT,
+                index as usize,
+                &mut cell as *mut _ as isize,
+            );
+            let mut text: [u16; 256] = [0; 256];
+            let mut column: HDITEMW = std::mem::zeroed();
+            column.mask = HDI_TEXT;
+            column.pszText = text.as_mut_ptr();
+            column.cchTextMax = text.len() as i32;
+            SendMessageW(
+                header,
+                HDM_GETITEMW,
+                index as usize,
+                &mut column as *mut _ as isize,
+            );
+            cell.left += 8;
+            DrawTextW(
+                hdc,
+                text.as_ptr(),
+                -1,
+                &mut cell,
+                DT_SINGLELINE | DT_VCENTER | DT_END_ELLIPSIS | DT_NOPREFIX,
+            );
+        }
+        if font != 0 {
+            SelectObject(hdc, previous);
+        }
+        EndPaint(header, &saved);
+    }
+}
+
+unsafe extern "system" fn theme_child(hwnd: HWND, dark: LPARAM) -> windows_sys::core::BOOL {
+    use windows_sys::Win32::Foundation::TRUE;
+    let sub = if dark == 0 {
+        "Explorer"
+    } else {
+        "DarkMode_Explorer"
+    };
+    SetWindowTheme(hwnd, wide(sub).as_ptr(), std::ptr::null());
+    TRUE
+}
+
 fn stand_in(parent: HWND, class: &str, id: u16, button: bool) -> HWND {
     use windows_sys::Win32::Graphics::Gdi::{CreateRectRgn, SetWindowRgn};
     use windows_sys::Win32::UI::WindowsAndMessaging::{
@@ -8806,6 +9686,1019 @@ fn exe_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A real in-memory DACL with the given well-known-SID entries,
+    /// decoded through the same retrieval path the registry lookup uses.
+    /// Each entry is (SID kind, access mask, allow?). The prior offset
+    /// bug read the mask one byte in; only a live descriptor catches that.
+    #[cfg(windows)]
+    unsafe fn acl_for(entries: &[(i32, u32, bool)]) -> Vec<u8> {
+        acl_for_ex(
+            &entries
+                .iter()
+                .map(|(k, m, a)| (*k, *m, *a, 0u32))
+                .collect::<Vec<_>>(),
+        )
+    }
+
+    /// Like [`acl_for`], with explicit ACE flags per entry (for example
+    /// inherit-only).
+    #[cfg(windows)]
+    unsafe fn acl_for_ex(entries: &[(i32, u32, bool, u32)]) -> Vec<u8> {
+        use windows_sys::Win32::Security::{
+            ACL_REVISION, AddAccessAllowedAceEx, AddAccessDeniedAce, CreateWellKnownSid,
+            InitializeAcl,
+        };
+        let mut buffer = vec![0u8; 512];
+        let pacl = buffer.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
+        assert_ne!(InitializeAcl(pacl, 512, ACL_REVISION), 0);
+        for (kind, mask, allow, flags) in entries {
+            let mut sid = [0u32; 17];
+            let mut length = 68u32;
+            assert_ne!(
+                CreateWellKnownSid(
+                    *kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr() as *mut _,
+                    &mut length
+                ),
+                0
+            );
+            let added = if *allow {
+                AddAccessAllowedAceEx(
+                    pacl,
+                    ACL_REVISION,
+                    *flags,
+                    *mask,
+                    sid.as_mut_ptr() as *mut _,
+                )
+            } else {
+                AddAccessDeniedAce(pacl, ACL_REVISION, *mask, sid.as_mut_ptr() as *mut _)
+            };
+            assert_ne!(added, 0);
+        }
+        buffer
+    }
+
+    /// Read-only Users passes; a write-capable Users ACE fails, proving the
+    /// mask comes from the right offset rather than a neighboring byte.
+    #[cfg(windows)]
+    #[test]
+    fn live_dacl_decode_trusts_read_only_users_and_refuses_write() {
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
+        use windows_sys::Win32::System::Registry::{KEY_READ, KEY_WRITE};
+        let read = unsafe { acl_for(&[(WinBuiltinUsersSid, KEY_READ, true)]) };
+        assert!(unsafe { dacl_trusted(read.as_ptr() as *const ACL) });
+        let write = unsafe { acl_for(&[(WinBuiltinUsersSid, KEY_WRITE, true)]) };
+        assert!(!unsafe { dacl_trusted(write.as_ptr() as *const ACL) });
+    }
+
+    /// SYSTEM and Administrators full-control ACEs are the normal shape of
+    /// a protected key: they are removed before the policy check, so the
+    /// store stays trusted. Any other full-control grant refuses it.
+    /// CREATOR OWNER is removed with them: its ACEs empower the object's
+    /// owner, verified separately, which is what makes stock keys with a
+    /// Creator-Owner full grant acceptable.
+    #[cfg(windows)]
+    #[test]
+    fn trusted_system_entries_are_removed_before_the_policy_check() {
+        use windows_sys::Win32::Security::{
+            ACL, WinBuiltinAdministratorsSid, WinBuiltinGuestsSid, WinBuiltinUsersSid,
+            WinCreatorOwnerSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const KEY_SET_VALUE: u32 = 0x0000_0002;
+        let protected_shape = unsafe {
+            acl_for(&[
+                (WinLocalSystemSid, GENERIC_ALL, true),
+                (WinBuiltinAdministratorsSid, GENERIC_ALL, true),
+                (WinCreatorOwnerSid, GENERIC_ALL, true),
+                (WinBuiltinUsersSid, KEY_READ, true),
+            ])
+        };
+        assert!(unsafe { dacl_trusted(protected_shape.as_ptr() as *const ACL) });
+        // A custom group (here Guests) with a value write is untrusted,
+        // even beside a system full-control entry.
+        let guest_write = unsafe {
+            acl_for(&[
+                (WinLocalSystemSid, GENERIC_ALL, true),
+                (WinBuiltinGuestsSid, KEY_SET_VALUE, true),
+            ])
+        };
+        assert!(!unsafe { dacl_trusted(guest_write.as_ptr() as *const ACL) });
+    }
+
+    /// A deny never blesses the store: allow-then-deny stays refused,
+    /// because a global mask subtraction cannot prove the deny actually
+    /// blocks the relevant access.
+    #[cfg(windows)]
+    #[test]
+    fn deny_never_blesses_the_store() {
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
+        const KEY_SET_VALUE: u32 = 0x0000_0002;
+        let allow_then_deny = unsafe {
+            acl_for(&[
+                (WinBuiltinUsersSid, KEY_SET_VALUE, true),
+                (WinBuiltinUsersSid, KEY_SET_VALUE, false),
+            ])
+        };
+        assert!(!unsafe { dacl_trusted(allow_then_deny.as_ptr() as *const ACL) });
+    }
+
+    /// An inherit-only grant does not apply to the key itself, so it
+    /// cannot refuse the store: Windows ignores it when checking access
+    /// to this object. Without this, ordinary inherited DACLs (such as a
+    /// broad subkeys-only grant on HKLM\SOFTWARE) would fail every clean
+    /// store.
+    #[cfg(windows)]
+    #[test]
+    fn inherit_only_grants_do_not_apply_to_the_key() {
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const INHERIT_ONLY: u32 = 0x8;
+        let shaped = unsafe {
+            acl_for_ex(&[
+                (WinBuiltinUsersSid, GENERIC_ALL, true, INHERIT_ONLY),
+                (WinBuiltinUsersSid, KEY_READ, true, 0),
+            ])
+        };
+        assert!(unsafe { dacl_trusted(shaped.as_ptr() as *const ACL) });
+        // The same grant without the flag still refuses.
+        let direct = unsafe { acl_for(&[(WinBuiltinUsersSid, GENERIC_ALL, true)]) };
+        assert!(!unsafe { dacl_trusted(direct.as_ptr() as *const ACL) });
+    }
+
+    /// The owner check runs on production well-known SIDs: SYSTEM and
+    /// Administrators own a protected store, anything else refuses it.
+    #[cfg(windows)]
+    #[test]
+    fn owner_check_accepts_only_trusted_system_principals() {
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+        };
+        unsafe fn well_known(kind: i32) -> [u32; 17] {
+            let mut sid = [0u32; 17];
+            let mut length = 68u32;
+            assert_ne!(
+                CreateWellKnownSid(
+                    kind,
+                    std::ptr::null_mut(),
+                    sid.as_mut_ptr() as *mut _,
+                    &mut length
+                ),
+                0
+            );
+            sid
+        }
+        assert!(unsafe { owner_trusted(well_known(WinLocalSystemSid).as_ptr() as *mut _) });
+        assert!(unsafe {
+            owner_trusted(well_known(WinBuiltinAdministratorsSid).as_ptr() as *mut _)
+        });
+        assert!(!unsafe { owner_trusted(well_known(WinBuiltinUsersSid).as_ptr() as *mut _) });
+    }
+
+    /// A disposable per-user fixture key with a Theme value. `name` is
+    /// relative to HKCU\Software (backslashes nest); the returned
+    /// subkey path is the full `Software\...` form. The caller removes
+    /// it, usually through [`FixtureGuard`].
+    #[cfg(windows)]
+    unsafe fn fixture_theme_key(name: &str, value: &str) -> String {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_SZ, RegCloseKey,
+            RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+        };
+        let path = format!(r"Software\{name}");
+        let subkey = wide(&path);
+        // A crashed earlier run must not turn this into an open-existing
+        // assertion below.
+        unsafe {
+            RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
+        }
+        let mut key = std::ptr::null_mut();
+        let mut disposition = 0u32;
+        assert_eq!(
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                subkey.as_ptr(),
+                0,
+                std::ptr::null(),
+                0,
+                KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut key,
+                &mut disposition,
+            ),
+            0
+        );
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let entry = wide("Theme");
+        let data = wide(value);
+        assert_eq!(
+            RegSetValueExW(
+                key,
+                entry.as_ptr(),
+                0,
+                REG_SZ,
+                data.as_ptr() as *const u8,
+                (data.len() * 2) as u32,
+            ),
+            0
+        );
+        unsafe {
+            RegCloseKey(key);
+        }
+        path
+    }
+
+    /// The full production path on a user-owned fixture: a plain window
+    /// reads the value, an elevated one refuses the store (the owner is
+    /// the interactive user, not a trusted system principal), and the
+    /// direct handle check agrees. No name is re-resolved between the
+    /// check and the read.
+    #[cfg(windows)]
+    #[test]
+    fn user_owned_fixture_is_refused_when_elevated() {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+        };
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let path = unsafe {
+            fixture_theme_key(
+                &format!("HivemendTrustOwnerProbe{}", std::process::id()),
+                "dark",
+            )
+        };
+        guard.targets.push(path.clone());
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &path, false),
+            Some(ThemeMode::Dark)
+        );
+        assert_eq!(machine_default_at(HKEY_CURRENT_USER, &path, true), None);
+        // The owner's verdict through the open handle, directly. The
+        // handle needs READ_CONTROL or the descriptor query fails.
+        const READ_CONTROL: u32 = 0x0002_0000;
+        let subkey = wide(&path);
+        let mut key = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    subkey.as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE | READ_CONTROL,
+                    &mut key,
+                )
+            },
+            0
+        );
+        assert!(!store_protected_for(key));
+        unsafe {
+            RegCloseKey(key);
+        }
+        guard.verify_cleaned();
+    }
+
+    /// The kernel's name for an open key (such as
+    /// `\REGISTRY\USER\S-1-5-...`), the authoritative spelling for a link
+    /// target. Hand-built NT paths are guesswork; this one is read back
+    /// from the object itself. Mirrors the maintenance registry helper.
+    #[cfg(windows)]
+    unsafe fn kernel_key_name(key: windows_sys::Win32::System::Registry::HKEY) -> Option<String> {
+        use windows_sys::Wdk::System::Registry::{KeyNameInformation, NtQueryKey};
+        let mut buffer = vec![0u32; 1024];
+        let mut got = 0u32;
+        let status = unsafe {
+            NtQueryKey(
+                key as _,
+                KeyNameInformation,
+                buffer.as_mut_ptr() as *mut _,
+                (buffer.len() * 4) as u32,
+                &mut got,
+            )
+        };
+        if status < 0 {
+            return None;
+        }
+        let bytes = buffer[0] as usize;
+        let units =
+            unsafe { std::slice::from_raw_parts(buffer.as_ptr().add(1) as *const u16, bytes / 2) };
+        String::from_utf16(units).ok()
+    }
+
+    /// Delete a link through a no-follow handle so its target is
+    /// untouched. Mirrors the maintenance registry's fixture cleanup.
+    #[cfg(windows)]
+    unsafe fn delete_link_nofollow(
+        root: windows_sys::Win32::System::Registry::HKEY,
+        path: &str,
+    ) -> bool {
+        use windows_sys::Wdk::System::Registry::NtDeleteKey;
+        use windows_sys::Win32::System::Registry::{
+            KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+        };
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let Some((parent_path, name)) = path.rsplit_once('\\') else {
+            return false;
+        };
+        let mut parent = std::ptr::null_mut();
+        if unsafe {
+            RegOpenKeyExW(
+                root,
+                wide(parent_path).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE,
+                &mut parent,
+            )
+        } != 0
+            || parent.is_null()
+        {
+            return false;
+        }
+        let mut link = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                wide(name).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                DELETE_ACCESS,
+                &mut link,
+            )
+        };
+        unsafe {
+            RegCloseKey(parent);
+        }
+        if opened != 0 || link.is_null() {
+            return false;
+        }
+        let deleted = unsafe { NtDeleteKey(link as _) } >= 0;
+        unsafe {
+            RegCloseKey(link);
+        }
+        deleted
+    }
+
+    /// Best-effort removal of fixture keys with verified outcomes. The
+    /// guard is created before any fallible setup step, so asserts and
+    /// panics still clean up. Targets must be gone afterwards (a hard
+    /// failure otherwise); a surviving link is reported loudly instead
+    /// of silently accumulating, since link deletion is the part some
+    /// restricted environments refuse.
+    #[cfg(windows)]
+    struct FixtureGuard {
+        root: windows_sys::Win32::System::Registry::HKEY,
+        targets: Vec<String>,
+        links: Vec<String>,
+    }
+
+    #[cfg(windows)]
+    impl FixtureGuard {
+        fn new(root: windows_sys::Win32::System::Registry::HKEY) -> Self {
+            Self {
+                root,
+                targets: Vec::new(),
+                links: Vec::new(),
+            }
+        }
+
+        fn remove_all(&self) {
+            use windows_sys::Win32::System::Registry::{
+                KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegDeleteTreeW, RegOpenKeyExW,
+            };
+            // Links first: a tree delete recurses into children and
+            // chokes on an unresolvable link inside, so the link object
+            // must go before the tree around it.
+            for link in &self.links {
+                if !(unsafe { delete_link_nofollow(self.root, link) }) {
+                    // Best effort already failed; confirm whether it is
+                    // really still there before alarming.
+                    let mut probe = std::ptr::null_mut();
+                    let status = unsafe {
+                        RegOpenKeyExW(
+                            self.root,
+                            wide(link).as_ptr(),
+                            REG_OPTION_OPEN_LINK,
+                            KEY_QUERY_VALUE,
+                            &mut probe,
+                        )
+                    };
+                    if status == 0 && !probe.is_null() {
+                        unsafe {
+                            RegCloseKey(probe);
+                        }
+                        eprintln!("WARNING: fixture link survived cleanup: {link}");
+                    }
+                }
+            }
+            for target in &self.targets {
+                unsafe {
+                    RegDeleteTreeW(self.root, wide(target).as_ptr());
+                }
+            }
+        }
+
+        /// A surviving or uncheckable fixture fails qualification.
+        fn verify_cleaned(&self) {
+            use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+            use windows_sys::Win32::System::Registry::{
+                KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+            };
+            self.remove_all();
+            for path in self.links.iter().chain(self.targets.iter()) {
+                let mut probe = std::ptr::null_mut();
+                let status = unsafe {
+                    RegOpenKeyExW(
+                        self.root,
+                        wide(path).as_ptr(),
+                        REG_OPTION_OPEN_LINK,
+                        KEY_QUERY_VALUE,
+                        &mut probe,
+                    )
+                };
+                if !probe.is_null() {
+                    unsafe {
+                        RegCloseKey(probe);
+                    }
+                }
+                assert!(
+                    status == ERROR_FILE_NOT_FOUND || status == ERROR_PATH_NOT_FOUND,
+                    "fixture not proven removed: {path} (status {status})"
+                );
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            self.remove_all();
+        }
+    }
+
+    /// Open a fixture key with the requested access. The caller closes
+    /// the handle.
+    #[cfg(windows)]
+    unsafe fn open_fixture_key(
+        path: &str,
+        access: u32,
+    ) -> windows_sys::Win32::System::Registry::HKEY {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegOpenKeyExW};
+        let mut key = std::ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, access, &mut key) };
+        assert_eq!(status, 0, "opening fixture {path} failed");
+        assert!(!key.is_null());
+        key
+    }
+
+    /// Replace the DACL on an open fixture handle with the given
+    /// in-memory entries (see [`acl_for`]). The handle must already
+    /// carry WRITE_DAC; the owner is untouched. Taking the handle (not
+    /// the path) lets tests hold one handle across a deny they could
+    /// not reopen through.
+    #[cfg(windows)]
+    unsafe fn set_dacl_on_handle(
+        key: windows_sys::Win32::System::Registry::HKEY,
+        entries: &[(i32, u32, bool)],
+    ) {
+        use windows_sys::Win32::Security::Authorization::{SE_REGISTRY_KEY, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            DACL_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        };
+        let dacl = unsafe { acl_for(entries) };
+        let status = unsafe {
+            SetSecurityInfo(
+                key as *mut _,
+                SE_REGISTRY_KEY,
+                DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl.as_ptr() as *const _,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "replacing the fixture DACL failed");
+    }
+
+    /// Replace a fixture key's DACL with the given in-memory entries.
+    /// The creator holds WRITE_DAC over its own key; the owner is
+    /// untouched.
+    #[cfg(windows)]
+    unsafe fn set_fixture_dacl(path: &str, entries: &[(i32, u32, bool)]) {
+        use windows_sys::Win32::System::Registry::RegCloseKey;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let key = unsafe { open_fixture_key(path, KEY_QUERY_VALUE | WRITE_DAC) };
+        unsafe { set_dacl_on_handle(key, entries) };
+        unsafe {
+            RegCloseKey(key);
+        }
+    }
+
+    /// Whether the named child of an open parent is a link, opened
+    /// without following it. A missing child is not a link; any other
+    /// failure to determine is an error, never a trusted `false` (the
+    /// production chain refuses whatever it cannot verify). Test-only:
+    /// the chain inlines its own opens because it keeps the handles.
+    #[cfg(windows)]
+    fn component_is_link(
+        parent: windows_sys::Win32::System::Registry::HKEY,
+        name: &str,
+    ) -> Result<bool, u32> {
+        use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+        use windows_sys::Win32::System::Registry::{
+            KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+        };
+        let child = wide(name);
+        let mut key = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                child.as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE,
+                &mut key,
+            )
+        };
+        if opened != 0 || key.is_null() {
+            if opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND {
+                return Ok(false);
+            }
+            return Err(opened);
+        }
+        let link = key_is_link(key).map_err(|status| status as u32);
+        unsafe {
+            RegCloseKey(key);
+        }
+        link
+    }
+
+    /// The link probe distinguishes three states: a link, a verifiable
+    /// non-link (including a missing child), and an uncheckable error.
+    /// Only the last one is ever allowed to refuse silently elsewhere;
+    /// here each state is pinned on fixtures.
+    #[cfg(windows)]
+    #[test]
+    fn link_probe_reports_link_plain_and_unknown() {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let plain_path = format!(r"Software\HivemendProbePlain{}", std::process::id());
+        let plain_name = plain_path.rsplit_once('\\').unwrap().1;
+        unsafe { fixture_theme_key(plain_name, "dark") };
+        guard.targets.push(plain_path.clone());
+        // A normal key probes false; a missing child is not a link.
+        let mut software = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide("Software").as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut software,
+                )
+            },
+            0
+        );
+        let leaf = plain_path.rsplit_once('\\').unwrap().1;
+        assert_eq!(component_is_link(software, leaf), Ok(false));
+        assert_eq!(
+            component_is_link(software, "HivemendProbeMissing"),
+            Ok(false)
+        );
+        // An uncheckable child errors: deny this user every access to a
+        // fixture, then probe it. One handle opened before the deny is
+        // held across it, so recovery never depends on reopening through
+        // the deny; the probe and the production lookup use fresh opens,
+        // which is exactly what must refuse.
+        let denied_path = format!(r"Software\HivemendProbeDenied{}", std::process::id());
+        let denied_name = denied_path.rsplit_once('\\').unwrap().1;
+        unsafe { fixture_theme_key(denied_name, "dark") };
+        guard.targets.push(denied_path.clone());
+        let denied_leaf = denied_path.rsplit_once('\\').unwrap().1.to_string();
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        let held =
+            unsafe { open_fixture_key(&denied_path, KEY_QUERY_VALUE | READ_CONTROL | WRITE_DAC) };
+        unsafe {
+            use windows_sys::Win32::Security::WinBuiltinUsersSid;
+            const GENERIC_ALL: u32 = 0x1000_0000;
+            set_dacl_on_handle(held, &[(WinBuiltinUsersSid, GENERIC_ALL, false)]);
+        }
+        assert!(component_is_link(software, &denied_leaf).is_err());
+        // The production lookup refuses the same uncheckable object.
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &denied_path, true),
+            None
+        );
+        unsafe {
+            use windows_sys::Win32::Security::WinBuiltinUsersSid;
+            // Full control, not just read: cleanup must delete this key,
+            // and read-only would leave it behind.
+            const GENERIC_ALL: u32 = 0x1000_0000;
+            set_dacl_on_handle(held, &[(WinBuiltinUsersSid, GENERIC_ALL, true)]);
+            RegCloseKey(held);
+            RegCloseKey(software);
+        }
+        guard.verify_cleaned();
+    }
+
+    /// Lock a fixture the way a protected store looks: SYSTEM and
+    /// Administrators full control, Users read-only. The owner stays the
+    /// creator, so this only yields an acceptable store for an
+    /// administrator creator; elsewhere it documents intent and the
+    /// tests probe acceptance before asserting contrasts.
+    #[cfg(windows)]
+    unsafe fn lock_fixture_store(path: &str) {
+        use windows_sys::Win32::Security::{
+            WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        unsafe {
+            set_fixture_dacl(
+                path,
+                &[
+                    (WinLocalSystemSid, GENERIC_ALL, true),
+                    (WinBuiltinAdministratorsSid, GENERIC_ALL, true),
+                    (WinBuiltinUsersSid, KEY_READ, true),
+                ],
+            )
+        };
+    }
+
+    /// Create a volatile link fixture whose target is the kernel's own
+    /// name for an open target handle, written length-delimited without
+    /// a terminator (MS-RRP). Returns the creation status so the caller
+    /// can skip when the environment refuses links; the caller registers
+    /// the link path with its guard.
+    #[cfg(windows)]
+    unsafe fn create_fixture_link(
+        link_path: &str,
+        target: windows_sys::Win32::System::Registry::HKEY,
+    ) -> u32 {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_CREATE_LINK, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_LINK,
+            REG_OPTION_CREATE_LINK, REG_OPTION_VOLATILE, RegCloseKey, RegCreateKeyExW,
+            RegSetValueExW,
+        };
+        let native = unsafe { kernel_key_name(target) }.expect("kernel name for the link target");
+        // Length-delimited, no terminator: MS-RRP requires the target
+        // object name without a trailing NUL.
+        let units: Vec<u16> = native.encode_utf16().collect();
+        let mut link = std::ptr::null_mut();
+        let mut disposition = 0u32;
+        let created = unsafe {
+            RegCreateKeyExW(
+                HKEY_CURRENT_USER,
+                wide(link_path).as_ptr(),
+                0,
+                std::ptr::null(),
+                REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
+                KEY_CREATE_LINK | KEY_SET_VALUE,
+                std::ptr::null(),
+                &mut link,
+                &mut disposition,
+            )
+        };
+        if created != 0 {
+            return created;
+        }
+        assert_eq!(disposition, REG_CREATED_NEW_KEY);
+        let marker = wide("SymbolicLinkValue");
+        let set = unsafe {
+            RegSetValueExW(
+                link,
+                marker.as_ptr(),
+                0,
+                REG_LINK,
+                units.as_ptr() as *const u8,
+                (units.len() * 2) as u32,
+            )
+        };
+        unsafe {
+            RegCloseKey(link);
+        }
+        assert_eq!(set, 0, "writing the link target failed");
+        0
+    }
+
+    /// Whether the OS resolves an ordinary open through the link path.
+    /// Link *detection* is deterministic everywhere, but follow-through
+    /// depends on the token and host policy. Callers assert the security
+    /// property unconditionally and gate follow-dependent contrasts on
+    /// this probe, saying so loudly instead of silently passing.
+    #[cfg(windows)]
+    unsafe fn link_resolves(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
+        use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+        let mut probe = std::ptr::null_mut();
+        let status =
+            unsafe { RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut probe) };
+        if status == 0 && !probe.is_null() {
+            unsafe {
+                RegCloseKey(probe);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// An ancestor link is refused even when everything behind it is an
+    /// acceptable protected store. The target subtree is locked and, for
+    /// an administrator creator, accepted directly; the only difference
+    /// on the linked path is the link, so removing the link check would
+    /// turn the refusal into acceptance. That is the mutation argument
+    /// the leaf case alone cannot carry: the chain never follows, so a
+    /// leaf link could never yield a value either way, while an ancestor
+    /// link would silently redirect the walk.
+    #[cfg(windows)]
+    #[test]
+    fn ancestor_link_is_refused_when_elevated() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD};
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let pid = std::process::id();
+        // Target subtree: locked leaf with a theme under a locked parent.
+        let target_leaf = format!(r"Software\HivemendAncTarget{pid}\Leaf");
+        unsafe { fixture_theme_key(&format!("HivemendAncTarget{pid}\\Leaf"), "dark") };
+        unsafe {
+            lock_fixture_store(&target_leaf);
+            lock_fixture_store(&format!(r"Software\HivemendAncTarget{pid}"));
+        }
+        guard
+            .targets
+            .push(format!(r"Software\HivemendAncTarget{pid}"));
+        // The stepping-stone parent is an ordinary key.
+        let stone = format!(r"Software\HivemendAncStone{pid}");
+        unsafe { fixture_theme_key(&format!("HivemendAncStone{pid}"), "dark") };
+        guard.targets.push(stone.clone());
+        let link_path = format!(r"{stone}\Link");
+        // Open the target for its kernel name, then link to it.
+        let target_parent = target_leaf.rsplit_once('\\').unwrap().0;
+        let target_key = unsafe { open_fixture_key(target_parent, KEY_QUERY_VALUE) };
+        let created = unsafe { create_fixture_link(&link_path, target_key) };
+        unsafe {
+            RegCloseKey(target_key);
+        }
+        if created == ERROR_ACCESS_DENIED || created == ERROR_PRIVILEGE_NOT_HELD {
+            eprintln!("SKIP: this environment refuses link creation ({created})");
+            guard.verify_cleaned();
+            return;
+        }
+        assert_eq!(created, 0, "creating the ancestor link fixture failed");
+        guard.links.push(link_path.clone());
+        // The ancestor component probes as a link; its siblings do not.
+        let mut stone_key = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&stone).as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut stone_key,
+                )
+            },
+            0
+        );
+        assert_eq!(component_is_link(stone_key, "Link"), Ok(true));
+        unsafe {
+            RegCloseKey(stone_key);
+        }
+        // The linked leaf path never yields a value when elevated.
+        let linked_leaf = format!(r"{link_path}\Leaf");
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &linked_leaf, true),
+            None
+        );
+        if machine_default_at(HKEY_CURRENT_USER, &target_leaf, true) == Some(ThemeMode::Dark) {
+            // Full contrast: the target subtree is acceptable on its own
+            // (administrator creator, locked DACLs, validated ancestry
+            // would pass), so only the link stands in the way. Without
+            // the link check the walk would cross into the target and
+            // accept its value.
+            assert!(
+                unsafe { link_resolves(HKEY_CURRENT_USER, &link_path) },
+                "the ancestor link must resolve for the contrast to mean refusal-by-guard"
+            );
+        } else {
+            eprintln!(
+                "NOTE: locked target not accepted here (non-administrator creator); refusal holds by policy, full guard isolation needs an administrator creator"
+            );
+        }
+        guard.verify_cleaned();
+    }
+
+    /// A leaf link is detected without following, and an elevated lookup
+    /// through it is refused. The fixture target is the kernel's own
+    /// name, written without a terminator; the target is locked so that,
+    /// for an administrator creator, only the link stands between the
+    /// lookup and acceptance. Follow-dependent contrasts run only where
+    /// the OS resolves the link, said loudly either way.
+    #[cfg(windows)]
+    #[test]
+    fn linked_fixture_is_refused_when_elevated() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD};
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let pid = std::process::id();
+        let target_path = format!(r"Software\HivemendLinkTarget{pid}");
+        unsafe { fixture_theme_key(&format!("HivemendLinkTarget{pid}"), "dark") };
+        unsafe { lock_fixture_store(&target_path) };
+        guard.targets.push(target_path.clone());
+        let target_key = unsafe { open_fixture_key(&target_path, KEY_QUERY_VALUE) };
+        let link_path = format!(r"Software\HivemendLink{pid}");
+        let created = unsafe { create_fixture_link(&link_path, target_key) };
+        unsafe {
+            RegCloseKey(target_key);
+        }
+        if created == ERROR_ACCESS_DENIED || created == ERROR_PRIVILEGE_NOT_HELD {
+            eprintln!("SKIP: this environment refuses link creation ({created})");
+            guard.verify_cleaned();
+            return;
+        }
+        assert_eq!(created, 0, "creating the link fixture failed");
+        guard.links.push(link_path.clone());
+        // Detection works with no following involved, on any host.
+        let mut software = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide("Software").as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut software,
+                )
+            },
+            0
+        );
+        let link_leaf = link_path.rsplit_once('\\').unwrap().1;
+        let target_leaf = target_path.rsplit_once('\\').unwrap().1;
+        assert_eq!(component_is_link(software, link_leaf), Ok(true));
+        assert_eq!(component_is_link(software, target_leaf), Ok(false));
+        assert_eq!(
+            component_is_link(software, "HivemendLinkMissing"),
+            Ok(false)
+        );
+        unsafe {
+            RegCloseKey(software);
+        }
+        // The fixture itself reads plainly; the linked path never yields
+        // a value to an elevated window.
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &target_path, false),
+            Some(ThemeMode::Dark)
+        );
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &link_path, true),
+            None
+        );
+        if machine_default_at(HKEY_CURRENT_USER, &target_path, true) == Some(ThemeMode::Dark)
+            && unsafe { link_resolves(HKEY_CURRENT_USER, &link_path) }
+        {
+            // Full contrast: the locked target is acceptable elevated and
+            // the link resolves, so a plain window reads straight through
+            // while an elevated one refuses by guard.
+            assert_eq!(
+                machine_default_at(HKEY_CURRENT_USER, &link_path, false),
+                Some(ThemeMode::Dark)
+            );
+        } else {
+            eprintln!(
+                "NOTE: no full link contrast here (target unaccepted or link unresolvable in this environment); refusal holds by detection plus fail-closed open"
+            );
+        }
+        guard.verify_cleaned();
+    }
+
+    /// Explicit qualification: no conditional success when link resolution or
+    /// trusted ownership is unavailable. Run elevated on disposable Windows.
+    #[cfg(windows)]
+    #[test]
+    #[ignore = "requires an elevated Windows token and resolvable registry links"]
+    fn protected_link_paths_require_guard_and_verified_cleanup() {
+        use windows_sys::Win32::Security::Authorization::{SE_REGISTRY_KEY, SetSecurityInfo};
+        use windows_sys::Win32::Security::{
+            CreateWellKnownSid, OWNER_SECURITY_INFORMATION, WinBuiltinAdministratorsSid,
+        };
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_ALL_ACCESS, RegCloseKey,
+        };
+        let name = format!("HivemendQualifiedLink{}", std::process::id());
+        let base_path = format!(r"Software\{name}");
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        // Register before setup so assertion unwinding also removes the tree.
+        guard.targets.push(base_path.clone());
+        unsafe { fixture_theme_key(&format!(r"{name}\Target\Leaf"), "dark") };
+        let mut admins = [0u32; 17];
+        let mut length = 68;
+        assert_ne!(
+            unsafe {
+                CreateWellKnownSid(
+                    WinBuiltinAdministratorsSid,
+                    std::ptr::null_mut(),
+                    admins.as_mut_ptr() as *mut _,
+                    &mut length,
+                )
+            },
+            0
+        );
+        // Secure children first: replacing a parent ACL removes inherited
+        // grants from children that have not yet received their own DACL.
+        for suffix in [r"\Target\Leaf", r"\Target", ""] {
+            let path = format!("{base_path}{suffix}");
+            let key = unsafe { open_fixture_key(&path, KEY_ALL_ACCESS) };
+            let status = unsafe {
+                SetSecurityInfo(
+                    key,
+                    SE_REGISTRY_KEY,
+                    OWNER_SECURITY_INFORMATION,
+                    admins.as_mut_ptr() as *mut _,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            };
+            unsafe {
+                RegCloseKey(key);
+            }
+            assert_eq!(status, 0, "qualification requires trusted ownership");
+            unsafe { lock_fixture_store(&path) };
+        }
+        let base = unsafe { open_fixture_key(&base_path, KEY_ALL_ACCESS) };
+        assert!(store_protected_for(base));
+        assert_eq!(
+            machine_default_at(base, r"Target\Leaf", true),
+            Some(ThemeMode::Dark)
+        );
+        // Every ordinary protected component is also checked under a forced
+        // identity-query error. This cannot pass through incidental ownership
+        // refusal: the same chain was accepted immediately above.
+        for fail_at in 1..=2 {
+            let mut checks = 0;
+            let result = open_validated_chain_with_link_check(base, r"Target\Leaf", |key| {
+                checks += 1;
+                if checks == fail_at {
+                    Err(0xC000_0022u32 as i32)
+                } else {
+                    key_is_link(key)
+                }
+            });
+            assert!(result.is_none());
+            assert_eq!(checks, fail_at);
+        }
+        for (link_name, target, lookup) in [
+            ("LeafLink", r"Target\Leaf", "LeafLink"),
+            ("AncestorLink", "Target", r"AncestorLink\Leaf"),
+        ] {
+            let target_key =
+                unsafe { open_fixture_key(&format!(r"{base_path}\{target}"), KEY_ALL_ACCESS) };
+            let link_path = format!(r"{base_path}\{link_name}");
+            // Register before writing the target, so a failed set cleans the link.
+            guard.links.push(link_path.clone());
+            let status = unsafe { create_fixture_link(&link_path, target_key) };
+            unsafe {
+                RegCloseKey(target_key);
+            }
+            assert_eq!(status, 0, "qualification requires link creation");
+            assert_eq!(component_is_link(base, link_name), Ok(true));
+            assert!(
+                unsafe { link_resolves(base, lookup) },
+                "ordinary resolution required"
+            );
+            assert_eq!(
+                machine_default_at(base, lookup, false),
+                Some(ThemeMode::Dark)
+            );
+            assert_eq!(machine_default_at(base, lookup, true), None);
+            let mut checks = 0;
+            let unknown = open_validated_chain_with_link_check(base, lookup, |_| {
+                checks += 1;
+                Err(0xC000_0022u32 as i32) // deterministic STATUS_ACCESS_DENIED
+            });
+            assert!(unknown.is_none());
+            assert_eq!(
+                checks, 1,
+                "the failed check must run on the no-follow handle"
+            );
+            assert_eq!(
+                machine_default_at(base, lookup, false),
+                Some(ThemeMode::Dark)
+            );
+            eprintln!(
+                "qualified {link_name}: ordinary=dark, injected link-query error=STATUS_ACCESS_DENIED, elevated chain=refused"
+            );
+        }
+        unsafe {
+            RegCloseKey(base);
+        }
+        guard.verify_cleaned();
+    }
+
     /// Counts every look at the per-user files and gives fixed contents.
     #[derive(Default)]
     struct Watched {
@@ -8963,5 +10856,51 @@ mod tests {
         assert_eq!(nested_reply(WM_JOB_DONE).1, NestedReply::Handled);
         assert_eq!(nested_reply(WM_SIZE).1, NestedReply::Default);
         assert_eq!(nested_reply(WM_SYSCOMMAND), (0, NestedReply::Default));
+    }
+
+    #[test]
+    fn settings_list_and_button_never_overlap_at_minimum_sizes() {
+        // The minimum outer size scales with DPI (900x660 logical), so the
+        // tightest supported client area is a frame below that. At every
+        // DPI the list bottom must stay at or above the button top, and
+        // the list must keep a visible, scrollable height.
+        for dpi in [96, 144, 192] {
+            let client = scale(660, dpi) - scale(52, dpi);
+            let top = scale(SETTINGS_IGNORED_Y + 62, dpi);
+            let button = client - scale(48, dpi);
+            let room = ignored_list_room(client, dpi);
+            assert!(room > 0, "dpi {dpi}: no visible list");
+            assert!(top + room <= button, "dpi {dpi}: list overlaps button");
+        }
+        // Below the minimum the list yields instead of overlapping.
+        assert_eq!(ignored_list_room(400, 96), 0);
+    }
+
+    #[test]
+    fn saved_window_procedures_go_through_the_system_dispatcher() {
+        // A value read back from GWLP_WNDPROC is only guaranteed callable
+        // through CallWindowProcW (an ANSI/Unicode thunk is not a plain
+        // function address), so invoking it directly is a crash condition.
+        // This gate fails if header_proc ever goes back to calling the
+        // saved procedure value as a function.
+        // Embedded at compile time so standalone VM test binaries need no
+        // source checkout beside them.
+        let text = include_str!("gui.rs");
+        assert!(
+            text.contains("CallWindowProcW(old, header, msg, wparam, lparam)"),
+            "header_proc must dispatch through CallWindowProcW"
+        );
+        // Line-scoped so this very assertion (which names the pattern)
+        // cannot trip the gate itself.
+        for (index, line) in text.lines().enumerate() {
+            if line.contains("text.contains") || line.contains("line.contains") {
+                continue;
+            }
+            assert!(
+                !line.contains("=> previous("),
+                "line {} invokes a saved procedure value directly",
+                index + 1
+            );
+        }
     }
 }

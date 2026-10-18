@@ -62,8 +62,11 @@ jobs:
   installer:
     name: installer (install, upgrade, uninstall)
     # Package managers upgrade by running the new installer over the old one,
-    # so every change is checked with two builds of the installer.
+    # so every change is checked with two builds of the installer. The cap
+    # keeps a stuck Setup (for example a dialog waiting for a click) from
+    # burning the 6 h quota the way the UI job once threatened to.
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -85,12 +88,24 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           & $iscc /DAppVersion=0.0.2 /DOutputDir=..\installer-test installer\hivemend.iss
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Disposable protected-store writer checks
+        shell: powershell
+        run: installer\test-theme-store.ps1
+      - name: Qualify valid protected registry links
+        shell: pwsh
+        run: cargo +1.99.0 test --locked --bin Hivemend protected_link_paths_require_guard_and_verified_cleanup -- --ignored --nocapture
       - name: Install, upgrade, and uninstall
         shell: pwsh
         run: >
           installer\test-installer.ps1
           -Old installer-test\Hivemend-v0.0.1-x86_64-setup.exe -OldVersion 0.0.1
           -New installer-test\Hivemend-v0.0.2-x86_64-setup.exe -NewVersion 0.0.2
+      - name: Chocolatey parameter validation
+        # The install script is a release-time template (render.py fills the
+        # URLs), so its parameter logic is tested here against the stubs,
+        # before Chocolatey moderation ever sees it.
+        shell: pwsh
+        run: installer\test-choco-params.ps1 -Script packaging\chocolatey\tools\chocolateyinstall.ps1
 
   ui:
     name: ui (keyboard, screen reader, scan, repair, restore)
@@ -127,6 +142,9 @@ jobs:
             -WorkingDirectory C:\HivemendTest `
             -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', 'C:\HivemendTest\seed.ps1', '-UserOnly'
           if ($seed.ExitCode -ne 0) { throw "seeding as hmtest failed ($($seed.ExitCode))" }
+      - name: Qualify theme headers and minimum-size Settings
+        shell: powershell
+        run: tests\ui\qualify-theme.ps1 -Exe target\debug\Hivemend.exe -OutDir theme-ui-output
       - name: Run the UI tests
         run: python -I -u tests\ui\run_ui_tests.py target\debug\Hivemend.exe ui-test-output
       - name: Remove the seeded entries
@@ -137,4 +155,6 @@ jobs:
         if: always()
         with:
           name: ui-test-screenshots
-          path: ui-test-output
+          path: |
+            ui-test-output
+            theme-ui-output
