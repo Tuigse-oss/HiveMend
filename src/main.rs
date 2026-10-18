@@ -42,6 +42,10 @@ enum Command {
     Hives,
     /// Run the built-in sample hive. Useful off Windows.
     Demo,
+    /// Print the machine theme default an elevated window would accept.
+    /// Reads only; installer verification uses it to prove a seeded
+    /// store is actually accepted, not just present.
+    MachineTheme,
 }
 
 #[derive(Args)]
@@ -174,6 +178,13 @@ fn real_main() -> Result<ExitCode, hive_mend::Error> {
         }
         Command::Restore { file } => restore_live(&file),
         Command::Hives => hives_live(),
+        Command::MachineTheme => {
+            #[cfg(windows)]
+            if let Some(mode) = gui::machine_default(true) {
+                println!("{}", mode.code());
+            }
+            Ok(ExitCode::SUCCESS)
+        }
         Command::Scan(args) => {
             let engine = load_engine(&args.data)?;
             let opts = options(&args)?;

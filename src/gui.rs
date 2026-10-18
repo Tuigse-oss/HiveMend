@@ -278,16 +278,18 @@ impl Theme {
 /// key lets a standard user steer an elevated window's appearance, so an
 /// untrusted store reads as absent.
 #[cfg(windows)]
-fn machine_default(elevated: bool) -> Option<ThemeMode> {
+pub(crate) fn machine_default(elevated: bool) -> Option<ThemeMode> {
     use windows_sys::Win32::System::Registry::HKEY_LOCAL_MACHINE;
     machine_default_at(HKEY_LOCAL_MACHINE, r"SOFTWARE\TUIGSE\Hivemend", elevated)
 }
 
 /// The same lookup against an arbitrary root, so tests can exercise the
-/// production open-validate-read path on disposable fixture keys. The key
-/// is opened once and the value is read through that same handle after
-/// validation: the name is never re-resolved between the trust check and
-/// the read, so a swapped object cannot slip a value past the check.
+/// production open-validate-read path on disposable fixture keys. An
+/// elevated lookup walks every path component without following links
+/// (see [`open_validated_chain`]) and reads the value through the
+/// retained validated leaf handle: no name is re-resolved between the
+/// trust checks and the read, so a swapped object cannot slip a value
+/// past them.
 #[cfg(windows)]
 fn machine_default_at(
     root: windows_sys::Win32::System::Registry::HKEY,
@@ -295,33 +297,28 @@ fn machine_default_at(
     elevated: bool,
 ) -> Option<ThemeMode> {
     use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
-    // READ_CONTROL (0x20000) so the same handle can carry the security
-    // check; windows-sys only names it under FileSystem, and borrowing
-    // that name for a registry mask would mislead.
-    const READ_CONTROL: u32 = 0x0002_0000;
-    let subkey = wide(path);
-    let mut key = std::ptr::null_mut();
-    let status = unsafe {
-        RegOpenKeyExW(
-            root,
-            subkey.as_ptr(),
-            0,
-            KEY_QUERY_VALUE | READ_CONTROL,
-            &mut key,
-        )
-    };
-    if status != 0 || key.is_null() {
-        return None;
+    if !elevated {
+        // A plain window trusts the installer path and reads it directly.
+        let subkey = wide(path);
+        let mut key = std::ptr::null_mut();
+        let status = unsafe {
+            RegOpenKeyExW(root, subkey.as_ptr(), 0, KEY_QUERY_VALUE, &mut key)
+        };
+        if status != 0 || key.is_null() {
+            return None;
+        }
+        let mode = read_theme_value(key);
+        unsafe {
+            RegCloseKey(key);
+        }
+        return mode;
     }
-    // A plain window trusts the installer path; an elevated one validates
-    // the exact open object (and its ancestry) before the value is read.
-    let trusted = !elevated
-        || (!is_registry_link(root, path)
-            && store_protected_for(key)
-            && ancestors_protected(root, path));
-    let mode = if trusted { read_theme_value(key) } else { None };
+    let Some(leaf) = open_validated_chain(root, path) else {
+        return None;
+    };
+    let mode = read_theme_value(leaf);
     unsafe {
-        RegCloseKey(key);
+        RegCloseKey(leaf);
     }
     mode
 }
@@ -357,47 +354,140 @@ fn read_theme_value(key: windows_sys::Win32::System::Registry::HKEY) -> Option<T
     ThemeMode::parse_any(&String::from_utf16_lossy(&text[..end]))
 }
 
-/// Whether the path resolves to a registry link. A link would redirect
-/// the open above to a key these checks never saw; planting one already
-/// needs an administrator, but a pre-existing link must still refuse
-/// rather than read through. Any query failure other than "no such
-/// value" also refuses: an unchecked object is never trusted.
+/// Whether an open key is a registry link, from the kernel's key flags
+/// rather than from a value anyone could write: a `SymbolicLinkValue`
+/// sitting on a normal key proves nothing, while the flags cannot be
+/// spoofed. Mirrors the maintenance registry's link check.
 #[cfg(windows)]
-fn is_registry_link(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
-    use windows_sys::Win32::Foundation::ERROR_FILE_NOT_FOUND;
-    use windows_sys::Win32::System::Registry::{
-        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegOpenKeyExW, RegQueryValueExW,
+fn key_is_link(key: windows_sys::Win32::System::Registry::HKEY) -> Result<bool, i32> {
+    use windows_sys::Wdk::System::Registry::{KeyFlagsInformation, NtQueryKey};
+    // REG_FLAG_LINK from winnt.h, absent from windows-sys as a constant.
+    const REG_FLAG_LINK: u32 = 0x2;
+    let mut info = [0u32; 3];
+    let mut got = 0u32;
+    let status = unsafe {
+        NtQueryKey(
+            key as _,
+            KeyFlagsInformation,
+            info.as_mut_ptr() as *mut _,
+            std::mem::size_of_val(&info) as u32,
+            &mut got,
+        )
     };
-    let subkey = wide(path);
-    let mut link = std::ptr::null_mut();
+    if status < 0 {
+        return Err(status);
+    }
+    Ok(info[1] & REG_FLAG_LINK != 0)
+}
+
+/// Whether the named child of an open parent is a link, opened without
+/// following it. A missing child is not a link; any other failure to
+/// determine is an error, never a trusted `false`: the caller refuses
+/// whatever it cannot verify.
+#[cfg(windows)]
+fn component_is_link(
+    parent: windows_sys::Win32::System::Registry::HKEY,
+    name: &str,
+) -> Result<bool, u32> {
+    use windows_sys::Win32::Foundation::{ERROR_FILE_NOT_FOUND, ERROR_PATH_NOT_FOUND};
+    use windows_sys::Win32::System::Registry::{
+        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+    };
+    let child = wide(name);
+    let mut key = std::ptr::null_mut();
     let opened = unsafe {
         RegOpenKeyExW(
-            root,
-            subkey.as_ptr(),
+            parent,
+            child.as_ptr(),
             REG_OPTION_OPEN_LINK,
             KEY_QUERY_VALUE,
-            &mut link,
+            &mut key,
         )
     };
-    if opened != 0 || link.is_null() {
-        return false;
+    if opened != 0 || key.is_null() {
+        if opened == ERROR_FILE_NOT_FOUND || opened == ERROR_PATH_NOT_FOUND {
+            return Ok(false);
+        }
+        return Err(opened);
     }
-    let marker = wide("SymbolicLinkValue");
-    let mut size = 0u32;
-    let probed = unsafe {
-        RegQueryValueExW(
-            link,
-            marker.as_ptr(),
-            std::ptr::null(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &mut size,
-        )
-    };
+    let link = key_is_link(key).map_err(|status| status as u32);
     unsafe {
-        windows_sys::Win32::System::Registry::RegCloseKey(link);
+        RegCloseKey(key);
     }
-    probed != ERROR_FILE_NOT_FOUND
+    link
+}
+
+/// Open the leaf of `path` under `root` for an elevated trust check.
+/// Every component is opened relative to its retained validated parent
+/// with no-follow semantics; links are refused, and every component's
+/// owner and DACL must pass [`store_protected_for`] (a user-writable
+/// ancestor would let a standard account delete and recreate the leaf
+/// with a strict DACL but a chosen value). Missing, link, untrusted, or
+/// uncheckable components all yield no handle: failed verification never
+/// grants trust. The caller reads through the returned handle and closes
+/// it. Mirrors the maintenance registry's component walk, with trust
+/// validation at every step instead of system-link crossing.
+#[cfg(windows)]
+fn open_validated_chain(
+    root: windows_sys::Win32::System::Registry::HKEY,
+    path: &str,
+) -> Option<windows_sys::Win32::System::Registry::HKEY> {
+    use windows_sys::Win32::System::Registry::{
+        KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+    };
+    // READ_CONTROL (0x20000) so each handle can carry its own security
+    // check; windows-sys only names it under FileSystem, and borrowing
+    // that name for a registry mask would mislead.
+    const READ_CONTROL: u32 = 0x0002_0000;
+    let mut parent = root;
+    let mut owns_parent = false;
+    let mut components = path.split('\\').peekable();
+    while let Some(name) = components.next() {
+        let mut child = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                wide(name).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE | READ_CONTROL,
+                &mut child,
+            )
+        };
+        if opened != 0 || child.is_null() {
+            if owns_parent {
+                unsafe {
+                    RegCloseKey(parent);
+                }
+            }
+            return None;
+        }
+        // The no-follow handle is the link object itself when the
+        // component is a link, so the kernel flags decide, and the
+        // descriptor below belongs to the exact object being validated.
+        let verified = key_is_link(child).is_ok_and(|link| !link) && store_protected_for(child);
+        if owns_parent {
+            unsafe {
+                RegCloseKey(parent);
+            }
+        }
+        if !verified {
+            unsafe {
+                RegCloseKey(child);
+            }
+            return None;
+        }
+        parent = child;
+        owns_parent = true;
+        if components.peek().is_none() {
+            return Some(child);
+        }
+    }
+    if owns_parent {
+        unsafe {
+            RegCloseKey(parent);
+        }
+    }
+    None
 }
 
 /// Whether the exact open object is a protected store: a trusted system
@@ -465,43 +555,6 @@ unsafe fn owner_trusted(owner: windows_sys::Win32::Security::PSID) -> bool {
         EqualSid(owner as *mut _, system.as_ptr() as *mut _) != 0
             || EqualSid(owner as *mut _, admins.as_ptr() as *mut _) != 0
     }
-}
-
-/// Whether every ancestor up to (but excluding) the root is itself a
-/// protected store. A user-writable ancestor lets a standard account
-/// delete and recreate the leaf with a strict DACL but a chosen value,
-/// which the leaf check alone would accept.
-#[cfg(windows)]
-fn ancestors_protected(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
-    use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
-    const READ_CONTROL: u32 = 0x0002_0000;
-    let mut offset = 0;
-    while let Some(sep) = path[offset..].find('\\') {
-        let ancestor = &path[..offset + sep];
-        let subkey = wide(ancestor);
-        let mut key = std::ptr::null_mut();
-        let status = unsafe {
-            RegOpenKeyExW(
-                root,
-                subkey.as_ptr(),
-                0,
-                KEY_QUERY_VALUE | READ_CONTROL,
-                &mut key,
-            )
-        };
-        if status != 0 || key.is_null() {
-            return false;
-        }
-        let trusted = store_protected_for(key);
-        unsafe {
-            RegCloseKey(key);
-        }
-        if !trusted {
-            return false;
-        }
-        offset += sep + 1;
-    }
-    true
 }
 
 /// Whether a live DACL (not a pre-decoded list) grants no untrusted
@@ -580,6 +633,18 @@ unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
                 DENIED | DENIED_CALLBACK => false,
                 _ => continue,
             };
+            // An inherit-only ACE does not apply to the key itself
+            // (Windows ignores it when checking access to this object),
+            // so skipping it is faithful, not lenient: it typically
+            // carries a broad full-control grant meant for subkeys
+            // (such as CREATOR OWNER on HKLM\SOFTWARE), which must not
+            // fail an otherwise protected store. The flags byte is the
+            // second byte of the ACE header.
+            let flags = unsafe { entry.cast::<u8>().as_ptr().add(1).read() };
+            const INHERIT_ONLY: u8 = 0x8;
+            if flags & INHERIT_ONLY != 0 {
+                continue;
+            }
             // add(1) steps one u32: the mask lives at byte offset 4, right
             // after the 4-byte ACE header (byte_add counts bytes, so it
             // would need 4 here and misleads; see the review finding).
@@ -9639,14 +9704,21 @@ mod tests {
     /// bug read the mask one byte in; only a live descriptor catches that.
     #[cfg(windows)]
     unsafe fn acl_for(entries: &[(i32, u32, bool)]) -> Vec<u8> {
+        acl_for_ex(&entries.iter().map(|(k, m, a)| (*k, *m, *a, 0u32)).collect::<Vec<_>>())
+    }
+
+    /// Like [`acl_for`], with explicit ACE flags per entry (for example
+    /// inherit-only).
+    #[cfg(windows)]
+    unsafe fn acl_for_ex(entries: &[(i32, u32, bool, u32)]) -> Vec<u8> {
         use windows_sys::Win32::Security::{
-            ACL_REVISION, AddAccessAllowedAce, AddAccessDeniedAce, CreateWellKnownSid,
+            ACL_REVISION, AddAccessAllowedAceEx, AddAccessDeniedAce, CreateWellKnownSid,
             InitializeAcl,
         };
         let mut buffer = vec![0u8; 512];
         let pacl = buffer.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
         assert_ne!(InitializeAcl(pacl, 512, ACL_REVISION), 0);
-        for (kind, mask, allow) in entries {
+        for (kind, mask, allow, flags) in entries {
             let mut sid = [0u32; 17];
             let mut length = 68u32;
             assert_ne!(
@@ -9659,7 +9731,13 @@ mod tests {
                 0
             );
             let added = if *allow {
-                AddAccessAllowedAce(pacl, ACL_REVISION, *mask, sid.as_mut_ptr() as *mut _)
+                AddAccessAllowedAceEx(
+                    pacl,
+                    ACL_REVISION,
+                    *flags,
+                    *mask,
+                    sid.as_mut_ptr() as *mut _,
+                )
             } else {
                 AddAccessDeniedAce(pacl, ACL_REVISION, *mask, sid.as_mut_ptr() as *mut _)
             };
@@ -9730,6 +9808,30 @@ mod tests {
         assert!(!unsafe { dacl_trusted(allow_then_deny.as_ptr() as *const ACL) });
     }
 
+    /// An inherit-only grant does not apply to the key itself, so it
+    /// cannot refuse the store: Windows ignores it when checking access
+    /// to this object. Without this, ordinary inherited DACLs (such as a
+    /// broad subkeys-only grant on HKLM\SOFTWARE) would fail every clean
+    /// store.
+    #[cfg(windows)]
+    #[test]
+    fn inherit_only_grants_do_not_apply_to_the_key() {
+        use windows_sys::Win32::Security::{ACL, WinBuiltinUsersSid};
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        const INHERIT_ONLY: u32 = 0x8;
+        let shaped = unsafe {
+            acl_for_ex(&[
+                (WinBuiltinUsersSid, GENERIC_ALL, true, INHERIT_ONLY),
+                (WinBuiltinUsersSid, KEY_READ, true, 0),
+            ])
+        };
+        assert!(unsafe { dacl_trusted(shaped.as_ptr() as *const ACL) });
+        // The same grant without the flag still refuses.
+        let direct = unsafe { acl_for(&[(WinBuiltinUsersSid, GENERIC_ALL, true)]) };
+        assert!(!unsafe { dacl_trusted(direct.as_ptr() as *const ACL) });
+    }
+
     /// The owner check runs on production well-known SIDs: SYSTEM and
     /// Administrators own a protected store, anything else refuses it.
     #[cfg(windows)]
@@ -9759,8 +9861,10 @@ mod tests {
         assert!(!unsafe { owner_trusted(well_known(WinBuiltinUsersSid).as_ptr() as *mut _) });
     }
 
-    /// A disposable per-user fixture key with a Theme value, written and
-    /// removed by the test. Returns its subkey path.
+    /// A disposable per-user fixture key with a Theme value. `name` is
+    /// relative to HKCU\Software (backslashes nest); the returned
+    /// subkey path is the full `Software\...` form. The caller removes
+    /// it, usually through [`FixtureGuard`].
     #[cfg(windows)]
     unsafe fn fixture_theme_key(name: &str, value: &str) -> String {
         use windows_sys::Win32::System::Registry::{
@@ -9819,14 +9923,16 @@ mod tests {
     #[test]
     fn user_owned_fixture_is_refused_when_elevated() {
         use windows_sys::Win32::System::Registry::{
-            HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegDeleteTreeW, RegOpenKeyExW,
+            HKEY_CURRENT_USER, KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
         };
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
         let path = unsafe {
             fixture_theme_key(
                 &format!("HivemendTrustOwnerProbe{}", std::process::id()),
                 "dark",
             )
         };
+        guard.targets.push(path.clone());
         assert_eq!(
             machine_default_at(HKEY_CURRENT_USER, &path, false),
             Some(ThemeMode::Dark)
@@ -9852,146 +9958,577 @@ mod tests {
         assert!(!store_protected_for(key));
         unsafe {
             RegCloseKey(key);
-            RegDeleteTreeW(HKEY_CURRENT_USER, subkey.as_ptr());
         }
+        guard.verify_cleaned();
     }
 
-    /// The current user's SID in string form, for link targets below.
+    /// The kernel's name for an open key (such as
+    /// `\REGISTRY\USER\S-1-5-...`), the authoritative spelling for a link
+    /// target. Hand-built NT paths are guesswork; this one is read back
+    /// from the object itself. Mirrors the maintenance registry helper.
     #[cfg(windows)]
-    unsafe fn current_user_sid_string() -> Option<String> {
-        use windows_sys::Win32::Foundation::{CloseHandle, LocalFree};
-        use windows_sys::Win32::Security::Authorization::ConvertSidToStringSidW;
-        use windows_sys::Win32::Security::{
-            GetTokenInformation, TOKEN_QUERY, TOKEN_USER, TokenUser,
-        };
-        use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
-        let mut token = std::ptr::null_mut();
-        if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
-            return None;
-        }
-        let mut needed = 0u32;
-        unsafe { GetTokenInformation(token, TokenUser, std::ptr::null_mut(), 0, &mut needed) };
-        let mut buffer = vec![0u8; needed as usize];
-        let ok = unsafe {
-            GetTokenInformation(
-                token,
-                TokenUser,
+    unsafe fn kernel_key_name(key: windows_sys::Win32::System::Registry::HKEY) -> Option<String> {
+        use windows_sys::Wdk::System::Registry::{KeyNameInformation, NtQueryKey};
+        let mut buffer = vec![0u32; 1024];
+        let mut got = 0u32;
+        let status = unsafe {
+            NtQueryKey(
+                key as _,
+                KeyNameInformation,
                 buffer.as_mut_ptr() as *mut _,
-                needed,
-                &mut needed,
+                (buffer.len() * 4) as u32,
+                &mut got,
             )
         };
-        unsafe { CloseHandle(token) };
-        if ok == 0 {
+        if status < 0 {
             return None;
         }
-        let user = unsafe { &*(buffer.as_ptr() as *const TOKEN_USER) };
-        let mut text: *mut u16 = std::ptr::null_mut();
-        if unsafe { ConvertSidToStringSidW(user.User.Sid, &mut text) } == 0 || text.is_null() {
-            return None;
-        }
-        let mut length = 0;
-        while unsafe { *text.add(length) } != 0 {
-            length += 1;
-        }
-        let string = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(text, length) });
-        unsafe { LocalFree(text as *mut _) };
-        Some(string)
+        let bytes = buffer[0] as usize;
+        let units = unsafe {
+            std::slice::from_raw_parts(buffer.as_ptr().add(1) as *const u16, bytes / 2)
+        };
+        String::from_utf16(units).ok()
     }
 
-    /// A link is detected by opening it without following, and an
-    /// elevated window refuses the linked path. Whether the OS resolves
-    /// the follow-through open is environment-dependent (restricted
-    /// tokens may refuse it), so the test asserts the security property
-    /// rather than the follow: detection is deterministic, and refusal
-    /// holds whether following succeeds (the check fires) or fails (the
-    /// open itself fails closed). The target fixture stays directly
-    /// readable, proving only the link stands in the way.
-    /// Link creation without sufficient rights reports the skip instead
-    /// of asserting on an unbuilt fixture.
+    /// Delete a link through a no-follow handle so its target is
+    /// untouched. Mirrors the maintenance registry's fixture cleanup.
+    #[cfg(windows)]
+    unsafe fn delete_link_nofollow(
+        root: windows_sys::Win32::System::Registry::HKEY,
+        path: &str,
+    ) -> bool {
+        use windows_sys::Wdk::System::Registry::NtDeleteKey;
+        use windows_sys::Win32::System::Registry::{
+            KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegOpenKeyExW,
+        };
+        const DELETE_ACCESS: u32 = 0x0001_0000;
+        let Some((parent_path, name)) = path.rsplit_once('\\') else {
+            return false;
+        };
+        let mut parent = std::ptr::null_mut();
+        if unsafe {
+            RegOpenKeyExW(
+                root,
+                wide(parent_path).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                KEY_QUERY_VALUE,
+                &mut parent,
+            )
+        } != 0
+            || parent.is_null()
+        {
+            return false;
+        }
+        let mut link = std::ptr::null_mut();
+        let opened = unsafe {
+            RegOpenKeyExW(
+                parent,
+                wide(name).as_ptr(),
+                REG_OPTION_OPEN_LINK,
+                DELETE_ACCESS,
+                &mut link,
+            )
+        };
+        unsafe {
+            RegCloseKey(parent);
+        }
+        if opened != 0 || link.is_null() {
+            return false;
+        }
+        let deleted = unsafe { NtDeleteKey(link as _) } >= 0;
+        unsafe {
+            RegCloseKey(link);
+        }
+        deleted
+    }
+
+    /// Best-effort removal of fixture keys with verified outcomes. The
+    /// guard is created before any fallible setup step, so asserts and
+    /// panics still clean up. Targets must be gone afterwards (a hard
+    /// failure otherwise); a surviving link is reported loudly instead
+    /// of silently accumulating, since link deletion is the part some
+    /// restricted environments refuse.
+    #[cfg(windows)]
+    struct FixtureGuard {
+        root: windows_sys::Win32::System::Registry::HKEY,
+        targets: Vec<String>,
+        links: Vec<String>,
+    }
+
+    #[cfg(windows)]
+    impl FixtureGuard {
+        fn new(root: windows_sys::Win32::System::Registry::HKEY) -> Self {
+            Self {
+                root,
+                targets: Vec::new(),
+                links: Vec::new(),
+            }
+        }
+
+        fn remove_all(&self) {
+            use windows_sys::Win32::System::Registry::{
+                KEY_QUERY_VALUE, REG_OPTION_OPEN_LINK, RegCloseKey, RegDeleteTreeW, RegOpenKeyExW,
+            };
+            // Links first: a tree delete recurses into children and
+            // chokes on an unresolvable link inside, so the link object
+            // must go before the tree around it.
+            for link in &self.links {
+                if !(unsafe { delete_link_nofollow(self.root, link) }) {
+                    // Best effort already failed; confirm whether it is
+                    // really still there before alarming.
+                    let mut probe = std::ptr::null_mut();
+                    let status = unsafe {
+                        RegOpenKeyExW(
+                            self.root,
+                            wide(link).as_ptr(),
+                            REG_OPTION_OPEN_LINK,
+                            KEY_QUERY_VALUE,
+                            &mut probe,
+                        )
+                    };
+                    if status == 0 && !probe.is_null() {
+                        unsafe {
+                            RegCloseKey(probe);
+                        }
+                        eprintln!("WARNING: fixture link survived cleanup: {link}");
+                    }
+                }
+            }
+            for target in &self.targets {
+                unsafe {
+                    RegDeleteTreeW(self.root, wide(target).as_ptr());
+                }
+            }
+        }
+
+        /// Remove everything and prove the targets are gone. Link
+        /// survival is reported, not asserted: deleting links needs a
+        /// cooperating environment, and a stuck link must not mask the
+        /// behavioral verdicts above it.
+        fn verify_cleaned(&self) {
+            use windows_sys::Win32::System::Registry::{
+                KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW,
+            };
+            self.remove_all();
+            for target in &self.targets {
+                let mut probe = std::ptr::null_mut();
+                let status = unsafe {
+                    RegOpenKeyExW(
+                        self.root,
+                        wide(target).as_ptr(),
+                        0,
+                        KEY_QUERY_VALUE,
+                        &mut probe,
+                    )
+                };
+                assert_ne!(status, 0, "fixture target survived cleanup: {target}");
+                if !probe.is_null() {
+                    unsafe {
+                        RegCloseKey(probe);
+                    }
+                }
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    impl Drop for FixtureGuard {
+        fn drop(&mut self) {
+            self.remove_all();
+        }
+    }
+
+    /// Open a fixture key with the requested access. The caller closes
+    /// the handle.
+    #[cfg(windows)]
+    unsafe fn open_fixture_key(
+        path: &str,
+        access: u32,
+    ) -> windows_sys::Win32::System::Registry::HKEY {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegOpenKeyExW};
+        let mut key = std::ptr::null_mut();
+        let status = unsafe { RegOpenKeyExW(HKEY_CURRENT_USER, wide(path).as_ptr(), 0, access, &mut key) };
+        assert_eq!(status, 0, "opening fixture {path} failed");
+        assert!(!key.is_null());
+        key
+    }
+
+    /// Replace the DACL on an open fixture handle with the given
+    /// in-memory entries (see [`acl_for`]). The handle must already
+    /// carry WRITE_DAC; the owner is untouched. Taking the handle (not
+    /// the path) lets tests hold one handle across a deny they could
+    /// not reopen through.
+    #[cfg(windows)]
+    unsafe fn set_dacl_on_handle(
+        key: windows_sys::Win32::System::Registry::HKEY,
+        entries: &[(i32, u32, bool)],
+    ) {
+        use windows_sys::Win32::Security::Authorization::{SE_REGISTRY_KEY, SetSecurityInfo};
+        use windows_sys::Win32::Security::DACL_SECURITY_INFORMATION;
+        let dacl = unsafe { acl_for(entries) };
+        let status = unsafe {
+            SetSecurityInfo(
+                key as *mut _,
+                SE_REGISTRY_KEY,
+                DACL_SECURITY_INFORMATION,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                dacl.as_ptr() as *const _,
+                std::ptr::null_mut(),
+            )
+        };
+        assert_eq!(status, 0, "replacing the fixture DACL failed");
+    }
+
+    /// Replace a fixture key's DACL with the given in-memory entries.
+    /// The creator holds WRITE_DAC over its own key; the owner is
+    /// untouched.
+    #[cfg(windows)]
+    unsafe fn set_fixture_dacl(path: &str, entries: &[(i32, u32, bool)]) {
+        use windows_sys::Win32::System::Registry::RegCloseKey;
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let key = unsafe { open_fixture_key(path, KEY_QUERY_VALUE | WRITE_DAC) };
+        unsafe { set_dacl_on_handle(key, entries) };
+        unsafe {
+            RegCloseKey(key);
+        }
+    }
+
+    /// The link probe distinguishes three states: a link, a verifiable
+    /// non-link (including a missing child), and an uncheckable error.
+    /// Only the last one is ever allowed to refuse silently elsewhere;
+    /// here each state is pinned on fixtures.
     #[cfg(windows)]
     #[test]
-    fn linked_fixture_is_refused_when_elevated() {
-        use windows_sys::Win32::Foundation::ERROR_ACCESS_DENIED;
-        use windows_sys::Win32::System::Registry::{
-            HKEY_CURRENT_USER, KEY_CREATE_LINK, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_LINK,
-            REG_OPTION_CREATE_LINK, RegCloseKey, RegCreateKeyExW, RegDeleteTreeW, RegSetValueExW,
+    fn link_probe_reports_link_plain_and_unknown() {
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let plain_path = format!(r"Software\HivemendProbePlain{}", std::process::id());
+        let plain_name = plain_path.rsplit_once('\\').unwrap().1;
+        unsafe { fixture_theme_key(plain_name, "dark") };
+        guard.targets.push(plain_path.clone());
+        // A normal key probes false; a missing child is not a link.
+        let mut software = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide("Software").as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut software,
+                )
+            },
+            0
+        );
+        let leaf = plain_path.rsplit_once('\\').unwrap().1;
+        assert_eq!(component_is_link(software, leaf), Ok(false));
+        assert_eq!(
+            component_is_link(software, "HivemendProbeMissing"),
+            Ok(false)
+        );
+        // An uncheckable child errors: deny this user every access to a
+        // fixture, then probe it. One handle opened before the deny is
+        // held across it, so recovery never depends on reopening through
+        // the deny; the probe and the production lookup use fresh opens,
+        // which is exactly what must refuse.
+        let denied_path = format!(r"Software\HivemendProbeDenied{}", std::process::id());
+        let denied_name = denied_path.rsplit_once('\\').unwrap().1;
+        unsafe { fixture_theme_key(denied_name, "dark") };
+        guard.targets.push(denied_path.clone());
+        let denied_leaf = denied_path.rsplit_once('\\').unwrap().1.to_string();
+        const WRITE_DAC: u32 = 0x0004_0000;
+        const READ_CONTROL: u32 = 0x0002_0000;
+        let held = unsafe {
+            open_fixture_key(&denied_path, KEY_QUERY_VALUE | READ_CONTROL | WRITE_DAC)
         };
-        // Process-id names: a failed run's leftovers can never collide
-        // with (or block) a later run.
-        let target_path = unsafe {
-            fixture_theme_key(
-                &format!("HivemendTrustLinkTarget{}", std::process::id()),
-                "dark",
+        unsafe {
+            use windows_sys::Win32::Security::WinBuiltinUsersSid;
+            const GENERIC_ALL: u32 = 0x1000_0000;
+            set_dacl_on_handle(held, &[(WinBuiltinUsersSid, GENERIC_ALL, false)]);
+        }
+        assert!(component_is_link(software, &denied_leaf).is_err());
+        // The production lookup refuses the same uncheckable object.
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &denied_path, true),
+            None
+        );
+        unsafe {
+            use windows_sys::Win32::Security::WinBuiltinUsersSid;
+            // Full control, not just read: cleanup must delete this key,
+            // and read-only would leave it behind.
+            const GENERIC_ALL: u32 = 0x1000_0000;
+            set_dacl_on_handle(held, &[(WinBuiltinUsersSid, GENERIC_ALL, true)]);
+            RegCloseKey(held);
+            RegCloseKey(software);
+        }
+        guard.verify_cleaned();
+    }
+
+    /// Lock a fixture the way a protected store looks: SYSTEM and
+    /// Administrators full control, Users read-only. The owner stays the
+    /// creator, so this only yields an acceptable store for an
+    /// administrator creator; elsewhere it documents intent and the
+    /// tests probe acceptance before asserting contrasts.
+    #[cfg(windows)]
+    unsafe fn lock_fixture_store(path: &str) {
+        use windows_sys::Win32::Security::{
+            WinBuiltinAdministratorsSid, WinBuiltinUsersSid, WinLocalSystemSid,
+        };
+        use windows_sys::Win32::System::Registry::KEY_READ;
+        const GENERIC_ALL: u32 = 0x1000_0000;
+        unsafe {
+            set_fixture_dacl(
+                path,
+                &[
+                    (WinLocalSystemSid, GENERIC_ALL, true),
+                    (WinBuiltinAdministratorsSid, GENERIC_ALL, true),
+                    (WinBuiltinUsersSid, KEY_READ, true),
+                ],
             )
         };
-        let Some(sid) = (unsafe { current_user_sid_string() }) else {
-            eprintln!("SKIP: cannot read the current user SID");
-            return;
+    }
+
+    /// Create a volatile link fixture whose target is the kernel's own
+    /// name for an open target handle, written length-delimited without
+    /// a terminator (MS-RRP). Returns the creation status so the caller
+    /// can skip when the environment refuses links; the caller registers
+    /// the link path with its guard.
+    #[cfg(windows)]
+    unsafe fn create_fixture_link(
+        link_path: &str,
+        target: windows_sys::Win32::System::Registry::HKEY,
+    ) -> u32 {
+        use windows_sys::Win32::System::Registry::{
+            HKEY_CURRENT_USER, KEY_CREATE_LINK, KEY_SET_VALUE, REG_CREATED_NEW_KEY, REG_LINK,
+            REG_OPTION_CREATE_LINK, REG_OPTION_VOLATILE, RegCloseKey, RegCreateKeyExW,
+            RegSetValueExW,
         };
-        let link_path = format!(r"Software\HivemendTrustLink{}", std::process::id());
-        let link_subkey = wide(&link_path);
-        unsafe {
-            RegDeleteTreeW(HKEY_CURRENT_USER, link_subkey.as_ptr());
-        }
+        let native =
+            unsafe { kernel_key_name(target) }.expect("kernel name for the link target");
+        // Length-delimited, no terminator: MS-RRP requires the target
+        // object name without a trailing NUL.
+        let units: Vec<u16> = native.encode_utf16().collect();
         let mut link = std::ptr::null_mut();
         let mut disposition = 0u32;
         let created = unsafe {
             RegCreateKeyExW(
                 HKEY_CURRENT_USER,
-                link_subkey.as_ptr(),
+                wide(link_path).as_ptr(),
                 0,
                 std::ptr::null(),
-                REG_OPTION_CREATE_LINK,
+                REG_OPTION_CREATE_LINK | REG_OPTION_VOLATILE,
                 KEY_CREATE_LINK | KEY_SET_VALUE,
                 std::ptr::null(),
                 &mut link,
                 &mut disposition,
             )
         };
-        if created == ERROR_ACCESS_DENIED {
-            eprintln!("SKIP: link creation needs elevation");
-            unsafe {
-                RegDeleteTreeW(HKEY_CURRENT_USER, wide(&target_path).as_ptr());
-            }
-            return;
+        if created != 0 {
+            return created;
         }
-        assert_eq!(created, 0);
         assert_eq!(disposition, REG_CREATED_NEW_KEY);
         let marker = wide("SymbolicLinkValue");
-        let target = wide(&format!(r"\Registry\User\{sid}\{target_path}"));
+        let set = unsafe {
+            RegSetValueExW(
+                link,
+                marker.as_ptr(),
+                0,
+                REG_LINK,
+                units.as_ptr() as *const u8,
+                (units.len() * 2) as u32,
+            )
+        };
+        unsafe {
+            RegCloseKey(link);
+        }
+        assert_eq!(set, 0, "writing the link target failed");
+        0
+    }
+
+    /// Whether the OS resolves an ordinary open through the link path.
+    /// Link *detection* is deterministic everywhere, but follow-through
+    /// depends on the token and host policy. Callers assert the security
+    /// property unconditionally and gate follow-dependent contrasts on
+    /// this probe, saying so loudly instead of silently passing.
+    #[cfg(windows)]
+    unsafe fn link_resolves(root: windows_sys::Win32::System::Registry::HKEY, path: &str) -> bool {
+        use windows_sys::Win32::System::Registry::{KEY_QUERY_VALUE, RegCloseKey, RegOpenKeyExW};
+        let mut probe = std::ptr::null_mut();
+        let status = unsafe {
+            RegOpenKeyExW(root, wide(path).as_ptr(), 0, KEY_QUERY_VALUE, &mut probe)
+        };
+        if status == 0 && !probe.is_null() {
+            unsafe {
+                RegCloseKey(probe);
+            }
+            return true;
+        }
+        false
+    }
+
+    /// An ancestor link is refused even when everything behind it is an
+    /// acceptable protected store. The target subtree is locked and, for
+    /// an administrator creator, accepted directly; the only difference
+    /// on the linked path is the link, so removing the link check would
+    /// turn the refusal into acceptance. That is the mutation argument
+    /// the leaf case alone cannot carry: the chain never follows, so a
+    /// leaf link could never yield a value either way, while an ancestor
+    /// link would silently redirect the walk.
+    #[cfg(windows)]
+    #[test]
+    fn ancestor_link_is_refused_when_elevated() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD};
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let pid = std::process::id();
+        // Target subtree: locked leaf with a theme under a locked parent.
+        let target_leaf = format!(r"Software\HivemendAncTarget{pid}\Leaf");
+        unsafe { fixture_theme_key(&format!("HivemendAncTarget{pid}\\Leaf"), "dark") };
+        unsafe {
+            lock_fixture_store(&format!(r"Software\HivemendAncTarget{pid}"));
+            lock_fixture_store(&target_leaf);
+        }
+        guard.targets.push(format!(r"Software\HivemendAncTarget{pid}"));
+        // The stepping-stone parent is an ordinary key.
+        let stone = format!(r"Software\HivemendAncStone{pid}");
+        unsafe { fixture_theme_key(&format!("HivemendAncStone{pid}"), "dark") };
+        guard.targets.push(stone.clone());
+        let link_path = format!(r"{stone}\Link");
+        // Open the target for its kernel name, then link to it.
+        let target_key = unsafe { open_fixture_key(&target_leaf, KEY_QUERY_VALUE) };
+        let created = unsafe { create_fixture_link(&link_path, target_key) };
+        unsafe {
+            RegCloseKey(target_key);
+        }
+        if created == ERROR_ACCESS_DENIED || created == ERROR_PRIVILEGE_NOT_HELD {
+            eprintln!("SKIP: this environment refuses link creation ({created})");
+            guard.verify_cleaned();
+            return;
+        }
+        assert_eq!(created, 0, "creating the ancestor link fixture failed");
+        guard.links.push(link_path.clone());
+        // The ancestor component probes as a link; its siblings do not.
+        let mut stone_key = std::ptr::null_mut();
         assert_eq!(
             unsafe {
-                RegSetValueExW(
-                    link,
-                    marker.as_ptr(),
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide(&stone).as_ptr(),
                     0,
-                    REG_LINK,
-                    target.as_ptr() as *const u8,
-                    (target.len() * 2) as u32,
+                    KEY_QUERY_VALUE,
+                    &mut stone_key,
                 )
             },
             0
         );
-        unsafe { RegCloseKey(link) };
+        assert_eq!(component_is_link(stone_key, "Link"), Ok(true));
+        unsafe {
+            RegCloseKey(stone_key);
+        }
+        // The linked leaf path never yields a value when elevated.
+        let linked_leaf = format!(r"{link_path}\Leaf");
+        assert_eq!(
+            machine_default_at(HKEY_CURRENT_USER, &linked_leaf, true),
+            None
+        );
+        if machine_default_at(HKEY_CURRENT_USER, &target_leaf, true) == Some(ThemeMode::Dark) {
+            // Full contrast: the target subtree is acceptable on its own
+            // (administrator creator, locked DACLs, validated ancestry
+            // would pass), so only the link stands in the way. Without
+            // the link check the walk would cross into the target and
+            // accept its value.
+            assert!(
+                unsafe { link_resolves(HKEY_CURRENT_USER, &link_path) },
+                "the ancestor link must resolve for the contrast to mean refusal-by-guard"
+            );
+        } else {
+            eprintln!(
+                "NOTE: locked target not accepted here (non-administrator creator); refusal holds by policy, full guard isolation needs an administrator creator"
+            );
+        }
+        guard.verify_cleaned();
+    }
+
+    /// A leaf link is detected without following, and an elevated lookup
+    /// through it is refused. The fixture target is the kernel's own
+    /// name, written without a terminator; the target is locked so that,
+    /// for an administrator creator, only the link stands between the
+    /// lookup and acceptance. Follow-dependent contrasts run only where
+    /// the OS resolves the link, said loudly either way.
+    #[cfg(windows)]
+    #[test]
+    fn linked_fixture_is_refused_when_elevated() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_PRIVILEGE_NOT_HELD};
+        use windows_sys::Win32::System::Registry::{HKEY_CURRENT_USER, RegCloseKey, RegOpenKeyExW};
+        const KEY_QUERY_VALUE: u32 = 0x0000_0001;
+        let mut guard = FixtureGuard::new(HKEY_CURRENT_USER);
+        let pid = std::process::id();
+        let target_path = format!(r"Software\HivemendLinkTarget{pid}");
+        unsafe { fixture_theme_key(&format!("HivemendLinkTarget{pid}"), "dark") };
+        unsafe { lock_fixture_store(&target_path) };
+        guard.targets.push(target_path.clone());
+        let target_key = unsafe { open_fixture_key(&target_path, KEY_QUERY_VALUE) };
+        let link_path = format!(r"Software\HivemendLink{pid}");
+        let created = unsafe { create_fixture_link(&link_path, target_key) };
+        unsafe {
+            RegCloseKey(target_key);
+        }
+        if created == ERROR_ACCESS_DENIED || created == ERROR_PRIVILEGE_NOT_HELD {
+            eprintln!("SKIP: this environment refuses link creation ({created})");
+            guard.verify_cleaned();
+            return;
+        }
+        assert_eq!(created, 0, "creating the link fixture failed");
+        guard.links.push(link_path.clone());
         // Detection works with no following involved, on any host.
-        assert!(is_registry_link(HKEY_CURRENT_USER, &link_path));
-        assert!(!is_registry_link(HKEY_CURRENT_USER, &target_path));
+        let mut software = std::ptr::null_mut();
+        assert_eq!(
+            unsafe {
+                RegOpenKeyExW(
+                    HKEY_CURRENT_USER,
+                    wide("Software").as_ptr(),
+                    0,
+                    KEY_QUERY_VALUE,
+                    &mut software,
+                )
+            },
+            0
+        );
+        let link_leaf = link_path.rsplit_once('\\').unwrap().1;
+        let target_leaf = target_path.rsplit_once('\\').unwrap().1;
+        assert_eq!(component_is_link(software, link_leaf), Ok(true));
+        assert_eq!(component_is_link(software, target_leaf), Ok(false));
+        assert_eq!(component_is_link(software, "HivemendLinkMissing"), Ok(false));
+        unsafe {
+            RegCloseKey(software);
+        }
         // The fixture itself reads plainly; the linked path never yields
-        // a value to an elevated window, whether following succeeds (the
-        // check fires) or fails (the open fails closed).
+        // a value to an elevated window.
         assert_eq!(
             machine_default_at(HKEY_CURRENT_USER, &target_path, false),
             Some(ThemeMode::Dark)
         );
-        assert_eq!(
-            machine_default_at(HKEY_CURRENT_USER, &link_path, true),
-            None
-        );
-        unsafe {
-            RegDeleteTreeW(HKEY_CURRENT_USER, link_subkey.as_ptr());
-            RegDeleteTreeW(HKEY_CURRENT_USER, wide(&target_path).as_ptr());
+        assert_eq!(machine_default_at(HKEY_CURRENT_USER, &link_path, true), None);
+        if machine_default_at(HKEY_CURRENT_USER, &target_path, true) == Some(ThemeMode::Dark)
+            && unsafe { link_resolves(HKEY_CURRENT_USER, &link_path) }
+        {
+            // Full contrast: the locked target is acceptable elevated and
+            // the link resolves, so a plain window reads straight through
+            // while an elevated one refuses by guard.
+            assert_eq!(
+                machine_default_at(HKEY_CURRENT_USER, &link_path, false),
+                Some(ThemeMode::Dark)
+            );
+        } else {
+            eprintln!(
+                "NOTE: no full link contrast here (target unaccepted or link unresolvable in this environment); refusal holds by detection plus fail-closed open"
+            );
         }
+        guard.verify_cleaned();
     }
 
     /// Counts every look at the per-user files and gives fixed contents.
