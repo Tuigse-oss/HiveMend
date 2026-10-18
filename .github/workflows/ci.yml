@@ -100,6 +100,7 @@ jobs:
           installer\test-installer.ps1
           -Old installer-test\Hivemend-v0.0.1-x86_64-setup.exe -OldVersion 0.0.1
           -New installer-test\Hivemend-v0.0.2-x86_64-setup.exe -NewVersion 0.0.2
+          -ThemeProbe installer-test\Hivemend-v0.0.1-x86_64-setup.exe
       - name: Chocolatey parameter validation
         # The install script is a release-time template (render.py fills the
         # URLs), so its parameter logic is tested here against the stubs,
