@@ -68,6 +68,12 @@ function Test-LinkComponent([UIntPtr]$parent, [string]$name) {
 $storeWrite = 0x2 -bor 0x4 -bor 0x20 -bor 0x10000 -bor 0x40000 -bor 0x80000
 $trustedOwners = @('BUILTIN\Administrators', 'NT AUTHORITY\SYSTEM')
 $trustedWriters = @('NT AUTHORITY\SYSTEM', 'BUILTIN\Administrators')
+# Must match the runtime policy (dacl_trusted in src/gui.rs): an
+# inherit-only ACE does not apply to the key itself. HKLM\SOFTWARE
+# carries a broad subkeys-only grant (CREATOR OWNER) that must not fail
+# an otherwise protected store; a standard user cannot become a
+# creator-owner under a key they cannot write, so it grants them nothing.
+$inheritOnly = [System.Security.AccessControl.PropagationFlags]::InheritOnly
 
 function Open-NoFollow([UIntPtr]$parent, [string]$name) {
     $child = [UIntPtr]::Zero
@@ -110,6 +116,7 @@ function Test-StoreObject([string]$path) {
         foreach ($ace in $acl.Access) {
             if ($ace.AccessControlType -ne 'Allow') { continue }
             if (($ace.RegistryRights.value__ -band $storeWrite) -eq 0) { continue }
+            if (($ace.PropagationFlags -band $inheritOnly) -ne 0) { continue }
             if ($trustedWriters -contains $ace.IdentityReference.Value) { continue }
             if ($parent -ne $HKEY_LOCAL_MACHINE) { [void][RegLinkProbe]::RegCloseKey($parent) }
             return "store-changing grant to $($ace.IdentityReference.Value) on $full"
