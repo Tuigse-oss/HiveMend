@@ -390,8 +390,14 @@ if ($linkFixture) {
     throw 'a refused redirected install changed the install (downgraded or duplicated)'
   }
   Write-Host 'ok: redirected store refused, install untouched'
-  $parent = Get-Item 'HKLM:\SOFTWARE\TUIGSE'
-  $parent.DeleteSubKey('Hivemend')
+  # Get-Item opens read-only, which cannot delete; a writable open
+  # deletes the link object itself by name, never its target.
+  $parent = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\TUIGSE', $true)
+  try {
+    $parent.DeleteSubKey('Hivemend')
+  } finally {
+    $parent.Close()
+  }
   if (Test-Path $themeKey) { throw 'the link fixture survived cleanup' }
   Write-Host 'ok: link fixture removed without touching its target'
   New-Item -Path $themeKey -Force | Out-Null
