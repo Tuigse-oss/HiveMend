@@ -327,7 +327,7 @@ fn machine_trusted() -> bool {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_REGISTRY_KEY};
     use windows_sys::Win32::Security::{
-        ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
+        ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
         DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
         WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid, WinWorldSid,
     };
@@ -389,17 +389,31 @@ fn machine_trusted() -> bool {
     if ok != 0 {
         for index in 0..info.AceCount {
             let mut raw: *mut std::ffi::c_void = std::ptr::null_mut();
-            if unsafe { GetAce(dacl, index, &mut raw) } == 0 || raw.is_null() {
+            if unsafe { GetAce(dacl, index, &mut raw) } == 0 {
                 continue;
             }
-            let ace_type = unsafe { *(raw as *const u8) };
-            let allow = match ace_type {
+            // NonNull is the non-null proof; the alignment and size checks
+            // below make every subsequent field read land inside the entry
+            // the API just handed over.
+            let Some(entry) = std::ptr::NonNull::new(raw) else {
+                continue;
+            };
+            if !(entry.as_ptr() as usize).is_multiple_of(4) {
+                continue;
+            }
+            let head = unsafe { entry.cast::<ACE_HEADER>().as_ref() };
+            if (head.AceSize as usize)
+                < std::mem::size_of::<ACE_HEADER>() + std::mem::size_of::<u32>()
+            {
+                continue;
+            }
+            let allow = match head.AceType {
                 ALLOWED | ALLOWED_CALLBACK => true,
                 DENIED | DENIED_CALLBACK => false,
                 _ => continue,
             };
-            let mask = unsafe { *(raw as *const u32).byte_add(4) };
-            let sid = unsafe { (raw as *const u8).byte_add(8) as *const _ };
+            let mask = unsafe { entry.cast::<u32>().as_ptr().byte_add(1).read() };
+            let sid = unsafe { entry.as_ptr().byte_add(8) as *const _ };
             let broad = unsafe {
                 if EqualSid(sid as *mut _, world.as_ptr() as *mut _) != 0 {
                     BroadSid::Everyone
