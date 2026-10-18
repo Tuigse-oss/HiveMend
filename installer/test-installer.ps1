@@ -165,6 +165,16 @@ if ($still.Count -ne 1 -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
 }
 if ((Theme-Default) -ne 'dark') { throw 'an empty /Theme= damaged the machine default' }
 Write-Host 'ok: empty /Theme= changed nothing (no downgrade, default intact)'
+$sentinel = Start-Process $Old -ArgumentList ($silent + @('/ALLUSERS', '/Theme=__ABSENT__')) -Wait -PassThru
+if ($sentinel.ExitCode -eq 0) { throw 'the former absence marker as /Theme= reported success; every supplied value is validated' }
+Write-Host "ok: former sentinel exited $($sentinel.ExitCode)"
+Start-Sleep -Seconds 30
+$still = @(Installs)
+if ($still.Count -ne 1 -or $still[0].Entry.DisplayVersion -ne $NewVersion) {
+  throw 'a rejected former sentinel changed the install (downgraded or duplicated)'
+}
+if ((Theme-Default) -ne 'dark') { throw 'a rejected former sentinel damaged the machine default' }
+Write-Host 'ok: former sentinel changed nothing (no downgrade, default intact)'
 $mortal = Start-Process $Old -ArgumentList ($silent + @('/CURRENTUSER', '/Theme=Dark')) -Wait -PassThru
 if ($mortal.ExitCode -eq 0) { throw 'per-user /Theme=Dark reported success; it must fail instead' }
 Write-Host "ok: per-user /Theme=Dark exited $($mortal.ExitCode)"

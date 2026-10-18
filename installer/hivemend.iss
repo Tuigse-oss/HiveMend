@@ -97,11 +97,28 @@ begin
     (CompareText(S, 'dark') = 0);
 end;
 
-// Marker value for "no /Theme switch was passed". The param default is
-// the only presence signal, so absence and an explicitly empty switch
-// (/Theme=) stay distinguishable. Passing this literal as a theme is
-// meaningless and falls through to validation, which rejects it.
-const ThemeAbsent = '__ABSENT__';
+// Presence comes from the raw command line, not from a sentinel default:
+// {param} cannot tell an absent switch from one whose value equals the
+// default, so any marker literal collides with an explicitly supplied
+// value. Every supplied value below is validated; only a genuinely
+// absent switch preserves the default.
+function ThemeSupplied(): Boolean;
+var
+  I: Integer;
+  Arg: String;
+begin
+  Result := False;
+  for I := 1 to ParamCount do
+  begin
+    Arg := ParamStr(I);
+    if (CompareText(Copy(Arg, 1, 7), '/Theme=') = 0) or
+        (CompareText(Copy(Arg, 1, 7), '/Theme:') = 0) then
+    begin
+      Result := True;
+      Exit;
+    end;
+  end;
+end;
 
 { Rejections happen in InitializeSetup, before anything is installed: a
   late abort (for example in CurStepChanged under /VERYSILENT with
@@ -113,9 +130,9 @@ var
   Choice: String;
 begin
   Result := True;
-  Choice := ExpandConstant('{param:Theme|' + ThemeAbsent + '}');
-  if Choice = ThemeAbsent then
+  if not ThemeSupplied() then
     Exit;
+  Choice := ExpandConstant('{param:Theme|}');
   // An explicitly empty switch lands here as '' and is rejected below,
   // exactly like any other invalid value.
   { A silent refusal shows no dialog: there is nobody to click it, and a

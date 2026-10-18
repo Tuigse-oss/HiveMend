@@ -326,33 +326,7 @@ fn read_machine_value() -> Option<ThemeMode> {
 fn machine_trusted() -> bool {
     use windows_sys::Win32::Foundation::LocalFree;
     use windows_sys::Win32::Security::Authorization::{GetNamedSecurityInfoW, SE_REGISTRY_KEY};
-    use windows_sys::Win32::Security::{
-        ACE_HEADER, ACL, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid,
-        DACL_SECURITY_INFORMATION, EqualSid, GetAce, GetAclInformation, PSECURITY_DESCRIPTOR,
-        WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid, WinWorldSid,
-    };
-    // winnt.h ACE types, absent from windows-sys as constants.
-    const ALLOWED: u8 = 0;
-    const DENIED: u8 = 1;
-    const ALLOWED_CALLBACK: u8 = 9;
-    const DENIED_CALLBACK: u8 = 10;
-    // Buffers big enough for any well-known SID (SECURITY_MAX_SID_SIZE).
-    let mut world = [0u32; 17];
-    let mut users = [0u32; 17];
-    let mut auth = [0u32; 17];
-    let mut interactive = [0u32; 17];
-    let mut known: [(i32, *mut std::ffi::c_void); 4] = [
-        (WinWorldSid, world.as_mut_ptr() as *mut _),
-        (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
-        (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
-        (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
-    ];
-    for (kind, slot) in &mut known {
-        let mut length = 68u32;
-        if unsafe { CreateWellKnownSid(*kind, std::ptr::null_mut(), *slot, &mut length) } == 0 {
-            return false;
-        }
-    }
+    use windows_sys::Win32::Security::{ACL, DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR};
     let path = wide(r"MACHINE\SOFTWARE\TUIGSE\Hivemend");
     let mut dacl: *mut ACL = std::ptr::null_mut();
     let mut sd: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
@@ -376,7 +350,47 @@ fn machine_trusted() -> bool {
         }
         return false;
     }
-    let mut info: ACL_SIZE_INFORMATION = unsafe { std::mem::zeroed() };
+    let trusted = unsafe { dacl_trusted(dacl) };
+    unsafe {
+        LocalFree(sd as *mut _);
+    }
+    trusted
+}
+
+/// Whether a live DACL (not a pre-decoded list) keeps broad identities
+/// without write access. Split from the registry lookup so tests can feed
+/// real descriptors built in memory, exercising retrieval and decoding as
+/// well as the pure policy.
+#[cfg(windows)]
+unsafe fn dacl_trusted(dacl: *const windows_sys::Win32::Security::ACL) -> bool {
+    use windows_sys::Win32::Security::{
+        ACE_HEADER, ACL_SIZE_INFORMATION, AclSizeInformation, CreateWellKnownSid, EqualSid, GetAce,
+        GetAclInformation, WinAuthenticatedUserSid, WinBuiltinUsersSid, WinInteractiveSid,
+        WinWorldSid,
+    };
+    // winnt.h ACE types, absent from windows-sys as constants.
+    const ALLOWED: u8 = 0;
+    const DENIED: u8 = 1;
+    const ALLOWED_CALLBACK: u8 = 9;
+    const DENIED_CALLBACK: u8 = 10;
+    // Buffers big enough for any well-known SID (SECURITY_MAX_SID_SIZE).
+    let mut world = [0u32; 17];
+    let mut users = [0u32; 17];
+    let mut auth = [0u32; 17];
+    let mut interactive = [0u32; 17];
+    let mut known: [(i32, *mut std::ffi::c_void); 4] = [
+        (WinWorldSid, world.as_mut_ptr() as *mut _),
+        (WinBuiltinUsersSid, users.as_mut_ptr() as *mut _),
+        (WinAuthenticatedUserSid, auth.as_mut_ptr() as *mut _),
+        (WinInteractiveSid, interactive.as_mut_ptr() as *mut _),
+    ];
+    for (kind, slot) in &mut known {
+        let mut length = 68u32;
+        if unsafe { CreateWellKnownSid(*kind, std::ptr::null_mut(), *slot, &mut length) } == 0 {
+            return false;
+        }
+    }
+    let mut info: ACL_SIZE_INFORMATION = std::mem::zeroed();
     let ok = unsafe {
         GetAclInformation(
             dacl,
@@ -412,7 +426,10 @@ fn machine_trusted() -> bool {
                 DENIED | DENIED_CALLBACK => false,
                 _ => continue,
             };
-            let mask = unsafe { entry.cast::<u32>().as_ptr().byte_add(1).read() };
+            // add(1) steps one u32: the mask lives at byte offset 4, right
+            // after the 4-byte ACE header (byte_add counts bytes, so it
+            // would need 4 here and misleads; see the review finding).
+            let mask = unsafe { entry.cast::<u32>().as_ptr().add(1).read() };
             let sid = unsafe { entry.as_ptr().byte_add(8) as *const _ };
             let broad = unsafe {
                 if EqualSid(sid as *mut _, world.as_ptr() as *mut _) != 0 {
@@ -433,9 +450,6 @@ fn machine_trusted() -> bool {
                 mask,
             });
         }
-    }
-    unsafe {
-        LocalFree(sd as *mut _);
     }
     // No DACL at all means nothing restricts the key.
     if info.AceCount == 0 {
@@ -9453,6 +9467,49 @@ fn exe_path() -> PathBuf {
 mod tests {
     use super::*;
 
+    /// A real in-memory DACL with one Users ACE, decoded through the same
+    /// retrieval path the registry lookup uses. The prior offset bug read
+    /// the mask one byte in; only a live descriptor catches that.
+    #[cfg(windows)]
+    unsafe fn users_acl(mask: u32) -> Vec<u8> {
+        use windows_sys::Win32::Security::{
+            ACL_REVISION, AddAccessAllowedAce, CreateWellKnownSid, InitializeAcl,
+            WinBuiltinUsersSid,
+        };
+        let mut sid = [0u32; 17];
+        let mut length = 68u32;
+        assert_ne!(
+            CreateWellKnownSid(
+                WinBuiltinUsersSid,
+                std::ptr::null_mut(),
+                sid.as_mut_ptr() as *mut _,
+                &mut length
+            ),
+            0
+        );
+        let mut buffer = vec![0u8; 256];
+        let pacl = buffer.as_mut_ptr() as *mut windows_sys::Win32::Security::ACL;
+        assert_ne!(InitializeAcl(pacl, 256, ACL_REVISION), 0);
+        assert_ne!(
+            AddAccessAllowedAce(pacl, ACL_REVISION, mask, sid.as_mut_ptr() as *mut _),
+            0
+        );
+        buffer
+    }
+
+    /// Read-only Users passes; a write-capable Users ACE fails, proving the
+    /// mask comes from the right offset rather than a neighboring byte.
+    #[cfg(windows)]
+    #[test]
+    fn live_dacl_decode_trusts_read_only_users_and_refuses_write() {
+        use windows_sys::Win32::Security::ACL;
+        use windows_sys::Win32::System::Registry::{KEY_READ, KEY_WRITE};
+        let read = unsafe { users_acl(KEY_READ) };
+        assert!(unsafe { dacl_trusted(read.as_ptr() as *const ACL) });
+        let write = unsafe { users_acl(KEY_WRITE) };
+        assert!(!unsafe { dacl_trusted(write.as_ptr() as *const ACL) });
+    }
+
     /// Counts every look at the per-user files and gives fixed contents.
     #[derive(Default)]
     struct Watched {
@@ -9637,8 +9694,9 @@ mod tests {
         // function address), so invoking it directly is a crash condition.
         // This gate fails if header_proc ever goes back to calling the
         // saved procedure value as a function.
-        let source = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("src/gui.rs");
-        let text = std::fs::read_to_string(&source).expect("own source stays readable");
+        // Embedded at compile time so standalone VM test binaries need no
+        // source checkout beside them.
+        let text = include_str!("gui.rs");
         assert!(
             text.contains("CallWindowProcW(old, header, msg, wparam, lparam)"),
             "header_proc must dispatch through CallWindowProcW"
