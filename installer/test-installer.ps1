@@ -142,9 +142,23 @@ function Show-Validation {
   Remove-Item $out -ErrorAction SilentlyContinue
   Remove-Item $err -ErrorAction SilentlyContinue
   $script = Join-Path $PSScriptRoot 'validate-theme-store.ps1'
-  $proc = Start-Process powershell.exe -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
-    '-File', $script, '-OutFile', $out) -Wait -PassThru `
-    -RedirectStandardError $err -RedirectStandardOutput (Join-Path $dir 'stdout.txt')
+  # Same engine order as the installer: pwsh first (some hosts cannot
+  # load the Security module under 5.1), powershell as fallback.
+  $proc = $null
+  foreach ($engine in @('pwsh.exe', 'powershell.exe')) {
+    try {
+      $proc = Start-Process $engine -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', $script, '-OutFile', $out) -Wait -PassThru -ErrorAction Stop `
+        -RedirectStandardError $err -RedirectStandardOutput (Join-Path $dir 'stdout.txt')
+      break
+    } catch {
+      Write-Host "validation engine $engine unavailable ($($_.Exception.Message))"
+    }
+  }
+  if ($null -eq $proc) {
+    Write-Host 'direct validation: no engine launched'
+    return
+  }
   $verdict = '(no verdict file)'
   if (Test-Path $out) { $verdict = (Get-Content $out -Raw).Trim() }
   Write-Host "direct validation: exit $($proc.ExitCode), $verdict"

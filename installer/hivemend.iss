@@ -143,6 +143,17 @@ var
   that could not run, refuses the install before any permissions or
   value mutation: Inno Permissions only grant rights and cannot scrub
   an existing hostile grant, so the store must be verified first. }
+{ Runs one validation engine. The caller tries pwsh first: some hosts
+  cannot load the Security module under Windows PowerShell 5.1, while
+  pwsh is absent on others, so launch failure (not a verdict) falls
+  through to the other engine. }
+function RunValidationEngine(const Engine, Script, VerdictFile: String; var Code: Integer): Boolean;
+begin
+  Result := Exec(Engine,
+    '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + VerdictFile + '"',
+    '', SW_HIDE, ewWaitUntilTerminated, Code);
+end;
+
 function ThemeStoreReady(var Detail: String): Boolean;
 var
   Script, VerdictFile: String;
@@ -159,9 +170,9 @@ begin
     ExtractTemporaryFile('validate-theme-store.ps1');
     Script := ExpandConstant('{tmp}\validate-theme-store.ps1');
     VerdictFile := ExpandConstant('{tmp}\theme-store-verdict.txt');
-    Ran := Exec('powershell.exe',
-      '-NoProfile -ExecutionPolicy Bypass -File "' + Script + '" -OutFile "' + VerdictFile + '"',
-      '', SW_HIDE, ewWaitUntilTerminated, Code);
+    Ran := RunValidationEngine('pwsh.exe', Script, VerdictFile, Code);
+    if not Ran then
+      Ran := RunValidationEngine('powershell.exe', Script, VerdictFile, Code);
     if Ran and (Code = 0) and LoadStringFromFile(VerdictFile, Loaded) then
       ThemeStoreVerdict := Trim(Loaded)
     else
