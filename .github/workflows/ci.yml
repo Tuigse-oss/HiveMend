@@ -62,8 +62,11 @@ jobs:
   installer:
     name: installer (install, upgrade, uninstall)
     # Package managers upgrade by running the new installer over the old one,
-    # so every change is checked with two builds of the installer.
+    # so every change is checked with two builds of the installer. The cap
+    # keeps a stuck Setup (for example a dialog waiting for a click) from
+    # burning the 6 h quota the way the UI job once threatened to.
     runs-on: windows-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:

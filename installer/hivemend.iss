@@ -110,11 +110,15 @@ begin
   Choice := ExpandConstant('{param:Theme|}');
   if Choice = '' then
     Exit;
+  { A silent refusal shows no dialog: there is nobody to click it, and a
+    stuck Setup would hang a package manager (or CI) forever. The refusal
+    still installs nothing, which the installer checks verify by effects. }
   if not ValidTheme(Choice) then
   begin
-    MsgBox(
-      'Invalid /Theme=' + Choice + '. Use /Theme=Light, /Theme=System, or /Theme=Dark.',
-      mbError, MB_OK);
+    if not WizardSilent() then
+      MsgBox(
+        'Invalid /Theme=' + Choice + '. Use /Theme=Light, /Theme=System, or /Theme=Dark.',
+        mbError, MB_OK);
     Result := False;
     Exit;
   end;
@@ -122,10 +126,11 @@ begin
     set a machine default: it says so instead of silently ignoring it. }
   if not IsAdminInstallMode() then
   begin
-    MsgBox(
-      '/Theme=' + Choice + ' needs an all-users (/ALLUSERS) install, which can write the machine default. ' +
-      'Install without /Theme and pick the theme in the app under Settings > Appearance instead.',
-      mbError, MB_OK);
+    if not WizardSilent() then
+      MsgBox(
+        '/Theme=' + Choice + ' needs an all-users (/ALLUSERS) install, which can write the machine default. ' +
+        'Install without /Theme and pick the theme in the app under Settings > Appearance instead.',
+        mbError, MB_OK);
     Result := False;
   end;
 end;
