@@ -213,7 +213,11 @@ function Invoke-MachineTheme {
     -RedirectStandardOutput $out -RedirectStandardError (Join-Path ([IO.Path]::GetTempPath()) 'machine-theme-err.txt')
   if ($proc.ExitCode -ne 0) { throw "machine-theme exited with $($proc.ExitCode)" }
   if (!(Test-Path $out)) { return '' }
-  return (Get-Content $out -Raw).Trim()
+  # Refusal is exit 0 with empty stdout, so an empty file reads as $null
+  # and must map to '' instead of throwing on .Trim().
+  $content = Get-Content $out -Raw
+  if ($null -eq $content) { return '' }
+  return $content.Trim()
 }
 $accepted = Invoke-MachineTheme
 if ($accepted -ne 'dark') {
