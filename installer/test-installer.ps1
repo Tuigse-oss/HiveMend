@@ -361,6 +361,8 @@ public static class FixtureLink {
         int type, byte[] data, int size);
     [DllImport("advapi32.dll")]
     public static extern int RegCloseKey(UIntPtr hKey);
+    [DllImport("advapi32.dll", CharSet = CharSet.Unicode)]
+    public static extern int RegDeleteKeyEx(UIntPtr hKey, string subKey, int access, int reserved);
 }
 '@ | Out-Null
   Remove-Item -Path $themeKey -Recurse -Force
@@ -390,14 +392,12 @@ if ($linkFixture) {
     throw 'a refused redirected install changed the install (downgraded or duplicated)'
   }
   Write-Host 'ok: redirected store refused, install untouched'
-  # Get-Item opens read-only, which cannot delete; a writable open
-  # deletes the link object itself by name, never its target.
-  $parent = [Microsoft.Win32.Registry]::LocalMachine.OpenSubKey('SOFTWARE\TUIGSE', $true)
-  try {
-    $parent.DeleteSubKey('Hivemend')
-  } finally {
-    $parent.Close()
-  }
+  # Delete by parent-relative name without opening the leaf: opening a
+  # link follows it, so .NET's DeleteSubKey (which opens the child first)
+  # and any recursive deleter would walk into the target. RegDeleteKeyEx
+  # removes the link object itself, never its target.
+  $rc = [FixtureLink]::RegDeleteKeyEx([UIntPtr]::new([uint64]2147483650), 'SOFTWARE\TUIGSE\Hivemend', 0x100, 0)
+  if ($rc -ne 0) { throw "the link fixture survived cleanup (delete exited $rc)" }
   if (Test-Path $themeKey) { throw 'the link fixture survived cleanup' }
   Write-Host 'ok: link fixture removed without touching its target'
   New-Item -Path $themeKey -Force | Out-Null
