@@ -324,7 +324,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ============================================================================
-libsqlite3-sys 0.38.2 (license: MIT; used under MIT)
+libsqlite3-sys 0.39.1 (license: MIT; used under MIT)
 ============================================================================
 
 Copyright (c) 2014 The rusqlite developers
@@ -372,7 +372,7 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 
 ============================================================================
-rusqlite 0.40.2 (license: MIT; used under MIT)
+rusqlite 0.41.1 (license: MIT; used under MIT)
 ============================================================================
 
 Copyright (c) 2014 The rusqlite developers
