@@ -475,7 +475,7 @@ fn trim_with(
             message,
             changed: false,
         }) => return Err(unchanged(message)),
-        Err(Edit { message, .. }) => return Err(put_back(conn, &snapshot, path, message)),
+        Err(Edit { message, .. }) => return Err(put_back(conn, &mut snapshot, path, message)),
     };
     match at(Stage::Committed).and_then(|()| settle(&conn)) {
         Ok(()) => {
@@ -500,7 +500,7 @@ fn trim_with(
             }
             Ok(count)
         }
-        Err(err) => Err(put_back(conn, &snapshot, path, err)),
+        Err(err) => Err(put_back(conn, &mut snapshot, path, err)),
     }
 }
 
@@ -621,7 +621,7 @@ fn settle(conn: &rusqlite::Connection) -> Result<(), String> {
 /// beside the database so nothing is lost, and say where it is.
 fn put_back(
     mut conn: rusqlite::Connection,
-    snapshot: &rusqlite::Connection,
+    snapshot: &mut rusqlite::Connection,
     path: &Path,
     err: String,
 ) -> String {
@@ -655,7 +655,7 @@ fn put_back(
 
 /// Save the in-memory copy to a new file beside the database, never over
 /// an existing one.
-fn save_copy(snapshot: &rusqlite::Connection, path: &Path) -> Result<PathBuf, String> {
+fn save_copy(snapshot: &mut rusqlite::Connection, path: &Path) -> Result<PathBuf, String> {
     for attempt in 0..100u32 {
         let mut name = path.as_os_str().to_owned();
         name.push(format!("{COPY_TAG}-{}-{attempt}", std::process::id()));
@@ -1020,7 +1020,7 @@ mod tests {
         copy_all(&rusqlite::Connection::open(&db).unwrap(), &mut snapshot).unwrap();
         // A read-only connection cannot take the copy back.
         let stuck = open(&db, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY).unwrap();
-        let message = put_back(stuck, &snapshot, &db, "injected failure".into());
+        let message = put_back(stuck, &mut snapshot, &db, "injected failure".into());
         let copies = leftover_copies(&db);
         assert_eq!(copies.len(), 1, "{message}");
         assert!(
