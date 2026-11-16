@@ -30,7 +30,7 @@ Hivemend gets better through people using it on real machines. Bug reports, fals
 1. Download `Hivemend-vX.Y.Z-x86_64-setup.exe` (installer) or `Hivemend-vX.Y.Z-x86_64-windows.zip` (portable) from [Releases](https://github.com/Tuigse-oss/HiveMend/releases/latest).
 2. Run it. It needs no administrator rights to install or use; it offers to restart as administrator when machine-wide entries need it.
 
-Builds are not code-signed yet, so Windows may show a SmartScreen warning; see [Releases](#releases) for how to check a download first.
+Builds are not code-signed yet, so Windows may show a SmartScreen warning; see [Releases](#releases) for how to check a download first, and the [code signing policy](#code-signing-policy) for how releases will be signed.
 
 > **Use at your own risk.** Hivemend changes the Windows registry and can permanently delete files. It writes a backup before registry changes, but cleaned temp, cache, and Recycle Bin files cannot be recovered. It is provided as is, without warranty of any kind; see [LICENSE-MIT](LICENSE-MIT) and [LICENSE-APACHE](LICENSE-APACHE).
 
@@ -433,6 +433,23 @@ cargo audit bin Hivemend.exe
 To cut a release, set `version` in `Cargo.toml`, merge, then push a matching tag (`git tag v0.1.0 && git push origin v0.1.0`). CI attaches the zip, installer, and checksums to a draft release, which goes public once it is reviewed and published on GitHub. Running the release workflow by hand from the Actions tab builds the same files as a downloadable workflow artifact without making a release.
 
 After changing `Cargo.lock`, regenerate the notices with `python3 scripts/third-party-notices.py`; a test fails until they cover every linked crate.
+
+## Code signing policy
+
+Free code signing provided by [SignPath.io](https://about.signpath.io), certificate by [SignPath Foundation](https://signpath.org).
+
+No release is signed yet. We are applying to SignPath Foundation, and this policy describes how signing will work once the project is accepted.
+
+Only the exe and installer built by this repository's [release workflow](.github/workflows/release.yml) from a version tag will be signed, and a maintainer will approve each signing request before SignPath signs it. Nothing built elsewhere, and no third-party program, will be signed under this certificate.
+
+**Team roles**
+
+- Committers and reviewers: [Brad Williamson](https://github.com/bradwilliamson)
+- Approvers: [Brad Williamson](https://github.com/bradwilliamson)
+
+**Privacy policy**
+
+This program will not transfer any information to other networked systems unless specifically requested by the user or the person installing or operating it. Hivemend contains no networking code.
 
 ## Security
 
