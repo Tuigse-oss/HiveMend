@@ -132,4 +132,4 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-        run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hivemend $TAG" --generate-notes --notes "[Code signing policy](https://github.com/Tuigse-oss/HiveMend#code-signing-policy)"
+        run: gh release create "$TAG" dist/* --draft --verify-tag --title "Hivemend $TAG" --generate-notes
